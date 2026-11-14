@@ -1,10 +1,10 @@
 """Tests for speculative execution posture and timer side-channel defenses.
 
 The guest kernel boots with mitigations=off — a deliberate density/latency
-decision (commit 5526750d): the VM boundary (KVM/HVF) is the security layer,
-not the guest kernel. x86 sysfs tests verify the runtime effect; arm64 tests
-verify readable, architecture-specific reporting. A host-side unit test pins
-the common cmdline token for both architectures.
+decision: the VM boundary (KVM/HVF) is the security layer, not the guest kernel.
+x86 sysfs tests verify the runtime effect; arm64 tests verify readable,
+architecture-specific reporting. A host-side unit test pins the common cmdline
+token for both architectures.
 
 Security model:
 - Guest-side mitigations do not implement the VMSCAPE host boundary.
@@ -17,7 +17,7 @@ Security model:
   root guest-agent intentionally stores no long-lived platform credential, but
   it transiently holds tenant code, environment values, and protocol state.
   Its host channels are virtio-serial devices (guest-agent/src/constants.rs).
-- nokaslr is omitted. The x86 base currently enables CONFIG_RANDOMIZE_BASE,
+- nokaslr is omitted. The x86 base config enables CONFIG_RANDOMIZE_BASE,
   but runtime KASLR on the direct-vmlinux PVH path is not asserted here. The
   arm64 base has CONFIG_RANDOMIZE_BASE=n and mitigations=off leaves KPTI off;
   that density tradeoff is explicit, not an accidental hardening claim.
@@ -39,14 +39,18 @@ Security model:
 
 Test categories:
 - Normal: verify x86 runtime effect and per-arch sysfs reporting
-- Normal: informational timer precision measurement (no assertion on bounds)
-- Edge: verify side-channel defense sysctls (perf_event_paranoid, KSM)
+- Normal: the guest monotonic clock never goes back (no assertion on its resolution)
+- Edge: verify the guest has no KSM (perf_event_paranoid: test_kernel_attack_surface.py)
 - Normal: document CPU vulnerability exposure transparency
 """
+
+import re
 
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, detect_host_arch
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 # Guest arch always equals host arch: forced emulation (TCG) emulates the SAME
 # architecture, only without hardware acceleration (see qemu_cmd.py -cpu block).
@@ -87,14 +91,14 @@ def _assert_mitigations_off_reached_guest(name: str, status: str) -> None:
     so AMD / Ice Lake+ hosts under -cpu host legitimately report it. Under TCG
     the arch-capabilities MSR is stripped, so affected bugs report 'Vulnerable*'.
 
-    An active 'Mitigation:' string means mitigations=off silently stopped
-    reaching the guest — check the qemu_cmd.py mitigations block and
+    An active 'Mitigation:' string means mitigations=off does not reach the
+    guest — check the qemu_cmd.py mitigations block and
     test_vm_manager.py::TestKernelCmdlineMitigations.
     """
     assert status == "Not affected" or status.startswith("Vulnerable"), (
         f"{name}: expected 'Not affected' or 'Vulnerable*' under mitigations=off "
-        f"(density posture, commit 5526750d); got: {status!r} — if this is a "
-        f"'Mitigation:' string, mitigations=off no longer reaches the guest"
+        f"(density posture); got: {status!r} — a 'Mitigation:' string means "
+        f"mitigations=off does not reach the guest"
     )
 
 
@@ -109,10 +113,10 @@ class TestMitigationStatus:
     dominated, so those branches validate reporting semantics without claiming
     to prove the runtime flag took effect.
 
-    A previous guest-side cmdline test (reading /proc/cmdline) was deleted:
-    guest-agent masks /proc/cmdline with a /dev/null bind-mount
-    (guest-agent/src/init.rs), so it read "" and passed vacuously. Masking
-    itself is asserted in test_kernel_attack_surface.py::TestProcInfoLeaks.
+    No guest-side cmdline test: guest-agent masks /proc/cmdline with a
+    /dev/null bind-mount (guest-agent/src/init.rs), so a read gives "" and
+    cannot fail. The mask itself is asserted in
+    test_kernel_attack_surface.py::TestProcInfoLeaks.
     """
 
     async def test_spectre_v2_status_matches_posture(self, dual_scheduler: Scheduler) -> None:
@@ -125,13 +129,15 @@ class TestMitigationStatus:
         QEMU TCG max), 'Mitigation:*' (BHB-listed cores), or 'Vulnerable*'
         (non-CSV2 cores) is hardware-truthful — transparency only.
         """
-        result = await dual_scheduler.run(code=_read_vuln_file_code("spectre_v2"), language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _read_vuln_file_code("spectre_v2"))
         assert result.exit_code == 0
         status = _extract_status(result.stdout, "spectre_v2")
         if IS_X86:
             _assert_mitigations_off_reached_guest("spectre_v2", status)
         else:
-            assert status, "spectre_v2: empty sysfs status"
+            assert status == "Not affected" or status.startswith(("Mitigation: ", "Vulnerable")), (
+                f"spectre_v2: not a kernel status string: {status!r}"
+            )
 
     async def test_spectre_v1_status_matches_posture(self, dual_scheduler: Scheduler) -> None:
         """Spectre v1 (CVE-2017-5753) status matches documented arch behavior.
@@ -143,7 +149,7 @@ class TestMitigationStatus:
         'Mitigation:*' is the permanent expected value even under
         mitigations=off.
         """
-        result = await dual_scheduler.run(code=_read_vuln_file_code("spectre_v1"), language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _read_vuln_file_code("spectre_v1"))
         assert result.exit_code == 0
         status = _extract_status(result.stdout, "spectre_v1")
         if IS_X86:
@@ -164,7 +170,7 @@ class TestMitigationStatus:
         arm64: MDS is an x86-only bug; the weak default handler in
         drivers/base/cpu.c always reports 'Not affected'.
         """
-        result = await dual_scheduler.run(code=_read_vuln_file_code("mds"), language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _read_vuln_file_code("mds"))
         assert result.exit_code == 0
         status = _extract_status(result.stdout, "mds")
         if IS_X86:
@@ -174,14 +180,13 @@ class TestMitigationStatus:
 
 
 # =============================================================================
-# Normal: Timer precision measurement (informational, no assertion on bounds)
+# Normal: Timer reads (no assertion on resolution)
 # =============================================================================
 class TestTimerPrecision:
-    """Informational measurement of timer resolution inside the guest VM.
+    """clock_gettime(CLOCK_MONOTONIC) inside the guest VM.
 
-    Documents clock_gettime(CLOCK_MONOTONIC) precision as a baseline.
-    No assertion on bounds because timer coarsening is not part of this
-    sandbox's security posture:
+    The test prints the resolution but does not assert it, because timer
+    coarsening is not part of this sandbox's security posture:
     - vDSO maps clock_gettime into userspace, bypassing seccomp entirely
     - KernelSnitch (NDSS 2025) demonstrates kernel-data-structure timing leaks
     - Cloudflare Workers freezes timers AND isolates processes (not applicable to VMs)
@@ -189,11 +194,10 @@ class TestTimerPrecision:
     """
 
     async def test_timer_resolution_measured(self, dual_scheduler: Scheduler) -> None:
-        """Measure clock_gettime resolution — informational baseline only.
+        """1000 back-to-back CLOCK_MONOTONIC reads never go back, and the clock advances.
 
-        Records minimum delta between consecutive CLOCK_MONOTONIC reads.
-        This documents the state without asserting bounds, since timer
-        coarsening is not an effective mitigation in VM environments.
+        The minimum and median step go to stdout for information: timer
+        coarsening is not a mitigation in VM environments, so no bound on them.
         """
         code = """\
 import ctypes, ctypes.util, struct, platform
@@ -211,33 +215,27 @@ ts = timespec()
 for _ in range(100):
     libc.clock_gettime(CLOCK_MONOTONIC, ctypes.byref(ts))
 
-# Measure minimum delta over 1000 consecutive reads
+# Steps between 1000 consecutive reads
 deltas = []
 prev_ns = None
 for _ in range(1000):
     libc.clock_gettime(CLOCK_MONOTONIC, ctypes.byref(ts))
     cur_ns = ts.tv_sec * 1_000_000_000 + ts.tv_nsec
     if prev_ns is not None:
-        delta = cur_ns - prev_ns
-        if delta > 0:
-            deltas.append(delta)
+        deltas.append(cur_ns - prev_ns)
     prev_ns = cur_ns
 
-if deltas:
-    min_d = min(deltas)
-    med_d = sorted(deltas)[len(deltas) // 2]
-    print(f"MIN_DELTA_NS:{min_d}")
-    print(f"MEDIAN_DELTA_NS:{med_d}")
-    print(f"SAMPLES:{len(deltas)}")
-else:
-    print("NO_DELTAS")
+forward = sorted(d for d in deltas if d > 0)
+print(f"BACKWARD:{sum(d < 0 for d in deltas)}")
+print(f"FORWARD:{len(forward)}")
+if forward:
+    print(f"MIN_DELTA_NS:{forward[0]} MEDIAN_DELTA_NS:{forward[len(forward) // 2]}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        # Informational only — just verify measurement succeeded
-        assert "MIN_DELTA_NS:" in result.stdout or "NO_DELTAS" in result.stdout, (
-            f"Timer measurement should produce results. stdout: {result.stdout}"
-        )
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
+        assert result.exit_code == 0, result.stderr
+        steps = re.fullmatch(r"BACKWARD:0\nFORWARD:(\d+)\nMIN_DELTA_NS:\d+ MEDIAN_DELTA_NS:\d+\n", result.stdout)
+        assert steps, result.stdout
+        assert int(steps[1]) > 0, result.stdout
 
 
 # =============================================================================
@@ -250,36 +248,6 @@ class TestTimerSideChannelDefenses:
     complementary guest perf/KSM posture; they do not assert host setup.
     """
 
-    async def test_perf_event_paranoid_blocks_perf(self, dual_scheduler: Scheduler) -> None:
-        """perf is restricted by sysctl on x86 and compiled out on arm64.
-
-        Hardware performance counters are a precise side-channel primitive.
-        Cross-referenced with test_kernel_attack_surface.py::TestKernelInfoLeakSysctls.
-        The final kernel has CONFIG_PERF_EVENTS=n on arm64; x86 arch Kconfig
-        force-selects it, so the runtime sysctl must be >= 3 there.
-        """
-        code = """\
-try:
-    with open('/proc/sys/kernel/perf_event_paranoid') as f:
-        val = f.read().strip()
-        print(f'PERF_PARANOID:{val}')
-except FileNotFoundError:
-    print('NOT_FOUND')
-except PermissionError:
-    print('PERM_DENIED')
-"""
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        if IS_X86:
-            assert "PERF_PARANOID:" in stdout and stdout.split(":", 1)[1].lstrip("-").isdigit(), (
-                f"x86 force-selects CONFIG_PERF_EVENTS; expected readable perf_event_paranoid, got: {stdout!r}"
-            )
-            val = int(stdout.split(":")[1])
-            assert val >= 3, f"Expected perf_event_paranoid >= 3, got {val}"
-        else:
-            assert stdout == "NOT_FOUND", f"arm64 CONFIG_PERF_EVENTS=n requires no perf sysctl, got: {stdout!r}"
-
     async def test_ksm_disabled(self, dual_scheduler: Scheduler) -> None:
         """KSM (Kernel Same-page Merging) must be disabled inside the guest.
 
@@ -287,6 +255,9 @@ except PermissionError:
         timing. Host-side KSM (QEMU mem-merge=on) is enabled for density, but
         the guest kernel has CONFIG_KSM=n. The sysfs control must therefore be
         absent; accepting run=0 would miss an accidental KSM re-enable.
+        Host-side KSM (mem-merge=on) operates at the QEMU process level and is
+        invisible to the guest. perf_event_paranoid, the other guest control:
+        test_kernel_attack_surface.py::TestKernelInfoLeakSysctls::test_perf_event_paranoid.
         """
         code = """\
 try:
@@ -298,34 +269,10 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert stdout == "NOT_FOUND", f"CONFIG_KSM=n requires /sys/kernel/mm/ksm/run to be absent, got: {stdout!r}"
-
-    async def test_guest_ksm_pages_shared_absent(self, dual_scheduler: Scheduler) -> None:
-        """Verify KSM pages_shared is absent inside the guest.
-
-        Guest kernel has CONFIG_KSM=n, so pages_shared must not exist.
-        Host-side KSM (mem-merge=on) operates at the QEMU process level and is
-        invisible to the guest.
-        """
-        code = """\
-try:
-    with open('/sys/kernel/mm/ksm/pages_shared') as f:
-        val = f.read().strip()
-        print(f'PAGES_SHARED:{val}')
-except FileNotFoundError:
-    print('NOT_FOUND')
-except PermissionError:
-    print('PERM_DENIED')
-"""
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        assert stdout == "NOT_FOUND", (
-            f"CONFIG_KSM=n requires /sys/kernel/mm/ksm/pages_shared to be absent, got: {stdout!r}"
-        )
 
 
 # =============================================================================
@@ -367,12 +314,13 @@ else:
             except (PermissionError, OSError) as e:
                 print(f'{name}:ERROR:{e}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert "DIR_NOT_FOUND" not in stdout, "CPU vulnerability directory should exist"
         error_lines = [line for line in stdout.splitlines() if ":ERROR:" in line]
         assert not error_lines, f"All CPU vulnerability files must be readable, got: {error_lines}"
-        # Verify at least some vulnerability files were read (sanity check)
-        lines = [line for line in stdout.splitlines() if ":" in line and "ERROR" not in line]
-        assert len(lines) > 0, f"Expected vulnerability status entries. stdout: {stdout}"
+        # The files that TestMitigationStatus reads are listed, each with a status
+        statuses = dict(line.split(":", 1) for line in stdout.splitlines())
+        assert {"mds", "spectre_v1", "spectre_v2"} <= statuses.keys(), stdout
+        assert all(statuses.values()), stdout

@@ -26,7 +26,7 @@ The sweep results inform the defaults in constants.py
 Re-run after changing VM sizing, admission logic, or target hardware:
     make bench-optimizer              # 200 VMs per combo (default)
     make bench-optimizer N_VMS=500    # heavier load
-    uv run python scripts/benchmark_optimizer.py -n 50   # quick local test
+    uv run --script scripts/benchmark_optimizer.py -n 50   # quick local test
 """
 
 from __future__ import annotations
@@ -39,31 +39,29 @@ import random
 import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Self
 
 import numpy as np  # type: ignore[reportMissingImports]
 import psutil
 from scipy.interpolate import RBFInterpolator  # type: ignore[reportMissingImports]
 from scipy.optimize import minimize  # type: ignore[reportMissingImports]
 
-from exec_sandbox import Scheduler, SchedulerConfig
+from exec_sandbox import Scheduler, SchedulerConfig, VmSpec
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.constants import DEFAULT_CPU_OVERCOMMIT_RATIO, DEFAULT_MEMORY_OVERCOMMIT_RATIO
 from exec_sandbox.models import Language
-from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 configure_logging()
 
 # ============================================================================
 # Workload definitions
 # ============================================================================
-# Each entry: language + {code: proportion}.  During a burst the benchmark
-# picks commands at random according to these proportions, simulating a
+# Each entry: language + {code: proportion}.  Each burst draws its commands
+# with these proportions (fixed seed, see _build_task_list) to model a
 # realistic consumer mix.
-
-_SampleDict = dict[str, int | float | str]
 
 
 @dataclass(frozen=True)
@@ -101,8 +99,6 @@ WORKLOADS: Final[list[Workload]] = [
     ),
 ]
 
-_HOST_OS: Final[HostOS] = detect_host_os()
-
 # ============================================================================
 # Sweep grid + result dataclass
 # ============================================================================
@@ -118,7 +114,7 @@ class BurstResult:
 
     Latency is split into three dimensions:
     - **setup**: cache lookup + overlay + cgroup (excludes admission)
-    - **admission**: time blocked in admission queue (subset of setup, 0 for warm pool hits)
+    - **admission**: time blocked in admission queue (not part of setup, 0 for warm pool hits)
     - **exec**: VM boot + code execution (the actual work)
     """
 
@@ -126,7 +122,6 @@ class BurstResult:
     mem_oc: float
     n_vms: int
     n_ok: int
-    n_fail: int
     wall_s: float
     # Admission queue latency (0 for warm pool hits)
     admission_p50_ms: int
@@ -137,11 +132,10 @@ class BurstResult:
     # Exec latency (boot + execute, hardware-dominated)
     exec_p50_ms: int
     exec_p95_ms: int
-    # Total (admission + setup + boot + execute + teardown)
+    # Total: wall clock of new() + exec() + close() over all VMs (failed ones too)
     total_p50_ms: int
     total_p95_ms: int
     # System pressure
-    peak_qemu: int
     peak_rss_mb: int
     mem_total_mb: int
 
@@ -172,8 +166,8 @@ class BurstResult:
         Formula: efficiency = 10^6 / (admission * setup * exec)^(1/3)
 
         Higher is better.  When admission_p95 is 0 (no queueing), uses
-        only setup and exec for a 2D geomean.  Returns NaN only when both
-        setup and exec are zero (degenerate burst with no successful VMs).
+        only setup and exec for a 2D geomean.  Returns NaN when setup or
+        exec is zero (for example a burst with no successful VM).
         """
         a, s, e = self.admission_p95_ms, self.setup_p95_ms, self.exec_p95_ms
         if s <= 0 or e <= 0:
@@ -187,23 +181,13 @@ class BurstResult:
 def _build_task_list(n: int) -> list[tuple[Language, str]]:
     """Build a deterministic list of (language, code) tuples from WORKLOADS.
 
-    Distributes *n* tasks across workloads proportionally, then within
-    each workload distributes across commands proportionally.
+    Draws *n* tasks with a fixed seed: each workload has an equal weight (its
+    proportions sum to 1), and each command its proportion of that weight.
+    Counts follow the weights only approximately.
     """
-    rng = random.Random(42)  # deterministic for reproducibility
-
-    # Flatten to weighted (lang, code) pairs
-    weighted: list[tuple[Language, str, float]] = []
-    for wl in WORKLOADS:
-        wl_weight = 1.0 / len(WORKLOADS)
-        for code, proportion in wl.commands.items():
-            weighted.append((wl.lang, code, wl_weight * proportion))
-
-    total_w = sum(w for _, _, w in weighted)
-    population = [(lang, code) for lang, code, _ in weighted]
-    weights = [w / total_w for _, _, w in weighted]
-
-    return rng.choices(population, weights=weights, k=n)
+    population = [(wl.lang, code) for wl in WORKLOADS for code in wl.commands]
+    weights = [proportion for wl in WORKLOADS for proportion in wl.commands.values()]
+    return random.Random(42).choices(population, weights=weights, k=n)  # deterministic for reproducibility
 
 
 # ============================================================================
@@ -212,76 +196,38 @@ def _build_task_list(n: int) -> list[tuple[Language, str]]:
 
 
 class SystemMonitor:
-    """Background system metrics sampler at 100 ms resolution."""
+    """Background sampler of the total QEMU RSS (MB) at 100 ms resolution, while its `with` block runs."""
 
-    def __init__(self, interval: float = 0.1) -> None:
+    def __init__(self, *, interval: float) -> None:
         self.interval = interval
-        self.samples: list[_SampleDict] = []
+        self.samples: list[int] = []
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
 
-    def stop(self) -> None:
+    def __enter__(self) -> Self:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
+        self._thread.join(timeout=5)
 
     def _run(self) -> None:
         while not self._stop.is_set():
             with contextlib.suppress(Exception):
-                self.samples.append(self._collect())
+                self.samples.append(_qemu_rss_mb())
             self._stop.wait(self.interval)
 
-    def _collect(self) -> _SampleDict:
-        s: _SampleDict = {"ts": time.monotonic(), "wall": time.strftime("%H:%M:%S")}
-        _collect_processes(s)
-        _collect_memory(s)
-        return s
 
-
-# -- Collection helpers -------------------------------------------------------
-
-
-def _collect_processes(s: _SampleDict) -> None:
-    """Count QEMU processes, threads, RSS via psutil."""
-    qemu_procs = 0
-    qemu_threads = 0
+def _qemu_rss_mb() -> int:
+    """Total RSS of the QEMU processes via psutil, in MB."""
     qemu_rss_bytes = 0
     for proc in psutil.process_iter(["cmdline"]):  # type: ignore[reportUnknownMemberType]
         with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             cmdline: list[str] = proc.info.get("cmdline") or []  # type: ignore[union-attr]
             if any("qemu-system" in arg for arg in cmdline):
-                qemu_procs += 1
-                qemu_threads += proc.num_threads()
                 qemu_rss_bytes += proc.memory_info().rss
-    s["qemu_procs"] = qemu_procs
-    s["qemu_threads"] = qemu_threads
-    s["qemu_rss_mb"] = qemu_rss_bytes // (1024 * 1024)
-
-
-def _collect_memory(s: _SampleDict) -> None:
-    """Collect system memory via psutil."""
-    vmem = psutil.virtual_memory()
-    s["mem_total_mb"] = vmem.total // (1024 * 1024)
-    s["mem_avail_mb"] = vmem.available // (1024 * 1024)
-    s["mem_used_mb"] = (vmem.total - vmem.available) // (1024 * 1024)
-    if _HOST_OS == HostOS.LINUX:
-        with contextlib.suppress(OSError, ValueError):
-            for line in Path("/proc/meminfo").read_text().splitlines():
-                if line.startswith("Committed_AS:"):
-                    s["committed_mb"] = int(line.split()[1]) // 1024
-                    break
-
-
-# -- Typed accessor for sample dicts ------------------------------------------
-
-
-def _g(s: _SampleDict, key: str) -> int:
-    v = s.get(key, 0)
-    return int(v) if isinstance(v, (int, float)) else 0
+    return qemu_rss_bytes // (1024 * 1024)
 
 
 # ============================================================================
@@ -293,44 +239,44 @@ def _g(s: _SampleDict, key: str) -> int:
 class VMResult:
     """Result from a single VM execution."""
 
-    idx: int
     ok: bool
+    error: str | None  # why the run failed (an exception or an exit code), None when ok
     elapsed_ms: int
     setup_ms: int
     admission_ms: int  # Time blocked in admission queue (0 for warm pool hits)
     exec_ms: int  # boot_ms + execute_ms (includes VM boot, not pure execution)
-    error: str | None = None
 
 
-async def _run_single(scheduler: Scheduler, idx: int, lang: Language, code: str) -> VMResult:
+async def _run_single(scheduler: Scheduler, lang: Language, code: str) -> VMResult:
     """Run a single VM and return timing/status."""
     t0 = time.monotonic()
     try:
-        result = await scheduler.run(code=code, language=lang)
+        async with await scheduler.new(VmSpec(language=lang)) as vm:
+            result = await vm.exec(code)
+            startup = vm.startup_timing
         elapsed = time.monotonic() - t0
-        t = result.timing
         return VMResult(
-            idx=idx,
             ok=result.exit_code == 0,
+            error=None if result.exit_code == 0 else f"exit code {result.exit_code}",
             elapsed_ms=round(elapsed * 1000),
-            setup_ms=t.setup_ms,
-            admission_ms=t.admission_ms or 0,
-            exec_ms=t.boot_ms + t.execute_ms,
+            setup_ms=startup.setup_ms,
+            admission_ms=startup.admission_ms,
+            exec_ms=startup.boot_ms + result.timing.execute_ms,
         )
-    except Exception as exc:
+    except Exception as e:
         elapsed = time.monotonic() - t0
         return VMResult(
-            idx=idx,
             ok=False,
+            error=f"{type(e).__name__}: {str(e)[:160]}",
             elapsed_ms=round(elapsed * 1000),
             setup_ms=0,
             admission_ms=0,
             exec_ms=0,
-            error=str(exc)[:200],
         )
 
 
 def _percentile(data: list[int], pct: float) -> int:
+    """Percentile (pct in 0-100) of sorted data, linearly interpolated; 0 when empty."""
     if not data:
         return 0
     k = (len(data) - 1) * pct / 100
@@ -346,44 +292,42 @@ def _percentile(data: list[int], pct: float) -> int:
 # ============================================================================
 
 
-async def _run_burst(n_vms: int, cpu_oc: float, mem_oc: float) -> BurstResult:
+async def _run_burst(n_vms: int, cpu_oc: float, mem_oc: float, *, images_dir: Path) -> BurstResult:
     """Execute a single burst and return summary metrics."""
     tasks_list = _build_task_list(n_vms)
-    monitor = SystemMonitor(interval=0.1)
-    monitor.start()
-    wall_start = time.monotonic()
-
-    async with Scheduler(
-        SchedulerConfig(
-            auto_download_assets=True,
-            cpu_overcommit_ratio=cpu_oc,
-            memory_overcommit_ratio=mem_oc,
-        )
-    ) as scheduler:
-        coros = [_run_single(scheduler, i, lang, code) for i, (lang, code) in enumerate(tasks_list)]
-        results = list(await asyncio.gather(*coros))
-
-    wall_elapsed = time.monotonic() - wall_start
-    monitor.stop()
+    # The monitor runs until the Scheduler has stopped (also on an error or Ctrl-C)
+    with SystemMonitor(interval=0.1) as monitor:
+        wall_start = time.monotonic()
+        async with Scheduler(
+            SchedulerConfig(
+                images_dir=images_dir,
+                auto_download_assets=False,
+                cpu_overcommit_ratio=cpu_oc,
+                memory_overcommit_ratio=mem_oc,
+            )
+        ) as scheduler:
+            coros = [_run_single(scheduler, lang, code) for lang, code in tasks_list]
+            results = list(await asyncio.gather(*coros))
+        wall_elapsed = time.monotonic() - wall_start
 
     ok_results = [r for r in results if r.ok]
+    for error, count in Counter(r.error for r in results if r.error is not None).most_common(3):
+        print(f"    Warning: {count} runs failed: {error}")
     # Total latency includes ALL VMs (failed VMs use wall-clock elapsed_ms,
     # reflecting the user-visible wait time including timeout).
     e2e_sorted = sorted(r.elapsed_ms for r in results)
     # Setup/admission/exec only from successes (failed VMs have setup_ms=0, admission_ms=0, exec_ms=0).
-    setup_sorted = sorted(r.setup_ms for r in ok_results) if ok_results else []
-    admission_sorted = sorted(r.admission_ms for r in ok_results) if ok_results else []
-    exec_sorted = sorted(r.exec_ms for r in ok_results) if ok_results else []
-    peak_qemu = max((_g(s, "qemu_procs") for s in monitor.samples), default=0)
-    peak_rss = max((_g(s, "qemu_rss_mb") for s in monitor.samples), default=0)
-    mem_total = _g(monitor.samples[0], "mem_total_mb") if monitor.samples else 0
+    setup_sorted = sorted(r.setup_ms for r in ok_results)
+    admission_sorted = sorted(r.admission_ms for r in ok_results)
+    exec_sorted = sorted(r.exec_ms for r in ok_results)
+    peak_rss = max(monitor.samples, default=0)
+    mem_total = psutil.virtual_memory().total // (1024 * 1024)
 
     return BurstResult(
         cpu_oc=cpu_oc,
         mem_oc=mem_oc,
         n_vms=n_vms,
         n_ok=len(ok_results),
-        n_fail=n_vms - len(ok_results),
         wall_s=wall_elapsed,
         admission_p50_ms=_percentile(admission_sorted, 50),
         admission_p95_ms=_percentile(admission_sorted, 95),
@@ -393,7 +337,6 @@ async def _run_burst(n_vms: int, cpu_oc: float, mem_oc: float) -> BurstResult:
         exec_p95_ms=_percentile(exec_sorted, 95),
         total_p50_ms=_percentile(e2e_sorted, 50),
         total_p95_ms=_percentile(e2e_sorted, 95),
-        peak_qemu=peak_qemu,
         peak_rss_mb=peak_rss,
         mem_total_mb=mem_total,
     )
@@ -414,39 +357,26 @@ def _pareto_front(results: list[BurstResult]) -> set[tuple[float, float]]:
     never appear on the efficient frontier regardless of survivor latency.
 
     Dominance: b dominates a iff b <= a on all 3 objectives AND b < a on
-    at least one.  The Pareto front is the set of non-dominated points.
+    at least one (b != a).  The Pareto front is the set of non-dominated points.
 
     Returns set of (cpu_oc, mem_oc) tuples on the Pareto front.
     """
-    candidates = [r for r in results if r.success_pct == 100]
-    front: set[tuple[float, float]] = set()
-    for a in candidates:
-        dominated = False
-        for b in candidates:
-            if b is a:
-                continue
-            b_leq = (
-                b.admission_p95_ms <= a.admission_p95_ms
-                and b.setup_p95_ms <= a.setup_p95_ms
-                and b.exec_p95_ms <= a.exec_p95_ms
-            )
-            b_lt = (
-                b.admission_p95_ms < a.admission_p95_ms
-                or b.setup_p95_ms < a.setup_p95_ms
-                or b.exec_p95_ms < a.exec_p95_ms
-            )
-            if b_leq and b_lt:
-                dominated = True
-                break
-        if not dominated:
-            front.add((a.cpu_oc, a.mem_oc))
-    return front
+    points = {
+        (r.cpu_oc, r.mem_oc): (r.admission_p95_ms, r.setup_p95_ms, r.exec_p95_ms)
+        for r in results
+        if r.success_pct == 100
+    }
+    return {
+        combo
+        for combo, a in points.items()
+        if not any(b != a and all(x <= y for x, y in zip(b, a, strict=True)) for b in points.values())
+    }
 
 
 def _print_ranking(results: list[BurstResult]) -> None:
     """Print efficiency ranking with Pareto front markers."""
     pareto = _pareto_front(results)
-    # NaN efficiency (unmeasured RSS) sorts to the bottom
+    # NaN efficiency (no setup or exec time) sorts to the bottom
     ranked = sorted(results, key=lambda r: -r.efficiency if math.isfinite(r.efficiency) else float("inf"))
 
     print(f"\n{'=' * 140}")
@@ -497,7 +427,7 @@ def _surrogate_analysis(results: list[BurstResult]) -> None:
     the latency efficiency score (10^6 / geomean of p95 tail latencies),
     then runs multi-start L-BFGS-B to locate the global maximum.
     """
-    # Filter results with unmeasured RSS (NaN efficiency) — cannot train on them
+    # Drop results with NaN efficiency (no setup or exec time): cannot train on them
     valid = [r for r in results if math.isfinite(r.efficiency)]
     if len(valid) < 4:
         print(f"\n  (need >= 4 valid grid points for surrogate, got {len(valid)} -- skipping)")
@@ -582,6 +512,12 @@ async def main() -> int:
     """Run 2D overcommit sweep and compute efficient frontier."""
     args = _parse_args()
     n_vms: int = args.n
+    # The images of this checkout (make build): `uv run --script` installs the package
+    # in its own environment, where the default would be the download cache
+    images_dir = Path(__file__).parent.parent / "images" / "dist"
+    if not images_dir.exists():
+        print(f"Error: Images directory not found at {images_dir}. Run 'make build' first.")
+        return 1
     combos = [(cpu, mem) for cpu in SWEEP_CPU_OC for mem in SWEEP_MEM_OC]
     print("=" * 80)
     print(f"  2D OVERCOMMIT SWEEP: {len(combos)} combos x {n_vms} VMs each")
@@ -593,7 +529,7 @@ async def main() -> int:
     all_results: list[BurstResult] = []
     for i, (cpu_oc, mem_oc) in enumerate(combos, 1):
         print(f"\n  [{i}/{len(combos)}] CPU_OC={cpu_oc:.1f} MEM_OC={mem_oc:.1f}...")
-        burst = await _run_burst(n_vms, cpu_oc, mem_oc)
+        burst = await _run_burst(n_vms, cpu_oc, mem_oc, images_dir=images_dir)
         all_results.append(burst)
         print(
             f"    → {burst.n_ok}/{burst.n_vms} ok ({burst.success_pct}%) | "

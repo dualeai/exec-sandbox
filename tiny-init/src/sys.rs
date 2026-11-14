@@ -6,14 +6,6 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-// Mount flags
-pub(crate) const MS_NOSUID: libc::c_ulong = 0x2;
-pub(crate) const MS_NODEV: libc::c_ulong = 0x4;
-pub(crate) const MS_RDONLY: libc::c_ulong = 0x1;
-pub(crate) const MS_NOATIME: libc::c_ulong = 0x400;
-pub(crate) const MS_BIND: libc::c_ulong = 0x1000;
-pub(crate) const MS_MOVE: libc::c_ulong = 0x2000;
-
 /// Write to stderr using raw syscall (safe before Rust stdio init).
 ///
 /// # Why not eprintln!?
@@ -98,7 +90,7 @@ pub(crate) fn mount_move(source: &str, target: &str) -> i32 {
             source.as_ptr(),
             target.as_ptr(),
             std::ptr::null(),
-            MS_MOVE,
+            libc::MS_MOVE,
             std::ptr::null(),
         )
     }

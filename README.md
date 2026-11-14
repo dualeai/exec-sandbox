@@ -1,19 +1,5 @@
 # exec-sandbox
 
-Your AI agent runs untrusted code. One `pip install` gives you hardware-isolated VMs. No cloud account, no API key, no egress fees.
-
-```python
-from exec_sandbox import Scheduler
-
-async with Scheduler() as scheduler:
-    result = await scheduler.run(
-        code="print('Hello from a secure VM!')",
-        language="python",  # or "javascript", "raw"
-    )
-    print(result.stdout)     # Hello from a secure VM!
-    print(result.exit_code)  # 0
-```
-
 [![CI](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml)
 [![CodSpeed Badge](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/dualeai/exec-sandbox?utm_source=badge)
 [![Coverage](https://img.shields.io/codecov/c/github/dualeai/exec-sandbox)](https://codecov.io/gh/dualeai/exec-sandbox)
@@ -21,92 +7,115 @@ async with Scheduler() as scheduler:
 [![Python](https://img.shields.io/pypi/pyversions/exec-sandbox)](https://pypi.org/project/exec-sandbox/)
 [![License](https://img.shields.io/pypi/l/exec-sandbox)](https://opensource.org/licenses/Apache-2.0)
 
-## Installation
+exec-sandbox runs untrusted Python, JavaScript or shell code in QEMU microVMs on your own Linux or macOS hosts, for example code that an AI agent wrote. It is a Python asyncio library with a command line (`sbx`). It needs no cloud account and no API key.
+
+```python
+import asyncio
+
+from exec_sandbox import Scheduler, VmSpec
+
+
+async def main() -> None:
+    async with Scheduler() as scheduler:
+        async with await scheduler.new(VmSpec(language="python")) as session:  # or "javascript", "raw"
+            result = await session.exec("print('Hello from a secure VM!')")
+            print(result.stdout)  # Hello from a secure VM!
+            print(result.exit_code)  # 0
+
+
+asyncio.run(main())
+```
+
+The other Python examples use `async with` and `await` at the top level: run them in an `async def` function, as `main()` above.
+
+## Contents
+
+- **Start:** [Features](#features) · [Install](#install) · [Quick start](#quick-start) · [Key terms](#key-terms)
+- **Use:** [Sessions](#sessions) · [Files](#files) · [Packages](#packages) · [Network](#network) · [Saved instances](#saved-instances) · [Configuration](#configuration) · [Errors and recovery](#errors-and-recovery)
+- **Operate:** [Performance](#performance) · [Caches and disk use](#caches-and-disk-use) · [VM images and offline use](#vm-images-and-offline-use) · [Linux host setup](#linux-host-setup) · [Instance store operations](#instance-store-operations)
+- **Reference:** [CLI reference](#cli-reference) · [API reference](#api-reference) · [Limits](#limits) · [Guest environment](#guest-environment)
+- **Internals:** [How it works](#how-it-works) · [Security](#security) · [Contributing](#contributing) · [License](#license)
+
+## Features
+
+- **Hardware isolation.** Each session runs in its own QEMU VM, not in a container, with KVM or HVF acceleration. Up to 8 layers of isolation ([Security](#security)).
+- **Fast start.** Under 1 ms from the warm pool, about 50-60 ms from an L1 memory snapshot. L2 disk snapshots keep the installed packages, and L3 shares them in S3 with all hosts ([Performance](#performance)).
+- **Self-hosted.** The first use downloads the VM images from GitHub Releases. For hosts with no internet access, use `sbx prefetch`.
+- **Python API and CLI.** Run code once or in several steps, stream stdout and stderr, and read and write files.
+- **Saved instances.** `save()` writes the RAM, the processes and `/home/user` of a VM, encrypted, to S3 or a local folder. `reuse()` continues it later on any worker of the same host kind.
+- **Network control.** No network access by default. Per spec, an allow-list of domains, checked by DNS filtering and TLS SNI inspection.
+- **Memory density.** zram in the guest. On Linux, KSM page merging and memory reclaim of idle warm-pool VMs.
+
+## Install
+
+- **Python:** 3.12, 3.13, 3.14 (including free-threaded).
+- **OS:** Linux or macOS, x64 or arm64. On Windows, use WSL2 (on native Windows, `import exec_sandbox` raises `ConfigError` `PLATFORM_UNSUPPORTED`).
+- **QEMU:** 11.0+ for L1 memory snapshots and saved instances; 8.0+ for the rest. ARM64 without KVM or HVF needs 9.0.4+.
+- **Hardware acceleration:** KVM (Linux) or HVF (macOS), recommended (~5-8x faster).
+
+### Install the package
 
 ```bash
 uv add exec-sandbox              # Core library
-uv add "exec-sandbox[s3]"        # + S3 snapshot caching
+uv add "exec-sandbox[cli]"       # + the sbx command line and the local instance store
+uv add "exec-sandbox[s3]"        # + the L3 snapshot cache and the s3 instance store (and the local store)
 ```
+
+With pip, use `pip install` with the same names. For `sbx` with the `s3` store, install `exec-sandbox[cli,s3]`.
+
+### Install QEMU
 
 ```bash
-# Install QEMU runtime
-brew install qemu                # macOS
-apt install qemu-system          # Ubuntu/Debian
+brew install qemu                             # macOS
+apt install qemu-system qemu-utils            # Ubuntu/Debian
+test -r /dev/kvm -a -w /dev/kvm && echo ok    # Linux: ok means your user can use KVM
+sysctl kern.hv_support                        # macOS: kern.hv_support: 1 means HVF is available
 ```
 
-## Why exec-sandbox
+exec-sandbox uses `qemu-system-x86_64` or `qemu-system-aarch64` from `/usr/bin/`, else from `PATH` (`EXEC_SANDBOX_QEMU_BIN_X86` and `EXEC_SANDBOX_QEMU_BIN_ARM` set another file), and `qemu-img` and `qemu-storage-daemon` from `PATH`. A missing binary raises `ConfigError` (`HOST_DEPENDENCY`). Check the version with `/usr/bin/qemu-system-x86_64 --version` (or `qemu-system-aarch64`): Ubuntu 24.04 ships 8.2.2.
 
-**The problem.** AI agents generate and execute code. Containers share the host kernel — one exploit and your infrastructure is compromised. Cloud sandboxes send your data to someone else's servers. You need hardware-level isolation that runs on your own machines.
+On Linux, give your user access to KVM with `sudo usermod -aG kvm $USER`, then log in again. Without this access, exec-sandbox logs a warning and uses TCG. To run QEMU as its own user, with cgroup limits and namespaces, see [Linux host setup](#linux-host-setup).
 
-**The solution.** exec-sandbox runs each Python, JavaScript, or shell execution in a dedicated QEMU microVM with hardware virtualization (KVM on Linux, HVF on macOS). The VM boots, runs code, and is destroyed. No state leaks between executions. No cloud dependency. 9 layers of security isolation, from a custom hardened kernel to socket-level process authentication.
+## Quick start
 
-### Highlights
-
-- **Hardware isolation** — Each execution runs in a dedicated lightweight VM (QEMU with KVM/HVF hardware acceleration), not containers
-- **1-2ms warm start** — Pre-booted VM pool. ~100ms from memory snapshot. ~400ms cold boot (+ interpreter startup, amortized by L1 cache)
-- **Self-hosted** — Runs on your hardware. No cloud account, no API key, no data leaving your network
-- **macOS + Linux** — Develop locally on Mac (HVF), deploy on Linux (KVM). Most VM-based alternatives are Linux-only
-- **Simple API** — `run()` for one-shot execution, `session()` for stateful multi-step workflows with file I/O; plus `sbx` CLI
-- **3-tier snapshot cache** — L1 memory snapshots (~100ms, interpreter warm), L2 disk snapshots (packages cached), L3 S3 remote cache for fleet sharing
-- **Network control** — Internet disabled by default. Opt-in with domain allowlisting and defense-in-depth filtering
-- **Streaming output** — See results as code runs, don't wait for completion
-- **Memory optimization** — Run more VMs per host with automatic compression and idle reclamation
-
-## Quick Start
-
-### CLI
-
-The `sbx` command provides quick access to sandbox execution from the terminal:
+The first run downloads the VM images ([How images download](#how-images-download)). For Python, see the example at the top and [Sessions](#sessions). `sbx` comes with the `cli` extra; all its options are in the [CLI reference](#cli-reference).
 
 ```bash
-# Run Python code
-sbx run 'print("Hello from sandbox")'
-
-# Run JavaScript
-sbx run -l javascript 'console.log("Hello from sandbox")'
-
-# Run a file (language auto-detected from extension)
-sbx run script.py
-sbx run app.js
-
-# With packages
-sbx run -p requests==2.32.5 -p pandas==3.0.1 'import pandas; print(pandas.__version__)'
-
-# Enable network with domain allowlist
-sbx run --network --allow-domain api.example.com fetch_data.py
+sbx run 'print("Hello from sandbox")'                                  # Python
+sbx run -l javascript 'console.log("Hello from sandbox")'              # JavaScript
+sbx run script.py                                                      # A file: the extension gives the language
+sbx run -p pandas==3.0.1 'import pandas; print(pandas.__version__)'    # With packages
+sbx run --network --allow-domain api.example.com fetch_data.py         # Network, with an allow-list
+sbx run --instance my-vm -c 'x = 41'                                   # Keep the VM state (Saved instances)
+sbx run --instance my-vm -c 'print(x + 1)'                             # 42
 ```
 
-**CLI Options:**
+## Key terms
 
-| Option | Short | Description | Default |
-|--------|-------|-------------|---------|
-| `--language` | `-l` | python, javascript, raw | auto-detect |
-| `--code` | `-c` | Inline code (repeatable, alternative to positional) | - |
-| `--package` | `-p` | Package to install (repeatable) | - |
-| `--timeout` | `-t` | Timeout in seconds | 30 |
-| `--memory` | `-m` | Memory in MB | 192 |
-| `--env` | `-e` | Environment variable KEY=VALUE (repeatable) | - |
-| `--network` | | Enable network access | false |
-| `--allow-domain` | | Allowed domain (repeatable) | - |
-| `--expose` | | Expose port `INTERNAL[:EXTERNAL][/PROTOCOL]` (repeatable) | - |
-| `--json` | | JSON output | false |
-| `--quiet` | `-q` | Suppress progress output | false |
-| `--no-validation` | | Skip package allowlist validation | false |
-| `--upload` | | Upload file `LOCAL:GUEST` (repeatable) | - |
-| `--download` | | Download file `GUEST:LOCAL` or `GUEST` (repeatable) | - |
-| `--debug` | | Stream kernel/init boot logs to stderr | false |
+| Term | Meaning |
+|------|---------|
+| Spec | A `VmSpec`: what a VM is made of ([VmSpec](#vmspec)) |
+| REPL | The interpreter in the VM that runs your code |
+| Warm pool | VMs started before the request ([Warm pool](#warm-pool)) |
+| L1, L2, L3 | The snapshot cache: memory snapshots, disk snapshots with the packages installed, and a copy of L2 in S3 ([Snapshot cache](#snapshot-cache)) |
+| Instance store | Where saved instances live: your S3 bucket (`s3`) or a folder on this host (`local`) ([Choose a store](#choose-a-store)) |
+| Generation | The save number of an instance: 1, then +1 for each save |
+| Head | The object in the store that names the current state of an instance |
+| VM images | The kernel, the initramfs and the base disk image of each language ([VM images and offline use](#vm-images-and-offline-use)) |
+| Assets | The VM images and the gvproxy-wrapper binary: what `sbx prefetch` downloads |
+| Guest images | The disk images of one VM: the base image and, with packages, the L2 package image |
+| Worker | A process that runs a `Scheduler`, on its host (a machine or a container) |
+| Host kind | What a saved instance must match to load ([Rules for save and reuse](#rules-for-save-and-reuse)) |
+| Admission | The wait until the host has the memory, CPU and disk for a VM ([Limits](#limits)) |
+| KVM, HVF, TCG | Hardware acceleration on Linux (KVM) and macOS (HVF). TCG is QEMU's software emulation |
 
-### Python API
+## Sessions
 
-#### Sessions (Stateful Multi-Step)
-
-Sessions keep a VM alive across multiple `exec()` calls — variables, imports, and state persist.
+`scheduler.new(spec)` starts a new VM and returns its session. The session keeps variables, imports, files and background processes between `exec()` calls ([Limits](#limits)), until `close()` destroys the VM. Some errors close a session ([What closes a session](#what-closes-a-session)).
 
 ```python
-from exec_sandbox import Scheduler
-
 async with Scheduler() as scheduler:
-    async with await scheduler.session(language="python") as session:
+    async with await scheduler.new(VmSpec(language="python")) as session:
         await session.exec("import math")
         await session.exec("x = math.pi * 2")
         result = await session.exec("print(f'{x:.4f}')")
@@ -114,771 +123,765 @@ async with Scheduler() as scheduler:
         print(session.exec_count)  # 3
 ```
 
-Sessions support all three languages:
+JavaScript sessions (also TypeScript) keep variables and functions. Shell sessions (`raw`, Bash) keep environment variables, the working folder and functions.
+
+A session closes after `session_idle_timeout_seconds` (default 300) with no call. For one session, pass `idle_timeout_seconds` (10-3600) to `new()` or `reuse()`; a value out of range raises `InvalidInputError` (`ARGUMENT_INVALID`).
+
+To get the output while the code runs, pass `on_stdout` and `on_stderr` to `exec()`: `await session.exec(code, on_stdout=lambda chunk: print(chunk, end=""))`. To get the boot output of the kernel, tiny-init and the guest agent, pass `on_boot_log` to `new()`; the VM then always cold boots (no warm pool, no L1). Keep each callback short: a slow callback blocks the event loop.
+
+## Files
+
+Paths are relative to `/home/user`, the folder where your code runs.
 
 ```python
-# JavaScript/TypeScript — variables and functions persist
-async with await scheduler.session(language="javascript") as session:
-    await session.exec("const greet = (name: string): string => `Hello, ${name}!`")
-    result = await session.exec("console.log(greet('World'))")
-
-# Shell (Bash) — env vars, cwd, and functions persist
-async with await scheduler.session(language="raw") as session:
-    await session.exec("cd /tmp && export MY_VAR=hello")
-    result = await session.exec("echo $MY_VAR from $(pwd)")
+await session.write_file("input.csv", b"name,score\nAlice,95")  # From bytes, a local Path or an IO[bytes] stream
+await session.write_file("run.sh", Path("./run.sh"), make_executable=True)  # Mode 0755 (default 0644)
+await session.exec("open('output.csv', 'w').write(open('input.csv').read().upper())")
+await session.read_file("output.csv", destination=Path("./output.csv"))  # To a local Path or an IO[bytes] stream
+for f in await session.list_files(""):  # "" is /home/user
+    print(f.name, f.is_dir, f.size)
 ```
-
-Sessions auto-close after idle timeout (default: 300s, configurable via `session_idle_timeout_seconds`).
-
-#### File I/O
-
-Sessions support reading, writing, and listing files inside the sandbox.
-
-```python
-import io
-from pathlib import Path
-from exec_sandbox import Scheduler
-
-async with Scheduler() as scheduler:
-    async with await scheduler.session(language="python") as session:
-        # Write from bytes, a local Path, or any IO[bytes] stream
-        await session.write_file("input.csv", b"name,score\nAlice,95\nBob,87")
-        await session.write_file("model.pkl", Path("./local_model.pkl"))
-        await session.write_file("data.bin", io.BytesIO(b"in-memory"))
-
-        # Execute code that reads input and writes output
-        await session.exec("data = open('input.csv').read().upper()")
-        await session.exec("open('output.csv', 'w').write(data)")
-
-        # Read to a local Path or any IO[bytes] buffer
-        await session.read_file("output.csv", destination=Path("./output.csv"))
-        buf = io.BytesIO()
-        await session.read_file("data.bin", destination=buf)
-
-        # List files in a directory
-        files = await session.list_files("")  # sandbox root
-        for f in files:
-            print(f"{f.name} {'dir' if f.is_dir else f'{f.size}B'}")
-```
-
-CLI file I/O uses sessions under the hood:
 
 ```bash
-# Upload a local file, run code, download the result
-sbx run --upload ./local.csv:input.csv --download output.csv:./result.csv \
-  -c "open('output.csv','w').write(open('input.csv').read().upper())"
-
-# Download to ./output.csv (shorthand, no local path)
-sbx run --download output.csv -c "open('output.csv','w').write('data')"
+sbx run --upload ./local.csv:input.csv --download output.csv:./result.csv -c "open('output.csv','w').write(open('input.csv').read().upper())"
 ```
 
-#### With Packages
+## Packages
 
-First run installs and creates a snapshot; subsequent runs restore from L1 memory cache in ~100ms.
+Set `packages` in the spec. The first VM of a spec installs the packages and caches the result; later VMs of that spec start from the cache ([Snapshot cache](#snapshot-cache)). Count and size limits: [Limits](#limits). Runtimes and tools: [Guest environment](#guest-environment).
+
+- Give each package a version: `VmSpec(language="python", packages=("pandas==3.0.1",))`, `VmSpec(language="javascript", packages=("lodash@4.17.21",))`. Other operators (`>=`, `~=`) pass too; `==` gives a stable cache entry.
+- A package without a version, a bad name, or packages for `raw` raise `InvalidInputError` (`ARGUMENT_INVALID`). Scoped npm names (`@scope/name`) are refused.
+- A package outside the allow-list (the top 10,000 of PyPI or npm) raises `InvalidInputError` (`PACKAGE_NOT_ALLOWED`). To skip this check, set `enable_package_validation=False` (`sbx run --no-validation`).
+- Python packages install into Python 3.14 on musl with no build step: use packages with pure-Python or musllinux wheels.
+- The install reaches PyPI or npm, whatever the network settings of the spec.
+
+## Network
+
+### Outbound access
+
+`allow_network=True` turns on outbound access. `allowed_domains` then sets what the guest can reach:
+
+- `None` (default): the package registries of the language (python: `pypi.org`, `files.pythonhosted.org`; javascript: `registry.npmjs.org`). `raw` reaches every host.
+- `()` (empty): every host.
+- A list of domains, such as `("httpbin.org",)`: these domains and their subdomains (`example.com` also allows `api.example.com`).
+
+### Port forwarding
 
 ```python
-async with Scheduler() as scheduler:
-    result = await scheduler.run(
-        code="import pandas; print(pandas.__version__)",
-        language="python",
-        packages=["pandas==2.2.0", "numpy==1.26.0"],
-    )
-    print(result.stdout)  # 2.2.0
+from exec_sandbox import PortMapping
+
+spec = VmSpec(language="python", expose_ports=(PortMapping(internal=8080, external=3000),))  # guest 8080 -> host 3000
+async with await scheduler.new(spec) as session:
+    print(session.exposed_ports[0].url)  # http://127.0.0.1:3000
 ```
 
-#### Error Handling
+- A fixed host port must be 1024-65535. An int in place of a `PortMapping` (`expose_ports=(8080,)`) is the guest port: the OS picks the host port. `protocol` is `"tcp"` (default) or `"udp"`.
+- Ports bind to 127.0.0.1. For access from other machines, put a reverse proxy on the host.
+- Port forwarding works without `allow_network`; all outbound TCP and UDP then stays blocked.
+- After `reuse()`, the ports open again: a fixed host port must be free on this host, and a dynamic one can change (read `exposed_ports` again).
+
+## Saved instances
+
+`save()` writes the state of a VM (RAM, processes, files in `/home/user`), compressed and encrypted, to the instance store. `reuse()` continues it later, on any worker of the same host kind. Every worker needs QEMU 11.0 or later (else the `Scheduler` start fails with `ConfigError` `MIGRATION_UNSUPPORTED`) and a keyring: set `EXEC_SANDBOX_INSTANCE_KEYRING`, or pass `instance_keyring=` in code ([Keys](#keys)).
 
 ```python
-from exec_sandbox import (
-    Scheduler,
-    InputValidationError,
-    PackageNotAllowedError,
-    SandboxError,
-    VmTimeoutError,
-    VmTransientError,
-)
-
-async with Scheduler() as scheduler:
-    try:
-        result = await scheduler.run(code="print('hello')", language="python", timeout_seconds=5)
-
-        # Execution timeouts are NOT exceptions — they return a result with exit_code=-1.
-        if result.exit_code == -1:
-            print(f"Code timed out: {result.stderr}")
-
-    except InputValidationError as e:
-        # Caller bug — bad code or env vars. Fix input and retry.
-        # (CodeValidationError, EnvVarValidationError inherit from this)
-        print(f"Invalid input: {e}")
-    except VmTimeoutError:
-        # VM failed to boot (guest agent not ready). Often transient (CPU contention).
-        print("VM boot timed out — retry may succeed")
-    except VmTransientError:
-        # Infrastructure failure before dispatch (connect/readiness failure) — code never ran, safe to retry.
-        # If the transport is lost AFTER dispatch, CommunicationOutcomeUnknownError is raised instead:
-        # the code may have run, so reconcile side effects before retrying.
-        # VmTimeoutError is a subclass, so this must come after it.
-        print("Transient VM failure, retry may succeed")
-    except PackageNotAllowedError as e:
-        print(f"Package not in allowlist: {e}")
-    except SandboxError as e:
-        print(f"Sandbox error: {e}")
+async with Scheduler(SchedulerConfig(instance_store="local")) as scheduler:  # "s3" for several workers
+    async with await scheduler.new(VmSpec(language="python")) as session:
+        await session.exec("x = 41")
+        ref = await session.save()  # InstanceRef(instance_id=..., generation=1)
+    async with await scheduler.reuse(ref.instance_id) as session:  # Later, with the same keyring
+        await session.exec("x += 1; print(x)")  # 42
+        await session.save()  # generation 2
 ```
 
-## How It Works
+### Keys
 
-```mermaid
-graph LR
-    subgraph Host["Your Python app"]
-        Scheduler["async with Scheduler():<br/>scheduler.run(...)"]
-        Pool["Warm VM pool"]
-        Cache["Snapshot cache (L1/L2)"]
-        Admission["Admission control"]
-        Proxy["gvproxy (networking)"]
-    end
+Make a key with `python -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())"`. The keyring is a comma-separated list of keys, newest first: the first key encrypts new saves, the others only open older instances. Keep the keyring in your secret store, and give every worker the same keyring. Keep every key that saved an instance: without it, `reuse()` raises `ConfigError` (`INSTANCE_KEY_MISSING`). To change keys: [Key rotation](#key-rotation).
 
-    subgraph Guest["QEMU microVM"]
-        Init["tiny-init (PID 1)"]
-        Agent["guest-agent (Rust)"]
-        REPL["Python / JS / Shell<br/>REPL"]
-        FS["EROFS rootfs (read-only)<br/>+ tmpfs /home/user"]
-    end
+### Instance ids
 
-    Scheduler <-->|"virtio-serial"| Init
-    Init --> Agent --> REPL
+To choose the id, pass it to `new()`: `scheduler.new(spec, instance_id="user-42")`. An id has 1 to 64 lowercase letters, digits, `.`, `_` or `-`, and starts with a letter or digit. If the id exists, the first `save()` fails with `INSTANCE_CONFLICT`. Without an id, the first save makes a random one (`ref.instance_id`).
+
+### Choose a store
+
+The `local` store (`instance_store="local"`) is a folder on this host, for one host. For the `s3` store, set up the bucket ([Set up the S3 bucket](#set-up-the-s3-bucket)), then give every worker the same keyring and the same config: `SchedulerConfig(instance_store="s3", s3_bucket="my-bucket")`. At start, the `Scheduler` checks the bucket and logs "Instance store ready" with its `key_ids`.
+
+### Use instances from the command line
+
+`sbx run --instance ID` continues the instance `ID`, or makes it when it does not exist:
+
+```bash
+sbx run --instance my-vm -c 'x = 41'            # Created instance my-vm, generation 1
+sbx run --instance my-vm -c 'x += 1; print(x)'  # 42, then: Saved instance my-vm, generation 2
+sbx instance list                               # One id on each line (--json for an array)
+sbx instance describe my-vm                     # JSON: generation, recent commits, key id, verified; spec and host when verified
+sbx instance rm my-vm other-vm                  # In order, stops at the first error; exit code 0 when they are gone
 ```
 
-> Created fresh. Destroyed after.
+- **Store.** `sbx` reads the environment variables of [SchedulerConfig](#schedulerconfig). By default, it uses the local store in `instance_store_dir` (`EXEC_SANDBOX_INSTANCE_STORE_DIR`). For S3, set `EXEC_SANDBOX_INSTANCE_STORE=s3`, `EXEC_SANDBOX_S3_BUCKET` and `EXEC_SANDBOX_INSTANCE_KEYRING`, and the other `EXEC_SANDBOX_S3_*` variables as needed. Only `--instance` and `sbx instance` open the store.
+- **Key.** `sbx` reads `EXEC_SANDBOX_INSTANCE_KEYRING`; set it on a host with no OS keyring, such as a server or a container. Else, for the local store, `sbx` makes one key at the first use and keeps it in the OS keyring (macOS Keychain; Secret Service or KWallet on Linux; no other `keyring` backend), entry `exec-sandbox` / `instance-keyring`. Back it up with `keyring get exec-sandbox instance-keyring`, restore it with `keyring set exec-sandbox instance-keyring` (the `keyring` command of the `cli` extra, in the same Python environment). To open these instances from code, pass `instance_keyring=keyring.get_password("exec-sandbox", "instance-keyring")`.
+- **Save.** A run saves after the uploads, the code and the downloads, also when the code exits with an error or a download fails. It saves nothing after a timeout, a VM that stopped, or a failed upload or run; stderr tells why. `-q` hides the "Created/Saved" line.
+- **VM settings.** `-l`, `-p`, `-m`, `--network`, `--allow-domain` and `--expose` are fixed when the instance is made. Leave them out or give the same value; another value exits with code 2. With `--allow-domain`, also give `--network`. `--instance` takes one source (`-c`, a file or `-`).
+- **Exit codes.** A bad id exits with code 2. If two runs save at the same time, the second save fails with `INSTANCE_CONFLICT` and exit code 125; its output stays, its state does not. Others: [Exit codes](#exit-codes).
 
-1. `Scheduler` boots a lightweight QEMU microVM (or grabs one from the warm pool in 1-2ms)
-2. A Rust guest-agent inside the VM receives code over virtio-serial and runs it in a sandboxed REPL
-3. stdout/stderr stream back in real-time. Files can be read/written. Ports can be forwarded.
-4. The VM is destroyed. No state persists. Next `run()` gets a fresh VM.
-
-For stateful workflows, `session()` keeps the VM alive — variables, imports, and functions persist across `exec()` calls.
-
-## Advanced Usage
-
-### Streaming Output
+### List, describe and delete instances
 
 ```python
-async with Scheduler() as scheduler:
-    result = await scheduler.run(
-        code="for i in range(5): print(i)",
-        language="python",
-        on_stdout=lambda chunk: print(f"[OUT] {chunk}", end=""),
-        on_stderr=lambda chunk: print(f"[ERR] {chunk}", end=""),
-    )
+info = await scheduler.describe_instance(
+    instance_id
+)  # Generation, recent commits, key id; spec and host when this keyring opens it
+deleted = await scheduler.delete_instance(instance_id)  # True if it existed
+async for instance_id in scheduler.list_instances():
+    ...
 ```
 
-### Boot Log Streaming
+### Rules for save and reuse
 
-Stream kernel, tiny-init, and guest-agent boot output for diagnostics:
+- **One writer.** `save()` fails, and closes its session, if another save of the instance was stored since this session loaded or last saved it. If two requests can reach one instance at the same time, use your own lock.
+- **`close()` never saves.** After an `exec()` or `write_file()` with no later save, `close()` warns with `InstanceNotSavedWarning`. The idle timeout closes the session with no save and no warning: save before a long pause.
+- **Host kind.** An instance loads only on a worker with the same CPU architecture, accelerator (`kvm`, `hvf` or `tcg`), CPU vendor (x86), guest CPU model and exec-sandbox release, and a QEMU that accepts the saved state. Other workers raise `RouteError`; its `required` field gives the values.
+- **After `reuse()`.** The network connections that were open at the save are closed.
 
-```python
-async with Scheduler() as scheduler:
-    boot_lines: list[str] = []
-    result = await scheduler.run(
-        code="print('hello')",
-        language="python",
-        on_boot_log=boot_lines.append,  # Automatically enables verbose boot
-    )
-    for line in boot_lines:
-        print(f"[boot] {line}")
-```
+### Errors of saved instances
 
-### Network Access
+| `action` (class) | Codes | Do this |
+|------------------|-------|---------|
+| `RETRY` (`TransientError`) | `INSTANCE_STORE_UNAVAILABLE`, `LOCAL_DISK` | Call again later. A failed save stored nothing. |
+| `ROUTE` (`RouteError`) | `INSTANCE_HOST_MISMATCH` | Use a worker that matches `required` ([Upgrades](#upgrades)). Keep the instance. |
+| `RECREATE` (`InstanceGoneError`) | `INSTANCE_NOT_FOUND`, `INSTANCE_EXPIRED`, `INSTANCE_INTEGRITY` | Start a new instance. To use the same id again, call `delete_instance(id)` first. |
+| `VERIFY` (`OutcomeUnknownError`) | `INSTANCE_CONFLICT`, `INSTANCE_SAVE_OUTCOME_UNKNOWN` | The session is closed. The save was stored if `describe_instance(id).recent_commits` has `error.context["commit_id"]`: check before you do the work again. |
+| `FIX_CONFIG` (`ConfigError`) | `INSTANCE_CONFIG`, `INSTANCE_KEY_MISSING`, `MIGRATION_UNSUPPORTED`, `IMAGE_DAMAGED` | `INSTANCE_CONFIG`: fix the bucket, store folder, permissions or keyring, or use a store with conditional writes. `INSTANCE_KEY_MISSING`: add the named key; keep the instance. `MIGRATION_UNSUPPORTED`: upgrade QEMU to 11.0+. `IMAGE_DAMAGED`: download or rebuild the images. |
+| `FIX_INPUT` (`InvalidInputError`) | `INSTANCE_INVALID_ID` | Fix the id ([Instance ids](#instance-ids)). |
 
-```python
-async with Scheduler() as scheduler:
-    result = await scheduler.run(
-        code="import urllib.request; print(urllib.request.urlopen('https://httpbin.org/ip').read())",
-        language="python",
-        allow_network=True,
-        allowed_domains=["httpbin.org"],  # Domain allowlist
-    )
-```
-
-### Port Forwarding
-
-Expose VM ports to the host for health checks, API testing, or service validation.
-
-```python
-from exec_sandbox import Scheduler, PortMapping
-
-async with Scheduler() as scheduler:
-    # Port forwarding without internet (isolated)
-    result = await scheduler.run(
-        code="print('server ready')",
-        language="python",
-        expose_ports=[PortMapping(internal=8080, external=3000)],  # Guest:8080 → Host:3000
-        allow_network=False,  # No outbound internet
-    )
-    print(result.exposed_ports[0].url)  # http://127.0.0.1:3000
-
-    # Dynamic port allocation (OS assigns external port)
-    result = await scheduler.run(
-        code="print('server ready')",
-        language="python",
-        expose_ports=[8080],  # external=None → OS assigns port
-    )
-    print(result.exposed_ports[0].external)  # e.g., 52341
-
-    # Long-running server with port forwarding
-    result = await scheduler.run(
-        code="import http.server; http.server.test(port=8080, bind='0.0.0.0')",
-        language="python",
-        expose_ports=[PortMapping(internal=8080)],
-        timeout_seconds=60,  # Server runs until timeout
-    )
-```
-
-**Security:** Port forwarding works independently of internet access. When `allow_network=False`, guest VMs cannot initiate outbound connections (all outbound TCP/UDP blocked), but host-to-guest port forwarding still works.
-
+`save()` and `reuse()` can also raise the other codes of `ErrorCode`: [Error codes](#error-codes).
 ## Configuration
 
+### VmSpec
+
+`VmSpec` says what a VM is made of. It is frozen and hashable: keep one spec per workload.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `language` | required | `"python"`, `"javascript"` or `"raw"` (shell) |
+| `memory_mb` | 192 | VM memory, 128 MB minimum. See [Memory and file systems](#memory-and-file-systems) |
+| `cpu_cores` | 1 | Guest vCPUs |
+| `disk_mb` | 1024 | Home disk size (`/home/user`, ext4), 128 MB minimum. Only written blocks use host disk |
+| `packages` | `()` | Packages, each with a version (`"pandas==3.0.1"`, `"lodash@4.17.21"`). See [Packages](#packages) |
+| `allow_network` | False | Outbound network access |
+| `allowed_domains` | None | With `allow_network`: the domains the guest can reach. See [Outbound access](#outbound-access) |
+| `expose_ports` | `()` | Guest ports to expose on the host (`PortMapping` or an int), at most 10. See [Port forwarding](#port-forwarding) |
+
+### SchedulerConfig
+
+Settings for all VMs of a `Scheduler`: `Scheduler(SchedulerConfig(warm_pool_size=1))`. A field that you do not set in code reads its environment variable. An invalid value fails the `Scheduler` start with `ConfigError` (`SETTING_INVALID`).
+
+| Field | Default | Env var | Description |
+|-------|---------|---------|-------------|
+| **Sessions and warm pool** | | | |
+| `warm_pool_size` | 0 | — | Warm-pool VMs per language, for `VmSpec(language=...)` with no other field. 0: no warm pool |
+| `default_timeout_seconds` | 30 | — | Execution timeout (1-300 s) |
+| `session_idle_timeout_seconds` | 300 | — | Close a session after this long without a call (10-3600 s) |
+| **Admission** | | | |
+| `memory_overcommit_ratio` | 5.0 | `EXEC_SANDBOX_MEMORY_OVERCOMMIT_RATIO` | 1.0-10.0. Budget = host memory × (1 - reserve) × ratio |
+| `cpu_overcommit_ratio` | 2.0 | `EXEC_SANDBOX_CPU_OVERCOMMIT_RATIO` | 1.0-20.0. Budget = (host CPUs - reserve) × ratio |
+| `disk_overcommit_ratio` | 4.0 | `EXEC_SANDBOX_DISK_OVERCOMMIT_RATIO` | 1.0-64.0. Each VM reserves the unwritten part of its `disk_mb` / ratio |
+| `host_memory_reserve_ratio` | 0.08 | `EXEC_SANDBOX_HOST_MEMORY_RESERVE_RATIO` | Fraction of host memory kept for the OS (0.01-0.5) |
+| `host_cpu_reserve_cores` | 0.5 | `EXEC_SANDBOX_HOST_CPU_RESERVE_CORES` | CPU cores kept for host processes (0.0-16.0) |
+| **Packages** | | | |
+| `enable_package_validation` | True | — | Check packages against the allow-list (top 10,000 of PyPI and of npm) |
+| **Images and caches** | | | |
+| `images_dir` | None | `EXEC_SANDBOX_IMAGES_DIR` | Folder of the VM images. None: found automatically ([How images download](#how-images-download)) |
+| `auto_download_assets` | True | — | Download missing VM images from GitHub Releases |
+| `disk_snapshot_cache_dir` | `<cache dir>/disk-snapshots/` | `EXEC_SANDBOX_DISK_SNAPSHOT_CACHE_DIR` | L2 cache folder ([Where files go](#where-files-go)) |
+| `memory_snapshot_cache_dir` | `<cache dir>/memory-snapshots/` | `EXEC_SANDBOX_MEMORY_SNAPSHOT_CACHE_DIR` | L1 cache folder |
+| **S3** | | | |
+| `s3_bucket` | None | `EXEC_SANDBOX_S3_BUCKET` | Bucket of the L3 snapshot cache and of the `s3` instance store |
+| `s3_region` | us-east-1 | `EXEC_SANDBOX_S3_REGION` | AWS region |
+| `s3_endpoint_url` | None | `EXEC_SANDBOX_S3_ENDPOINT_URL` | S3-compatible endpoint (R2, MinIO, Ceph RGW); None for AWS |
+| `s3_snapshot_prefix` | snapshots/ | `EXEC_SANDBOX_S3_SNAPSHOT_PREFIX` | Key prefix of the L3 snapshot cache |
+| `s3_instance_prefix` | instances/ | `EXEC_SANDBOX_S3_INSTANCE_PREFIX` | Key prefix of saved instances ([Set up the S3 bucket](#set-up-the-s3-bucket)) |
+| `max_concurrent_s3_uploads` | 128 | `EXEC_SANDBOX_MAX_CONCURRENT_S3_UPLOADS` | Max concurrent background S3 uploads (1 or more) |
+| **Saved instances** | | | |
+| `instance_store` | None | `EXEC_SANDBOX_INSTANCE_STORE` | `s3` (`s3_bucket`, `s3` extra) or `local` (`instance_store_dir`, `cli` or `s3` extra). `None` set in code turns saved instances off |
+| `instance_store_dir` | OS data folder | `EXEC_SANDBOX_INSTANCE_STORE_DIR` | Root of the `local` store. macOS: `~/Library/Application Support/exec-sandbox/instances/`. Linux: `~/.local/share/exec-sandbox/instances/` (under `$XDG_DATA_HOME` when it is an absolute path) |
+| `instance_keyring` | None | `EXEC_SANDBOX_INSTANCE_KEYRING` | Required with `instance_store`: comma-separated base64 32-byte keys, newest first. Never logged or passed to child processes |
+
+Folder rules: `instance_store_dir` must be a folder of this user, mode 0700, with no ACL entry (exec-sandbox makes it when it is missing). Only root and this user can write the parent folders of `instance_store_dir`, the cache folders and `EXEC_SANDBOX_HOME_DISK_DIR`. Sticky folders such as `/tmp` pass, and on Linux, so does a folder that only this user's private group can write. For a root volume that others can write (for example a Kubernetes `emptyDir`), set the sticky bit (`chmod +t`) as root, for example in an init container.
+
+### Environment variables
+
+Variables that are not `SchedulerConfig` fields:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EXEC_SANDBOX_CACHE_DIR` | OS cache folder | Root of the cache folders ([Where files go](#where-files-go)) |
+| `EXEC_SANDBOX_HOME_DISK_DIR` | `<cache dir>/home-disks` | Home disks of running VMs, and work files of `save()` and `reuse()`. A folder of this user that group and others cannot write, with no ACL entry, on a disk (not tmpfs) |
+| `EXEC_SANDBOX_INSTANCE_ASSET_DIR` | `<cache dir>/instance-assets` | Guest images downloaded from the instance store |
+| `EXEC_SANDBOX_DISK_FREE_FLOOR_MB` | 1024 | Free space that admission keeps on the disk of the home disk folder |
+| `EXEC_SANDBOX_AVAILABLE_MEMORY_FLOOR_MB` | 0 | Available host memory that admission keeps free |
+| `EXEC_SANDBOX_HOST_MEMORY_MB`, `EXEC_SANDBOX_HOST_CPU_COUNT` | detected | Host size for the admission budgets |
+| `EXEC_SANDBOX_QEMU_BIN_X86`, `EXEC_SANDBOX_QEMU_BIN_ARM` | `/usr/bin/qemu-system-x86_64`, `/usr/bin/qemu-system-aarch64` | QEMU binary ([Install QEMU](#install-qemu)) |
+| `EXEC_SANDBOX_FORCE_EMULATION` | false | Use TCG even when KVM or HVF is available |
+| `EXEC_SANDBOX_SNAPSHOT_CACHE_TTL_DAYS` | 14 | Value of the `ttl_days` tag on L3 uploads |
+| `EXEC_SANDBOX_OFFLINE` | unset | `1`: never download assets (a missing asset fails) |
+| `EXEC_SANDBOX_ASSET_VERSION` | unset | Use the assets of this release version |
+| `EXEC_SANDBOX_LOG_LEVEL` | unset | Level of the `exec_sandbox` logger (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `GITHUB_TOKEN` | unset | Sent to the GitHub API for asset downloads (higher rate limit) |
+
+The library logs to the `exec_sandbox` logger and adds no handler. `configure_logging(level="INFO")` adds a stderr handler (the CLI does this).
+
+## Errors and recovery
+
+### Error classes
+
+Every run-time error is a `SandboxError` with an `action` (what to do next, from its class), a `code` (an `ErrorCode`), a `message`, a `hint`, an `instance_id` and a `context`. After a QEMU crash or a boot timeout, `context["console_log"]` holds the VM console. A bad value in `VmSpec`, `SchedulerConfig` or `PortMapping` raises pydantic's `ValidationError`.
+
+| Name | Action | When |
+|------|--------|------|
+| `SandboxError` | — | Base class (never raised itself) |
+| `TransientError` | `RETRY` | The call did nothing you rely on (exec: the code was not sent). If the session closed, redo its unsaved work on a new session first |
+| `OutcomeUnknownError` | `VERIFY` | The code may have run, or a save's outcome is unknown, or another save was stored first. Check the state first |
+| `SessionClosedError` | `RESTART` | The session is closed. Open a new one with `new()` or `reuse()` |
+| `InvalidInputError` | `FIX_INPUT` | The call is wrong, or the scheduler cannot take it now. The session stays open |
+| `ConfigError` | `FIX_CONFIG` | This worker's setup is wrong: settings, keyring, store, binaries, images, Python extras, permissions or OS |
+| `RouteError` | `ROUTE` | Another worker can serve the call: `required` gives its values, `found` this worker's |
+| `InstanceGoneError` | `RECREATE` | The saved instance is gone, expired or damaged. Start a new one |
+| `InternalError` | `REPORT` | A bug or a broken host. Report it with the log |
+| `ErrorAction` | | The 8 actions above |
+| `ErrorCode` | | See [Error codes](#error-codes) |
+| `InstanceNotSavedWarning` | | Warning: `close()` of a saved-instance session with `exec()` or `write_file()` calls after its last `save()` |
+
+Catch the class of each action that you handle:
+
 ```python
-from exec_sandbox import Scheduler, SchedulerConfig
+from exec_sandbox import ErrorCode, InvalidInputError, OutcomeUnknownError, SandboxError, TransientError
 
-config = SchedulerConfig(
-    warm_pool_size=1,            # Pre-started VMs per language (0 disables)
-    default_memory_mb=512,       # Per-VM memory
-    default_timeout_seconds=60,  # Execution timeout
-    s3_bucket="my-snapshots",    # Remote cache for package snapshots
-    s3_region="us-east-1",
-)
-
-async with Scheduler(config) as scheduler:
-    result = await scheduler.run(...)
+try:
+    async with await scheduler.new(VmSpec(language="python")) as session:
+        result = await session.exec("print('hello')", timeout_seconds=5)  # A timeout does not raise: exit_code -1
+except InvalidInputError as e:  # FIX_INPUT: change the call
+    if e.code is ErrorCode.PACKAGE_NOT_ALLOWED:
+        ...
+except TransientError:  # RETRY: the same call can succeed later
+    ...
+except OutcomeUnknownError:  # VERIFY: the code may have run
+    ...
+except SandboxError as e:  # The other actions
+    print(f"{e.code} ({e.action}): {e}")
 ```
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript, Raw). Set >0 to enable |
-| `default_memory_mb` | 192 | VM memory (128 MB minimum, no upper bound). Compressed swap (zram) adds ~40% logical headroom, physically capped at 20% of RAM |
-| `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
-| `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
-| `images_dir` | auto | VM images directory |
-| `disk_snapshot_cache_dir` | OS cache dir | Local disk snapshot cache (macOS: `~/Library/Caches/exec-sandbox/disk-snapshots/`, Linux: `~/.cache/exec-sandbox/disk-snapshots/`) |
-| `memory_snapshot_cache_dir` | OS cache dir | Local memory snapshot cache (macOS: `~/Library/Caches/exec-sandbox/memory-snapshots/`, Linux: `~/.cache/exec-sandbox/memory-snapshots/`) |
-| `s3_bucket` | None | S3 bucket for remote snapshot cache |
-| `s3_region` | us-east-1 | AWS region |
-| `s3_prefix` | snapshots/ | Prefix for S3 keys |
-| `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
-| `memory_overcommit_ratio` | 5.0 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
-| `cpu_overcommit_ratio` | 2.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
-| `host_memory_reserve_ratio` | 0.08 | Fraction of host memory reserved for OS (e.g., 0.08 = 8%) |
-| `host_cpu_reserve_cores` | 0.5 | CPU cores reserved for host processes (fixed, not a ratio) |
-| `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
-| `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
+### Exit codes and timeouts
 
-Environment variables: `EXEC_SANDBOX_IMAGES_DIR`, `EXEC_SANDBOX_CACHE_DIR`, `EXEC_SANDBOX_OFFLINE`, etc.
+`result.exit_code` is 0 for success and -1 for a timeout. A value above 128 usually means that signal N (exit code - 128) killed the code (137 = SIGKILL, 139 = SIGSEGV). Other values mean that the program failed. It is a process status (0-255): `sys.exit(-1)` gives 255. Infrastructure failures raise an error and return no result. For the exit codes of `sbx`, see [Exit codes](#exit-codes).
+
+### What closes a session
+
+- **Stays open, state kept:** an exception, a syntax error, `sys.exit(n)` with n ≠ 137, and `InvalidInputError` (for example `OUTPUT_LIMIT`).
+- **Stays open, the next `exec()` runs in a new REPL:** a timeout (-1), a signal other than SIGKILL (128 + signal), `os._exit(n)` with n ≠ 137, and a REPL exit between two calls with a code other than 137.
+- **Closes, state lost:** exit code 137 (for example SIGKILL), also between two calls (the next `exec()` raises `GUEST_UNAVAILABLE`); a VM communication failure; QEMU stops; a full host disk under the home disk. Every later call raises `SessionClosedError`.
+- Other errors: in `exec()`, they close the session. File calls close it only on cancellation, `OutcomeUnknownError`, a dead VM or a full host disk. For `save()`, see its docstring.
+
+### Error codes
+
+| Code | Class | Meaning |
+|------|-------|---------|
+| `VM_BOOT_TIMEOUT` | `TransientError` | The guest agent did not answer in time at boot. |
+| `QEMU_CRASHED` | `TransientError` | QEMU exited or did not come up. |
+| `OVERLAY_FAILED` | `TransientError` | qemu-img or qemu-storage-daemon could not make a disk image. |
+| `GVPROXY_FAILED` | `TransientError` | gvproxy did not start or become ready. |
+| `CAPACITY` | `TransientError` | No resources became free within the admission timeout. |
+| `GUEST_UNAVAILABLE` | `TransientError` | The guest could not take the call or start the code. The code did not run. |
+| `GUEST_SILENT_AFTER_RESTORE` | `TransientError` | The guest did not answer after a memory snapshot restore. |
+| `LOCAL_DISK` | `TransientError` | A local file is missing (a path that you gave: `ARGUMENT_INVALID`), or the host cannot read or write it now (disk full, quota, I/O error, file handle or memory limit), or the host disk has no room for a home disk. |
+| `PACKAGE_DOWNLOAD` | `TransientError` | The package manager could not download (network error or timeout). |
+| `MIGRATION_FAILED` | `TransientError` | QEMU did not save or load the VM state. |
+| `ASSET_DOWNLOAD` | `TransientError` | A VM image download failed after its retries. |
+| `INSTANCE_STORE_UNAVAILABLE` | `TransientError` | The instance store failed, answered badly, or kept changing. |
+| `GUEST_OUTCOME_UNKNOWN` | `OutcomeUnknownError` | The transport was lost after the call reached the guest. The code may have run. |
+| `INSTANCE_CONFLICT` | `OutcomeUnknownError` | Another save was stored first, or the id given to `new()` is taken. This save was not stored. |
+| `INSTANCE_SAVE_OUTCOME_UNKNOWN` | `OutcomeUnknownError` | The store did not confirm the save, and a read-back could not tell. |
+| `SESSION_CLOSED` | `SessionClosedError` | The session is closed. |
+| `CODE_INVALID` | `InvalidInputError` | The code is empty, only spaces, holds null bytes, or is too large. |
+| `ENV_VAR_INVALID` | `InvalidInputError` | An env var name or value breaks a rule. |
+| `OUTPUT_LIMIT` | `InvalidInputError` | stdout or stderr went above the guest limit. |
+| `PATH_INVALID` | `InvalidInputError` | A guest path breaks a rule (empty, too long, outside the sandbox, a folder). |
+| `GUEST_IO` | `InvalidInputError` | The guest could not read, list or write the path (not found, no access, disk full). |
+| `ARGUMENT_INVALID` | `InvalidInputError` | An argument breaks a documented limit: timeout range, content size, stream, local path, package without a version, packages for `raw`. |
+| `PACKAGE_NOT_ALLOWED` | `InvalidInputError` | A package is not in the allow-list. |
+| `PACKAGE_INSTALL_FAILED` | `InvalidInputError` | The package manager refused the packages. |
+| `INSTANCE_INVALID_ID` | `InvalidInputError` | The value breaks the instance id rule. |
+| `SCHEDULER_STATE` | `InvalidInputError` | The scheduler is not started, already started, or stopping. |
+| `HOST_DEPENDENCY` | `ConfigError` | A binary (QEMU, qemu-img, qemu-storage-daemon, gvproxy-wrapper), system user, cgroup or ACL support is missing or too old, or this user cannot run it. |
+| `EXTRA_MISSING` | `ConfigError` | A Python extra is not installed (the message gives the pip command). |
+| `SETTING_INVALID` | `ConfigError` | A worker setting is not valid. |
+| `ASSET_NOT_FOUND` | `ConfigError` | A VM image is not on this host and was not downloaded. |
+| `IMAGE_DAMAGED` | `ConfigError` | A local guest image does not match its digest: download or rebuild the images. |
+| `PLATFORM_UNSUPPORTED` | `ConfigError` | The OS is not Linux or macOS. |
+| `MIGRATION_UNSUPPORTED` | `ConfigError` | This worker's QEMU cannot save or load VM state (below QEMU 11.0, or a capability refused). |
+| `INSTANCE_CONFIG` | `ConfigError` | The instance settings are wrong (store, keyring, store check). |
+| `INSTANCE_KEY_MISSING` | `ConfigError` | The instance's key is not in this keyring. The data is intact: do not delete the instance. |
+| `INSTANCE_HOST_MISMATCH` | `RouteError` | This worker's host or release values differ from the saved ones. |
+| `CAPACITY_NEVER_FITS` | `RouteError` | The VM is larger than this worker's whole budget. |
+| `MIGRATION_REJECTED` | `RouteError` | QEMU refused the saved state. It shows only in the cause chain of `INSTANCE_HOST_MISMATCH`. |
+| `INSTANCE_NOT_FOUND` | `InstanceGoneError` | No instance with this id (deleted, expired, or never saved). |
+| `INSTANCE_EXPIRED` | `InstanceGoneError` | Part of the saved state is gone from the store. |
+| `INSTANCE_INTEGRITY` | `InstanceGoneError` | Stored data failed its checks. |
+| `CLEANUP_UNCONFIRMED` | `InternalError` | The end of a QEMU or gvproxy process, or the release of VM resources, was not confirmed. |
+| `GUEST_PROTOCOL` | `InternalError` | The guest sent a protocol error or an answer of the wrong type. |
+| `INTERNAL` | `InternalError` | A bug. |
 
 ## Performance
 
-Measured on a 16-vCPU / 32 GB EC2 instance (Intel Xeon 6975P, KVM, Debian 13) using a mixed workload of Python, JavaScript, and shell commands.
+The start time of a VM depends on its source: [Snapshot cache](#snapshot-cache).
 
-### Concurrent Throughput
+### Warm pool
 
-250 VMs per config, 16 overcommit combos. **Admission** = queue wait, **Setup** = overlay + cgroup, **Exec** = VM boot + code run:
+Set `warm_pool_size` to keep that many VMs ready for each language. Only `VmSpec(language=...)` with no other field comes from the warm pool.
 
-| Config | VMs/s | Admit p50/p95 | Setup p50/p95 | Exec p50/p95 | Total p50/p95 | Peak RSS | Efficiency |
-|--------|-------|---------------|---------------|--------------|---------------|----------|------------|
-| CPU=2x MEM=5x (default) | **66.8** | 1.5s / 3.0s | 83ms / 160ms | 132ms / 188ms | **1.8s / 3.3s** | 1.1 GB (3.4%) | 2223 |
-| CPU=2x MEM=3x | 66.7 | 1.5s / 3.0s | 84ms / 163ms | 134ms / 193ms | 1.8s / 3.3s | 1.0 GB (3.2%) | 2201 |
-| CPU=4x MEM=5x | 63.9 | 1.4s / 2.7s | 221ms / 719ms | 170ms / 336ms | 1.9s / 3.2s | 1.9 GB (5.9%) | 1159 |
-| CPU=8x MEM=5x | 47.8 | 1.4s / 2.6s | 505ms / 768ms | 296ms / 783ms | 2.6s / 3.5s | 3.9 GB (12.4%) | 857 |
-| CPU=12x MEM=1.5x | 4.0 | 0s / 17.1s | 12.9s / 31.1s | 1.9s / 37.8s | 50.9s / 52.8s | 11.6 GB (36.9%) | 37 |
+```python
+async with Scheduler(SchedulerConfig(warm_pool_size=1)) as scheduler:
+    await scheduler.wait_pool_ready()  # Waits until the pool is full, 120 s at most
+    async with await scheduler.new(VmSpec(language="python")) as session:  # From the warm pool
+        ...
+```
 
-Exec latency is only 132ms p50 at the optimal config — admission dominates under burst load. **Efficiency** = 10⁶ / geomean(admission, setup, exec) p95; higher is better. 13/16 configs achieved 100% success (3,151/4,000 VMs).
+Each warm-pool VM takes 272 MB of the memory budget (192 MB + 80 MB overhead): `warm_pool_size=5` takes about 4.1 GB (5 VMs × 3 languages).
 
-> **Production sizing.** The 3s admission p95 is specific to this stress test (250 VMs on ~24 slots). When `concurrent_requests ≤ max_slots`, admission is **0ms**. Scale horizontally — add hosts so that `max_slots ≥ peak_concurrency`, don't increase overcommit.
->
-> **Local/desktop tuning.** The defaults (CPU=2x, MEM=5x) were optimized via RBF surrogate on production KVM hosts. On a desktop (macOS HVF or fewer cores), run `make bench-optimizer` to find the optimal values for your hardware.
+### Concurrent throughput
 
-### Single VM Latency
+The default overcommit ratios come from tuning on production KVM hosts. To serve more requests at once, add hosts; do not raise the ratios. On a desktop, find the best values with `make bench-optimizer` in a clone of the repository ([Contributing](#contributing)).
 
-| Path | Time to First Exec |
-|------|--------------------|
-| Warm pool hit | 1-2ms |
-| L1 memory snapshot | ~100ms |
-| Cold boot (KVM) | ~400ms boot + 4-5s REPL |
-| Cold boot (HVF/macOS) | ~400ms boot + 4-11s REPL |
+## Caches and disk use
 
-### Tuning
+### Where files go
 
-Re-run the optimizer after changing VM sizing, admission logic, or target hardware:
+The cache folder (`<cache dir>`) is `~/Library/Caches/exec-sandbox/` on macOS and `~/.cache/exec-sandbox/` on Linux (or `$XDG_CACHE_HOME/exec-sandbox/` when that is an absolute path). It holds:
+
+- `v<version>/`: the download cache (VM images and gvproxy-wrapper)
+- `memory-snapshots/` (L1) and `disk-snapshots/` (L2)
+- `home-disks/`: the home disks of running VMs
+- `instance-assets/`: guest images from the instance store
+
+`EXEC_SANDBOX_CACHE_DIR` moves all of them (the download cache is then the folder itself, with no `v<version>`). Use one cache folder per host. Put the home disk folder and the L1 cache on a disk, not on tmpfs (`/tmp` on many Linux hosts): on tmpfs, QEMU writes count against the memory of the VM.
+
+### Snapshot cache
+
+A new VM comes from the first source that has it (times with KVM or HVF):
+
+| Source | Start time |
+|--------|------------|
+| Warm pool | Under 1 ms |
+| L1 memory snapshot (a spec that ran before; QEMU 11.0 or later) | About 50-60 ms |
+| L2 disk snapshot (packages already installed) | About 200 ms boot, then 0.1-1 s REPL start |
+| L3 snapshot cache (L2 from S3) | Download, then as L2 |
+| Cold boot | As L2, plus the package install |
+
+After a boot, the REPL starts in the first `exec()` (counted in `timing.execute_ms`, not in `startup_timing`).
+
+#### L3: S3 snapshot cache
+
+L3 shares L2 entries between hosts through S3. Set `s3_bucket` to turn it on (keys under `s3_snapshot_prefix`). It needs `s3:GetObject`, `s3:PutObject`, `s3:PutObjectTagging` and `s3:AbortMultipartUpload` on `<s3_snapshot_prefix>*`. Add two lifecycle rules on that prefix: one that expires objects (uploads have the tag `ttl_days=14`, `EXEC_SANDBOX_SNAPSHOT_CACHE_TTL_DAYS`), and `AbortIncompleteMultipartUpload` (1 day). An L3 error only logs a warning.
+
+### Clean up
+
+L1 and L2 have no size limit. exec-sandbox removes entries (oldest last use first) only when the disk is full or a new home disk needs the space, and never an entry that a running VM uses. When no `Scheduler` runs, you can delete L1 and L2 entries, old `v<version>` image folders and the files in `instance-assets`.
+
+## VM images and offline use
+
+exec-sandbox needs VM images (kernel, initramfs, qcow2 base images) and the gvproxy-wrapper binary. It downloads them from GitHub Releases at first use.
+
+### How images download
+
+Each `Scheduler` start uses the first of these folders that holds both the kernel and the initramfs:
+
+1. `images_dir` ([SchedulerConfig](#schedulerconfig))
+2. `EXEC_SANDBOX_IMAGES_DIR`
+3. `images/dist/` of a clone of the repository (a local build)
+4. the download cache ([Where files go](#where-files-go))
+
+If no folder holds them, exec-sandbox downloads them to the download cache (with `auto_download_assets=False`: `ConfigError` `ASSET_NOT_FOUND`). It looks for gvproxy-wrapper in the folder of the boot files, then in `gvproxy-wrapper/bin/` of a clone, then in the folders above. It looks for the base image of a language, at the first VM of that language, in the folder of the boot files, then in the download cache. With downloads on, a missing asset downloads to the download cache.
+
+Downloads come from the GitHub release of this version (`v{__version__}`) over HTTPS, and each is checked against its SHA-256 digest from the GitHub API. Set `GITHUB_TOKEN` for a higher GitHub API rate limit.
+
+### Offline hosts and Docker
+
+`sbx prefetch` downloads all assets before use:
 
 ```bash
-make bench-optimizer              # 200 VMs per combo (4x4 grid = 16 combos)
-make bench-optimizer N_VMS=250    # heavier load (recommended for tuning)
+sbx prefetch                    # All assets for this architecture
+sbx prefetch --arch aarch64     # Assets of another architecture
+sbx prefetch -q                 # No progress output (CI, Docker)
 ```
 
-## Memory Optimization
-
-VMs include automatic memory optimization (no configuration required):
-
-- **Compressed swap (zram)** - 40% of RAM as lz4-compressed swap, physically capped at 20% of RAM
-- **Memory reclamation (virtio-balloon)** - Reclaims unused guest pages on idle warm-pool VMs (192→140 MB default), reducing host memory pressure
-
-### Memory Architecture
-
-Guest RAM is a fixed budget shared between the kernel, userspace processes, and tmpfs mounts. tmpfs is demand-allocated — writing 10 MB of files consumes ~10 MB of the VM's memory budget. All tmpfs mounts enforce per-UID quota (`usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
-
-```
-Guest RAM (default 192 MB)
-├── Kernel + slab caches     (~20 MB fixed)
-├── Userspace (code execution) (variable)
-├── tmpfs mounts (on demand, per-UID quota)
-│   ├── /home/user           40% of RAM — user files, packages
-│   ├── /tmp                 50% of RAM — pip/uv wheel builds, temp files
-│   └── /dev/shm             40% of RAM — POSIX shared memory
-└── zram compressed swap     (40% disksize, 20% mem_limit)
+```dockerfile
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm
+# The image also needs QEMU (see Install)
+RUN uv pip install --system "exec-sandbox[cli]"
+RUN sbx prefetch -q
+ENV EXEC_SANDBOX_OFFLINE=1
+# A spec with packages still needs PyPI or npm for its first build (L2 cache miss).
+# Run the container with --device /dev/kvm for hardware acceleration.
 ```
 
-| Mount | Size | Purpose |
-|---|---|---|
-| `/home/user` | 40% of RAM | Writable home dir — installed packages, user scripts, data files |
-| `/tmp` | 50% of RAM | Scratch space for package managers (wheel builds), temp files |
-| `/dev/shm` | 40% of RAM | POSIX shared memory segments (Python multiprocessing semaphores) |
+### Build images from source
 
-## Design Trade-offs
+From a clone of the repository, `./scripts/build-images.sh` writes `python-3.14-base-{arch}.qcow2`, `node-1.4-base-{arch}.qcow2` and `raw-base-{arch}.qcow2` to `./images/dist/`.
 
-Optimized for AI agent workloads: long-lived but mostly idle sessions, high concurrency, untrusted code.
+## Linux host setup
 
-### Why QEMU over alternatives
+### Run QEMU as qemu-vm
 
-| Approach | Trade-off |
-|----------|-----------|
-| **Containers** (Docker, K8s pods) | Shared host kernel — container escapes are a proven, recurring class: [CVE-2019-5736](https://nvd.nist.gov/vuln/detail/CVE-2019-5736) (runc), [CVE-2024-21626](https://nvd.nist.gov/vuln/detail/CVE-2024-21626) (runc "Leaky Vessels"), [CVE-2022-0185](https://nvd.nist.gov/vuln/detail/CVE-2022-0185) (user namespace). VMs run their own kernel, eliminating this class. Remaining surface is the [hypervisor device model](https://venom.crowdstrike.com/) |
-| **gVisor** | User-space kernel ([Sentry](https://gvisor.dev/docs/architecture_guide/security/)), not a hardware boundary. A Sentry bug exposes the host. Incomplete syscall coverage breaks some workloads |
-| **Firecracker** | Genuine VM isolation (powers AWS Lambda, [E2B](https://e2b.dev)). But [requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) — no macOS, no software emulation fallback. Many cloud VMs and containerized environments don't expose nested virtualization |
-| **Cloud sandboxes** | Data leaves your network. Per-execution pricing. Vendor lock-in |
-| **Namespace isolation** (Bubblewrap, nsjail) | No hardware boundary — host kernel processes all syscalls directly |
+For more isolation on Linux, exec-sandbox can run QEMU as an unprivileged `qemu-vm` user:
 
-QEMU/KVM: [in the Linux kernel since 2007](https://kernelnewbies.org/Linux_2_6_20), powers [Google Cloud](https://cloud.google.com/blog/products/gcp/7-ways-we-harden-our-kvm-hypervisor-at-google-cloud-security-in-plaintext) and [AWS Nitro](https://perspectives.mvdirona.com/2019/02/aws-nitro-system/). exec-sandbox uses KVM on Linux, HVF on macOS, and falls back to software emulation (TCG) when neither is available — deploy on bare metal, cloud VMs, or inside containers without nested virtualization. The trade-off is complexity: cross-platform support (KVM/HVF/TCG × x86_64/aarch64) requires careful engineering.
+```bash
+# Create qemu-vm system user, add it to the kvm group (hardware acceleration), and add your user to its group (socket access)
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin qemu-vm
+sudo usermod -aG kvm qemu-vm
+sudo usermod -aG qemu-vm $USER
 
-### Optimized for sandbox density, not raw performance
+# Let your user run commands as qemu-vm, and chown and rm as root, with no password
+echo "$USER ALL=(qemu-vm) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/qemu-vm
+echo "$USER ALL=(root) NOPASSWD: $(command -v chown), $(command -v rm)" | sudo tee -a /etc/sudoers.d/qemu-vm
+sudo chmod 0440 /etc/sudoers.d/qemu-vm
 
-AI agent sandboxes are long-lived (hours) but mostly idle — typical code bursts every 30s to 5 min, each lasting seconds. **Sandbox density** (VMs per GB) matters more than per-VM performance.
+# setfacl gives qemu-vm access to the home disks and the L1 cache files
+sudo apt install acl
 
-Memory optimizations maximize VMs per host: COW template memory (x-ignore-shared VM templating — L1 snapshots save 350KB device state, restored VMs share RAM pages via MAP_PRIVATE), free page reporting, KSM page dedup (Linux), cgroup memory.reclaim, zram compression, and virtio-balloon reclamation. Trade-off: template VMs cannot use balloon (incompatible with file-backed COW); cold-boot VMs retain balloon.
+# Log in again, or start a shell with the new group (for a service: sg qemu-vm -c '<command>')
+newgrp qemu-vm
 
-### Why not Kubernetes for sandbox orchestration
-
-Kubernetes targets long-running services, not high-churn ephemeral workloads. At scale, pod lifecycle hits [etcd throughput](https://etcd.io/docs/v3.5/op-guide/performance/), [scheduler limits (~100-200 pods/s)](https://github.com/kubernetes/community/blob/master/sig-scalability/slos/slos.md), and [cluster ceiling (~150k pods)](https://kubernetes.io/docs/setup/best-practices/cluster-large/). [Knative](https://knative.dev/) and [agent-sandbox](https://agent-sandbox.sigs.k8s.io/) help, but each sandbox still pays the full pod lifecycle cost with multiple etcd writes per transition.
-
-exec-sandbox manages VMs directly as processes — no orchestration layer. A single host sustains [39 VMs/s](#concurrent-throughput) with sub-second setup.
-
-## Snapshot Caching Architecture
-
-exec-sandbox uses a 3-tier snapshot cache to eliminate redundant work across executions. The first run with a given configuration pays the full cost (boot + package install); every subsequent run restores from cache.
-
-```
-Request arrives
-│
-├─ Warm pool hit? ──────────────── 1-2ms     (pre-started VM, REPL already warm)
-│
-├─ L1 memory snapshot? ────────── ~100ms     (full VM state restore — REPL already warm)
-│
-├─ L2 disk snapshot? ──────────── ~400ms boot + 4-11s REPL startup
-│                                             (packages cached, but interpreter cold-starts)
-│
-├─ L3 S3 remote cache? ────────── download + same as L2
-│
-└─ Cold miss ──────────────────── ~400ms boot + 4-11s REPL + package install
+# Check: each line must print ok
+sudo -n -k -u qemu-vm /bin/sh -c 'umask 007 && exec "$@"' qemu-vm true && echo ok
+id -nG | grep -qw qemu-vm && echo ok
+sudo -n -k -l chown >/dev/null && sudo -n -k -l rm >/dev/null && echo ok
+# the group's members, and the accounts whose primary group it is: only qemu-vm and you
+gid=$(getent group qemu-vm | cut -d: -f3); { getent group qemu-vm | cut -d: -f4 | tr , '\n'; awk -F: -v g="$gid" '$4 == g {print $1}' /etc/passwd; } | grep -vx -e '' -e qemu-vm -e "$(id -un)" | grep -q . || echo ok
+# in the shell that starts the service, after the cgroup setup below: makes a VM-like cgroup and moves a process into it
+d=/sys/fs/cgroup/code-exec/check-$$; mkdir "$d" && sh -c 'echo 0 > "$1/cgroup.procs"' sh "$d" 2>/dev/null && test -e "$d/cgroup.kill" && echo ok; rmdir "$d"
 ```
 
-### L1: Memory Snapshots
+- Give these sudo rights to the service account only: `chown` and `rm` as root reach every file. A `(qemu-vm)` rule limited to some commands must allow `/bin/sh`.
+- The `qemu-vm` group must have no members other than `qemu-vm` and your user.
+- The service must run in the `qemu-vm` group (or as root), inside the cgroup v2 subtree of [Resource limits (cgroups)](#resource-limits-cgroups), on Linux 5.14 or later.
+- exec-sandbox runs `chmod a+x` on the folders above the images, the VM files and the L1 cache files (for example your home folder).
 
-L1 captures the complete VM state — CPU registers, RAM pages, device state — via QEMU's [migration subsystem](https://www.qemu.org/docs/master/devel/migration/main.html). Restoring from L1 resumes the VM exactly where it was, with REPL already warm and packages loaded. No boot, no initialization. The guest-agent forces an immediate kernel CRNG reseed (`RNDRESEEDCRNG` ioctl) before every command dispatch, ensuring each restored VM produces unique cryptographic random output despite sharing the same snapshot origin.
+Each process checks this setup at its first `Scheduler` start. If a check fails, its VMs run QEMU as your user, and a warning names the failed check.
 
-On QEMU >= 9.0, exec-sandbox enables [mapped-ram](https://www.qemu.org/docs/master/devel/migration/mapped-ram.html) for fixed-offset page storage (enabling parallel I/O) and [multifd](https://www.qemu.org/docs/master/devel/migration/main.html) for multi-threaded migration channels. Mapped-ram files are sparse — unused RAM pages become filesystem holes. A default 192 MB VM produces a file that appears as ~326 MB (`ls -l`) but consumes only ~50-100 MB of actual disk (Python ~86 MB, JavaScript ~96 MB, raw ~56 MB).
+### Resource limits (cgroups)
 
-**How L1 saves work:** After a cold boot, exec-sandbox schedules a background save — it boots a sacrificial VM with the same parameters, warms the REPL, saves the migration stream to disk via QMP (`stop` → `migrate` → poll → `quit`), and destroys the VM. The next request with matching parameters restores from the saved vmstate instead of booting.
+cgroup limits (layer 6) need a cgroup v2 subtree that your user owns, and your service must start inside it. A reboot removes this setup:
 
-L1 cache keys include: language, packages, exec-sandbox version, base image hash, QEMU version, CPU architecture, acceleration type, memory size, CPU cores, network topology, migration format version, kernel hash, and initramfs hash. Any parameter change produces a different cache entry.
+```bash
+sudo mkdir -p /sys/fs/cgroup/code-exec/service
+echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/code-exec/cgroup.subtree_control
+sudo chown -R "$USER": /sys/fs/cgroup/code-exec
+echo $$ | sudo tee /sys/fs/cgroup/code-exec/service/cgroup.procs   # then start the service from this shell
+```
 
-### L2: Disk Snapshots
+Do not name your service cgroup `exec-sandbox`, `exec-sandbox-probe`, `exec-sandbox-watcher`, `warm-pool` or `l1-cache`: exec-sandbox uses these names. Without this setup, exec-sandbox logs "cgroup v2 unavailable, resource limits disabled" and uses `ulimit` only.
 
-L2 stores standalone ext4 qcow2 images with packages pre-installed. When a request needs packages (e.g., `pandas==2.2.0`), exec-sandbox checks L2 for a matching snapshot. On hit, the VM boots with the cached disk overlaid on the read-only EROFS base via overlayfs — skipping package installation but still going through kernel boot (~400ms) and interpreter startup (4-11s for Python/Bun on HVF, ~4-5s on KVM). The snapshot only contains the writable layer (installed packages and their files), not the full rootfs.
+### Namespaces
 
-This is where L1 matters: L1 snapshots the memory state *after* the interpreter is fully loaded, eliminating the 4-11s REPL startup cost entirely. An L1 save is automatically scheduled after every L2 cold boot, so the interpreter startup penalty is paid only once per unique configuration.
+Namespaces (layer 7) need `unshare` from util-linux 2.32 or later. Check: `/usr/bin/unshare --pid --fork --kill-child=SIGKILL -- /usr/bin/true && echo ok`. Without it, exec-sandbox logs "unshare unavailable (namespace isolation disabled)" and starts QEMU without namespaces.
 
-### L3: S3 Remote Cache
+`setpriv --pdeathsig` (util-linux 2.33 or later) makes gvproxy, qemu-storage-daemon and a QEMU that runs as your user end with the service. Check: `setpriv --pdeathsig KILL -- /bin/sh -c : && echo ok`. Without it, exec-sandbox logs "setpriv --pdeathsig unavailable" and starts these processes more slowly when the service uses much memory.
+## Instance store operations
 
-L3 extends L2 across machines. When an L2 snapshot is created, it's compressed with zstd and uploaded to S3 in the background. Other hosts can download and decompress it to populate their local L2 cache, avoiding redundant package installations across a fleet.
+### Set up the S3 bucket
 
-## API Reference
+`<prefix>` below is `s3_instance_prefix` (default `instances/`).
 
-### Execution Result
+- **Conditional writes.** The store must support `If-None-Match` and `If-Match` on PUT: AWS S3, Cloudflare R2, MinIO and Ceph RGW 19.2.7 or later do. The `Scheduler` checks this at start.
+- **Credentials.** The standard AWS chain (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `~/.aws/credentials`, or the machine role). For R2, MinIO or Ceph RGW, set `s3_endpoint_url`.
+- **Permissions.** `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:AbortMultipartUpload` on `<prefix>*`, and `s3:ListBucket` on the bucket (without it, S3 answers 403 for a missing key). An access error raises `ConfigError` (`INSTANCE_CONFIG`). Example for `instances/`:
+
+  ```json
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"], "Resource": "arn:aws:s3:::my-bucket/instances/*"},
+      {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::my-bucket"}
+    ]
+  }
+  ```
+
+- **Lifecycle rules.** `AbortIncompleteMultipartUpload` (1 day) on `<prefix>`, and an expiration of 1 day on `<prefix>probe/`. To remove unused instances, add an expiration of X days on `<prefix>s/` ([Expiration](#expiration)); without it, instances stay until `delete_instance()`. Never expire `<prefix>assets/`: all instances share these guest images. Delete an image there only when no instance uses it.
+- **No versioning.** With versioning, deleted instances still use storage. If versioning was on, suspend it and add a lifecycle rule that deletes noncurrent versions.
+- **No archive storage class** (such as S3 Glacier Flexible Retrieval or Deep Archive): a load cannot read an archived object and fails with `ConfigError` (`INSTANCE_CONFIG`).
+- `s3_instance_prefix` and `s3_snapshot_prefix` must not overlap.
+- Give write access to the workers only: anyone who can write to the bucket can put back an older head and so roll an instance back.
+
+### Expiration
+
+An expiration rule of X days on `<prefix>s/` deletes each object X days after its write (S3 can take 1-2 more days). Each save writes the head again, and a full copy or a pack (the blocks that changed). A new full copy comes when the packs since the last one reach its size, after 64 packs, or after a key rotation. An instance stays loadable for at least X days after its **last full copy**.
+
+So an instance saved at each request must be used at least every **X / (n + 1) days**, where n = min(full copy size / typical pack size, 64). Example: X = 30 days, a 45 MiB full copy and 1 MiB packs give n = 45: use the instance at least every 15 hours.
+
+When an object is gone, `reuse()` fails with `INSTANCE_EXPIRED` (`action == "RECREATE"`). The next save of a session that is still open repairs the stored instance.
+
+### Key rotation
+
+An instance moves to the newest key at its next save. To rotate the key on all workers:
+
+1. Add the new key at the end of `instance_keyring` on every worker (`OLD,NEW`).
+2. When every worker has it, move it to the front (`NEW,OLD`). If one worker puts it first too early, the others fail to load the instances it saves (`INSTANCE_KEY_MISSING`).
+3. Remove the old key when no instance uses it: for each id of `list_instances()`, `describe_instance(id).key_id` is not the old key's id. An instance that is never saved again keeps the old key. Each `Scheduler` logs its key ids at start (log "Instance store ready", field `key_ids`, newest first).
+
+### Upgrades
+
+A saved instance loads only on the exec-sandbox release that saved it (`describe_instance(id).host.release`). On another release, `reuse()` fails with `RouteError` (`INSTANCE_HOST_MISMATCH`) before any download. Before you upgrade all workers, keep workers of the old release for the instances you need, or plan to make these instances again. Old L1 snapshots and VM images stay on disk ([Clean up](#clean-up)).
+
+### Storage layout and costs
+
+- **Store.** Each instance holds its full copy and its packs (at most about twice the full copy) under `<prefix>s/<instance_id>/`. The store holds one copy of each guest image under `<prefix>assets/`.
+- **Encryption.** The RAM, the home disk, the `VmSpec` and the host values use AES-256-GCM. The key names, instance id, generation, commit ids and key id are in clear. Guest images are not encrypted.
+- **Worker disk.** Each open session of a saved instance, and each save and load, keeps a RAM file and a home disk copy (not encrypted) in a private folder (mode 0700) under the home disk folder (`EXEC_SANDBOX_HOME_DISK_DIR`, default `<cache dir>/home-disks/`). exec-sandbox deletes them when the session closes, or at the next start after a crash. Guest images from the store stay in `<cache dir>/instance-assets/` ([Clean up](#clean-up)).
+
+## CLI reference
+
+### sbx run options
+
+`sbx run --help` prints the same list.
+
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `--code` | `-c` | Code to run (repeatable, in place of SOURCES) | - |
+| `--language` | `-l` | python, javascript or raw | from the file extension, else python |
+| `--timeout` | `-t` | Timeout in seconds (1-300) | 30 |
+| `--env` | `-e` | Environment variable KEY=VALUE (repeatable) | - |
+| `--memory` | `-m` | Memory in MB (128 or more) | 192 |
+| `--package` | `-p` | Package to install (repeatable) | - |
+| `--no-validation` | | Skip the package allow-list check | false |
+| `--network` | | Outbound network. Without `--allow-domain`: python reaches PyPI only, javascript npm only, raw any host | false |
+| `--allow-domain` | | Allowed domain and its subdomains (repeatable; needs `--network`) | - |
+| `--expose` | | Expose port: `INTERNAL[:EXTERNAL][/tcp\|udp]` (repeatable) | - |
+| `--upload` | | Upload file `LOCAL:GUEST` (repeatable) | - |
+| `--download` | | Download file `GUEST:LOCAL`, or `GUEST` to `./<file name>` (repeatable) | - |
+| `--instance` | | Saved instance to continue (made at the first run), saved after the code runs ([Instance ids](#instance-ids)) | - |
+| `--json` | | JSON output ([JSON output](#json-output)) | false |
+| `--quiet` | `-q` | Hide progress output | false |
+| `--debug` | | DEBUG logging, and kernel and init boot logs on stderr (skips the warm pool and L1) | false |
+
+### Exit codes
+
+| Code | When |
+|------|------|
+| 0-255 | The exit code of the code ([Exit codes and timeouts](#exit-codes-and-timeouts)) |
+| 2 | Usage error (also `--allow-domain` without `--network`, or an invalid VM option such as `-m 100` or more than 10 `--expose`), or an error with action `FIX_INPUT` or `FIX_CONFIG` |
+| 124 | The code timed out (with `--json`, `result.exit_code` stays -1), or the VM did not boot in time (`VM_BOOT_TIMEOUT`) |
+| 125 | Other sandbox and instance errors |
+| 130 | Ctrl+C (a second Ctrl+C stops the VMs at once) |
+
+With several sources, the run exits with 2 if a source has a `FIX_INPUT` or `FIX_CONFIG` error, else 124 if a source timed out or did not boot in time, else the highest exit code of the sources. When the code itself exits with 2 or 124, that is only its exit code. In the JSON array, the `exit_code` of a source that timed out is 124.
+
+### JSON output
+
+| Sources | `--json` prints | Fields |
+|---------|-----------------|--------|
+| One | One object | `result` (`stdout`, `stderr`, `exit_code` and the timings), `startup`, `exposed_ports`, `instance` and `total_ms` |
+| Several | An array of objects | `index`, `source`, `run` (the object above, or `null`), `error`, `code`, `action` and `exit_code` |
+
+A single source that fails before its code runs prints no JSON: the error goes to stderr.
+
+### Other commands
+
+| Command | Use | Exit codes |
+|---------|-----|------------|
+| `sbx instance list\|describe\|rm` | [Use instances from the command line](#use-instances-from-the-command-line) | 0 on success; 2 for invalid settings, a bad id, or a `FIX_INPUT` or `FIX_CONFIG` error; 125 for the other errors; 130 after Ctrl+C |
+| `sbx prefetch` | [Offline hosts and Docker](#offline-hosts-and-docker) | 1 when a download fails |
+
+`sbx ARGS...` is `sbx run ARGS...`. `sbx -V` shows the version. `exec-sandbox` is the same command as `sbx`.
+
+## API reference
+
+The docstring of each method (`help(Scheduler.new)`) lists its errors.
+
+### Scheduler
+
+| Member | Description |
+|--------|-------------|
+| `Scheduler(config=None)` | Use as `async with Scheduler(config) as scheduler:`; `None` uses the defaults ([SchedulerConfig](#schedulerconfig)) |
+| `new(spec, *, idle_timeout_seconds=None, on_boot_log=None, instance_id=None)` | Start a new VM; returns its `Session` ([Sessions](#sessions)) |
+| `reuse(instance_id, *, idle_timeout_seconds=None)` | Start a VM from a saved instance; returns the `Session` that continues it ([Saved instances](#saved-instances)) |
+| `wait_pool_ready(timeout=120)` | Wait until the warm pool is full, or until `timeout` seconds pass ([Warm pool](#warm-pool)) |
+| `describe_instance(instance_id)` | `InstanceInfo` of a saved instance ([List, describe and delete instances](#list-describe-and-delete-instances)) |
+| `list_instances()` | Async iterator of the instance ids in the store |
+| `delete_instance(instance_id)` | Delete a saved instance; `True` if it existed |
+| `config` | The `SchedulerConfig` |
+
+### Session
+
+| Member | Description |
+|--------|-------------|
+| `exec(code, *, timeout_seconds=None, env_vars=None, on_stdout=None, on_stderr=None)` | Run code; returns an `ExecutionResult`. `timeout_seconds` defaults to `default_timeout_seconds`; `env_vars` is a dict ([Exit codes and timeouts](#exit-codes-and-timeouts)) |
+| `write_file(path, content, *, make_executable=False)` | Write a file from bytes, a local `Path` or an `IO[bytes]` stream ([Files](#files)) |
+| `read_file(path, *, destination)` | Read a file to a local `Path` or an `IO[bytes]` stream |
+| `list_files(path="")` | List a folder; returns `FileInfo` entries (`name`, `is_dir`, `size` in bytes, 0 for folders) |
+| `save()` | Save the VM state; returns an `InstanceRef` ([Saved instances](#saved-instances)) |
+| `close()` | Destroy the VM; it never saves ([Rules for save and reuse](#rules-for-save-and-reuse)) |
+| `spec` | `VmSpec`: what the VM is made of |
+| `startup_timing` | `StartupTiming`: how the VM started (below) |
+| `exposed_ports` | `list[ExposedPort]`: `.internal`, `.external`, `.host`, `.protocol`, `.url` |
+| `exec_count` | `int`: number of `exec()` calls that returned a result |
+| `closed` | `bool`: the session is closed |
+| `vm_id` | `str`: id of the VM |
+| `instance` | `InstanceRef \| None`: the saved instance this session continues, set by `reuse()` and by each `save()` |
+
+### ExecutionResult
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `stdout` | str | Captured output (max 1MB) |
-| `stderr` | str | Captured errors (max 100KB) |
-| `exit_code` | int | Process exit code (0 = success, 128+N = killed by signal N) |
-| `execution_time_ms` | int \| None | Duration reported by VM |
-| `external_cpu_time_ms` | int \| None | CPU time measured by host |
-| `external_memory_peak_mb` | int \| None | Peak memory measured by host |
-| `external_cpu_nr_throttled` | int \| None | CFS bandwidth throttle events (host cgroup) |
-| `timing.setup_ms` | int | Resource setup (filesystem, limits, network) |
-| `timing.boot_ms` | int | VM boot time |
-| `timing.execute_ms` | int | Code execution |
-| `timing.total_ms` | int | End-to-end time |
-| `warm_pool_hit` | bool | Whether a pre-started VM was used |
-| `l1_cache_hit` | bool | True if served from the L1 memory-snapshot cache |
-| `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
+| `stdout` | str | Output (at most 1 MB) |
+| `stderr` | str | Errors (at most 100 KB) |
+| `exit_code` | int | 0-255 (0 = success, 128+N = usually killed by signal N), or -1 for a timeout |
+| `execution_time_ms` | int \| None | Run time that the VM reports |
+| `external_cpu_time_ms` | int \| None | CPU time that the host measures |
+| `external_memory_peak_mb` | int \| None | Peak memory that the host measures |
+| `external_cpu_nr_throttled` | int \| None | CFS throttle events (host cgroup) |
+| `timing.execute_ms` | int | Connect + run + response, measured on the host |
+| `timing.connect_ms` | int \| None | Connection to the guest agent (None when not measured) |
+| `spawn_ms` | int \| None | Time to get the REPL process (guest) |
+| `process_ms` | int \| None | Time from spawn to process exit (guest) |
 
-Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = execution timeout (code ran too long), other non-zero = program error. Infrastructure failures raise instead of returning a result: `VmTransientError` before dispatch (code never ran, safe to retry), `CommunicationOutcomeUnknownError` after dispatch (QEMU crash, REPL spawn OOM mid-flight — reconcile side effects before retrying).
+### StartupTiming
 
-```python
-# Infrastructure failures raise before reaching here (see Error Handling).
-result = await scheduler.run(code="...", language="python")
-
-if result.exit_code == 0:
-    pass  # Success
-elif result.exit_code > 128:
-    signal_num = result.exit_code - 128  # e.g., 9 for SIGKILL
-elif result.exit_code == -1:
-    pass  # Execution timeout (code ran too long, see result.stderr)
-else:
-    pass  # Program exited with error
-```
-
-### FileInfo
-
-Returned by `Session.list_files()`.
+Times in ms of the `new()` or `reuse()` call, measured on the host. After a cold boot, the interpreter starts in the first `exec()` and counts in its `timing.execute_ms`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | str | File or directory name |
-| `is_dir` | bool | True if entry is a directory |
-| `size` | int | File size in bytes (0 for directories) |
+| `total_ms` | int | The whole call |
+| `admission_ms` | int | Wait for a resource slot |
+| `setup_ms` | int | Cache lookup, overlay, cgroup; after `reuse()`, the restore of the saved state |
+| `boot_ms` | int | Cold boot only |
+| `warm_pool_hit` | bool | The VM came from the warm pool |
+| `l1_cache_hit` | bool | The VM came from an L1 memory snapshot |
+| `l1_restore_ms` | int \| None | L1 restore (None unless `l1_cache_hit`) |
+| `instance_load_ms` | int \| None | `reuse()` only: read, check and download of the saved state |
+| `overlay_ms`, `qemu_cmd_build_ms`, `gvproxy_start_ms`, `qemu_fork_ms`, `guest_wait_ms`, `boot_retries` | int | Parts of a cold boot |
 
-### Exceptions
+### InstanceRef and InstanceInfo
 
-| Exception | Description |
-|-----------|-------------|
-| `SandboxError` | Base exception for all sandbox errors |
-| `TransientError` | Retryable errors — may succeed on retry |
-| `VmTransientError` | Transport failure or guest infrastructure failure before dispatch (code never ran) |
-| `VmTimeoutError` | VM boot timed out |
-| `VmCapacityError` | VM pool at capacity |
-| `PermanentError` | Non-retryable errors |
-| `VmPermanentError` | Protocol/request corruption or invalid VM state |
-| `VmConfigError` | Invalid VM configuration |
-| `InputValidationError` | Caller-bug errors — bad input, session stays alive |
-| `CodeValidationError` | Empty, whitespace-only, or null-byte code |
-| `EnvVarValidationError` | Invalid env var names/values (control chars, size) |
-| `OutputLimitError` | stdout/stderr exceeded guest-enforced limits (session stays alive) |
-| `SessionClosedError` | Session already closed |
-| `CommunicationError` | Guest communication failed |
-| `CommunicationOutcomeUnknownError` | Transport lost after dispatch — the code may have run; reconcile side effects before retrying |
-| `GuestAgentError` | Guest agent returned error |
-| `PackageNotAllowedError` | Package not in allowlist |
-| `SnapshotError` | Snapshot operation failed |
-| `SocketAuthError` | Socket peer authentication failed |
-| `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3) |
-| `AssetError` | Asset download/verification failed |
+`save()` returns an `InstanceRef` (`instance_id`, `generation`); pass the id to `reuse()`. `describe_instance()` returns an `InstanceInfo`:
 
-### Session Resilience
-
-Sessions survive user code failures, input validation errors (`InputValidationError`), and output limit errors (`OutputLimitError`). VM-level communication errors, cancellation, exit 137, and a VM found dead all close a session. A closed session cannot be reused.
-
-| Failure | Exit Code | Session | State | Next `exec()` |
-|---------|-----------|---------|-------|----------------|
-| Exception (ValueError, etc.) | 1 | Alive | Preserved | Works, state intact |
-| `sys.exit(n)`, n != 137 | n | Alive | Preserved | Works, state intact |
-| Syntax error | 1 | Alive | Preserved | Works, state intact |
-| Output limit exceeded | 1 | Alive | Preserved | Works, state intact |
-| `os._exit(n)`, n != 137 | n | Alive | **Reset** | Works, fresh REPL |
-| Exit 137 (for example, SIGKILL) | 137 | **Closed** | Lost | `SessionClosedError` |
-| QEMU died while delivering a result | result's code | **Closed** | Lost | `SessionClosedError` |
-| Signal other than SIGKILL | 128 + signal | Alive | **Reset** | Works, fresh REPL |
-| Timeout | -1 | Alive | **Reset** | Works, fresh REPL |
-| VM communication failure | N/A | **Closed** | Lost | `SessionClosedError` |
-
-## Pitfalls
-
-```python
-# run() creates a fresh VM each time - state doesn't persist across calls
-result1 = await scheduler.run("x = 42", language="python")
-result2 = await scheduler.run("print(x)", language="python")  # NameError!
-# Fix: use sessions for multi-step stateful execution
-async with await scheduler.session(language="python") as session:
-    await session.exec("x = 42")
-    result = await session.exec("print(x)")  # Works! x persists
-
-# Pre-started VMs (warm pool) only work without packages
-config = SchedulerConfig(warm_pool_size=1)
-await scheduler.run(code="...", packages=["pandas==2.2.0"])  # Bypasses warm pool, cold boot + install (~100ms after L1 cached)
-await scheduler.run(code="...")                        # Uses warm pool (1-2ms)
-await scheduler.run(code="...", on_boot_log=print)     # Bypasses warm pool (needs cold boot for logs)
-
-# Version specifiers are required (security + caching)
-packages=["pandas==2.2.0"]  # Valid, cacheable
-packages=["pandas"]         # PackageNotAllowedError! Must pin version
-
-# Streaming callbacks must be fast (blocks async execution)
-on_stdout=lambda chunk: time.sleep(1)        # Blocks!
-on_stdout=lambda chunk: buffer.append(chunk)  # Fast (same applies to on_boot_log)
-
-# Memory overhead: pre-started VMs use warm_pool_size × 3 languages × 192MB
-# warm_pool_size=5 → 5 VMs/lang × 3 × 192MB = 2.88GB for warm pool alone
-
-# Memory can exceed configured limit due to compressed swap
-default_memory_mb=192  # Code can use up to ~269MB logically (40% zram swap), physically capped at 20% of RAM
-# Don't rely on memory limits for security - use timeouts for runaway allocations
-
-# Network without domain restrictions is risky
-allow_network=True                              # Full internet access
-allow_network=True, allowed_domains=["api.example.com"]  # Controlled
-
-# Port forwarding binds to localhost only
-expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
-# If you need external access, use a reverse proxy on the host
-
-# multiprocessing.Pool works, but single vCPU means no CPU-bound speedup
-from multiprocessing import Pool
-Pool(2).map(lambda x: x**2, [1, 2, 3])  # Works (cloudpickle handles lambda serialization)
-# For CPU-bound parallelism, use multiple VMs via scheduler.run() concurrently instead
-
-# Background processes survive across session exec() calls — state accumulates
-async with await scheduler.session(language="python") as session:
-    await session.exec("import subprocess; subprocess.Popen(['sleep', '300'])")
-    await session.exec("import subprocess; subprocess.Popen(['sleep', '300'])")
-    # Both sleep processes are still running! VM process limit (RLIMIT_NPROC=1024) prevents unbounded growth
-    # All processes are cleaned up when session.close() destroys the VM
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `instance_id` | str | The id given to `new(instance_id=...)`, else the one the first save made (32 lowercase hex characters) |
+| `generation` | int | 1 after the first save; +1 for each later save |
+| `recent_commits` | tuple[RecentCommit, ...] | The last saves (`generation`, `commit_id`), newest first, at most 16 |
+| `key_id` | str | Id of the keyring key that protects the instance |
+| `verified` | bool | True: this keyring opened and authenticated the head. False: this keyring does not have the key, and the other fields are not checked |
+| `spec` | VmSpec \| None | What the VM is made of (None unless `verified`) |
+| `host` | HostFacts \| None | The host that saved it: `arch`, `accelerator`, `cpu_vendor`, `cpu_model`, `qemu_version`, `base_image`, `packages_image`, `release` (None unless `verified`) |
 
 ## Limits
 
 | Resource | Limit |
 |----------|-------|
-| Max code size | 1MB |
-| Max stdout | 1MB |
-| Max stderr | 100KB |
-| Max packages | 50 |
-| Max env vars | 100 |
-| Max exposed ports | 10 |
-| Max file size (I/O) | 500MB |
-| Max file path length | 4096 bytes (255 per component) |
-| Execution timeout | 1-300s |
-| VM memory | 128MB minimum (no upper bound) |
-| Max concurrent VMs | Resource-aware (auto-computed from host memory + CPU) |
+| Code size | 1 MiB |
+| stdout / stderr | 1 MB / 100 KB |
+| Packages | 50 (214 bytes each) |
+| Env vars | 100 (name: 256 bytes, value: 4096 bytes; no control characters except tab) |
+| Exposed ports | 10 |
+| File I/O | 500 MiB per file; path 4096 bytes (255 per component); 120 s wait for a guest answer (the end of a write, each chunk of a read, a listing) |
+| Timeouts | Execution 1-300 s; package install 300 s per try; VM boot 45 s per try, up to 4 tries |
+| VM memory | 128 MB minimum (no upper bound) |
+| Processes and threads of your code (user 1000) | 1024 (`RLIMIT_NPROC`) |
+| Concurrent VMs | Set by admission (host memory, CPU and disk: [SchedulerConfig](#schedulerconfig), [Disk admission](#disk-admission)). A wait of 120 s fails with `TransientError` (`CAPACITY`); a home disk that cannot fit fails at once with `TransientError` (`LOCAL_DISK`) |
+| One saved-state object in S3 | About 78 GiB |
 
-## Security Architecture
+## Guest environment
 
-| Layer | Technology | Protection |
-|-------|------------|------------|
-| 1 | Hardware virtualization (KVM/HVF) | CPU isolation enforced by hardware |
-| 2 | Custom hardened kernel | Modules disabled at compile time, [io_uring](https://security.googleblog.com/2023/06/learnings-from-kctf-vrps-42-linux.html) and eBPF compiled out, slab/memory hardening, ~360+ subsystems removed |
-| 3 | Unprivileged QEMU | No root privileges, minimal exposure |
-| 4 | Non-root REPL (UID 1000) | Blocks mount, ptrace, raw sockets, kernel modules |
-| 5 | System call filtering (seccomp) | Blocks unauthorized OS calls |
-| 6 | Resource limits (cgroups v2) | Memory, CPU, process limits |
-| 7 | Process isolation (namespaces) | Separate process, network, filesystem views |
-| 8 | Security policies (AppArmor/SELinux) | When available |
-| 9 | Socket authentication (SO_PEERCRED/LOCAL_PEERCRED) | Verifies QEMU process identity |
+Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/releases), all based on Alpine Linux (musl libc):
 
-**Guarantees:**
+| Image | Runtime | Package manager | Size |
+|-------|---------|-----------------|------|
+| `python-3.14-base` | Python 3.14 ([python-build-standalone](https://github.com/astral-sh/python-build-standalone), musl), cloudpickle 3.1.2 | uv 0.13 | ~75 MB |
+| `node-1.4-base` | Bun 1.4 | bun | ~71 MB |
+| `raw-base` | GNU Bash | None | ~17 MB |
 
-- Fresh VM per `run()`, destroyed immediately after. Sessions reuse the same VM across `exec()` calls (same isolation, persistent state)
-- Network disabled by default - requires explicit `allow_network=True`
-- Domain allowlisting with 3-layer outbound filtering — DNS resolution blocked for non-allowed domains, TLS SNI inspection on port 443, and DNS cross-validation to prevent SNI spoofing
-- Package validation - only top 10k Python/JavaScript packages allowed by default
-- Port forwarding isolation - when `expose_ports` is used without `allow_network`, guest cannot initiate any outbound connections (all outbound TCP/UDP blocked)
+All images include `bash`; the GNU `coreutils`, `grep` (PCRE with `-P`), `findutils`, `sed`, `gawk` and `diffutils`; and `git`, `curl`, `jq`, `openssl`, `patch`, `less`, `make`, `tree`, `tar`, `gzip`, `unzip` and `file`.
 
-## VM Images
+- **Python.** Use `uv pip install`: there is no `pip` command. There is no gcc or musl-dev, so packages that need a source build do not install ([Packages](#packages)). `multiprocessing.Pool` works with no setup, also with functions, lambdas and closures defined in the REPL. With the default `cpu_cores=1`, CPU-bound work does not run faster: set `VmSpec(cpu_cores=N)` or use several sessions.
+- **JavaScript.** Bun is a Node.js-compatible runtime, not Node.js. `exec()` runs JavaScript and TypeScript with no build step, but not JSX: put JSX in a `.jsx` or `.tsx` file and run it with `bun run`. Use `bun install` for packages and `bun run` for scripts.
+- **Shell (raw).** The common tools only, for shell scripts and runtimes that you install yourself. `language="raw"` runs GNU Bash. Code that starts with `#!` runs as a script file in its own process: its variables and working folder do not stay for the next call.
 
-Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/releases):
+### Memory and file systems
 
-| Image | Runtime | Package Manager | Size | Description |
-|-------|---------|-----------------|------|-------------|
-| `python-3.14-base` | Python 3.14 | uv | ~75MB | Full Python environment |
-| `node-1.3-base` | Bun 1.3 | bun | ~57MB | Fast JavaScript/TypeScript runtime with Node.js compatibility |
-| `raw-base` | Bash | None | ~15MB | Shell scripts and custom runtimes |
+`memory_mb` holds the kernel (about 20 MB), your processes and the tmpfs mounts. Files in tmpfs use RAM: 10 MB of files use about 10 MB. Each tmpfs mount has a quota per user (UID).
 
-All images are based on **Alpine Linux** (version and kernel pinned in `versions.lock`, musl libc) and include common tools for AI agent workflows.
+| Mount | Size | Purpose |
+|---|---|---|
+| `/home/user` | `VmSpec.disk_mb` (host disk, not RAM) | Writable home folder (ext4, nosuid, nodev) |
+| `/tmp` | 50% of RAM | Temp files, package manager scratch space |
+| `/dev/shm` | 40% of RAM | POSIX shared memory (Python multiprocessing semaphores) |
 
-### Common Tools (all images)
+Compressed swap (zram, lz4) adds 40% of RAM: code can use about 40% more than `memory_mb` (about 269 MB at 192 MB). The compressed data takes at most 20% of RAM. Use timeouts, not memory limits, to stop code that allocates memory without end.
 
-| Tool | Purpose |
-|------|---------|
-| `git` | Version control, clone repositories |
-| `curl` | HTTP requests, download files |
-| `jq` | JSON processing |
-| `bash` | Shell scripting |
-| `coreutils` | Standard Unix utilities (ls, cp, mv, etc.) |
-| `grep` | GNU grep (PCRE via `-P`, `--include`, etc.) |
-| `findutils` | GNU find (`-printf`, `-regex`, etc.) |
-| `sed` | GNU sed (in-place editing, extended regex) |
-| `gawk` | GNU awk (`gensub`, `strftime`, FPAT, etc.) |
-| `diffutils` | GNU diff/diff3/sdiff (`--color`, unified format) |
-| `patch` | Apply unified diffs |
-| `less` | Pager (backward scroll, search) |
-| `make` | Build automation |
-| `tree` | Directory structure visualization |
-| `tar`, `gzip`, `unzip` | Archive extraction |
-| `file` | File type detection |
+## How it works
 
-### Python Image
+1. The `Scheduler` runs in your Python process. It takes a VM from the warm pool, restores it from a snapshot, or boots it ([Snapshot cache](#snapshot-cache)). It uses KVM on Linux and HVF on macOS, else software emulation (TCG): it also runs on cloud VMs and in containers without nested virtualization.
+2. In the VM, tiny-init (PID 1) starts the guest agent. The agent gets the code over virtio-serial, runs it in a REPL as a non-root user, and sends stdout and stderr back while the code runs.
+3. The root filesystem is read-only (EROFS). `/home/user` is a writable ext4 disk.
 
-| Component | Version | Notes |
-|-----------|---------|-------|
-| Python | 3.14 | [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (musl) |
-| uv | 0.9+ | 10-100x faster than pip ([docs](https://docs.astral.sh/uv/)) |
-| cloudpickle | 3.1.2 | Serialization for `multiprocessing` in REPL ([docs](https://github.com/cloudpipe/cloudpickle)) |
+### L1 saves on Linux
 
-**Usage notes:**
+- An L1 save keeps the VM RAM in `/dev/shm`. In a container, give `/dev/shm` room for the RAM of each L1 save that runs at the same time (`docker run --shm-size`; the default is 64 MB). Else the save is slower.
+- For a service that runs as a regular user (uid 1000 or more), run `loginctl enable-linger <user>`, or set `RemoveIPC=no` in `/etc/systemd/logind.conf`. Else an L1 save can fail when the last login session of that user ends (the next save tries again).
 
-- Use `uv pip install` instead of `pip install` (pip not included)
-- Only prebuilt wheels are supported — packages without `cp314` `musllinux` wheels will fail instantly. No source builds (gcc/musl-dev not included; see [python-build-standalone#684](https://github.com/astral-sh/python-build-standalone/issues/684))
-- Python 3.14 includes t-strings and deferred annotations
-- `multiprocessing.Pool` works out of the box — cloudpickle handles serialization of REPL-defined functions, lambdas, and closures. Single vCPU means no CPU-bound speedup, but I/O-bound parallelism and `Pool`-based APIs work correctly
+### Disk admission
 
-### JavaScript Image
+Home disks are sparse. Each VM reserves the part of its `disk_mb` that it has not written yet, divided by `disk_overcommit_ratio`, and `EXEC_SANDBOX_DISK_FREE_FLOOR_MB` (1024 MB) stays free. Admission counts only the home disks of its own `Scheduler`; of other processes, it sees only the space that they use now.
 
-| Component | Version | Notes |
-|-----------|---------|-------|
-| Bun | 1.3 | Runtime, bundler, package manager ([docs](https://bun.com/docs)) |
+When space is short, admission removes the L1 and L2 cache entries on the same filesystem that no running VM uses (oldest last use first), then waits for VMs to end. When neither makes room, the request fails at once with `TransientError` (`LOCAL_DISK`).
 
-**Usage notes:**
+### Memory density
 
-- Bun is a Node.js-compatible runtime (not Node.js itself)
-- Built-in TypeScript/JSX support, no transpilation needed
-- Use `bun install` for packages, `bun run` for scripts
-- Near-complete Node.js API compatibility
-
-### Raw Image
-
-Minimal Alpine Linux with common tools only. Use for:
-
-- Shell script execution (`language="raw"`) — runs under **GNU Bash**, full bash syntax supported
-- Custom runtime installation
-- Lightweight workloads
-
-Build from source:
-
-```bash
-./scripts/build-images.sh
-# Output: ./images/dist/python-3.14-base-{arch}.qcow2, ./images/dist/node-1.3-base-{arch}.qcow2, ./images/dist/raw-base-{arch}.qcow2
-```
-
-## Asset Downloads
-
-exec-sandbox requires VM images (kernel, initramfs, qcow2) and binaries (gvproxy-wrapper) to run. These assets are **automatically downloaded** from GitHub Releases on first use.
-
-### How it works
-
-1. On first `Scheduler` initialization, exec-sandbox checks if assets exist in the cache directory
-2. If missing, it queries the GitHub Releases API for the matching version (`v{__version__}`)
-3. Assets are downloaded over HTTPS, verified against SHA256 checksums (provided by GitHub API), and decompressed
-4. Subsequent runs use the cached assets (no re-download)
-
-### Cache locations
-
-| Platform | Location |
-|----------|----------|
-| macOS | `~/Library/Caches/exec-sandbox/` |
-| Linux | `~/.cache/exec-sandbox/` (or `$XDG_CACHE_HOME/exec-sandbox/`) |
-
-### Environment variables
-
-| Variable | Description |
-|----------|-------------|
-| `EXEC_SANDBOX_CACHE_DIR` | Override cache directory |
-| `EXEC_SANDBOX_OFFLINE` | Set to `1` to disable auto-download (fail if assets missing) |
-| `EXEC_SANDBOX_ASSET_VERSION` | Force specific release version |
-| `EXEC_SANDBOX_LOG_LEVEL` | Set log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-
-### Pre-downloading for offline use
-
-Use `sbx prefetch` to download all assets ahead of time:
-
-```bash
-sbx prefetch                    # Download all assets for current arch
-sbx prefetch --arch aarch64     # Cross-arch prefetch
-sbx prefetch -q                 # Quiet mode (CI/Docker)
-```
-
-**Dockerfile example:**
-
-```dockerfile
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm
-RUN uv pip install --system exec-sandbox
-RUN sbx prefetch -q
-ENV EXEC_SANDBOX_OFFLINE=1
-# Assets cached, no network needed at runtime
-```
-
-### Security
-
-Assets are verified against SHA256 checksums and built with [provenance attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds).
-
-## Requirements
-
-| Requirement | Supported |
-|-------------|-----------|
-| Python | 3.12, 3.13, 3.14 (including free-threaded) |
-| Linux | x64, arm64 |
-| macOS | x64, arm64 |
-| QEMU | 8.0+ |
-| Hardware acceleration | KVM (Linux) or HVF (macOS) recommended, ~5-8x faster |
-
-Verify hardware acceleration is available:
-
-```bash
-ls /dev/kvm              # Linux
-sysctl kern.hv_support   # macOS
-```
-
-Without hardware acceleration, QEMU uses software emulation (TCG), which is ~5-8x slower.
-
-### Linux Setup (Optional Security Hardening)
-
-For enhanced security on Linux, exec-sandbox can run QEMU as an unprivileged `qemu-vm` user. This isolates the VM process from your user account.
-
-```bash
-# Create qemu-vm system user
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin qemu-vm
-
-# Add qemu-vm to kvm group (for hardware acceleration)
-sudo usermod -aG kvm qemu-vm
-
-# Add your user to qemu-vm group (for socket access)
-sudo usermod -aG qemu-vm $USER
-
-# Re-login or activate group membership
-newgrp qemu-vm
-```
-
-**Why is this needed?** When `qemu-vm` user exists, exec-sandbox runs QEMU as that user for process isolation. The host needs to connect to QEMU's Unix sockets (0660 permissions), which requires group membership. This follows the [libvirt security model](https://wiki.archlinux.org/title/Libvirt).
-
-If `qemu-vm` user doesn't exist, exec-sandbox runs QEMU as your user (no additional setup required, but less isolated).
-
-## Documentation
-
-- [QEMU Documentation](https://www.qemu.org/docs/master/) - Virtual machine emulator
-- [KVM](https://www.linux-kvm.org/page/Documents) - Linux hardware virtualization
-- [HVF](https://developer.apple.com/documentation/hypervisor) - macOS hardware virtualization (Hypervisor.framework)
-- [cgroups v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) - Linux resource limits
-- [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html) - System call filtering
+- VMs restored from one L1 memory snapshot share its RAM pages (copy-on-write).
+- Linux: KSM page merging, when the host runs KSM (`echo 1 | sudo tee /sys/kernel/mm/ksm/run`).
+- Linux with cgroups v2 and host zswap on: exec-sandbox moves the memory of idle warm-pool VMs to zswap.
 
 ## Security
 
-- [Security Policy](./SECURITY.md) - Vulnerability reporting
-- [Dependency list (SBOM)](https://github.com/dualeai/exec-sandbox/releases) - Full list of included software, attached to releases
+To report a vulnerability, follow the [security policy](./SECURITY.md).
+
+### Isolation layers
+
+| Layer | Technology | Protection |
+|-------|------------|------------|
+| 1 | Hardware virtualization | CPU isolation enforced by hardware (KVM or HVF; not TCG) |
+| 2 | Hardened guest kernel | No modules, no io_uring, no eBPF, slab and memory hardening, about 530 kernel options turned off |
+| 3 | Unprivileged QEMU | QEMU runs as your user, or as `qemu-vm` on Linux ([Linux host setup](#linux-host-setup)) |
+| 4 | Non-root REPL (UID 1000) | Blocks mount, ptrace, raw sockets, kernel modules |
+| 5 | seccomp | Linux, when QEMU supports `-sandbox`: a filter on the QEMU process |
+| 6 | cgroups v2 | Linux, with a delegated cgroup ([Linux host setup](#linux-host-setup)): memory, CPU and process limits per VM |
+| 7 | Namespaces | Linux, when `unshare` works for your user ([Linux host setup](#linux-host-setup)): PID, network, mount, UTS and IPC namespaces for QEMU |
+| 8 | Socket authentication (SO_PEERCRED/LOCAL_PEERCRED) | Checks the identity of the QEMU process |
+
+All VMs of a host run as the same user (layer 3): run workloads that must not share files on separate hosts.
+
+### Guarantees
+
+- **One VM per session.** Sessions never share a VM, and `close()` destroys it.
+- **No network by default.** Set `allow_network=True` to turn it on.
+- **Domain allow-list.** DNS does not resolve the domains that are not allowed. On port 443, the TLS SNI is checked, also against the DNS answers.
+- **Package check.** By default, only the top 10,000 PyPI and npm packages.
+- **Different random output in each VM**, also in VMs restored from the same memory snapshot.
+
+### Supply chain
+
+exec-sandbox checks each download against its SHA-256 digest ([How images download](#how-images-download)). Release assets have [provenance attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds): check a file with `gh attestation verify <file> --repo dualeai/exec-sandbox`. Each [release](https://github.com/dualeai/exec-sandbox/releases) includes an SBOM (CycloneDX and SPDX) of the Python dependencies, not of the VM images.
 
 ## Contributing
 
-Contributions welcome! Please open an issue first to discuss changes.
+To contribute, open an issue first to discuss the change.
 
 ```bash
-make install      # Setup environment
+make install      # Set up the environment
 make test         # Run tests
 make lint         # Format and lint
+make test-sudo    # Tests that need sudo (Linux: qemu-vm user, cgroups); make test does not run them
 ```
 
 ## License

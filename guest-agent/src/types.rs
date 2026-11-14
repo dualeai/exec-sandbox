@@ -10,6 +10,9 @@ use std::collections::HashMap;
 // Inbound commands (host → guest, deserialized from JSON)
 // ============================================================================
 
+/// A host request, tagged by `action`. The host models are in
+/// src/exec_sandbox/guest_agent_protocol.py. connection.rs reads the top-level
+/// `op_id` and `host_time_ns` from the raw JSON before this parse.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
 pub(crate) enum GuestCommand {
@@ -18,15 +21,17 @@ pub(crate) enum GuestCommand {
 
     #[serde(rename = "install_packages")]
     InstallPackages {
-        language: String,
+        language: Language,
         packages: Vec<String>,
+        /// Seconds for the package manager process; 0 means MAX_TIMEOUT_SECONDS.
         timeout: u64,
     },
 
     #[serde(rename = "exec")]
     ExecuteCode {
-        language: String,
+        language: Language,
         code: String,
+        /// Seconds, at most MAX_TIMEOUT_SECONDS; 0 means MAX_TIMEOUT_SECONDS.
         #[serde(default)]
         timeout: u64,
         #[serde(default)]
@@ -44,9 +49,12 @@ pub(crate) enum GuestCommand {
     #[serde(rename = "read_file")]
     ReadFile { op_id: String, path: String },
 
+    /// One chunk of a write_file stream: base64 of zstd-compressed bytes.
     #[serde(rename = "file_chunk")]
     FileChunk { op_id: String, data: String },
 
+    /// End of a write_file stream: the guest commits the file and replies
+    /// with FileWriteAck.
     #[serde(rename = "file_end")]
     FileEnd { op_id: String },
 
@@ -57,13 +65,15 @@ pub(crate) enum GuestCommand {
     },
 
     #[serde(rename = "warm_repl")]
-    WarmRepl { language: String },
+    WarmRepl { language: Language },
 }
 
 // ============================================================================
 // Outbound messages (guest → host, serialized to JSON)
 // ============================================================================
 
+/// A guest message, tagged by `type`. ResponseWriter adds the `op_id` of the
+/// request to each message.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum GuestResponse {
@@ -87,41 +97,23 @@ pub(crate) enum GuestResponse {
     Pong { version: &'static str },
 
     #[serde(rename = "error")]
-    Error {
-        message: String,
-        error_type: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        op_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        version: Option<&'static str>,
-    },
+    Error { message: String, error_type: String },
 
     #[serde(rename = "file_write_ack")]
-    FileWriteAck {
-        op_id: String,
-        path: String,
-        bytes_written: usize,
-    },
+    FileWriteAck { path: String, bytes_written: usize },
 
     #[serde(rename = "file_chunk")]
-    FileChunk { op_id: String, data: String },
+    FileChunk { data: String },
 
     #[serde(rename = "file_read_complete")]
-    FileReadComplete {
-        op_id: String,
-        path: String,
-        size: u64,
-    },
+    FileReadComplete { path: String, size: u64 },
 
     #[serde(rename = "file_list")]
-    FileList {
-        path: String,
-        entries: Vec<FileEntry>,
-    },
+    FileList { entries: Vec<FileEntry> },
 
     #[serde(rename = "warm_repl_ack")]
     WarmReplAck {
-        language: String,
+        language: Language,
         status: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
@@ -139,8 +131,10 @@ pub(crate) struct FileEntry {
 // Language dispatch
 // ============================================================================
 
-/// Supported execution languages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Supported execution languages. Their wire names are those of the host's
+/// `Language` enum; a request with another name does not parse (request_error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Language {
     Python,
     Javascript,
@@ -148,15 +142,6 @@ pub(crate) enum Language {
 }
 
 impl Language {
-    pub(crate) fn parse(s: &str) -> Option<Self> {
-        match s {
-            "python" => Some(Self::Python),
-            "javascript" => Some(Self::Javascript),
-            "raw" => Some(Self::Raw),
-            _ => None,
-        }
-    }
-
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Python => "python",
@@ -175,43 +160,22 @@ mod tests {
     use super::*;
 
     // -------------------------------------------------------------------------
-    // Language::parse
+    // Language
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_language_parse_python() {
-        assert_eq!(Language::parse("python"), Some(Language::Python));
-    }
-
-    #[test]
-    fn test_language_parse_javascript() {
-        assert_eq!(Language::parse("javascript"), Some(Language::Javascript));
-    }
-
-    #[test]
-    fn test_language_parse_raw() {
-        assert_eq!(Language::parse("raw"), Some(Language::Raw));
-    }
-
-    #[test]
-    fn test_language_parse_uppercase_none() {
-        assert_eq!(Language::parse("PYTHON"), None);
-    }
-
-    #[test]
-    fn test_language_parse_empty_none() {
-        assert_eq!(Language::parse(""), None);
-    }
-
-    #[test]
-    fn test_language_parse_unknown_none() {
-        assert_eq!(Language::parse("cobol"), None);
-    }
-
-    #[test]
-    fn test_language_roundtrip() {
+    fn test_language_wire_name_is_its_log_name() {
         for lang in [Language::Python, Language::Javascript, Language::Raw] {
-            assert_eq!(Language::parse(lang.as_str()), Some(lang));
+            let wire = format!("\"{}\"", lang.as_str());
+            assert_eq!(serde_json::to_string(&lang).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<Language>(&wire).unwrap(), lang);
+        }
+    }
+
+    #[test]
+    fn test_language_other_names_do_not_parse() {
+        for name in [r#""PYTHON""#, r#""""#, r#""cobol""#] {
+            assert!(serde_json::from_str::<Language>(name).is_err(), "{name}");
         }
     }
 
@@ -312,7 +276,7 @@ mod tests {
         let json = r#"{"action":"warm_repl","language":"python"}"#;
         let cmd: GuestCommand = serde_json::from_str(json).unwrap();
         match cmd {
-            GuestCommand::WarmRepl { language } => assert_eq!(language, "python"),
+            GuestCommand::WarmRepl { language } => assert_eq!(language, Language::Python),
             _ => panic!("Expected WarmRepl"),
         }
     }
@@ -320,11 +284,7 @@ mod tests {
     #[test]
     fn test_deserialize_warm_repl_unknown_language() {
         let json = r#"{"action":"warm_repl","language":"cobol"}"#;
-        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            GuestCommand::WarmRepl { language } => assert_eq!(language, "cobol"),
-            _ => panic!("Expected WarmRepl"),
-        }
+        assert!(serde_json::from_str::<GuestCommand>(json).is_err());
     }
 
     #[test]
@@ -340,7 +300,6 @@ mod tests {
     #[test]
     fn test_serialize_file_write_ack() {
         let ack = GuestResponse::FileWriteAck {
-            op_id: "test_op".to_string(),
             path: "test.txt".to_string(),
             bytes_written: 42,
         };
@@ -352,7 +311,6 @@ mod tests {
     #[test]
     fn test_serialize_file_chunk_response() {
         let chunk = GuestResponse::FileChunk {
-            op_id: "abc123".to_string(),
             data: "SGVsbG8=".to_string(),
         };
         let json = serde_json::to_string(&chunk).unwrap();
@@ -362,7 +320,6 @@ mod tests {
     #[test]
     fn test_serialize_file_read_complete() {
         let msg = GuestResponse::FileReadComplete {
-            op_id: "def456".to_string(),
             path: "data.csv".to_string(),
             size: 1024,
         };
@@ -374,7 +331,6 @@ mod tests {
     #[test]
     fn test_serialize_file_list() {
         let list = GuestResponse::FileList {
-            path: "".to_string(),
             entries: vec![
                 FileEntry {
                     name: "file.txt".to_string(),

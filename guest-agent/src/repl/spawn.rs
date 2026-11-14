@@ -1,5 +1,4 @@
 //! REPL process lifecycle: spawn wrapper scripts.
-//! Wrapper scripts are lazily written on first spawn via init::ensure_repl_wrappers().
 
 use tokio::process::Command;
 
@@ -8,7 +7,7 @@ use crate::types::Language;
 
 /// State for a persistent REPL process.
 pub(crate) struct ReplState {
-    pub(crate) child: tokio::process::Child,
+    pub(crate) child: crate::init::WaitedChild,
     pub(crate) stdin: tokio::process::ChildStdin,
     pub(crate) stdout: tokio::process::ChildStdout,
     pub(crate) stderr: tokio::process::ChildStderr,
@@ -17,13 +16,9 @@ pub(crate) struct ReplState {
 /// Spawn a fresh REPL process for the given language.
 ///
 /// Scripts run from SANDBOX_ROOT so package resolution works naturally.
-/// Wrapper scripts are lazily written on first call (deferred from init for boot speed).
-pub(crate) async fn spawn_repl(
-    language: Language,
-) -> Result<ReplState, Box<dyn std::error::Error>> {
+/// Wrapper scripts are written on the first call (deferred from init for boot speed).
+pub(crate) fn spawn_repl(language: Language) -> Result<ReplState, Box<dyn std::error::Error>> {
     crate::oom_guard::ensure_vm_usable()?;
-
-    // Lazily write REPL wrapper scripts on first spawn
     crate::init::ensure_repl_wrappers();
 
     let mut cmd = match language {
@@ -63,9 +58,9 @@ pub(crate) async fn spawn_repl(
             );
             c.env("PYTHONINTMAXSTRDIGITS", "0");
             c.env("PYTHONSAFEPATH", "1");
-            // Redirect .pyc writes to writable tmpfs. Stdlib uses pre-compiled .pyc
-            // from the image; user-installed packages get cached here for the session.
-            c.env("PYTHONPYCACHEPREFIX", "/home/user/.pycache");
+            // No PYTHONPYCACHEPREFIX: with a prefix, CPython reads .pyc only under it
+            // and recompiles the stdlib (precompiled next to its sources in the image)
+            // at every start. L2 packages ship .pyc (uv --compile-bytecode).
             // Replace musl's slow default malloc with jemalloc (~30% Python startup speedup).
             // musl's allocator uses a global lock; Python calls malloc ~26k times during init.
             // Note: inherited by subprocesses (uv, etc.) — harmless but visible.
@@ -76,14 +71,20 @@ pub(crate) async fn spawn_repl(
         Language::Javascript => {
             let mut c = Command::new(BUN_BIN_PATH);
             c.arg("--smol");
+            // No auto-install in the REPL: an import resolves only from the installed
+            // packages (the spec's, allow-listed, and those of the image). Bun would else
+            // fetch a missing package from the registry at run time: past the package
+            // allow-list with network on, and a 30 s wait with network off. A
+            // `bun` that user code starts has no such flag (Bun has no switch for it).
+            c.arg("--no-install");
             c.arg(format!("{SANDBOX_ROOT}/_repl.mjs"));
             c.env(
                 "NODE_PATH",
                 format!("{SANDBOX_ROOT}/node_modules:{NODE_MODULES_SYSTEM}"),
             );
-            // TLS certificate trust chain — Bun 1.3.x (BoringSSL)
+            // TLS certificate trust chain — Bun (BoringSSL; BUN_VERSION in build-qcow2.sh)
             //
-            // Bun embeds a bundled Mozilla CA store (NSS 3.117 as of 1.3.3) and also
+            // Bun embeds a bundled Mozilla CA store and also
             // probes system CA paths via X509_STORE_set_default_paths():
             //   /etc/ssl/certs/ca-certificates.crt  (Alpine, installed via ca-certificates pkg)
             //   /etc/ssl/cert.pem                   (Alpine fallback)
@@ -97,7 +98,7 @@ pub(crate) async fn spawn_repl(
             //
             // Root cause is unresolved upstream.  Bun 1.3.0 had a regression (#23735)
             // where system CAs were gated behind NODE_USE_SYSTEM_CA; fixed in 1.3.2
-            // (PR #24350).  The intermittent failures on 1.3.10 are a separate issue —
+            // (PR #24350).  The intermittent failures seen on 1.3.10 are a separate issue —
             // likely BoringSSL's session cache or CDN edge certificate rotation.
             //
             // We do NOT set SSL_CERT_FILE here: Bun's Linux cert loader short-circuits
@@ -108,6 +109,9 @@ pub(crate) async fn spawn_repl(
             //
             // See: https://github.com/oven-sh/bun/issues/23735
             //      https://github.com/oven-sh/bun/pull/24350
+            //
+            // No FTL, the most costly JIT tier: it starts after 100k+ iterations,
+            // which short execs do not reach. This saves JIT code memory.
             c.env("BUN_JSC_useFTLJIT", "0");
             // Minimize background thread CPU when idle. Without these, JSC's
             // concurrent GC/JIT threads and Bun's GC timer cause ~20-25% CPU
@@ -118,7 +122,8 @@ pub(crate) async fn spawn_repl(
             c.env("BUN_JSC_useConcurrentJIT", "false"); // No background JIT compilation
             // Reduce idle RSS. Tighter growth factor limits heap expansion;
             // earlier critical threshold triggers GC sooner; mimalloc purge
-            // returns freed pages to the OS immediately (important for balloon).
+            // returns freed pages to the OS immediately (zeroed by init_on_free, so
+            // host reclaim stores them at no cost).
             c.env("BUN_JSC_miniVMHeapGrowthFactor", "1.05"); // 5% growth (default 1.20)
             c.env("BUN_JSC_criticalGCMemoryThreshold", "0.50"); // Aggressive GC at 50% of RAM
             c.env("MIMALLOC_PURGE_DELAY", "0"); // Immediate page release to OS
@@ -194,19 +199,14 @@ pub(crate) async fn spawn_repl(
     let mut child = cmd.spawn()?;
 
     // 5. RLIMIT_NPROC=1024 via prlimit64 from parent (root)
-    {
-        let nproc_limit = libc::rlimit {
-            rlim_cur: 1024,
-            rlim_max: 1024,
-        };
-        let pid = match child.id() {
-            Some(id) => id as libc::pid_t,
-            None => {
-                log_warn!("REPL child exited before prlimit64(RLIMIT_NPROC)");
-                0
-            }
-        };
-        if pid > 0 {
+    match child.id() {
+        None => log_warn!("REPL child exited before prlimit64(RLIMIT_NPROC)"),
+        Some(id) => {
+            let pid = id as libc::pid_t;
+            let nproc_limit = libc::rlimit {
+                rlim_cur: 1024,
+                rlim_max: 1024,
+            };
             let ret = unsafe {
                 libc::syscall(
                     libc::SYS_prlimit64,
@@ -226,6 +226,8 @@ pub(crate) async fn spawn_repl(
     let stdin = child.stdin.take().expect("stdin piped at spawn");
     let stdout = child.stdout.take().expect("stdout piped at spawn");
     let stderr = child.stderr.take().expect("stderr piped at spawn");
+    // No await since the spawn: the PID 1 reaper cannot have collected it yet.
+    let child = crate::init::WaitedChild::register(child);
 
     log_info!("Spawned REPL for language={}", language.as_str());
 

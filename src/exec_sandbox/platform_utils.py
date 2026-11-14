@@ -1,24 +1,35 @@
 """Cross-platform OS detection and configuration utilities.
 
-Uses psutil's built-in OS detection constants for robust platform identification.
-Provides PID-reuse safe process management wrappers.
+- Host OS (psutil constants), CPU architecture and x86 vendor, and their names
+- child_env: the environment every child process gets
+- Per-user folders (get_user_dir, get_account_dir)
+- ProcessWrapper: PID-reuse safe process management
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import ctypes
-import ctypes.util
 import os
 import platform
-from enum import Enum, auto
+import pwd
+import subprocess
+from enum import Enum, StrEnum, auto
 from functools import cache
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Final
 
 import psutil
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+_CHILD_ENV_BLACKLIST: Final = (
+    "EXEC_SANDBOX", "KEY", "SECRET", "TOKEN", "PASS", "PWD", "CRED", "AUTH", "URL", "PROXY", "DSN", "CONN", "HEADER",
+)  # fmt: skip
+
+
+def child_env() -> dict[str, str]:
+    """Library env minus every EXEC_SANDBOX_* var and every var whose name suggests a secret,
+    URL or proxy; no child needs one."""
+    return {k: v for k, v in os.environ.items() if not any(word in k.upper() for word in _CHILD_ENV_BLACKLIST)}
 
 
 class HostOS(Enum):
@@ -61,6 +72,10 @@ def detect_host_os() -> HostOS:
     return HostOS.UNKNOWN
 
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+
 class HostArch(Enum):
     """Supported host CPU architectures."""
 
@@ -100,6 +115,30 @@ def detect_host_arch() -> HostArch:
     return HostArch.UNKNOWN
 
 
+@cache
+def detect_host_x86_vendor() -> str:
+    """CPUID vendor of the host CPU ("GenuineIntel" or "AuthenticAMD").
+
+    x86 guests get the host vendor (KVM runs best with matching vendors). A
+    non-x86 host runs x86 guests under TCG and gets qemu64's own vendor.
+    """
+    if detect_host_arch() != HostArch.X86_64:
+        return "AuthenticAMD"
+    if detect_host_os() == HostOS.MACOS:
+        return subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "machdep.cpu.vendor"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=child_env(),
+        ).stdout.strip()
+    for line in Path("/proc/cpuinfo").read_text().splitlines():
+        if line.startswith("vendor_id"):
+            return line.split(":", 1)[1].strip()
+    return "AuthenticAMD"
+
+
 def get_os_name() -> str:
     """Get OS name string for binary naming conventions.
 
@@ -118,134 +157,109 @@ def get_os_name() -> str:
             raise ValueError("Unsupported OS")
 
 
-def get_arch_name(convention: Literal["kernel", "go"] = "kernel") -> str:
-    """Get architecture string for naming conventions.
-
-    Args:
-        convention: "kernel" for x86_64/aarch64 (Linux kernel style),
-                   "go" for amd64/arm64 (Go toolchain style)
-
-    Returns:
-        Architecture string in requested convention
+def get_arch_name() -> str:
+    """The host architecture in the Linux kernel's names (arch_name of detect_host_arch).
 
     Raises:
         ValueError: If running on unsupported architecture
     """
-    arch = detect_host_arch()
-    match (convention, arch):
-        case ("go", HostArch.X86_64):
-            return "amd64"
-        case ("go", HostArch.AARCH64):
-            return "arm64"
-        case ("kernel", HostArch.X86_64):
+    return arch_name(detect_host_arch())
+
+
+def arch_of(name: str) -> HostArch:
+    """The HostArch of a name that arch_name gives ("x86_64", "aarch64")."""
+    return {"x86_64": HostArch.X86_64, "aarch64": HostArch.AARCH64}.get(name, HostArch.UNKNOWN)
+
+
+def arch_name(arch: HostArch) -> str:
+    """`arch` in the Linux kernel's names, as image and binary names spell it: "x86_64" or "aarch64".
+
+    Raises:
+        ValueError: UNKNOWN
+    """
+    match arch:
+        case HostArch.X86_64:
             return "x86_64"
-        case ("kernel", HostArch.AARCH64):
+        case HostArch.AARCH64:
             return "aarch64"
         case _:
             raise ValueError(f"Unsupported architecture: {arch}")
 
 
-def get_cache_dir(app_name: str = "exec-sandbox") -> Path:
-    """Get platform-specific cache directory.
+class UserDir(StrEnum):
+    """Kind of per-user folder. The cost of lost files decides where each kind goes."""
+
+    CACHE = "cache"
+    """Files the library can make again (images, snapshots). macOS may delete files in
+    ~/Library/Caches when the disk is nearly full, and users clear ~/.cache freely."""
+
+    DATA = "data"
+    """Files the library cannot make again (the "local" instance store)."""
+
+
+# kind -> (override env var, folder under the macOS home, XDG env var, folder under the home elsewhere)
+_USER_DIR_RULES: Final[dict[UserDir, tuple[str | None, tuple[str, ...], str, tuple[str, ...]]]] = {
+    UserDir.CACHE: ("EXEC_SANDBOX_CACHE_DIR", ("Library", "Caches"), "XDG_CACHE_HOME", (".cache",)),
+    UserDir.DATA: (None, ("Library", "Application Support"), "XDG_DATA_HOME", (".local", "share")),
+}
+
+
+_APP_FOLDER: Final = "exec-sandbox"
+
+
+def get_user_dir(*, kind: UserDir) -> Path:
+    """Get the per-user folder of this kind for exec-sandbox.
 
     Returns:
-        - macOS: ~/Library/Caches/<app_name>/
-        - Linux: ~/.cache/<app_name>/ (or $XDG_CACHE_HOME/<app_name>/)
+        - macOS: ~/Library/Caches/exec-sandbox/ or ~/Library/Application Support/exec-sandbox/
+        - Linux: $XDG_CACHE_HOME/exec-sandbox/ or $XDG_DATA_HOME/exec-sandbox/ when the value is
+          an absolute path; else ~/.cache/exec-sandbox/ or ~/.local/share/exec-sandbox/
+        - Other: ~/.cache/exec-sandbox/ or ~/.local/share/exec-sandbox/
 
-    Override with EXEC_SANDBOX_CACHE_DIR environment variable.
+    "~" is Path.home() (HOME when it is set). Override CACHE with the EXEC_SANDBOX_CACHE_DIR
+    environment variable. DATA has no override here: callers take theirs from settings
+    (instance_store_dir). For a path that ignores the environment, use get_account_dir.
     """
-    if env_path := os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
+    return _user_dir(kind=kind, home=Path.home(), env=os.environ)
+
+
+def get_account_dir(*, kind: UserDir) -> Path:
+    """The default per-user folder of this kind for the effective user: the home from the user
+    database, and no environment override (HOME, XDG_*, EXEC_SANDBOX_CACHE_DIR are ignored).
+
+    Every process of one account gets the same path, whatever its environment (an IDE task,
+    a shell, another HOME): use it for a lock those processes must share. A process under
+    `sudo` (also `sudo -E`) runs as root and gets root's folder.
+    """
+    return _user_dir(kind=kind, home=Path(pwd.getpwuid(os.geteuid()).pw_dir), env={})
+
+
+def _user_dir(*, kind: UserDir, home: Path, env: Mapping[str, str]) -> Path:
+    override_env, macos_parts, xdg_env, home_parts = _USER_DIR_RULES[kind]
+    if override_env and (env_path := env.get(override_env)):
         return Path(env_path)
 
     match detect_host_os():
         case HostOS.MACOS:
-            return Path.home() / "Library" / "Caches" / app_name
+            return home.joinpath(*macos_parts, _APP_FOLDER)
         case HostOS.LINUX:
-            # XDG_CACHE_HOME takes precedence if set
-            xdg_cache = os.environ.get("XDG_CACHE_HOME")
-            if xdg_cache:
-                return Path(xdg_cache) / app_name
-            return Path.home() / ".cache" / app_name
+            # XDG Base Directory spec: an empty or relative value is invalid and is ignored
+            xdg_home = env.get(xdg_env, "")
+            if Path(xdg_home).is_absolute():
+                return Path(xdg_home) / _APP_FOLDER
+            return home.joinpath(*home_parts, _APP_FOLDER)
         case _:
             # Fallback for other platforms
-            return Path.home() / ".cache" / app_name
+            return home.joinpath(*home_parts, _APP_FOLDER)
 
 
-# ---------------------------------------------------------------------------
-# Page-cache advisory prefetch
-# ---------------------------------------------------------------------------
-#
-# Asks the kernel to asynchronously read a file into the page cache (zero-copy,
-# returns near-instantly).  Used before concurrent QEMU restores so that every
-# process hits RAM instead of storage.
-#
-# macOS: fcntl(fd, F_RDADVISE=44, struct radvisory{off_t, int})
-#        — "Issue an advisory read async with no copy to user"
-#        — F_RDADVISE is not exposed by Python's fcntl module (cpython#113092),
-#          so we call libc directly via ctypes.
-# Linux: os.posix_fadvise(fd, 0, size, POSIX_FADV_WILLNEED)
-#        — Recent kernels (≥3.x) perform truly async readahead.
-#
-# References:
-#   darwin-xnu  bsd/sys/fcntl.h  (F_RDADVISE = 44, struct radvisory)
-#   PostgreSQL  commit 2024-08-27 "Add prefetching support on macOS"
-
-# macOS ctypes plumbing (module-level so the CDLL is loaded once)
-_F_RDADVISE = 44  # from darwin-xnu/bsd/sys/fcntl.h
-
-
-class _Radvisory(ctypes.Structure):
-    """macOS struct radvisory { off_t ra_offset; int ra_count; }."""
-
-    _fields_ = [  # noqa: RUF012 - ctypes protocol requires mutable _fields_
-        ("ra_offset", ctypes.c_int64),  # off_t
-        ("ra_count", ctypes.c_int),  # int
-    ]
-
-
-_libc_path = ctypes.util.find_library("c")
-_libc = ctypes.CDLL(_libc_path) if _libc_path else None
-
-
-def advise_willneed(path: Path) -> None:
-    """Ask the kernel to prefetch *path* into the page cache.
-
-    Non-blocking, zero-copy.  The kernel schedules background I/O and the call
-    returns near-instantly; actual disk reads happen asynchronously.
-
-    Best-effort: silently ignored on unsupported platforms or on failure (the
-    file is advisory, not required — QEMU will simply read from disk).
-    """
-    fd = -1
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-        size = os.fstat(fd).st_size
-        host = detect_host_os()
-        if host is HostOS.MACOS and _libc is not None:
-            advisory = _Radvisory(ra_offset=0, ra_count=min(size, 2**31 - 1))
-            _libc.fcntl(fd, _F_RDADVISE, ctypes.byref(advisory))
-        elif host is HostOS.LINUX:
-            os.posix_fadvise(fd, 0, size, os.POSIX_FADV_WILLNEED)  # type: ignore[attr-defined]
-    except OSError:
-        pass  # Advisory — silently degrade
-    finally:
-        if fd >= 0:
-            os.close(fd)
-
-
-# Transient psutil exceptions that may occur during process inspection
-# Used for retry logic and error handling in ProcessWrapper
-_PSUTIL_TRANSIENT_ERRORS: tuple[type[Exception], ...] = (
+# psutil errors that mean "this process is gone or not ours to inspect". None of them
+# clears with time: a reaped pid never comes back (a retry could only find another
+# process on a reused pid), and permissions do not change within milliseconds.
+_PSUTIL_GONE_ERRORS: tuple[type[Exception], ...] = (
     psutil.NoSuchProcess,
     psutil.AccessDenied,
 )
-
-# Retry configuration for psutil operations
-# Exponential backoff: 1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 64ms (7 attempts, ~127ms total)
-_PSUTIL_RETRY_ATTEMPTS = 7
-_PSUTIL_RETRY_MULTIPLIER = 0.001
-_PSUTIL_RETRY_MIN = 0.001
-_PSUTIL_RETRY_MAX = 0.064
 
 
 class ProcessWrapper:
@@ -263,26 +277,16 @@ class ProcessWrapper:
         """
         self.async_proc = async_proc
         self.psutil_proc: psutil.Process | None = None
+        # The background task that reads stdout/stderr, set by subprocess_utils.start_drain:
+        # while it runs, wait_with_timeout never reads the pipes.
+        self.drain_task: asyncio.Task[None] | None = None
 
-        # Wrap with psutil for PID-reuse safe monitoring
-        # Use exponential backoff to handle race conditions where the process
-        # may not be immediately visible to psutil (especially on free-threaded
-        # Python where scheduling differs). Retries: 1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 64ms
-        if async_proc.pid:
-            try:
-                for attempt in Retrying(
-                    stop=stop_after_attempt(_PSUTIL_RETRY_ATTEMPTS),
-                    wait=wait_exponential(
-                        multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX
-                    ),
-                    retry=retry_if_exception_type(_PSUTIL_TRANSIENT_ERRORS),
-                    reraise=True,
-                ):
-                    with attempt:
-                        self.psutil_proc = psutil.Process(async_proc.pid)
-            except _PSUTIL_TRANSIENT_ERRORS:
-                # Process not visible after retries - fallback to returncode-based checks
-                pass
+        # Wrap with psutil for PID-reuse safe monitoring. One attempt: the kernel lists a
+        # child as soon as fork() returns. NoSuchProcess means the asyncio child watcher
+        # already reaped a short process; returncode-based checks then apply.
+        if async_proc.pid and async_proc.returncode is None:
+            with contextlib.suppress(*_PSUTIL_GONE_ERRORS):
+                self.psutil_proc = psutil.Process(async_proc.pid)
 
     async def is_running(self) -> bool:
         """Check if process exists and hasn't terminated (PID-reuse safe).
@@ -306,22 +310,9 @@ class ProcessWrapper:
         if not self.psutil_proc:
             return self.async_proc.returncode is None
 
-        def _check() -> bool:
-            for attempt in Retrying(
-                stop=stop_after_attempt(_PSUTIL_RETRY_ATTEMPTS),
-                wait=wait_exponential(
-                    multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX
-                ),
-                retry=retry_if_exception_type(_PSUTIL_TRANSIENT_ERRORS),
-                reraise=True,
-            ):
-                with attempt:
-                    return self.psutil_proc.is_running()  # type: ignore[union-attr]
-            return False
-
         try:
-            return await asyncio.to_thread(_check)
-        except _PSUTIL_TRANSIENT_ERRORS:
+            return await asyncio.to_thread(self.psutil_proc.is_running)
+        except _PSUTIL_GONE_ERRORS:
             return False
 
     async def is_stopped(self) -> bool:
@@ -341,22 +332,10 @@ class ProcessWrapper:
         if not self.psutil_proc:
             return False
 
-        def _check() -> bool:
-            for attempt in Retrying(
-                stop=stop_after_attempt(_PSUTIL_RETRY_ATTEMPTS),
-                wait=wait_exponential(
-                    multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX
-                ),
-                retry=retry_if_exception_type(_PSUTIL_TRANSIENT_ERRORS),
-                reraise=True,
-            ):
-                with attempt:
-                    return self.psutil_proc.status() == psutil.STATUS_STOPPED  # type: ignore[union-attr]
-            return False
-
+        proc = self.psutil_proc
         try:
-            return await asyncio.to_thread(_check)
-        except _PSUTIL_TRANSIENT_ERRORS:
+            return await asyncio.to_thread(lambda: proc.status() == psutil.STATUS_STOPPED)
+        except _PSUTIL_GONE_ERRORS:
             return False
 
     @property
@@ -425,27 +404,28 @@ class ProcessWrapper:
         else:
             self.async_proc.kill()
 
-    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+    async def communicate(self) -> tuple[bytes, bytes]:
         """Wait for process to terminate and return stdout/stderr.
-
-        Args:
-            input: Data to send to stdin
 
         Returns:
             Tuple of (stdout, stderr) bytes
         """
-        return await self.async_proc.communicate(input)
+        return await self.async_proc.communicate()
 
     async def wait_with_timeout(self, timeout: float) -> int:
         """Wait for process with timeout, handling pipe draining automatically.
 
         Prevents pipe buffer deadlock by draining stdout/stderr if pipes exist.
-        Handles both scenarios:
+        Handles three cases:
+        - Pipes read by a running background task (drain_task): use wait() only.
+          communicate() would read the same streams; when the two readers
+          interleave, one loses its wakeup, and communicate() waits for the full
+          timeout although the process has exited. A drain task that ended (an
+          error of its handler) reads nothing more: communicate() drains then, or
+          a child that still writes blocks on a full pipe.
         - Pipes exist with no background reader: use communicate() to drain
-        - Pipes exist with background reader: use wait() (pipes drained by reader)
+          (wait() if another coroutine already reads them: RuntimeError)
         - No pipes: use wait()
-
-        Best practice pattern from Nov 2025 asyncio docs for subprocess cleanup.
 
         Args:
             timeout: Timeout in seconds
@@ -454,11 +434,12 @@ class ProcessWrapper:
             Process exit code
 
         Raises:
-            asyncio.TimeoutError: If process doesn't exit within timeout
+            TimeoutError: If process doesn't exit within timeout
         """
         has_pipes = self.stdout is not None or self.stderr is not None
 
-        if has_pipes:
+        drained = self.drain_task is not None and not self.drain_task.done()
+        if has_pipes and not drained:
             try:
                 # Drain stdout/stderr pipes to prevent deadlock
                 await asyncio.wait_for(self.async_proc.communicate(), timeout=timeout)
@@ -467,7 +448,7 @@ class ProcessWrapper:
                 # Pipes being drained by other reader, so just wait for exit
                 await asyncio.wait_for(self.wait(), timeout=timeout)
         else:
-            # No pipes - just wait for process exit
+            # No pipes, or the drain task reads them - just wait for process exit
             await asyncio.wait_for(self.wait(), timeout=timeout)
 
         return self.returncode  # type: ignore[return-value]

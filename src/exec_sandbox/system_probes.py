@@ -2,27 +2,33 @@
 
 These probes detect system capabilities once and cache the results.
 Async probes use a shared cache container to avoid global statements.
+The Scheduler start also raises the process limits it can (raise_fd_limit,
+raise_nproc_limit) and warns about unsafe host settings (warn_*).
 """
 
 import asyncio
 import contextlib
+import errno
 import os
 import platform
 import re
 import resource
 import sys
-from collections.abc import Callable, Coroutine
+import time
+import weakref
+from collections.abc import Callable, Coroutine, Sequence
 from functools import wraps
 from pathlib import Path
-from typing import Any, Final, ParamSpec, TypeVar
+from typing import Any, ClassVar, Final, ParamSpec, TypeVar, cast
 
-import aiofiles
-import aiofiles.os
-
+from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.cgroup import CGROUP_V2_BASE_PATH, is_cgroup_available, resolve_self_cgroup_v2
-from exec_sandbox.permission_utils import can_access
-from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
+from exec_sandbox.aio_utils import await_cancellation_safe
+from exec_sandbox.cgroup import CGROUP_V2_BASE_PATH, cgroup_v2_available, resolve_self_cgroup_v2
+from exec_sandbox.exceptions import ErrorCode, SandboxError, spawn_error
+from exec_sandbox.files.disk import LINUX_MEMORY_FILESYSTEMS, OVERLAYFS_SUPER_MAGIC, overlay_upper, statfs_type
+from exec_sandbox.platform_utils import HostArch, HostOS, child_env, detect_host_arch, detect_host_os
+from exec_sandbox.settings import QemuBinaries
 from exec_sandbox.vm_types import AccelType
 
 P = ParamSpec("P")
@@ -33,24 +39,33 @@ logger = get_logger(__name__)
 __all__ = [
     "NOT_CACHED",
     "ProbeCache",
-    "check_fast_balloon_available",
+    "can_access",
     "check_hvf_available",
-    "check_hwaccel_available",
     "check_kvm_available",
     "check_tsc_deadline",
     "detect_accel_type",
+    "posix_acl_xattr",
     "probe_cache",
+    "probe_direct_io",
+    "probe_drive_direct_io",
     "probe_io_uring_support",
     "probe_qemu_accelerators",
+    "probe_qemu_runnable",
     "probe_qemu_sandbox_support",
     "probe_qemu_version",
+    "probe_setpriv_pdeathsig",
     "probe_unshare_support",
+    "qemu_system_binary",
+    "qemu_unrunnable_error",
     "raise_fd_limit",
     "raise_nproc_limit",
+    "run_probe",
     "warn_cgroup_pids_limit",
+    "warn_damon",
     "warn_max_map_count",
     "warn_overcommit",
     "warn_threads_max",
+    "warn_zswap",
 ]
 
 # ============================================================================
@@ -275,7 +290,7 @@ def warn_cgroup_pids_limit() -> None:
     Called once during Scheduler startup on Linux only. No-op on macOS.
     """
     cgroup_root = Path(CGROUP_V2_BASE_PATH)
-    if not is_cgroup_available(cgroup_root):
+    if not cgroup_v2_available():
         return
 
     cgroup_rel = resolve_self_cgroup_v2()
@@ -402,8 +417,7 @@ def warn_damon() -> None:
 # ============================================================================
 
 # Sentinel value for "not yet cached" (distinguishes from None results)
-_NOT_CACHED: Any = object()
-NOT_CACHED = _NOT_CACHED  # Public alias for testing
+NOT_CACHED: Any = object()
 
 # KVM ioctl constants for probing
 # See: linux/kvm.h - these are stable ABI
@@ -415,7 +429,7 @@ class ProbeCache:
     """Container for cached system probe results.
 
     Uses a class to avoid global statements while maintaining module-level caching.
-    Locks are lazily initialized to ensure they're created in the right event loop.
+    Locks are made on first use (get_lock), one per probe name and event loop.
 
     The locks prevent cache stampede when multiple VMs start concurrently - without
     them, all VMs would run the detection subprocess simultaneously instead of
@@ -424,54 +438,61 @@ class ProbeCache:
 
     __slots__ = (
         "_locks",
+        "direct_io",
+        "drive_direct_io",
         "hvf",
         "io_uring",
         "kvm",
+        "posix_acls",
         "qemu_accels",
         "qemu_sandbox",
+        "qemu_unrunnable",
         "qemu_version",
+        "setpriv",
         "tsc_deadline",
         "unshare",
     )
+    _RESULTS: ClassVar[tuple[str, ...]] = tuple(name for name in __slots__ if name != "_locks")
 
     def __init__(self) -> None:
-        self.hvf: bool | None = _NOT_CACHED
-        self.io_uring: bool | None = _NOT_CACHED
-        self.kvm: bool | None = _NOT_CACHED
-        self.qemu_accels: set[str] | None = _NOT_CACHED  # Accelerators available in QEMU binary
-        self.qemu_sandbox: bool | None = _NOT_CACHED  # QEMU compiled with CONFIG_SECCOMP
-        self.qemu_version: tuple[int, int, int] | None = _NOT_CACHED  # QEMU semver (major, minor, patch)
-        self.tsc_deadline: bool | None = _NOT_CACHED
-        self.unshare: bool | None = _NOT_CACHED
-        self._locks: dict[str, asyncio.Lock] = {}
+        self.direct_io: dict[int, bool] = {}  # per device (st_dev): its filesystem takes O_DIRECT
+        self.drive_direct_io: dict[Path, bool] = {}  # per folder: VM drive files there use O_DIRECT
+        self.posix_acls: dict[int, bool] = {}  # per device (st_dev): its filesystem keeps POSIX ACLs
+        self.hvf: bool | None = NOT_CACHED
+        self.io_uring: bool | None = NOT_CACHED
+        self.kvm: bool | None = NOT_CACHED
+        self.qemu_accels: set[str] | None = NOT_CACHED  # Accelerators available in QEMU binary
+        self.qemu_sandbox: bool | None = NOT_CACHED  # QEMU compiled with CONFIG_SECCOMP
+        self.qemu_version: tuple[int, int, int] | None = NOT_CACHED  # QEMU semver (major, minor, patch)
+        # The QEMU binary and the exec error of the version probe, when this host cannot run it
+        self.qemu_unrunnable: tuple[str, OSError] | None = None
+        self.setpriv: bool | None = NOT_CACHED  # setpriv --pdeathsig works
+        self.tsc_deadline: bool | None = NOT_CACHED
+        self.unshare: bool | None = NOT_CACHED
+        # One map per event loop: an asyncio.Lock binds to the loop that first waits on it,
+        # so a second loop (asyncio.run again) must never get it. A map goes with its loop.
+        self._locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = (
+            weakref.WeakKeyDictionary()
+        )
 
     def get_lock(self, name: str) -> asyncio.Lock:
-        """Get or create a lock for the given probe (lazy initialization).
-
-        Locks must be created lazily because asyncio.Lock requires an event loop,
-        which may not exist at module import time.
-        """
-        if name not in self._locks:
-            self._locks[name] = asyncio.Lock()
-        return self._locks[name]
+        """The lock of the probe `name` in the running event loop, made on first use (reset()
+        keeps it)."""
+        locks = self._locks.setdefault(asyncio.get_running_loop(), {})
+        if name not in locks:
+            locks[name] = asyncio.Lock()
+        return locks[name]
 
     def reset(self, attr: str | None = None) -> None:
-        """Reset cached probe result(s) to uncached state (for testing).
+        """Put cached probe result(s) back to their uncached value (for testing): the value a new
+        cache has, so a per-device dict is an empty dict again, not the sentinel.
 
         Args:
             attr: Specific attribute to reset, or None to reset all.
         """
-        if attr is not None:
-            setattr(self, attr, _NOT_CACHED)
-        else:
-            self.hvf = _NOT_CACHED
-            self.io_uring = _NOT_CACHED
-            self.kvm = _NOT_CACHED
-            self.qemu_accels = _NOT_CACHED
-            self.qemu_sandbox = _NOT_CACHED
-            self.qemu_version = _NOT_CACHED
-            self.tsc_deadline = _NOT_CACHED
-            self.unshare = _NOT_CACHED
+        fresh = ProbeCache()
+        for name in self._RESULTS if attr is None else (attr,):
+            setattr(self, name, getattr(fresh, name))
 
 
 # Module-level cache instance
@@ -484,14 +505,14 @@ def _async_cached_probe(
     """Decorator for async probes with double-checked locking cache.
 
     Eliminates boilerplate pattern:
-        if cache.attr is not _NOT_CACHED: return cache.attr
+        if cache.attr is not NOT_CACHED: return cache.attr
         async with cache.get_lock("attr"):
-            if cache.attr is not _NOT_CACHED: return cache.attr
+            if cache.attr is not NOT_CACHED: return cache.attr
             result = await actual_work()
             cache.attr = result
             return result
 
-    Uses a sentinel value (_NOT_CACHED) to distinguish "not yet cached" from
+    Uses a sentinel value (NOT_CACHED) to distinguish "not yet cached" from
     cached None results, allowing probes that return None on failure to be cached.
 
     Args:
@@ -506,13 +527,13 @@ def _async_cached_probe(
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             # Fast path: return cached result (no lock needed)
             cached = getattr(probe_cache, cache_attr)
-            if cached is not _NOT_CACHED:
+            if cached is not NOT_CACHED:
                 return cached
             # Slow path: acquire lock to prevent stampede, then check cache again
             async with probe_cache.get_lock(cache_attr):
                 # Double-check after acquiring lock (another task may have populated cache)
                 cached = getattr(probe_cache, cache_attr)
-                if cached is not _NOT_CACHED:
+                if cached is not NOT_CACHED:
                     return cached
                 result = await func(*args, **kwargs)
                 setattr(probe_cache, cache_attr, result)
@@ -523,10 +544,48 @@ def _async_cached_probe(
     return decorator
 
 
-def _qemu_system_binary() -> str:
-    """Return the QEMU system emulator binary name for the host architecture."""
-    arch = detect_host_arch()
+def qemu_system_binary(binaries: QemuBinaries, *, arch: HostArch) -> str:
+    """The qemu-system binary for `arch`: the configured file (EXEC_SANDBOX_QEMU_BIN_X86 /
+    _ARM, /usr/bin by default) when it exists, else the bare name, found on PATH by exec.
+    The one resolver: VMs (qemu_cmd) and the QEMU probes run the binary it gives."""
+    configured = binaries.qemu_bin_arm if arch == HostArch.AARCH64 else binaries.qemu_bin_x86
+    if configured.is_file():
+        return str(configured)
     return "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
+
+
+def _probed_qemu_binary() -> str:
+    """The binary the QEMU probes run: VMs read the same two variables (Settings is a
+    QemuBinaries; SchedulerConfig does not set them)."""
+    return qemu_system_binary(QemuBinaries(), arch=detect_host_arch())
+
+
+_PROBE_TIMEOUT_SECONDS: Final = 5.0
+"""Upper bound of a probe command (sysctl, `qemu -accel help`, a sudo): each ends in ms."""
+
+
+async def run_probe(cmd: Sequence[str], *, stdout: int, stderr: int) -> tuple[int | None, bytes, bytes]:
+    """Run the probe command `cmd` to its end (stdin /dev/null, child_env()), at most
+    _PROBE_TIMEOUT_SECONDS: (exit status, stdout, stderr). On the timeout or a cancel, the
+    command is killed and reaped before the call ends: no probe leaves a process behind.
+    stdout and stderr: asyncio.subprocess.PIPE or DEVNULL.
+
+    Raises:
+        OSError: the command did not start (FileNotFoundError: not found)
+        TimeoutError: it did not end within the bound
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=stdout, stderr=stderr, env=child_env()
+    )
+    try:
+        async with asyncio.timeout(_PROBE_TIMEOUT_SECONDS):
+            out, err = await proc.communicate()
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await await_cancellation_safe(proc.wait())
+        raise
+    return proc.returncode, out, err
 
 
 @_async_cached_probe("qemu_accels")
@@ -548,22 +607,17 @@ async def probe_qemu_accelerators() -> set[str]:
     Returns:
         Set of available accelerator names (e.g., {"tcg", "kvm"} or {"tcg", "hvf"})
     """
-    qemu_bin = _qemu_system_binary()
+    qemu_bin = _probed_qemu_binary()
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            qemu_bin,
-            "-accel",
-            "help",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, _ = await run_probe(
+            (qemu_bin, "-accel", "help"), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
 
-        if proc.returncode != 0:
+        if returncode != 0:
             logger.warning(
                 "QEMU accelerator probe failed",
-                extra={"qemu_bin": qemu_bin, "returncode": proc.returncode},
+                extra={"qemu_bin": qemu_bin, "returncode": returncode},
             )
             return set()
 
@@ -607,19 +661,16 @@ async def probe_qemu_version() -> tuple[int, int, int] | None:
 
     Tuples compare naturally as semver: (9, 2, 0) >= (9, 2, 0) works correctly.
     """
-    qemu_bin = _qemu_system_binary()
+    qemu_bin = _probed_qemu_binary()
+    probe_cache.qemu_unrunnable = None
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            qemu_bin,
-            "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+        returncode, stdout, _ = await run_probe(
+            (qemu_bin, "--version"), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
 
-        if proc.returncode != 0:
-            logger.warning("QEMU version probe failed", extra={"returncode": proc.returncode})
+        if returncode != 0:
+            logger.warning("QEMU version probe failed", extra={"returncode": returncode})
             return None
 
         # Parse "QEMU emulator version X.Y.Z" (handles suffixes like "(Homebrew)")
@@ -639,8 +690,43 @@ async def probe_qemu_version() -> tuple[int, int, int] | None:
         logger.warning("QEMU binary not found", extra={"qemu_bin": qemu_bin})
         return None
     except (OSError, TimeoutError) as e:
+        if e.errno in _NOT_A_PROGRAM_HERE:  # TimeoutError: no errno
+            probe_cache.qemu_unrunnable = (qemu_bin, e)  # probe_qemu_runnable gives it
         logger.warning("QEMU version probe failed", extra={"error": str(e)})
         return None
+
+
+_NOT_A_PROGRAM_HERE: Final = frozenset({errno.ENOEXEC, getattr(errno, "EBADARCH", errno.ENOEXEC)})
+"""Exec errors of a file that this host cannot run at all: another CPU architecture or no
+program (ENOEXEC; EBADARCH on macOS)."""
+
+
+async def probe_qemu_runnable() -> tuple[str, OSError] | None:
+    """The QEMU binary and its exec error when this host cannot run it at all (another CPU
+    architecture, no program: _NOT_A_PROGRAM_HERE), else None (cached). A capability, as the
+    other probes: VmManager.start asks it with them, and a use that needs QEMU raises
+    qemu_unrunnable_error. A launch cannot always tell: behind unshare or stdbuf (glibc
+    execvp), or under busybox ash, such a file runs as a shell script and QEMU_CRASHED comes
+    after the boot retries. The exec of probe_qemu_version answers it (one exec for both)."""
+    await probe_qemu_version()
+    return probe_cache.qemu_unrunnable
+
+
+def qemu_unrunnable_error(unrunnable: tuple[str, OSError]) -> SandboxError:
+    """The error of a QEMU binary that this host cannot run (probe_qemu_runnable): ConfigError
+    HOST_DEPENDENCY that names the binary and the CPU build to install. No VM can start."""
+    binary, error = unrunnable
+    return spawn_error(
+        error,
+        binary=binary,
+        code=ErrorCode.QEMU_CRASHED,
+        context={},
+        hint=f"Install the QEMU build for this host's CPU ({detect_host_arch().name.lower()}).",
+    )
+
+
+_SANDBOX_PROBE_TIMEOUT_SECONDS: Final = 10.0
+"""Upper bound for the QMP greeting of the sandbox probe; it arrives in ~10 ms."""
 
 
 @_async_cached_probe("qemu_sandbox")
@@ -650,12 +736,14 @@ async def probe_qemu_sandbox_support() -> bool:
     The -sandbox option requires CONFIG_SECCOMP at QEMU compile time.  When
     absent, QEMU rejects the flag at CLI parsing with "There is no option
     group 'sandbox'" (util/qemu-config.c:find_list).  Neither ``-sandbox help``
-    nor ``--help`` output can reliably detect this (both produce false results).
+    nor ``--help`` output can reliably detect this (both produce false results),
+    and ``-version`` exits before QEMU installs the filter.
 
-    Strategy: launch ``qemu-system-xxx -machine none -sandbox on -S -display none``
-    and inspect the outcome.  If -sandbox is unrecognised QEMU exits immediately
-    with code 1.  If it is recognised QEMU starts paused (``-S``), so we
-    treat a short timeout as "supported" and terminate the process.
+    Strategy: launch ``qemu-system-xxx -machine none -sandbox <QEMU_SANDBOX_POLICY> -S
+    -display none -qmp stdio``.  QEMU prints the QMP greeting only after its start-up, which
+    installs the seccomp filter, so the greeting proves both that the option is
+    compiled in and that this kernel accepts the filter (~10 ms).  If -sandbox
+    is unrecognised or the filter fails, QEMU exits with code 1 and no greeting.
 
     Returns:
         True if -sandbox is available, False otherwise.
@@ -664,7 +752,7 @@ async def probe_qemu_sandbox_support() -> bool:
     if detect_host_os() != HostOS.LINUX:
         return False
 
-    qemu_bin = _qemu_system_binary()
+    qemu_bin = _probed_qemu_binary()
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -672,29 +760,42 @@ async def probe_qemu_sandbox_support() -> bool:
             "-machine",
             "none",
             "-sandbox",
-            "on",
+            constants.QEMU_SANDBOX_POLICY,  # the filter VMs install
             "-S",
             "-display",
             "none",
-            stdout=asyncio.subprocess.DEVNULL,
+            "-qmp",
+            "stdio",
+            stdin=asyncio.subprocess.PIPE,  # kept open: an EOF on the QMP chardev is not our signal
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
-
+        assert proc.stdout is not None and proc.stderr is not None  # noqa: S101 - PIPE above
+        # stderr drains while the probe waits: a full pipe would block QEMU before its greeting
+        stderr_task = asyncio.create_task(proc.stderr.read())
+        running = True  # still running at the bound, without a greeting
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=3)
-        except TimeoutError:
-            # QEMU didn't exit → -sandbox was accepted, it's paused on -S.
-            # Guard kill() for the race where the process exits between the
-            # timeout firing and our kill signal.
+            async with asyncio.timeout(_SANDBOX_PROBE_TIMEOUT_SECONDS):
+                while line := await proc.stdout.readline():
+                    if line.startswith(b'{"QMP"'):
+                        break
+                else:
+                    running = False  # stdout EOF: QEMU exited before its greeting
+        except (TimeoutError, ValueError):  # ValueError: a line over the stream limit, not the greeting
+            logger.warning(
+                "QEMU sandbox probe: no QMP greeting, assuming supported",
+                extra={"qemu_bin": qemu_bin, "timeout_seconds": _SANDBOX_PROBE_TIMEOUT_SECONDS},
+            )
+        finally:
             with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+                proc.kill()  # every path: the probe never leaves a QEMU behind
             await proc.wait()
-            logger.debug("QEMU sandbox probe: supported (process stayed alive)")
-            return True
-
-        # QEMU exited on its own.
-        if proc.returncode == 0:
-            logger.debug("QEMU sandbox probe: supported (clean exit)")
+            stderr = await stderr_task
+        if running:
+            # The greeting comes after start-up, which installs the filter. A silent QEMU that
+            # still runs accepted -sandbox (an unknown option or a failed filter exits at once).
+            logger.debug("QEMU sandbox probe: supported (-sandbox on, QEMU started)")
             return True
 
         stderr_text = stderr.decode(errors="replace").strip() if stderr else ""
@@ -763,30 +864,37 @@ async def check_kvm_available() -> bool:
         False otherwise (falls back to TCG software emulation)
     """
     kvm_path = "/dev/kvm"
-    if not await aiofiles.os.path.exists(kvm_path):
+    if not Path(kvm_path).exists():
         logger.debug("KVM not available: /dev/kvm does not exist")
         return False
 
     # Check if we can actually access /dev/kvm (not just that it exists)
     # This catches permission issues that would cause QEMU to fail or hang
     # See: https://github.com/actions/runner-images/issues/8542
-    if not await can_access(kvm_path, os.R_OK | os.W_OK):
-        logger.debug("KVM not available: permission denied on /dev/kvm")
+    # A WARNING, once per process (this probe is cached): else VMs silently run under TCG.
+    if not can_access(kvm_path, os.R_OK | os.W_OK):
+        logger.warning(
+            "KVM not available: this user cannot read and write /dev/kvm, so VMs use software emulation "
+            "(TCG, about 5-8 times slower). Add the user to the kvm group (sudo usermod -aG kvm $USER), "
+            "then log in again.",
+            extra={"path": kvm_path},
+        )
         return False
 
     # Actually try to open /dev/kvm and check API version via subprocess
     # Some environments (nested VMs, containers) have /dev/kvm but it doesn't work
     # Uses subprocess to avoid blocking the event loop with ioctl()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-c",
-            f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
+        returncode, stdout, _ = await run_probe(
+            (
+                sys.executable,
+                "-c",
+                f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
+            ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode != 0:
+        if returncode != 0:
             logger.warning("KVM device accessible but ioctl failed")
             return False
 
@@ -838,15 +946,12 @@ async def check_hvf_available() -> bool:
     """
     try:
         # sysctl kern.hv_support returns 1 if Hypervisor.framework is available
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/sbin/sysctl",
-            "-n",
-            "kern.hv_support",
+        returncode, stdout, _ = await run_probe(
+            ("/usr/sbin/sysctl", "-n", "kern.hv_support"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        hvf_kernel_support = proc.returncode == 0 and stdout.decode().strip() == "1"
+        hvf_kernel_support = returncode == 0 and stdout.decode().strip() == "1"
 
         if not hvf_kernel_support:
             logger.debug("HVF not available: kern.hv_support is not enabled")
@@ -870,98 +975,6 @@ async def check_hvf_available() -> bool:
 
     logger.debug("HVF available and working (kernel + QEMU verified)")
     return True
-
-
-async def check_hwaccel_available() -> bool:
-    """Check if hardware acceleration (KVM or HVF) is available.
-
-    TCG (software emulation) is ~5-8x slower than hardware virtualization,
-    making timing-sensitive tests unreliable.
-
-    Returns:
-        True if KVM (Linux) or HVF (macOS) is available
-        False otherwise (will use TCG software emulation)
-    """
-    host_os = detect_host_os()
-
-    if host_os == HostOS.LINUX:
-        return await check_kvm_available()
-    if host_os == HostOS.MACOS:
-        return await check_hvf_available()
-    return False
-
-
-async def check_fast_balloon_available() -> bool:
-    """Check if fast balloon operations are expected (not degraded nested virtualization).
-
-    Used for timing-sensitive tests that include balloon inflate/deflate overhead.
-
-    Background
-    ==========
-    Balloon operations (memory reclaim via virtio-balloon) have vastly different
-    performance characteristics depending on the virtualization environment:
-
-    - Bare-metal KVM: Balloon operations complete in <100ms
-    - Nested KVM (CI runners): Balloon operations can take 5+ seconds due to
-      hypervisor overhead, often timing out after retry limits
-
-    The Problem
-    ===========
-    GitHub Actions runners are VMs on Azure, creating nested virtualization when
-    running QEMU. Even when /dev/kvm exists and KVM "works", balloon operations
-    are significantly degraded:
-
-    1. KVM availability is inconsistent on GitHub Actions - "/dev/kvm sometimes
-       exists (and works!), and sometimes it doesn't" (GitHub community #8305)
-
-    2. pytest-xdist workers perform independent test collection, so flaky KVM
-       detection can cause tests to run on workers where KVM isn't actually fast
-
-    3. TSC_DEADLINE timer (required for efficient APIC timer virtualization) is
-       often not exposed to nested VMs, causing timer fallback to slower modes
-
-    Solution
-    ========
-    Use TSC_DEADLINE availability as a proxy for "fast virtualization":
-
-    - TSC_DEADLINE is a CPU feature, not a kernel module state - deterministic
-    - When missing, QEMU enables legacy PIT/PIC timers (slower, more overhead)
-    - Reliably identifies degraded nested virt vs bare-metal/L1 KVM
-
-    References
-    ==========
-    - Linux kernel timekeeping: https://docs.kernel.org/virt/kvm/x86/timekeeping.html
-    - QEMU Hyper-V enlightenments: https://www.qemu.org/docs/master/system/i386/hyperv.html
-    - GitHub Actions KVM issues: https://github.com/actions/runner-images/issues/8542
-    - pytest-xdist collection: https://pytest-xdist.readthedocs.io/en/stable/how-it-works.html
-
-    Returns:
-        True if balloon operations are expected to be fast:
-          - Linux x86_64: KVM available AND TSC_DEADLINE available
-          - Linux ARM64: KVM available (ARM uses different timer, less affected)
-          - macOS: HVF available (nested virt not possible on macOS)
-        False otherwise (balloon operations may be slow, skip timing tests)
-    """
-    if not await check_hwaccel_available():
-        return False
-
-    host_os = detect_host_os()
-    host_arch = detect_host_arch()
-
-    # On Linux x86_64, TSC_DEADLINE absence indicates degraded nested virt
-    # See: https://www.qemu.org/docs/master/system/i386/microvm.html
-    if host_os == HostOS.LINUX and host_arch == HostArch.X86_64:
-        return await check_tsc_deadline()
-
-    # On macOS, HVF availability implies not nested (macOS doesn't support nested virt)
-    # If we got here, HVF is available, so balloon should be fast
-    if host_os == HostOS.MACOS:
-        return True
-
-    # On ARM64 Linux, KVM availability is sufficient
-    # ARM uses GIC timer (not TSC/APIC), less affected by nested virt overhead
-    # Unknown platform: conservative assumption (return False)
-    return host_os == HostOS.LINUX and host_arch == HostArch.AARCH64
 
 
 @_async_cached_probe("tsc_deadline")
@@ -1000,13 +1013,14 @@ async def _check_tsc_deadline_linux() -> bool:
 
     Note: Called from check_tsc_deadline() which handles caching and locking.
     """
-    cpuinfo_path = "/proc/cpuinfo"
-    if not await aiofiles.os.path.exists(cpuinfo_path):
+    cpuinfo_path = Path("/proc/cpuinfo")
+    if not cpuinfo_path.exists():
         return False
 
     try:
-        async with aiofiles.open(cpuinfo_path) as f:
-            cpuinfo = await f.read()
+        # In a worker thread: the kernel builds this file for every CPU (large on
+        # big hosts; some kernels sample each CPU's frequency while doing so)
+        cpuinfo = await asyncio.to_thread(cpuinfo_path.read_text)
         # Look for tsc_deadline_timer in the flags line
         # Format: "flags : fpu vme ... tsc_deadline_timer ..."
         for line in cpuinfo.split("\n"):
@@ -1029,15 +1043,12 @@ async def _check_tsc_deadline_macos() -> bool:
     Note: Called from check_tsc_deadline() which handles caching and locking.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/sbin/sysctl",
-            "-n",
-            "machdep.cpu.features",
+        returncode, stdout, _ = await run_probe(
+            ("/usr/sbin/sysctl", "-n", "machdep.cpu.features"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0:
+        if returncode == 0:
             features = stdout.decode().upper()
             has_tsc = "TSC_DEADLINE" in features or "TSCDEAD" in features
             if has_tsc:
@@ -1051,6 +1062,147 @@ async def _check_tsc_deadline_macos() -> bool:
     return False
 
 
+def can_access(path: Path | str, mode: int) -> bool:
+    """Whether this user can access `path` with `mode` (os.R_OK, os.W_OK, os.X_OK, or a
+    combination): one metadata call."""
+    return os.access(path, mode)
+
+
+_GETXATTR: Final = cast("Callable[[Path, str], bytes] | None", getattr(os, "getxattr", None))
+"""The xattr read call, or None: this OS has none in Python (macOS)."""
+
+POSIX_ACL_ACCESS_XATTR: Final = "system.posix_acl_access"
+"""Where a filesystem keeps the POSIX access ACL of a file (acl(5)): a version, then
+(tag, perm, id) entries (include/uapi/linux/posix_acl_xattr.h)."""
+
+
+def posix_acl_xattr(path: Path) -> bytes | None:
+    """The POSIX access ACL of `path` as the filesystem keeps it (POSIX_ACL_ACCESS_XATTR), or
+    None: no ACL beyond the mode bits, or no POSIX ACLs here. Whether the filesystem keeps
+    POSIX ACLs is probed once per device (ProbeCache.posix_acls): an OS with no xattr call
+    (macOS: its ACLs are another model, read with acl_get_fd_np) or a filesystem that refuses
+    the name (EOPNOTSUPP: no ACL support, mounted noacl) has none, whatever the OS is called.
+    Another error (access, a file gone) is this call's only."""
+    if _GETXATTR is None:
+        return None
+    try:
+        device = path.stat().st_dev
+    except OSError:
+        return None
+    if probe_cache.posix_acls.get(device) is False:
+        return None
+    try:
+        raw = _GETXATTR(path, POSIX_ACL_ACCESS_XATTR)
+    except OSError as e:
+        if e.errno == errno.EOPNOTSUPP:  # ENOTSUP too (one value on Linux)
+            probe_cache.posix_acls[device] = False
+        elif e.errno == errno.ENODATA:
+            probe_cache.posix_acls[device] = True
+        return None
+    probe_cache.posix_acls[device] = True
+    return raw
+
+
+_O_DIRECT: Final = cast("int | None", getattr(os, "O_DIRECT", None))
+"""The open flag of direct IO, or None: this OS has none (macOS, where F_NOCACHE is another
+thing, and QEMU's direct-io needs O_DIRECT)."""
+
+
+async def probe_direct_io(folder: Path) -> bool:
+    """Whether a file in `folder` takes O_DIRECT, as QEMU opens its multifd channels for
+    direct-io: the filesystem answers (cached per device, st_dev), whatever the OS; False where
+    the OS has no O_DIRECT. One probe file per device (the kernel makes it before it refuses
+    O_DIRECT, so it goes on every path). EINVAL is the filesystem's answer, cached and warned
+    once per device; another error (no space, quota, file handles, access) is this call's
+    only: False, not cached."""
+    if _O_DIRECT is None:
+        return False
+    try:
+        device = (await asyncio.to_thread(folder.stat)).st_dev
+    except OSError:
+        return False
+    if (known := probe_cache.direct_io.get(device)) is not None:
+        return known
+    async with probe_cache.get_lock(f"direct_io:{device}"):
+        if (known := probe_cache.direct_io.get(device)) is not None:
+            return known
+        takes = await asyncio.to_thread(_opens_direct, folder, flag=_O_DIRECT)
+        if takes is not None:
+            probe_cache.direct_io[device] = takes
+        return bool(takes)
+
+
+_CHECKSUMMED_FILESYSTEMS: Final = {0x9123683E: "btrfs", 0x2FC12FC1: "zfs"}
+"""statfs f_type of the filesystems that checksum the data of a direct write from the writer's
+own memory (linux/magic.h BTRFS_SUPER_MAGIC; ZFS's ZFS_SUPER_MAGIC)."""
+
+
+async def probe_drive_direct_io(folder: Path) -> bool:
+    """Whether QEMU writes the drive files of a VM in `folder` (overlay, home disk, the layer
+    of a snapshot build) with O_DIRECT (qemu_cmd), cached per folder (a fixed one: the caller
+    passes the folder of the VM folders, not one per VM): once known, a VM start asks no
+    thread. Yes when the filesystem takes O_DIRECT (probe_direct_io) and is neither memory
+    (tmpfs, ramfs: the file is memory charged to the VM either way, and O_DIRECT only adds
+    read-modify-writes) nor btrfs or ZFS (they checksum a direct write from the writer's
+    memory: a guest page that changes meanwhile is stored with a bad checksum or fails with
+    EIO; btrfs from Linux 6.14 writes buffered anyway). No off Linux (no memory cgroup to
+    protect). A probe that failed for another reason (no space, file handles) is not cached:
+    the next VM start asks again."""
+    if sys.platform != "linux":
+        return False
+    if (known := probe_cache.drive_direct_io.get(folder)) is not None:
+        return known
+    try:
+        device = await asyncio.to_thread(_drive_filesystem_device, folder)
+    except OSError:  # the folder cannot be read (not made yet): no answer, asked again
+        return False
+    if device is None:
+        probe_cache.drive_direct_io[folder] = False
+        return False
+    takes = await probe_direct_io(folder)
+    if device in probe_cache.direct_io:  # a definite answer of the filesystem
+        probe_cache.drive_direct_io[folder] = takes
+    return takes
+
+
+def _drive_filesystem_device(folder: Path) -> int | None:
+    """The device (st_dev) of the filesystem of `folder` when O_DIRECT drive files can help
+    there (not memory-backed, not checksummed: probe_drive_direct_io), else None. An overlay
+    (a container's root) is judged by the filesystem of its upper folder, where its writes go;
+    one whose upper folder this process cannot see: None. Raises OSError when the folder
+    cannot be read."""
+    fs_type = statfs_type(folder)
+    if fs_type is None:
+        raise OSError(f"statfs of {folder} failed")
+    if fs_type == OVERLAYFS_SUPER_MAGIC:
+        upper = overlay_upper(folder)
+        fs_type = None if upper is None else statfs_type(upper)
+    if fs_type is None or fs_type in LINUX_MEMORY_FILESYSTEMS or fs_type in _CHECKSUMMED_FILESYSTEMS:
+        return None
+    return folder.stat().st_dev
+
+
+def _opens_direct(folder: Path, *, flag: int) -> bool | None:
+    """Open a new probe file in `folder` with `flag` (O_DIRECT): True, False (the filesystem
+    refuses it: EINVAL), or None (another error, this call's only). The file goes either way."""
+    probe = folder / f".direct-io-probe-{os.getpid()}-{time.monotonic_ns()}"
+    try:
+        os.close(os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flag, 0o600))
+    except OSError as e:
+        if e.errno != errno.EINVAL:
+            logger.warning(
+                "O_DIRECT probe of the folder failed: writes there are buffered this time",
+                extra={"folder": str(folder), "error": e.strerror or str(e)},
+            )
+            return None
+        logger.warning("Folder does not take O_DIRECT: writes there are buffered", extra={"folder": str(folder)})
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
+    return True
+
+
 @_async_cached_probe("io_uring")
 async def probe_io_uring_support() -> bool:
     """Probe for io_uring support using syscall test (cached).
@@ -1062,13 +1214,11 @@ async def probe_io_uring_support() -> bool:
     if detect_host_os() != HostOS.LINUX:
         return False
 
-    # Check 1: Sysctl restrictions (kernel 5.12+)
-    sysctl_path = "/proc/sys/kernel/io_uring_disabled"
-    if await aiofiles.os.path.exists(sysctl_path):
+    # Check 1: Sysctl restrictions (kernel 6.6+)
+    sysctl_path = Path("/proc/sys/kernel/io_uring_disabled")
+    if sysctl_path.exists():
         try:
-            async with aiofiles.open(sysctl_path) as f:
-                content = await f.read()
-            disabled_value = int(content.strip())
+            disabled_value = int(sysctl_path.read_text().strip())  # a sysctl: answered at once
             # io_uring_disabled sysctl values: 0=enabled, 1=restricted, 2=disabled
             if disabled_value == 2:  # noqa: PLR2004
                 logger.info(
@@ -1110,28 +1260,23 @@ try:
 except Exception:
     sys.exit(3)  # Error
 """
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-c",
-            probe_script,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        returncode, _, _ = await run_probe(
+            (sys.executable, "-c", probe_script), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
         )
-        await asyncio.wait_for(proc.wait(), timeout=5)
 
-        if proc.returncode == 0:
+        if returncode == 0:
             logger.info(
                 "io_uring syscall available",
                 extra={"kernel": platform.release()},
             )
             return True
-        if proc.returncode == 1:
+        if returncode == 1:
             logger.info(
                 "io_uring syscall not available (ENOSYS)",
                 extra={"kernel": platform.release()},
             )
             return False
-        if proc.returncode == 2:  # noqa: PLR2004
+        if returncode == 2:  # noqa: PLR2004
             logger.warning(
                 "io_uring blocked by seccomp/container policy",
                 extra={"kernel": platform.release()},
@@ -1140,7 +1285,7 @@ except Exception:
 
         logger.warning(
             "io_uring probe failed with unexpected result",
-            extra={"exit_code": proc.returncode},
+            extra={"exit_code": returncode},
         )
         return False
 
@@ -1160,36 +1305,39 @@ async def probe_unshare_support() -> bool:
     This requires either:
     - Root privileges
     - CAP_SYS_ADMIN capability
-    - Unprivileged user namespaces enabled (/proc/sys/kernel/unprivileged_userns_clone=1)
+    Unprivileged user namespaces do not help: neither the probe nor the VM command
+    makes a user namespace (no --user).
 
     Returns:
         True if unshare works, False otherwise (skip namespace isolation)
     """
     # Skip on non-Linux - unshare is Linux-specific
-    if detect_host_os() == HostOS.MACOS:
+    if detect_host_os() != HostOS.LINUX:
         return False
 
     try:
         # Test unshare with minimal namespaces (pid requires fork)
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/bin/unshare",
-            "--pid",
-            "--fork",
-            "--",
-            "/usr/bin/true",
+        returncode, _, stderr = await run_probe(
+            (
+                "/usr/bin/unshare",
+                "--pid",
+                "--fork",
+                "--kill-child=SIGKILL",  # the VM command uses it: util-linux 2.32+
+                "--",
+                "/usr/bin/true",
+            ),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
 
-        if proc.returncode == 0:
+        if returncode == 0:
             logger.info("unshare available (namespace isolation enabled)")
             return True
 
         stderr_text = stderr.decode().strip() if stderr else ""
         logger.warning(
             "unshare unavailable (namespace isolation disabled)",
-            extra={"exit_code": proc.returncode, "stderr": stderr_text[:200]},
+            extra={"exit_code": returncode, "stderr": stderr_text[:200]},
         )
         return False
     except (OSError, TimeoutError) as e:
@@ -1200,17 +1348,41 @@ async def probe_unshare_support() -> bool:
         return False
 
 
-async def detect_accel_type(
-    kvm_available: bool | None = None, hvf_available: bool | None = None, force_emulation: bool = False
-) -> AccelType:
+@_async_cached_probe("setpriv")
+async def probe_setpriv_pdeathsig() -> bool:
+    """Whether `setpriv --pdeathsig` works (util-linux 2.33+; cached). Children that end with
+    this process (subprocess_utils.start_managed_process) then need no Python preexec_fn, so
+    Popen can vfork. Else one warning: each such launch forks this process. False off Linux."""
+    if detect_host_os() != HostOS.LINUX:
+        return False
+    try:
+        # The launch form: setpriv, then /bin/sh (subprocess_utils._launch_command)
+        returncode, _, stderr = await run_probe(
+            ("setpriv", "--pdeathsig", "KILL", "--", "/bin/sh", "-c", ":"),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (OSError, TimeoutError) as e:
+        reason: dict[str, object] = {"error": str(e), "error_type": type(e).__name__}
+    else:
+        if returncode == 0:
+            return True
+        reason = {"exit_code": returncode, "stderr": stderr.decode(errors="replace").strip()[:200]}
+    logger.warning(
+        "setpriv --pdeathsig unavailable (util-linux 2.33+): each child that ends with this process "
+        "(QEMU as this user, gvproxy, qemu-storage-daemon) starts through a fork of this process",
+        extra=reason,
+    )
+    return False
+
+
+async def detect_accel_type(*, force_emulation: bool = False) -> AccelType:
     """Detect which QEMU accelerator to use.
 
     This is the single source of truth for virtualization mode detection.
     Used for both cgroup memory sizing (TCG needs more) and QEMU command building.
 
     Args:
-        kvm_available: Override KVM check result (for testing)
-        hvf_available: Override HVF check result (for testing)
         force_emulation: Force TCG software emulation
 
     Returns:
@@ -1220,13 +1392,8 @@ async def detect_accel_type(
     """
     if force_emulation:
         return AccelType.TCG
-    if kvm_available is None:
-        kvm_available = await check_kvm_available()
-    if kvm_available:
+    if await check_kvm_available():
         return AccelType.KVM
-    if detect_host_os() == HostOS.MACOS:
-        if hvf_available is None:
-            hvf_available = await check_hvf_available()
-        if hvf_available:
-            return AccelType.HVF
+    if detect_host_os() == HostOS.MACOS and await check_hvf_available():
+        return AccelType.HVF
     return AccelType.TCG

@@ -5,12 +5,14 @@ Measures:
 - Cold boot latency: Time to create a fresh VM and execute code
 - Warm pool latency: Time with pre-warmed VMs (concurrent)
 
-Uses TimingBreakdown from exec-sandbox for detailed phase timings:
+Phase timings come from Session.startup_timing (new()) and the execution
+result (exec()); teardown is the close() time measured here:
+- admission_ms: Time blocked in admission queue (0 for warm pool hits)
 - setup_ms: Infra setup (cache, overlay, cgroup) — excludes admission
-- admission_ms: Time blocked in admission queue (subset of setup, 0 for warm pool hits)
 - boot_ms: VM boot (QEMU + kernel + initramfs + guest-agent)
-- execute_ms: Code execution (connect + run + response)
-- teardown_ms: VM teardown (destroy + cleanup)
+- execute_ms: Code execution (connect + run + response); after a cold boot it
+  also holds the REPL start (warm-pool and L1 VMs have a started REPL)
+- teardown: close() (destroy + cleanup)
 
 Usage:
     uv run python scripts/benchmark_latency.py           # Quick benchmark
@@ -28,7 +30,7 @@ from operator import attrgetter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from exec_sandbox import ExecutionResult, Scheduler, SchedulerConfig
+from exec_sandbox import ExecutionResult, Scheduler, SchedulerConfig, StartupTiming, VmSpec
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.constants import DEFAULT_MEMORY_MB
 from exec_sandbox.exceptions import SandboxError
@@ -60,28 +62,38 @@ LANG_DISPLAY: dict[Language, str] = {
 # Timing Data Collection
 # ============================================================================
 
-# (source_path on ExecutionResult, stats_attr on TimingStats)
+
+@dataclass(frozen=True)
+class Sample:
+    """One VM: how it started, its one execution, and its close() time."""
+
+    result: ExecutionResult
+    startup: StartupTiming
+    teardown_ms: int
+    e2e_ms: float
+
+
+# (source_path on Sample, stats_attr on TimingStats)
 _ALWAYS_FIELDS: tuple[tuple[str, str], ...] = (
-    ("timing.total_ms", "total"),
-    ("timing.setup_ms", "setup"),
-    ("timing.boot_ms", "boot"),
-    ("timing.execute_ms", "execute"),
-    ("timing.boot_retries", "boot_retries"),
+    ("startup.admission_ms", "admission"),
+    ("startup.setup_ms", "setup"),
+    ("startup.boot_ms", "boot"),
+    ("result.timing.execute_ms", "execute"),
+    ("teardown_ms", "teardown"),
+    ("startup.overlay_ms", "overlay"),
+    ("startup.qemu_cmd_build_ms", "qemu_cmd_build"),
+    ("startup.gvproxy_start_ms", "gvproxy_start"),
+    ("startup.qemu_fork_ms", "qemu_fork"),
+    ("startup.guest_wait_ms", "guest_wait"),
+    ("startup.boot_retries", "boot_retries"),
 )
 
 _OPTIONAL_FIELDS: tuple[tuple[str, str], ...] = (
-    ("execution_time_ms", "guest_exec"),
-    ("timing.teardown_ms", "teardown"),
-    ("timing.admission_ms", "admission"),
-    ("timing.overlay_ms", "overlay"),
-    ("timing.connect_ms", "connect"),
-    ("timing.l1_restore_ms", "l1_restore"),
-    ("spawn_ms", "spawn"),
-    ("process_ms", "process"),
-    ("timing.qemu_cmd_build_ms", "qemu_cmd_build"),
-    ("timing.gvproxy_start_ms", "gvproxy_start"),
-    ("timing.qemu_fork_ms", "qemu_fork"),
-    ("timing.guest_wait_ms", "guest_wait"),
+    ("result.execution_time_ms", "guest_exec"),
+    ("result.timing.connect_ms", "connect"),
+    ("startup.l1_restore_ms", "l1_restore"),
+    ("result.spawn_ms", "spawn"),
+    ("result.process_ms", "process"),
 )
 
 
@@ -89,20 +101,19 @@ _OPTIONAL_FIELDS: tuple[tuple[str, str], ...] = (
 class TimingStats:
     """Collected timing measurements."""
 
-    e2e: list[float] = field(default_factory=list[float])  # End-to-end (measured)
-    total: list[float] = field(default_factory=list[float])  # From TimingBreakdown
+    e2e: list[float] = field(default_factory=list[float])  # End-to-end: new() + exec() + close()
     setup: list[float] = field(default_factory=list[float])
     boot: list[float] = field(default_factory=list[float])
     execute: list[float] = field(default_factory=list[float])
     teardown: list[float] = field(default_factory=list[float])
     guest_exec: list[float] = field(default_factory=list[float])
-    # Granular setup timing
+    # Admission and setup parts
     admission: list[float] = field(default_factory=list[float])  # Admission queue wait (0 for warm pool hits)
     overlay: list[float] = field(default_factory=list[float])  # Overlay acquisition (pool or on-demand)
     # Granular execute timing
     connect: list[float] = field(default_factory=list[float])  # Host: channel.connect()
-    spawn: list[float] = field(default_factory=list[float])  # Guest: cmd.spawn() fork/exec
-    process: list[float] = field(default_factory=list[float])  # Guest: actual process runtime
+    spawn: list[float] = field(default_factory=list[float])  # Guest: get the REPL (spawn it when none runs)
+    process: list[float] = field(default_factory=list[float])  # Guest: code run time in the REPL
     # Granular boot timing
     qemu_cmd_build: list[float] = field(default_factory=list[float])
     gvproxy_start: list[float] = field(default_factory=list[float])
@@ -112,47 +123,39 @@ class TimingStats:
     l1_restore: list[float] = field(default_factory=list[float])
     # Retry tracking
     boot_retries: list[int] = field(default_factory=list[int])
-    warm_hits: int = 0
-    l1_hits: int = 0
-    cold_boots: int = 0
     # Runs excluded from the lists above, reported instead of aborting:
     failures: int = 0  # errored or non-zero exit
     off_source: int = 0  # served by a different VM source (checked before exit code)
 
 
-def collect_timing(result: ExecutionResult, stats: TimingStats, e2e_ms: float) -> None:
-    """Extract timing info from ExecutionResult."""
-    stats.e2e.append(e2e_ms)
+def collect_timing(sample: Sample, stats: TimingStats) -> None:
+    """Extract timing info from one sample."""
+    stats.e2e.append(sample.e2e_ms)
     for source_path, stats_attr in _ALWAYS_FIELDS:
-        getattr(stats, stats_attr).append(attrgetter(source_path)(result))
+        getattr(stats, stats_attr).append(attrgetter(source_path)(sample))
     for source_path, stats_attr in _OPTIONAL_FIELDS:
-        value = attrgetter(source_path)(result)
+        value = attrgetter(source_path)(sample)
         if value is not None:
             getattr(stats, stats_attr).append(value)
-    if result.warm_pool_hit:
-        stats.warm_hits += 1
-    elif result.l1_cache_hit:
-        stats.l1_hits += 1
-    else:
-        stats.cold_boots += 1
 
 
-def _vm_source(result: ExecutionResult) -> str:
-    if result.warm_pool_hit:
+def _vm_source(startup: StartupTiming) -> str:
+    if startup.warm_pool_hit:
         return "warm"
-    if result.l1_cache_hit:
+    if startup.l1_cache_hit:
         return "l1"
     return "cold"
 
 
 def _collect_results(
-    results: list[tuple[ExecutionResult, float] | None],
-    expected_source: str | None = None,
+    results: list[Sample | None],
+    *,
+    expected_source: str,
 ) -> TimingStats:
     """Collect timing from results.
 
-    Failed runs and (when expected_source is set) runs served by another VM
-    source are excluded from the samples and counted instead — a lone
+    Failed runs and runs served by a VM source other than expected_source
+    are excluded from the samples and counted instead — a lone
     transient failure must not abort minutes of benchmark, and a run that
     became e.g. an L1 hit through admission queuing must not pollute cold
     numbers.
@@ -162,10 +165,10 @@ def _collect_results(
         if item is None:
             stats.failures += 1
             continue
-        result, e2e_ms = item
+        result = item.result
         # Source classification first: a fallback that also failed must count
         # as off_source, or the warm-phase purity check would miss it.
-        if expected_source is not None and _vm_source(result) != expected_source:
+        if _vm_source(item.startup) != expected_source:
             stats.off_source += 1
             continue
         if result.exit_code != 0:
@@ -173,7 +176,7 @@ def _collect_results(
             stderr_preview = result.stderr[:200].strip()
             print(f"  Warning: run failed (exit_code={result.exit_code}): {stderr_preview}")
             continue
-        collect_timing(result, stats, e2e_ms)
+        collect_timing(item, stats)
     if stats.failures:
         print(f"  Warning: {stats.failures}/{len(results)} runs failed, excluded from stats")
     if stats.off_source:
@@ -191,36 +194,36 @@ def _collect_results(
 
 async def benchmark_concurrent(
     scheduler: Scheduler,
-    language: Language,
+    spec: VmSpec,
     concurrency: int,
     *,
-    memory_mb: int | None = None,
-    allow_network: bool = False,
-    expected_source: str | None = None,
+    expected_source: str,
 ) -> TimingStats:
     """Benchmark VM boot + execution latency with concurrent requests."""
-    code = CODE_MAP.get(language, "echo ok")
+    code = CODE_MAP[spec.language]
 
-    async def single_run() -> tuple[ExecutionResult, float] | None:
+    async def single_run() -> Sample | None:
         start = time.perf_counter()
         try:
-            result = await scheduler.run(
-                code=code,
-                language=language,
-                timeout_seconds=60,
-                memory_mb=memory_mb,
-                allow_network=allow_network,
-            )
+            vm = await scheduler.new(spec)
+            try:
+                result = await vm.exec(code, timeout_seconds=60)
+            finally:
+                close_start = time.perf_counter()
+                await vm.close()
+            teardown_ms = round((time.perf_counter() - close_start) * 1000)
         except SandboxError as e:
             e2e_ms = (time.perf_counter() - start) * 1000
             print(f"  Warning: run failed after {e2e_ms:.0f}ms: {type(e).__name__}: {e}")
             return None
         e2e_ms = (time.perf_counter() - start) * 1000
-        return result, e2e_ms
+        return Sample(result=result, startup=vm.startup_timing, teardown_ms=teardown_ms, e2e_ms=e2e_ms)
 
-    # Launch all requests concurrently
-    results = await asyncio.gather(*[single_run() for _ in range(concurrency)])
-    return _collect_results(list(results), expected_source=expected_source)
+    # Launch all requests concurrently. An error other than SandboxError cancels the other
+    # runs, and each closes its VM, before the error reaches the Scheduler's exit
+    async with asyncio.TaskGroup() as runs:
+        tasks = [runs.create_task(single_run()) for _ in range(concurrency)]
+    return _collect_results([task.result() for task in tasks], expected_source=expected_source)
 
 
 # ============================================================================
@@ -229,7 +232,7 @@ async def benchmark_concurrent(
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float:
-    """Compute the p-th percentile using the nearest-rank method (0-indexed)."""
+    """Return the p quantile (p in (0, 1]) of sorted values by the nearest-rank method."""
     idx = min(math.ceil(len(sorted_vals) * p) - 1, len(sorted_vals) - 1)
     return sorted_vals[idx]
 
@@ -297,31 +300,15 @@ def print_stats(name: str, stats: TimingStats) -> None:
         print(f"\n{name}: No data")
         return
 
-    n = len(stats.e2e)
-    parts: list[str] = []
-    if stats.warm_hits:
-        parts.append(f"{stats.warm_hits} warm")
-    if stats.l1_hits:
-        parts.append(f"{stats.l1_hits} L1")
-    if stats.cold_boots:
-        parts.append(f"{stats.cold_boots} cold")
-    source_info = f" [{', '.join(parts)}]" if parts else ""
-    print(f"\n{name} ({n} VMs concurrent){source_info}:")
+    print(f"\n{name} ({len(stats.e2e)} VMs concurrent):")
     print("  Per-VM latency (median / p95):")
     print(f"    E2E:        {fmt_stats(stats.e2e)} ms")
     _render_tree("    ", _MAIN_TREE, stats)
 
-    if any(getattr(stats, attr) for _, attr, _ in _SETUP_BREAKDOWN):
-        print("  Setup breakdown:")
-        _render_tree("       ", _SETUP_BREAKDOWN, stats)
-
-    if any(getattr(stats, attr) for _, attr, _ in _BOOT_BREAKDOWN):
-        print("  Boot breakdown:")
-        _render_tree("       ", _BOOT_BREAKDOWN, stats)
-
-    if any(getattr(stats, attr) for _, attr, _ in _EXEC_BREAKDOWN):
-        print("  Execute breakdown:")
-        _render_tree("       ", _EXEC_BREAKDOWN, stats)
+    for part, rows in (("Setup", _SETUP_BREAKDOWN), ("Boot", _BOOT_BREAKDOWN), ("Execute", _EXEC_BREAKDOWN)):
+        if any(getattr(stats, attr) for _, attr, _ in rows):
+            print(f"  {part} breakdown:")
+            _render_tree("       ", rows, stats)
 
     if stats.guest_exec:
         print(f"    Guest time: {fmt_stats(stats.guest_exec)} ms")
@@ -383,7 +370,7 @@ Examples:
         type=int,
         default=10,
         metavar="N",
-        help="iterations per benchmark (default: 10)",
+        help="VMs started at the same time per benchmark (default: 10)",
     )
     parser.add_argument(
         "--pool",
@@ -424,18 +411,16 @@ async def run_cold_benchmarks(
     n: int,
     network: bool,
     langs: list[Language],
-) -> dict[str, TimingStats]:
+) -> dict[Language, TimingStats]:
     """Run cold benchmarks and reject samples from another VM source."""
-    results: dict[str, TimingStats] = {}
+    results: dict[Language, TimingStats] = {}
 
     for lang in langs:
         print(f"\nRunning {LANG_DISPLAY[lang]} cold boot benchmark ({n} concurrent)...")
         stats = await benchmark_concurrent(
             scheduler,
-            lang,
+            VmSpec(language=lang, allow_network=network),
             n,
-            memory_mb=None,  # Use scheduler default
-            allow_network=network,
             expected_source="cold",
         )
         if not stats.e2e:
@@ -443,7 +428,7 @@ async def run_cold_benchmarks(
                 f"Cold benchmark produced no usable samples for {lang.value}: "
                 f"failures={stats.failures}, off_source={stats.off_source}"
             )
-        results[f"Cold Boot ({LANG_DISPLAY[lang]})"] = stats
+        results[lang] = stats
 
     return results
 
@@ -452,9 +437,9 @@ async def run_warm_pool_benchmarks(
     scheduler: Scheduler,
     pool: int,
     langs: list[Language],
-) -> dict[str, TimingStats]:
+) -> dict[Language, TimingStats]:
     """Run warm-pool benchmarks; ANY fallback aborts the run (purity check)."""
-    results: dict[str, TimingStats] = {}
+    results: dict[Language, TimingStats] = {}
 
     print("\nWaiting for warm pool to replenish...")
     await scheduler.wait_pool_ready()
@@ -463,9 +448,8 @@ async def run_warm_pool_benchmarks(
         print(f"\nRunning {LANG_DISPLAY[lang]} warm pool benchmark ({pool} concurrent = pool size)...")
         stats = await benchmark_concurrent(
             scheduler,
-            lang,
+            VmSpec(language=lang),
             pool,
-            allow_network=False,
             expected_source="warm",
         )
         # The pool is sized exactly to concurrency and wait_pool_ready() ran:
@@ -473,30 +457,26 @@ async def run_warm_pool_benchmarks(
         if stats.off_source or not stats.e2e:
             raise RuntimeError(
                 f"Warm benchmark produced fallback VM sources for {lang.value}: "
-                f"warm={stats.warm_hits}/{pool}, off_source={stats.off_source}, "
+                f"warm={len(stats.e2e)}/{pool}, off_source={stats.off_source}, "
                 f"failures={stats.failures}"
             )
-        results[f"Warm Pool ({LANG_DISPLAY[lang]})"] = stats
+        results[lang] = stats
 
     return results
 
 
-def print_report(all_results: dict[str, TimingStats], langs: list[Language]) -> None:
+def print_report(cold: dict[Language, TimingStats], warm: dict[Language, TimingStats]) -> None:
     """Print full benchmark report."""
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
 
-    for name, stats in all_results.items():
-        print_stats(name, stats)
+    for lang, stats in cold.items():
+        print_stats(f"Cold Boot ({LANG_DISPLAY[lang]})", stats)
+    for lang, stats in warm.items():
+        print_stats(f"Warm Pool ({LANG_DISPLAY[lang]})", stats)
 
-    # Comparison table for cold boot results
-    cold_boot_results: dict[Language, TimingStats] = {}
-    for lang in langs:
-        key = f"Cold Boot ({LANG_DISPLAY[lang]})"
-        if key in all_results:
-            cold_boot_results[lang] = all_results[key]
-    print_comparison(cold_boot_results)
+    print_comparison(cold)
 
     print("\n" + "=" * 60)
 
@@ -509,7 +489,7 @@ async def main() -> None:
     images_dir = Path(__file__).parent.parent / "images" / "dist"
     if not images_dir.exists():
         print(f"Error: Images directory not found at {images_dir}")
-        print("Run 'make build-images' first.")
+        print("Run 'make build' first.")
         return
 
     pool_enabled = args.pool > 0
@@ -539,8 +519,9 @@ async def main() -> None:
             memory_snapshot_cache_dir=memory_snapshot_cache_dir,
         )
         async with Scheduler(cold_config) as cold_scheduler:
-            all_results = await run_cold_benchmarks(cold_scheduler, args.n, args.network, args.langs)
+            cold = await run_cold_benchmarks(cold_scheduler, args.n, args.network, args.langs)
 
+        warm: dict[Language, TimingStats] = {}
         if pool_enabled:
             warm_config = SchedulerConfig(
                 images_dir=images_dir,
@@ -549,9 +530,9 @@ async def main() -> None:
                 memory_snapshot_cache_dir=memory_snapshot_cache_dir,
             )
             async with Scheduler(warm_config) as warm_scheduler:
-                all_results.update(await run_warm_pool_benchmarks(warm_scheduler, args.pool, args.langs))
+                warm = await run_warm_pool_benchmarks(warm_scheduler, args.pool, args.langs)
 
-    print_report(all_results, args.langs)
+    print_report(cold, warm)
 
 
 if __name__ == "__main__":

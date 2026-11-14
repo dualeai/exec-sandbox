@@ -6,13 +6,15 @@ Tests that gvproxy-wrapper OutboundAllow filtering actually works in VMs:
 3. Edge cases: subdomains, exact match, parent/sibling blocked
 4. Security: direct IP bypass, plain HTTP blocked, raw TCP blocked
 5. DNS behavior: blocked domains fail DNS, allowed domains resolve to real IPs
-6. Boundary: large allowlists, IDN domains, special TLDs
+6. Boundary: large allowlists, IDN domains
 """
 
 import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 from .conftest import (
     JS_SAFETY,
@@ -24,72 +26,41 @@ from .conftest import (
     PY_SAFETY,
 )
 
+# Expected stdout of get_connection_test_code: the domain filter blocks a name at DNS (gaierror); the
+# TLS filter closes a connection whose SNI does not match (an IP literal has no domain to match).
+CONNECTED = "CONNECTED"
+DNS_BLOCKED = "BLOCKED:gaierror"
+TLS_BLOCKED = "BLOCKED:SSLEOFError"
+
 # =============================================================================
 # Normal cases: Basic allow/block behavior
 # =============================================================================
 OUTBOUND_FILTER_NORMAL_CASES = [
     # Explicitly allowed domain should connect
-    pytest.param(
-        Language.PYTHON,
-        ["cp.cloudflare.com"],
-        "cp.cloudflare.com",
-        True,
-        id="normal-allowed-connects",
-    ),
+    pytest.param(["cp.cloudflare.com"], "cp.cloudflare.com", CONNECTED, id="normal-allowed-connects"),
     # Non-allowed domain should be blocked
-    pytest.param(
-        Language.PYTHON,
-        ["cp.cloudflare.com"],
-        "google.com",
-        False,
-        id="normal-blocked-fails",
-    ),
+    pytest.param(["cp.cloudflare.com"], "google.com", DNS_BLOCKED, id="normal-blocked-fails"),
     # Multiple allowed domains
     pytest.param(
-        Language.PYTHON,
         ["google.com", "pypi.org", "cp.cloudflare.com"],
         "cp.cloudflare.com",
-        True,
+        CONNECTED,
         id="normal-multiple-domains-third-connects",
     ),
     # Empty allowed_domains = no filtering (all allowed)
-    pytest.param(
-        Language.PYTHON,
-        [],  # Empty list = allow all
-        "google.com",
-        True,
-        id="normal-empty-allowlist-permits-all",
-    ),
+    pytest.param([], "google.com", CONNECTED, id="normal-empty-allowlist-permits-all"),
 ]
 
 # =============================================================================
 # Language defaults: Auto-included package registries
 # =============================================================================
 OUTBOUND_FILTER_DEFAULTS_CASES = [
-    # Python defaults: pypi.org should work
-    pytest.param(
-        Language.PYTHON,
-        None,  # Use language defaults
-        "pypi.org",
-        True,
-        id="defaults-python-pypi-connects",
-    ),
+    # Python defaults (allowed_domains=None): pypi.org should work
+    pytest.param(None, "pypi.org", CONNECTED, id="defaults-python-pypi-connects"),
     # Python defaults: files.pythonhosted.org should work
-    pytest.param(
-        Language.PYTHON,
-        None,
-        "files.pythonhosted.org",
-        True,
-        id="defaults-python-pythonhosted-connects",
-    ),
-    # Python defaults: non-pypi domain should be blocked
-    pytest.param(
-        Language.PYTHON,
-        None,
-        "google.com",  # Exists but not in Python defaults, so should be blocked
-        False,
-        id="defaults-python-blocks-others",
-    ),
+    pytest.param(None, "files.pythonhosted.org", CONNECTED, id="defaults-python-pythonhosted-connects"),
+    # Python defaults: google.com exists but is not in the Python defaults
+    pytest.param(None, "google.com", DNS_BLOCKED, id="defaults-python-blocks-others"),
 ]
 
 # =============================================================================
@@ -97,37 +68,17 @@ OUTBOUND_FILTER_DEFAULTS_CASES = [
 # =============================================================================
 OUTBOUND_FILTER_EDGE_CASES = [
     # Subdomain of allowed domain should connect
-    pytest.param(
-        Language.PYTHON,
-        ["pythonhosted.org"],
-        "files.pythonhosted.org",
-        True,
-        id="edge-subdomain-of-allowed-connects",
-    ),
+    pytest.param(["pythonhosted.org"], "files.pythonhosted.org", CONNECTED, id="edge-subdomain-of-allowed-connects"),
     # Parent domain NOT allowed when only subdomain specified
     pytest.param(
-        Language.PYTHON,
-        ["sub.cp.cloudflare.com"],
-        "cp.cloudflare.com",
-        False,
-        id="edge-parent-blocked-when-subdomain-allowed",
+        ["sub.cp.cloudflare.com"], "cp.cloudflare.com", DNS_BLOCKED, id="edge-parent-blocked-when-subdomain-allowed"
     ),
-    # Sibling subdomain NOT allowed
-    pytest.param(
-        Language.PYTHON,
-        ["api.cp.cloudflare.com"],
-        "www.cp.cloudflare.com",
-        False,
-        id="edge-sibling-subdomain-blocked",
-    ),
+    # Sibling subdomain NOT allowed (both names exist: without the filter, test.pypi.org connects)
+    pytest.param(["upload.pypi.org"], "test.pypi.org", DNS_BLOCKED, id="edge-sibling-subdomain-blocked"),
     # Exact domain match (not subdomain) — domain itself matches the pattern
-    pytest.param(
-        Language.PYTHON,
-        ["pypi.org"],
-        "pypi.org",
-        True,
-        id="edge-exact-domain-match-connects",
-    ),
+    pytest.param(["pypi.org"], "pypi.org", CONNECTED, id="edge-exact-domain-match-connects"),
+    # Internationalized domain name in punycode (münchen.de): the allowlist matches the ASCII form
+    pytest.param(["xn--mnchen-3ya.de"], "xn--mnchen-3ya.de", CONNECTED, id="edge-idn-punycode-connects"),
 ]
 
 # =============================================================================
@@ -139,13 +90,7 @@ OUTBOUND_FILTER_EDGE_CASES = [
 OUTBOUND_FILTER_SECURITY_CASES = [
     # Direct IP connection without prior DNS resolution — no cached mapping exists,
     # and the TLS SNI is an IP literal, not a domain pattern. Should be blocked.
-    pytest.param(
-        Language.PYTHON,
-        ["cp.cloudflare.com"],
-        "93.184.216.34",
-        False,
-        id="security-direct-ip-no-dns-blocked",
-    ),
+    pytest.param(["cp.cloudflare.com"], "93.184.216.34", TLS_BLOCKED, id="security-direct-ip-no-dns-blocked"),
 ]
 
 # Combine all parametrized test cases
@@ -157,21 +102,17 @@ OUTBOUND_FILTER_TEST_CASES = (
 )
 
 
-def get_connection_test_code(language: Language, test_domain: str, *, retries: bool = False) -> str:
-    """Generate language-appropriate TLS connection test code.
+def get_connection_test_code(test_domain: str, *, retries: bool) -> str:
+    """Python code that tries a TLS connection to port 443 of `test_domain`.
 
-    Tests whether a TLS connection to port 443 can be established.
-    OutboundAllow filters at both DNS and TLS levels — blocked domains
-    fail DNS resolution, allowed domains resolve and connect via TLS.
-
-    When *retries* is True the generated code retries transient failures
-    (``NET_RETRY_COUNT`` attempts) — used for allowed-domain tests.
+    It prints CONNECTED, or BLOCKED:<exception type> (BLOCKED:Timeout from PY_SAFETY when the
+    process hangs). When *retries* is True the code retries transient failures (``NET_RETRY_COUNT``
+    attempts): used for allowed-domain tests.
     """
-    if language == Language.PYTHON:
-        if retries:
-            return (
-                PY_SAFETY
-                + f"""
+    if retries:
+        return (
+            PY_SAFETY
+            + f"""
 import socket, ssl, time
 for attempt in range({NET_RETRY_COUNT + 1}):
     try:
@@ -186,10 +127,10 @@ for attempt in range({NET_RETRY_COUNT + 1}):
             continue
         print(f"BLOCKED:{{type(e).__name__}}")
 """
-            )
-        return (
-            PY_SAFETY
-            + f"""
+        )
+    return (
+        PY_SAFETY
+        + f"""
 import socket, ssl
 try:
     ctx = ssl.create_default_context()
@@ -199,85 +140,35 @@ try:
 except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
 """
-        )
-    if language == Language.JAVASCRIPT:
-        if retries:
-            return (
-                JS_SAFETY
-                + f"""for (let attempt = 0; attempt < {NET_RETRY_COUNT + 1}; attempt++) {{
-    try {{
-        const res = await fetch("https://{test_domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
-        console.log("CONNECTED:" + res.status);
-        break;
-    }} catch (e) {{
-        if (attempt < {NET_RETRY_COUNT}) {{ await new Promise(r => setTimeout(r, {NET_RETRY_BACKOFF_S * 1000} * (attempt + 1))); continue; }}
-        console.log("BLOCKED:" + e.name);
-    }}
-}}"""
-            )
-        return (
-            JS_SAFETY
-            + f"""
-try {{
-    const res = await fetch("https://{test_domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
-    console.log("CONNECTED:" + res.status);
-}} catch (e) {{
-    console.log("BLOCKED:" + e.name);
-}}
-"""
-        )
-    # RAW — ``timeout`` wraps curl because curl's ``--max-time`` cannot
-    # interrupt musl's blocking ``getaddrinfo()`` (even with c-ares, some
-    # code paths fall back to musl).  See ``_curl_tls_code`` docstring.
-    retry_flags = f" --retry {NET_RETRY_COUNT} --retry-connrefused" if retries else ""
-    return (
-        f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf"
-        f" --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S}"
-        f"{retry_flags}"
-        f' https://{test_domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
     )
 
 
-@pytest.mark.parametrize(
-    "language,allowed_domains,test_domain,should_connect",
-    OUTBOUND_FILTER_TEST_CASES,
-)
+@pytest.mark.parametrize("allowed_domains,test_domain,expected", OUTBOUND_FILTER_TEST_CASES)
 async def test_outbound_filtering(
     scheduler: Scheduler,
-    language: Language,
     allowed_domains: list[str] | None,
     test_domain: str,
-    should_connect: bool,
+    expected: str,
 ) -> None:
-    """Test outbound filtering enforcement in VM.
+    """Python TLS connection to port 443 through the outbound filter.
 
     OutboundAllow behavior:
-    - Allowed domains: DNS resolves, TLS connections succeed
+    - Allowed domains: DNS resolves, TLS connections succeed (CONNECTED)
     - Blocked domains: DNS resolution fails (gaierror)
+    - IP literals: the TLS filter closes the connection (SSLEOFError)
     """
-    code = get_connection_test_code(language, test_domain, retries=should_connect)
+    code = get_connection_test_code(test_domain, retries=expected == CONNECTED)
 
-    result = await scheduler.run(
-        code=code,
-        language=language,
-        allow_network=True,
-        allowed_domains=allowed_domains,
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=allowed_domains), code
     )
 
-    if should_connect:
-        assert "CONNECTED" in result.stdout, (
-            f"Expected TLS connection to {test_domain} to succeed.\n"
-            f"allowed_domains={allowed_domains}\n"
-            f"stdout: {result.stdout}\n"
-            f"stderr: {result.stderr}"
-        )
-    else:
-        assert "BLOCKED:" in result.stdout, (
-            f"Expected TLS connection to {test_domain} to be blocked.\n"
-            f"allowed_domains={allowed_domains}\n"
-            f"stdout: {result.stdout}\n"
-            f"stderr: {result.stderr}"
-        )
+    assert result.stdout == f"{expected}\n", (
+        f"Expected {expected} for a TLS connection to {test_domain}.\n"
+        f"allowed_domains={allowed_domains}\n"
+        f"stdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
 
 
 # =============================================================================
@@ -297,11 +188,8 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["pypi.org"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["pypi.org"]), code
     )
 
     assert "STATUS:200" in result.stdout, (
@@ -310,7 +198,7 @@ except Exception as e:
 
 
 async def test_outbound_filtering_http_blocked(scheduler: Scheduler) -> None:
-    """Test that blocked domain fails via HTTPS."""
+    """urllib HTTPS to a blocked domain fails at DNS (the URLError reason is a gaierror)."""
     code = (
         PY_SAFETY
         + f"""
@@ -319,19 +207,22 @@ try:
     with urllib.request.urlopen("https://google.com/", timeout={NET_OP_TIMEOUT_S}) as r:
         print(f"STATUS:{{r.status}}")
 except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
+    print(f"BLOCKED:{{type(getattr(e, 'reason', e)).__name__}}")
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["pypi.org"],  # Only pypi allowed
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["pypi.org"],  # Only pypi allowed
+        ),
+        code,
     )
 
-    assert "BLOCKED:" in result.stdout, (
-        f"Expected HTTPS to google.com to fail but it succeeded.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.stdout == "BLOCKED:gaierror\n", (
+        f"Expected HTTPS to google.com to fail at DNS.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 
@@ -339,7 +230,7 @@ except Exception as e:
 # Network disabled (no gvproxy at all)
 # =============================================================================
 async def test_network_disabled_no_resolution(scheduler: Scheduler) -> None:
-    """Test that allow_network=False prevents all network access."""
+    """With allow_network=False, name resolution fails (the VM has no DNS server to reach)."""
     code = (
         PY_SAFETY
         + """
@@ -347,20 +238,21 @@ import socket
 try:
     ip = socket.gethostbyname("google.com")
     print(f"RESOLVED:{ip}")
-except socket.gaierror as e:
-    print(f"NO_NETWORK:{e}")
 except OSError as e:
-    print(f"NO_NETWORK:{e}")
+    print(f"NO_NETWORK:{type(e).__name__}")
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=False,  # Network disabled
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=False,  # Network disabled
+        ),
+        code,
     )
 
-    assert "NO_NETWORK:" in result.stdout or "RESOLVED:" not in result.stdout, (
+    assert result.stdout == "NO_NETWORK:gaierror\n", (
         f"Expected network to be disabled.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
@@ -375,16 +267,13 @@ async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
     no bot challenges, no scheduled downtime. No ``-f``: any HTTP response
     proves the path works end-to-end (DNS, SNI filter, TLS).
     """
-    result = await scheduler.run(
-        code=(
-            f"timeout {NET_SAFETY_TIMEOUT_S} curl -s"
-            f" --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S}"
-            f" --retry {NET_RETRY_COUNT} --retry-connrefused -o /dev/null"
-            " https://cp.cloudflare.com/generate_204 && echo 'SUCCESS' || echo 'FAILED'"
-        ),
-        language=Language.RAW,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler,
+        VmSpec(language=Language.RAW, allow_network=True, allowed_domains=["cp.cloudflare.com"]),
+        f"timeout {NET_SAFETY_TIMEOUT_S} curl -s"
+        f" --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S}"
+        f" --retry {NET_RETRY_COUNT} --retry-connrefused -o /dev/null"
+        " https://cp.cloudflare.com/generate_204 && echo 'SUCCESS' || echo 'FAILED'",
     )
 
     assert "SUCCESS" in result.stdout, (
@@ -393,16 +282,20 @@ async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
 
 
 async def test_outbound_filtering_raw_blocked(scheduler: Scheduler) -> None:
-    """Test that blocked domain fails with RAW language."""
-    result = await scheduler.run(
-        code=f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S} https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
-        language=Language.RAW,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # google.com not allowed
+    """curl to a blocked domain fails at DNS: exit code 6 (could not resolve host)."""
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.RAW,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # google.com not allowed
+        ),
+        f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf --connect-timeout {NET_CONNECT_TIMEOUT_S}"
+        f" --max-time {NET_OP_TIMEOUT_S} https://google.com/ && echo 'SUCCESS' || echo \"BLOCKED:$?\"",
     )
 
-    assert "BLOCKED" in result.stdout, (
-        f"Expected curl to google.com to fail but it succeeded.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.stdout == "BLOCKED:6\n", (
+        f"Expected curl to google.com to fail at DNS.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 
@@ -410,7 +303,7 @@ async def test_outbound_filtering_raw_blocked(scheduler: Scheduler) -> None:
 # JavaScript tests
 # =============================================================================
 async def test_outbound_filtering_javascript_blocked(scheduler: Scheduler) -> None:
-    """Test that blocked domain fails with JavaScript."""
+    """Bun fetch to a blocked domain fails at DNS (error code ENOTFOUND)."""
     code = (
         JS_SAFETY
         + f"""
@@ -418,20 +311,23 @@ try {{
     const res = await fetch("https://google.com/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
     console.log("STATUS:" + res.status);
 }} catch (e) {{
-    console.log("BLOCKED:" + e.name);
+    console.log("BLOCKED:" + e.code);
 }}
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.JAVASCRIPT,
-        allow_network=True,
-        allowed_domains=["registry.npmjs.org"],  # google.com not allowed
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.JAVASCRIPT,
+            allow_network=True,
+            allowed_domains=["registry.npmjs.org"],  # google.com not allowed
+        ),
+        code,
     )
 
-    assert "BLOCKED:" in result.stdout, (
-        f"Expected fetch to google.com to fail but it succeeded.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.stdout == "BLOCKED:ENOTFOUND\n", (
+        f"Expected fetch to google.com to fail at DNS.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 
@@ -439,7 +335,7 @@ try {{
 # Security: SNI bypass attempts
 # =============================================================================
 async def test_outbound_filtering_plain_http_blocked(scheduler: Scheduler) -> None:
-    """Plain HTTP (port 80) should be blocked when OutboundAllow is active.
+    """Plain HTTP (port 80) is refused when OutboundAllow is active.
 
     OutboundAllow only allows TLS connections whose SNI matches a pattern.
     Plain HTTP has no TLS/SNI, so it must be blocked even for allowed domains.
@@ -452,142 +348,27 @@ try:
     with urllib.request.urlopen("http://cp.cloudflare.com/", timeout={NET_OP_TIMEOUT_S}) as r:
         print(f"STATUS:{{r.status}}")
 except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
+    print(f"BLOCKED:{{type(getattr(e, 'reason', e)).__name__}}")
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # Allowed, but only on TLS
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # Allowed, but only on TLS
+        ),
+        code,
     )
 
-    assert "BLOCKED:" in result.stdout, (
-        f"Expected plain HTTP to be blocked by OutboundAllow.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-
-
-async def test_outbound_filtering_dns_blocked_for_non_allowed(
-    scheduler: Scheduler,
-) -> None:
-    """DNS resolution is blocked for non-allowed domains.
-
-    OutboundAllow filters at both DNS and TLS levels — blocked domains
-    fail to resolve (gaierror), not just fail at TLS handshake.
-    """
-    code = (
-        PY_SAFETY
-        + """
-import socket
-try:
-    ip = socket.gethostbyname("google.com")
-    print(f"RESOLVED:{ip}")
-except socket.gaierror as e:
-    print(f"DNS_BLOCKED:{e}")
-except Exception as e:
-    print(f"OTHER_ERROR:{type(e).__name__}")
-"""
-    )
-
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # google.com NOT allowed
-    )
-
-    # DNS should be blocked for non-allowed domains
-    assert "DNS_BLOCKED:" in result.stdout or "RESOLVED:" not in result.stdout, (
-        f"Expected DNS to be blocked for non-allowed domain.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-
-
-async def test_outbound_filtering_dns_works_for_allowed(
-    scheduler: Scheduler,
-) -> None:
-    """DNS resolution works for allowed domains.
-
-    Allowed domains should resolve normally (to real IPs, not sinkholed).
-    """
-    code = (
-        PY_SAFETY
-        + """
-import socket
-try:
-    ip = socket.gethostbyname("cp.cloudflare.com")
-    print(f"RESOLVED:{ip}")
-except Exception as e:
-    print(f"DNS_FAILED:{type(e).__name__}")
-"""
-    )
-
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
-    )
-
-    # Allowed domain should resolve to a real IP
-    assert "RESOLVED:" in result.stdout, (
-        f"Expected DNS to resolve for allowed domain.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-    # Should NOT be sinkholed
-    assert "RESOLVED:0.0.0.0" not in result.stdout, (
-        f"DNS should resolve to real IP, not sinkhole.\nstdout: {result.stdout}"
-    )
-
-
-@pytest.mark.slow
-async def test_outbound_filtering_block_all_outbound(scheduler: Scheduler) -> None:
-    """BlockAllOutbound (Mode 1) should block everything including TLS.
-
-    When block_outbound=True (Mode 1: port-forward only), no guest-initiated
-    connections should succeed, even if allowed_domains would normally match.
-    This tests Mode 1 isolation.
-
-    Slow under TCG: VM boot + Python SSL handshake attempt (5s socket timeout)
-    can exceed the 30s default execution timeout on CI runners without HVF.
-    """
-    code = (
-        PY_SAFETY
-        + f"""
-import socket, ssl
-try:
-    ctx = ssl.create_default_context()
-    with socket.create_connection(("cp.cloudflare.com", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="cp.cloudflare.com") as ssock:
-            print("CONNECTED")
-except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
-"""
-    )
-
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        # Mode 1: has expose_ports but no allow_network — wait, this tests
-        # via scheduler.run which doesn't expose Mode 1 directly.
-        # Instead, we test with empty allowlist + block semantics:
-        # allowed_domains=[] means no OutboundAllow patterns = all outbound blocked
-        # when combined with the VM manager's Mode 1 detection
-        allowed_domains=[],  # No domains allowed = no patterns passed
-    )
-
-    # With empty allowlist and allow_network=True, gvproxy has no -outbound-allow
-    # flag, so it falls through to default behavior (no filtering).
-    # This is correct: [] means "don't filter" (let everything through).
-    # True Mode 1 blocking requires expose_ports + !allow_network, which the
-    # scheduler handles at a higher level.
-    assert "CONNECTED" in result.stdout or "BLOCKED:" in result.stdout, (
-        f"Unexpected result.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.stdout == "BLOCKED:ConnectionRefusedError\n", (
+        f"Expected plain HTTP to be refused by OutboundAllow.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 
 async def test_outbound_filtering_raw_tcp_blocked(scheduler: Scheduler) -> None:
-    """Raw TCP connections (non-TLS) to arbitrary ports should be blocked.
+    """Raw TCP connections (non-TLS) to arbitrary ports are refused.
 
     OutboundAllow only permits TLS on port 443 with matching SNI.
     Raw TCP to other ports has no SNI to match, so it must be blocked.
@@ -608,15 +389,18 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # Allowed, but only TLS
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # Allowed, but only TLS
+        ),
+        code,
     )
 
-    assert "BLOCKED:" in result.stdout, (
-        f"Expected raw TCP (non-TLS) to be blocked by OutboundAllow.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.stdout == "BLOCKED:ConnectionRefusedError\n", (
+        f"Expected raw TCP (non-TLS) to be refused by OutboundAllow.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 
@@ -627,6 +411,7 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_with_sni(
 
     The proxy caches DNS resolutions and cross-checks TLS SNI against them.
     Resolve allowed domain → get IP → TLS to that IP with matching SNI should work.
+    The TLS handshake (certificate check included) succeeds only on a real IP of the domain, not a sinkhole.
     """
     code = (
         PY_SAFETY
@@ -644,11 +429,8 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
     )
 
     assert "RESOLVED:" in result.stdout, (
@@ -665,7 +447,7 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_no_sni(
     """DNS-resolve allowed domain, then raw TCP to the IP without TLS/SNI.
 
     Even after resolving an allowed domain, a raw TCP connection (no TLS,
-    no SNI) to the resulting IP should be blocked. The proxy requires TLS
+    no SNI) to the resulting IP is refused. The proxy requires TLS
     with matching SNI on port 443.
     """
     code = (
@@ -674,7 +456,7 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_no_sni(
 import socket
 try:
     ip = socket.gethostbyname("cp.cloudflare.com")
-    print(f"RESOLVED:{{ip}}")
+    print("RESOLVED")
     # Raw TCP to resolved IP on port 80 — no TLS, no SNI
     sock = socket.create_connection((ip, 80), timeout={NET_CONNECT_TIMEOUT_S})
     sock.sendall(b"GET / HTTP/1.1\\r\\nHost: cp.cloudflare.com\\r\\n\\r\\n")
@@ -686,18 +468,12 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
     )
 
-    assert "RESOLVED:" in result.stdout, (
-        f"DNS should resolve for allowed domain.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-    assert "BLOCKED:" in result.stdout, (
-        f"Raw TCP to resolved IP (no TLS/SNI) should be blocked.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.stdout == "RESOLVED\nBLOCKED:ConnectionRefusedError\n", (
+        f"Raw TCP to resolved IP (no TLS/SNI) should be refused.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 
@@ -707,8 +483,8 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_wrong_sni(
     """DNS-resolve allowed domain, then TLS-connect to its IP with a DIFFERENT SNI.
 
     SNI spoofing attempt: resolve cp.cloudflare.com → IP, then connect to that IP
-    but claim to be pypi.org in the TLS SNI. The proxy cross-checks SNI
-    against DNS — pypi.org doesn't resolve to cp.cloudflare.com's IP, so it's blocked.
+    but claim to be pypi.org in the TLS SNI. pypi.org is not in the allowlist, so the
+    TLS filter closes the connection (SSLEOFError).
     """
     code = (
         PY_SAFETY
@@ -716,7 +492,7 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_wrong_sni(
 import socket, ssl
 try:
     ip = socket.gethostbyname("cp.cloudflare.com")
-    print(f"RESOLVED:{{ip}}")
+    print("RESOLVED")
     ctx = ssl.create_default_context()
     # Connect to cp.cloudflare.com's IP but set SNI to pypi.org (not allowed domain)
     with socket.create_connection((ip, 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
@@ -727,14 +503,17 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # pypi.org NOT in allowlist
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # pypi.org NOT in allowlist
+        ),
+        code,
     )
 
-    assert "BLOCKED:" in result.stdout, (
+    assert result.stdout == f"RESOLVED\n{TLS_BLOCKED}\n", (
         f"TLS with mismatched SNI (pypi.org) to cp.cloudflare.com IP should be blocked.\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
@@ -748,7 +527,7 @@ async def test_outbound_filtering_sni_spoof_allowed_domain_wrong_ip(
     The proxy's DNS cross-check should catch this: the SNI says "cp.cloudflare.com"
     but the destination IP (8.8.8.8) doesn't match cp.cloudflare.com's DNS records.
     (8.8.8.8 — a non-Cloudflare anycast IP — so the SNI's provider can never
-    legitimately serve it.)
+    legitimately serve it.) The TLS filter closes the connection (SSLEOFError).
     """
     code = (
         PY_SAFETY
@@ -765,14 +544,11 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
     )
 
-    assert "BLOCKED:" in result.stdout, (
+    assert result.stdout == f"{TLS_BLOCKED}\n", (
         f"SNI spoofing (allowed domain to wrong IP) should be blocked.\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
@@ -787,134 +563,10 @@ async def test_outbound_filtering_many_domains(scheduler: Scheduler) -> None:
     many_domains = [f"domain{i}.com" for i in range(50)]
     many_domains.append("cp.cloudflare.com")  # Add a real one
 
-    code = (
-        PY_SAFETY
-        + f"""
-import socket, ssl
-try:
-    ctx = ssl.create_default_context()
-    with socket.create_connection(("cp.cloudflare.com", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="cp.cloudflare.com") as ssock:
-            print("CONNECTED")
-except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
-"""
+    result = await run_once(
+        scheduler,
+        VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=many_domains),
+        get_connection_test_code("cp.cloudflare.com", retries=True),
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=many_domains,
-    )
-
-    assert "CONNECTED" in result.stdout, f"Large allowlist failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-
-
-async def test_outbound_filtering_unicode_domain(scheduler: Scheduler) -> None:
-    """Test with internationalized domain name (IDN in punycode)."""
-    code = (
-        PY_SAFETY
-        + f"""
-import socket, ssl
-try:
-    ctx = ssl.create_default_context()
-    with socket.create_connection(("xn--nxasmq5b.com", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="xn--nxasmq5b.com") as ssock:
-            print("CONNECTED")
-except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
-"""
-    )
-
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["xn--nxasmq5b.com"],
-    )
-
-    # Should either connect or be blocked, not crash
-    assert "CONNECTED" in result.stdout or "BLOCKED:" in result.stdout, (
-        f"IDN domain handling failed unexpectedly.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-
-
-async def test_outbound_filtering_special_tld(scheduler: Scheduler) -> None:
-    """Test with special TLDs (.local) — should fail since not in allowlist."""
-    code = (
-        PY_SAFETY
-        + f"""
-import socket, ssl
-try:
-    ctx = ssl.create_default_context()
-    with socket.create_connection(("test.local", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="test.local") as ssock:
-            print("CONNECTED")
-except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
-"""
-    )
-
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # .local not in allowlist
-    )
-
-    # .local should be blocked (not in allowlist, and doesn't resolve via DNS)
-    assert "BLOCKED:" in result.stdout, (
-        f"Expected .local to be blocked.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-
-
-async def test_outbound_filtering_single_domain_only(scheduler: Scheduler) -> None:
-    """Single domain allowlist: allowed domain works, everything else blocked."""
-    # First: allowed domain connects
-    code_allowed = (
-        PY_SAFETY
-        + f"""
-import socket, ssl
-try:
-    ctx = ssl.create_default_context()
-    with socket.create_connection(("cp.cloudflare.com", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="cp.cloudflare.com") as ssock:
-            print("CONNECTED")
-except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
-"""
-    )
-    result = await scheduler.run(
-        code=code_allowed,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
-    )
-    assert "CONNECTED" in result.stdout, (
-        f"Allowed domain should connect.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-
-    # Second: blocked domain in same config
-    code_blocked = (
-        PY_SAFETY
-        + f"""
-import socket, ssl
-try:
-    ctx = ssl.create_default_context()
-    with socket.create_connection(("pypi.org", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="pypi.org") as ssock:
-            print("CONNECTED")
-except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
-"""
-    )
-    result = await scheduler.run(
-        code=code_blocked,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # pypi.org NOT allowed
-    )
-    assert "BLOCKED:" in result.stdout, (
-        f"pypi.org should be blocked when only cp.cloudflare.com allowed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
+    assert result.stdout == "CONNECTED\n", f"Large allowlist failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"

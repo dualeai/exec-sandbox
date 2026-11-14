@@ -1,31 +1,35 @@
-"""Integration tests for memory optimization features (balloon + zram).
+"""Integration tests for memory optimization features (zram).
 
-These tests verify that virtio-balloon and zram compression work correctly
+These tests verify that zram compression works correctly
 in real QEMU VMs.
 
 Run with: uv run pytest tests/test_memory_optimization.py -v
 """
 
 import asyncio
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
-from exec_sandbox import Scheduler, SchedulerConfig
-from exec_sandbox.warm_vm_pool import Language
+from exec_sandbox import Scheduler, SchedulerConfig, constants
+from exec_sandbox.models import Language
+from exec_sandbox.vm_spec import VmSpec
 
 if TYPE_CHECKING:
     from exec_sandbox.models import ExecutionResult
     from exec_sandbox.vm_manager import VmManager
 
-from .conftest import skip_unless_fast_balloon, skip_unless_hwaccel, skip_unless_macos_arm64
+from tests.conftest import run_once, run_timed
+
+from .conftest import skip_unless_fast_virt, skip_unless_hwaccel, skip_unless_macos_arm64
 
 # Memory-intensive tests that push VMs to near-maximum utilization (250MB in 256MB VM)
-# require fast balloon/memory operations. On x64 CI runners with nested virtualization
+# require fast memory operations. On x64 CI runners with nested virtualization
 # (GitHub Actions on Azure), these operations are 50-100x slower due to missing
 # TSC_DEADLINE timer support, causing timeouts and VM crashes. These tests are skipped
-# on degraded environments via skip_unless_fast_balloon and run on:
+# on degraded environments via skip_unless_fast_virt and run on:
 # - ARM64 Linux (native KVM, no nested virt penalty)
 # - macOS (HVF, no nested virt)
 # - Local development with native KVM/HVF
@@ -45,12 +49,18 @@ class TestZramConfiguration:
     ) -> None:
         """A cold 192 MiB VM exposes the required effective zram geometry."""
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=192, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="zram-config-192mb",
-            memory_mb=192,
-            allow_network=False,
-            allowed_domains=None,
+            cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
         try:
             result = await vm.execute(
@@ -108,67 +118,43 @@ assert swap_size_kib == expected_swap_size_kib, (
 print('PASS: effective zram geometry')
 """,
                 timeout_seconds=execute_timeout,
+                env_vars=None,
+                on_stdout=None,
+                on_stderr=None,
             )
             assert result.exit_code == 0, result.stderr
-            assert "PASS: effective zram geometry" in result.stdout
+            assert result.stdout == "PASS: effective zram geometry\n"
         finally:
             await vm_manager.destroy_vm(vm)
 
     async def test_compression_actually_compresses(self, scheduler: Scheduler) -> None:
-        """zram should achieve real compression on compressible data."""
-        result = await scheduler.run(
-            code="""
-import gc
-gc.collect()
+        """zram compresses what goes to swap: 130 % of MemAvailable, in 10 MiB chunks of a repeated
+        256-byte sequence, swaps out, and lz4 stores it at least 2x smaller.
 
-def get_zram_stats():
-    '''Get orig_data_size and compr_data_size from mm_stat.'''
-    with open('/sys/block/zram0/mm_stat') as f:
-        parts = f.read().strip().split()
-        # mm_stat format: orig_data_size compr_data_size mem_used_total ...
-        return int(parts[0]), int(parts[1])
+        Not one byte repeated: zram keeps a page of one repeated word without compression (same_pages),
+        and compr_data_size would not grow."""
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            """
+def zram():
+    with open('/sys/block/zram0/mm_stat') as f:  # orig_data_size compr_data_size ...
+        orig, compr = (int(v) for v in f.read().split()[:2])
+    return orig, compr
 
-initial_orig, initial_compr = get_zram_stats()
-print(f'Initial: orig={initial_orig}, compr={initial_compr}')
-
-# Allocate compressible data (repetitive pattern compresses well)
-# 120MB exceeds available RAM but fits within zram capacity thanks to compression.
-# (zram mem_limit is 20% of RAM; repetitive patterns compress >10x with lz4.)
-chunks = []
-for i in range(12):  # 120MB of compressible data
-    chunk = bytearray(10 * 1024 * 1024)
-    # Fill with repetitive pattern (highly compressible)
-    pattern = bytes([i % 256] * 4096)
-    for j in range(0, len(chunk), 4096):
-        chunk[j:j+4096] = pattern
-    chunks.append(chunk)
-
-# Force some to swap by accessing in reverse order
-for chunk in reversed(chunks):
-    _ = chunk[0]
-
-final_orig, final_compr = get_zram_stats()
-print(f'Final: orig={final_orig}, compr={final_compr}')
-
-# If data was swapped, compression should be significant
-if final_orig > initial_orig:
-    data_swapped = final_orig - initial_orig
-    data_compressed = final_compr - initial_compr
-    if data_compressed > 0:
-        ratio = data_swapped / data_compressed
-        print(f'Compression ratio: {ratio:.2f}x')
-        # lz4 should achieve at least 2x on repetitive data
-        assert ratio >= 1.5, f'Compression ratio {ratio:.2f}x too low'
-        print(f'PASS: Compression ratio {ratio:.2f}x')
-    else:
-        print('PASS: No compression needed (data fit in RAM)')
-else:
-    print('PASS: No swap used (data fit in RAM)')
+with open('/proc/meminfo') as f:
+    available_mb = next(int(line.split()[1]) for line in f if line.startswith('MemAvailable:')) // 1024
+before = zram()
+page = bytearray(range(256)) * 16
+chunks = [page * 2560 for _ in range(available_mb * 13 // 100)]  # 10 MiB each
+after = zram()
+print(after[0] - before[0], after[1] - before[1])
 """,
-            language=Language.PYTHON,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
+        swapped, compressed = (int(v) for v in result.stdout.split())
+        assert swapped >= 10 * 1024 * 1024, result.stdout  # the data went over RAM
+        assert 0 < compressed <= swapped / 2, result.stdout
 
 
 class TestZramMemoryExpansion:
@@ -176,8 +162,10 @@ class TestZramMemoryExpansion:
 
     async def test_allocate_well_beyond_physical_ram(self, scheduler: Scheduler) -> None:
         """VM should allocate well beyond available RAM using zram."""
-        result = await scheduler.run(
-            code="""
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            """
 import gc
 gc.collect()
 
@@ -216,16 +204,19 @@ except MemoryError:
     print(f'FAIL: MemoryError after {allocated}MB')
     raise
 """,
-            language=Language.PYTHON,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
-        assert "exceeded available by" in result.stdout
+        assert re.fullmatch(
+            r"Available memory: \d+MB\nTarget allocation: \d+MB\nPASS: Allocated \d+MB, exceeded available by \d+MB\n",
+            result.stdout,
+        ), result.stdout
 
     async def test_memory_survives_repeated_cycles(self, scheduler: Scheduler) -> None:
         """Memory allocation should work reliably across multiple cycles."""
-        result = await scheduler.run(
-            code="""
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            """
 import gc
 
 def allocate_and_verify(size_mb, pattern_byte):
@@ -259,10 +250,16 @@ for cycle in range(3):
 
 print('PASS: All 3 allocation cycles completed without corruption')
 """,
-            language=Language.PYTHON,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS: All 3 allocation cycles" in result.stdout
+        assert (
+            result.stdout
+            == "".join(
+                f"Cycle {cycle}: Allocating 150MB with pattern {cycle * 42}\nCycle {cycle}: PASS\n"
+                for cycle in (1, 2, 3)
+            )
+            + "PASS: All 3 allocation cycles completed without corruption\n"
+        )
 
 
 # ============================================================================
@@ -280,6 +277,8 @@ while True:
 """
 
 
+# slow: not for its time (about 1 s) but to run alone (-n 0): its memory pressure slows the VMs of
+# parallel tests, and their time limits fail (a QMP stop, a sudo bound: 2 of 3 runs)
 @pytest.mark.slow
 @skip_unless_hwaccel
 class TestZramMemLimit:
@@ -315,19 +314,18 @@ class TestZramMemLimit:
         """A cold-boot execution under incompressible pressure returns 137 fast."""
         config = self._pressure_config(images_dir, tmp_path)
         async with Scheduler(config) as scheduler:
-            cold = await asyncio.wait_for(
-                scheduler.run(
-                    code=_INCOMPRESSIBLE_PRESSURE,
-                    language=Language.PYTHON,
-                    memory_mb=192,
+            cold, cold_startup, _ = await asyncio.wait_for(
+                run_timed(
+                    scheduler,
+                    VmSpec(language=Language.PYTHON, memory_mb=192),
+                    _INCOMPRESSIBLE_PRESSURE,
                     timeout_seconds=60,
                 ),
                 timeout=30,
             )
-            assert cold.exit_code == 137, cold.stderr
-            assert "WORKLOAD_STARTED" in cold.stdout
-            assert cold.warm_pool_hit is False
-            assert cold.l1_cache_hit is False
+            assert (cold.exit_code, cold.stdout) == (137, "WORKLOAD_STARTED\n"), cold.stderr
+            assert cold_startup.warm_pool_hit is False
+            assert cold_startup.l1_cache_hit is False
 
     @skip_unless_macos_arm64
     async def test_incompressible_pressure_retires_l1_restored_192mb_vm(
@@ -343,93 +341,22 @@ class TestZramMemLimit:
             # restores from L1 (no reach into private snapshot-manager state).
             restored = None
             for _ in range(10):
-                result = await asyncio.wait_for(
-                    scheduler.run(
-                        code=_INCOMPRESSIBLE_PRESSURE,
-                        language=Language.PYTHON,
-                        memory_mb=192,
+                result, startup, _ = await asyncio.wait_for(
+                    run_timed(
+                        scheduler,
+                        VmSpec(language=Language.PYTHON, memory_mb=192),
+                        _INCOMPRESSIBLE_PRESSURE,
                         timeout_seconds=60,
                     ),
                     timeout=30,
                 )
-                assert result.exit_code == 137, result.stderr
-                assert "WORKLOAD_STARTED" in result.stdout
-                assert result.warm_pool_hit is False
-                if result.l1_cache_hit:
+                assert (result.exit_code, result.stdout) == (137, "WORKLOAD_STARTED\n"), result.stderr
+                assert startup.warm_pool_hit is False
+                if startup.l1_cache_hit:
                     restored = result
                     break
                 await asyncio.sleep(1)
             assert restored is not None, "no run restored from L1 within retry budget"
-
-
-# ============================================================================
-# Balloon Tests
-# ============================================================================
-
-
-class TestBalloonDevice:
-    """Tests for virtio-balloon device in guest.
-
-    Balloon is only present on cold-boot VMs (anonymous memory).  Template-restored
-    VMs (L1 cache hit) use file-backed COW memory which is incompatible with balloon.
-    """
-
-    async def test_balloon_device_and_driver(self, scheduler: Scheduler) -> None:
-        """Balloon device should be visible with correct type (5), bound to a driver, and expose features.
-
-        On L1-restored VMs (template COW), balloon is absent by design — verify
-        that instead.
-        """
-        result = await scheduler.run(
-            code="""
-import os
-
-virtio_path = '/sys/bus/virtio/devices'
-assert os.path.exists(virtio_path), f'{virtio_path} not found'
-
-found_balloon = False
-for dev in os.listdir(virtio_path):
-    modalias_path = os.path.join(virtio_path, dev, 'modalias')
-    if os.path.exists(modalias_path):
-        with open(modalias_path) as f:
-            modalias = f.read().strip()
-            if 'd00000005' not in modalias:
-                continue
-
-        found_balloon = True
-        print(f'Found balloon device: {dev}')
-        print(f'  modalias: {modalias}')
-
-        # Driver must be bound (proves driver is working)
-        driver_path = os.path.join(virtio_path, dev, 'driver')
-        assert os.path.islink(driver_path), f'Balloon device {dev} not bound to driver'
-        driver = os.path.basename(os.readlink(driver_path))
-        print(f'  driver: {driver}')
-
-        # Check features sysfs attribute
-        features_path = os.path.join(virtio_path, dev, 'features')
-        if os.path.exists(features_path):
-            with open(features_path) as f:
-                features = f.read().strip()
-                print(f'  features: {features}')
-
-        break
-
-if found_balloon:
-    print('PASS: Balloon device visible and driver functional')
-else:
-    print('NO_BALLOON: Balloon device absent (expected for template COW VMs)')
-""",
-            language=Language.PYTHON,
-        )
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        if result.l1_cache_hit:
-            # Template-restored VM: balloon absent by design (COW file-backed memory)
-            assert "NO_BALLOON" in result.stdout
-        else:
-            # Cold-boot VM: balloon must be present
-            assert "PASS" in result.stdout
-            assert "d00000005" in result.stdout
 
 
 # ============================================================================
@@ -440,8 +367,10 @@ else:
 class TestConcurrentVMs:
     """Tests for multiple VMs running concurrently with memory features."""
 
+    # slow: not for its time (about 1 s) but to run alone (-n 0): its memory pressure slows the VMs of
+    # parallel tests, and their time limits fail (a QMP stop, a sudo bound: 2 of 3 runs)
     @pytest.mark.slow
-    @skip_unless_fast_balloon
+    @skip_unless_fast_virt
     async def test_concurrent_vms_with_heavy_memory_pressure(self, images_dir: Path) -> None:
         """Concurrent VMs should each handle 180MB allocation.
 
@@ -451,7 +380,6 @@ class TestConcurrentVMs:
         are too slow.
         """
         config = SchedulerConfig(
-            default_memory_mb=256,
             default_timeout_seconds=90,
             images_dir=images_dir,
         )
@@ -480,7 +408,7 @@ with open('/proc/swaps') as f:
 
 print(f'PASS: 180MB allocated, swap_used={swap_used}MB')
 """
-            tasks = [sched.run(code=code, language=Language.PYTHON) for _ in range(3)]
+            tasks = [run_once(sched, VmSpec(language=Language.PYTHON, memory_mb=256), code) for _ in range(3)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # All should succeed
@@ -489,4 +417,4 @@ print(f'PASS: 180MB allocated, swap_used={swap_used}MB')
                     pytest.fail(f"VM {i + 1} failed with exception: {r}")
                 result: ExecutionResult = r
                 assert result.exit_code == 0, f"VM {i + 1} exit_code={result.exit_code}, stderr={result.stderr}"
-                assert "PASS" in result.stdout, f"VM {i + 1} output: {result.stdout}"
+                assert re.fullmatch(r"PASS: 180MB allocated, swap_used=\d+MB\n", result.stdout), result.stdout

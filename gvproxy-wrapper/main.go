@@ -3,15 +3,23 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/containers/gvisor-tap-vsock/pkg/virtualnetwork"
+)
+
+// Pauses between two failed Accept calls: the first, and the most after doubling.
+const (
+	acceptRetryFirst = 5 * time.Millisecond
+	acceptRetryMax   = time.Second
 )
 
 var (
@@ -19,14 +27,14 @@ var (
 	outboundAllow = flag.String("outbound-allow", "", "OutboundAllow JSON: list of regex patterns for allowed outbound domains (DNS + TLS filtering)")
 	portForward   = flag.String("port-forward", "", "Port forwards JSON: {\"local\": \"remote\"} e.g. {\"127.0.0.1:8080\": \"192.168.127.2:8080\"}")
 	blockOutbound = flag.Bool("block-outbound", false, "Block all guest-initiated outbound connections (Mode 1: port-forward only)")
-	debug         = flag.Bool("debug", false, "Enable debug logging")
 )
 
 func main() {
 	flag.Parse()
 
-	// Configure logger to write to stdout (info messages)
-	// Errors still go to stderr via log.Fatal
+	// All output of the standard logger goes to stdout, log.Fatal too. The host
+	// (src/exec_sandbox/gvproxy.py) reads stdout for the ready line. Only
+	// gvisor-tap-vsock (logrus) and Go runtime crashes write to stderr.
 	log.SetOutput(os.Stdout)
 
 	if *listenFD < 0 {
@@ -42,7 +50,8 @@ func main() {
 	}
 
 	// Parse port forwards from JSON
-	// Format: {"local_addr:port": "remote_addr:port", ...}
+	// Format: {"local_addr:port": "remote_addr:port", ...}; a UDP forward's key
+	// starts with "udp:" (a key without it is TCP)
 	// Example: {"127.0.0.1:8080": "192.168.127.2:8080"}
 	var forwards map[string]string
 	if *portForward != "" {
@@ -53,7 +62,6 @@ func main() {
 
 	// Build configuration
 	config := types.Configuration{
-		Debug:             *debug,
 		MTU:               1500,
 		Subnet:            "192.168.127.0/24",
 		GatewayIP:         "192.168.127.1",
@@ -62,11 +70,6 @@ func main() {
 		Forwards:          forwards,       // Port forwarding: host -> guest
 		BlockAllOutbound:  *blockOutbound, // Block guest-initiated outbound (Mode 1)
 		OutboundAllow:     allowPatterns,  // Outbound filtering: DNS + TLS (Mode 2)
-	}
-
-	if *debug {
-		configJSON, _ := json.MarshalIndent(config, "", "  ")
-		log.Printf("Starting gvproxy-wrapper with configuration:\n%s", string(configJSON))
 	}
 
 	// Create virtual network
@@ -78,20 +81,21 @@ func main() {
 		log.Fatalf("Error creating virtual network: %v", err)
 	}
 
-	// Create listener from pre-bound FD (socket activation pattern)
-	// Parent process creates and binds the socket, then passes FD to us
-	// This eliminates polling latency - socket is already bound and listening
+	// Create the listener from the pre-bound FD (socket activation pattern).
+	// The parent process creates, binds and listens on the socket, then passes
+	// the FD, so the socket is ready before this process starts: no polling.
 	file := os.NewFile(uintptr(*listenFD), "socket")
 	if file == nil {
 		log.Fatalf("Error: invalid file descriptor %d", *listenFD)
 	}
 	listener, err := net.FileListener(file)
-	file.Close() // Close Go's file wrapper, FD ownership transferred to listener
+	file.Close() // FileListener uses a dup of the FD: close the original
 	if err != nil {
 		log.Fatalf("Error creating listener from FD %d: %v", *listenFD, err)
 	}
 	defer listener.Close()
 
+	// The host waits for "Listening on QEMU socket" on stdout: keep the text.
 	log.Printf("Listening on QEMU socket: (pre-bound FD %d)", *listenFD)
 	if *blockOutbound {
 		log.Printf("Outbound blocking enabled (Mode 1: port-forward only, no internet)")
@@ -116,26 +120,35 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Accept QEMU connection
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				log.Printf("Error accepting connection: %v", err)
-				continue
-			}
-		}
-
+	acceptLoop(listener, time.Sleep, func(conn net.Conn) {
+		// The host reads "QEMU connected from" on stdout: keep the text.
 		log.Printf("QEMU connected from: %s", conn.RemoteAddr())
-
-		// Handle connection in virtualnetwork
 		go func() {
 			if err := vn.AcceptQemu(ctx, conn); err != nil {
 				log.Printf("Error handling QEMU connection: %v", err)
 			}
 		}()
+	})
+}
+
+// acceptLoop hands each connection of listener to handle until the listener
+// closes (the shutdown handler closes it). A failing Accept (EMFILE, ENFILE) is
+// retried after a pause (sleep) that doubles from acceptRetryFirst to
+// acceptRetryMax, never in a busy loop; an accepted connection resets the pause.
+func acceptLoop(listener net.Listener, sleep func(time.Duration), handle func(net.Conn)) {
+	delay := acceptRetryFirst
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("Error accepting connection: %v (retry in %v)", err, delay)
+			sleep(delay)
+			delay = min(delay*2, acceptRetryMax)
+			continue
+		}
+		delay = acceptRetryFirst
+		handle(conn)
 	}
 }

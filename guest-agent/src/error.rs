@@ -2,8 +2,8 @@
 
 use tokio::sync::mpsc;
 
-use crate::constants::VERSION;
-use crate::types::{GuestResponse, Language};
+use crate::constants::KILL_WAIT;
+use crate::types::GuestResponse;
 
 // ============================================================================
 // ErrorType — domain-specific error classification
@@ -11,9 +11,9 @@ use crate::types::{GuestResponse, Language};
 
 /// Domain-specific error types sent to the host as the `error_type` wire field.
 ///
-/// Replaces the previous ad-hoc `&'static str` approach where `"validation_error"`
-/// was overloaded across env vars, code, paths, and packages. Each variant maps
-/// to a distinct wire string so the host can dispatch without parsing messages.
+/// Each variant maps to a distinct wire string, so the host can dispatch
+/// without parsing messages. The host enum is `GuestErrorType` in
+/// src/exec_sandbox/constants.py; keep the two in sync.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ErrorType {
     EnvVar,      // "env_var_error"
@@ -140,9 +140,8 @@ impl From<mpsc::error::SendError<Vec<u8>>> for CmdError {
 // ResponseWriter — op_id-aware response sender
 // ============================================================================
 
-/// Wraps a write channel and an optional `op_id`.  Every message sent through
-/// this writer gets `op_id` injected into its JSON (unless the message already
-/// carries one, e.g. file-transfer responses with their own `op_id`).
+/// Wraps a write channel and the optional `op_id` of a request. Every message
+/// sent through this writer gets that `op_id` in its JSON.
 pub(crate) struct ResponseWriter {
     write_tx: mpsc::Sender<Vec<u8>>,
     op_id: Option<String>,
@@ -153,17 +152,14 @@ impl ResponseWriter {
         Self { write_tx, op_id }
     }
 
-    /// Serialize `msg` to JSON, inject `op_id` (preserving any existing one),
-    /// append newline, and queue for sending.
+    /// Serialize `msg` to JSON, inject `op_id`, append newline, and queue for sending.
     pub(crate) async fn send(&self, msg: &GuestResponse) -> Result<(), CmdError> {
         let mut value = serde_json::to_value(msg).map_err(|e| CmdError::Fatal(e.into()))?;
 
-        // Inject op_id only if the message doesn't already have one
         if let Some(ref id) = self.op_id
             && let Some(obj) = value.as_object_mut()
         {
-            obj.entry("op_id")
-                .or_insert_with(|| serde_json::Value::String(id.clone()));
+            obj.insert("op_id".to_string(), serde_json::Value::String(id.clone()));
         }
 
         let mut bytes = serde_json::to_vec(&value).map_err(|e| CmdError::Fatal(e.into()))?;
@@ -181,51 +177,9 @@ impl ResponseWriter {
         self.send(&GuestResponse::Error {
             message,
             error_type: error_type.to_string(),
-            op_id: self.op_id.clone(),
-            version: Some(VERSION),
         })
         .await
     }
-}
-
-// ============================================================================
-// Response helpers (pre-parse error paths where no op_id is available)
-// ============================================================================
-
-/// Serialize a GuestResponse to JSON + newline and queue it for sending.
-///
-/// Used only for pre-parse error paths (before `op_id` is extracted from JSON).
-/// Prefer `ResponseWriter::send()` for all other cases.
-pub(crate) async fn send_response(
-    write_tx: &mpsc::Sender<Vec<u8>>,
-    msg: &GuestResponse,
-) -> Result<(), CmdError> {
-    let mut bytes = serde_json::to_vec(msg).map_err(|e| CmdError::Fatal(e.into()))?;
-    bytes.push(b'\n');
-    write_tx.send(bytes).await?;
-    Ok(())
-}
-
-/// Send an error response to the host.
-///
-/// Used only for pre-parse error paths (before `op_id` is extracted from JSON).
-/// Prefer `ResponseWriter::send_error()` for all other cases.
-pub(crate) async fn send_streaming_error(
-    write_tx: &mpsc::Sender<Vec<u8>>,
-    message: String,
-    error_type: &str,
-    op_id: Option<&str>,
-) -> Result<(), CmdError> {
-    send_response(
-        write_tx,
-        &GuestResponse::Error {
-            message,
-            error_type: error_type.to_string(),
-            op_id: op_id.map(|s| s.to_string()),
-            version: Some(VERSION),
-        },
-    )
-    .await
 }
 
 // ============================================================================
@@ -245,27 +199,22 @@ pub(crate) fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(255)
 }
 
-/// Parse a language string, returning CmdError::Reply on failure.
-pub(crate) fn parse_language(language_str: &str, context: &str) -> Result<Language, CmdError> {
-    Language::parse(language_str)
-        .ok_or_else(|| CmdError::code(format!("Unsupported language '{language_str}' ({context})")))
-}
-
 /// Gracefully terminate a process group: SIGTERM → wait → SIGKILL.
 ///
 /// Implements Kubernetes-style graceful shutdown:
 /// 1. Send SIGTERM to entire process group (allows cleanup)
-/// 2. Wait for grace period
-/// 3. If still running, send SIGKILL
+/// 2. Wait for the leader, at most the grace period
+/// 3. Send SIGKILL to the group: as when the init of a container ends, the
+///    members that outlive the leader (one that ignores SIGTERM) end with it
 pub(crate) async fn graceful_terminate_process_group(
-    child: &mut tokio::process::Child,
+    child: &mut crate::init::WaitedChild,
     grace_period_secs: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) {
     use tokio::time::{Duration, timeout};
 
     let pid = match child.id() {
         Some(id) => id as i32,
-        None => return Ok(()), // Process already exited
+        None => return, // Process already exited (its PID may be another process now)
     };
 
     // Phase 1: SIGTERM to entire process group
@@ -275,20 +224,28 @@ pub(crate) async fn graceful_terminate_process_group(
         if errno.raw_os_error() != Some(libc::ESRCH) {
             log_error!("SIGTERM to process group {pid} failed: {errno}");
         }
-        let _ = child.wait().await;
-        return Ok(());
+        let _ = wait_child_bounded(child, "a failed SIGTERM", KILL_WAIT).await;
+        return;
     }
 
-    // Phase 2: Wait for grace period
-    match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
-        Ok(Ok(_)) => return Ok(()),
-        Ok(Err(e)) => log_error!("Wait error after SIGTERM: {e}"),
-        Err(_) => log_warn!(
-            "Process {pid} didn't respond to SIGTERM within {grace_period_secs}s, sending SIGKILL"
-        ),
-    }
+    // Phase 2: Wait for the leader, at most the grace period
+    let leader_ended = match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            log_error!("Wait error after SIGTERM: {e}");
+            false
+        }
+        Err(_) => {
+            log_warn!(
+                "Process {pid} didn't respond to SIGTERM within {grace_period_secs}s, sending SIGKILL"
+            );
+            false
+        }
+    };
 
-    // Phase 3: SIGKILL
+    // Phase 3: SIGKILL to the group, also after the leader ended. The group ID
+    // stays reserved while a member lives, so the signal reaches only the
+    // group (ESRCH when no member is left).
     let kill_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
     if kill_result == -1 {
         let errno = std::io::Error::last_os_error();
@@ -297,13 +254,45 @@ pub(crate) async fn graceful_terminate_process_group(
         }
     }
 
-    let _ = child.wait().await;
-    Ok(())
+    if !leader_ended {
+        let _ = wait_child_bounded(child, "SIGKILL", KILL_WAIT).await;
+    }
+}
+
+/// Wait for `child` to exit, at most `limit` (`KILL_WAIT` in the agent).
+///
+/// For a child that got SIGKILL, or that closed both output pipes. A process
+/// in uninterruptible sleep (D state) exits only when its I/O ends, and the
+/// agent serves one command at a time: it must not wait for that. A child
+/// that is still running is reaped later (tokio's orphan queue, or the PID 1
+/// reaper).
+pub(crate) async fn wait_child_bounded(
+    child: &mut crate::init::WaitedChild,
+    after: &str,
+    limit: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let pid = child.id();
+    match tokio::time::timeout(limit, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(e)) => {
+            log_error!("Wait for process {pid:?} after {after} failed: {e}");
+            None
+        }
+        Err(_) => {
+            log_warn!("Process {pid:?} still runs {limit:?} after {after}; not waiting longer");
+            None
+        }
+    }
 }
 
 /// Spawn a task that reads lines from a child process stream, respecting a byte limit.
 ///
-/// Used by `install_packages` to capture stdout/stderr without duplication.
+/// Used by `install_packages` to collect stdout and stderr. Whole lines are
+/// kept while their total fits in `max_bytes` (a newline counts one byte); the
+/// line that crosses it is cut at a character boundary and a `[truncated: ...]`
+/// line follows. The task then reads on and drops the rest, so the child never
+/// writes into a closed pipe (EPIPE). Bytes that are not UTF-8 become U+FFFD.
+/// A line holds at most `max_bytes` in memory, however long the child makes it.
 pub(crate) fn spawn_output_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     stream: R,
     max_bytes: usize,
@@ -311,27 +300,69 @@ pub(crate) fn spawn_output_reader<R: tokio::io::AsyncRead + Unpin + Send + 'stat
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     tokio::spawn(async move {
-        let mut reader = BufReader::new(stream).lines();
+        let mut reader = BufReader::new(stream);
         let mut lines = Vec::new();
-        let mut total_bytes = 0usize;
-
-        while let Ok(Some(line)) = reader.next_line().await {
-            if total_bytes + line.len() + 1 > max_bytes {
-                let remaining = max_bytes.saturating_sub(total_bytes);
-                if remaining > 0 {
-                    lines.push(line[..remaining.min(line.len())].to_string());
+        let mut kept = 0usize; // bytes of `lines`, a newline counting one
+        let mut current: Vec<u8> = Vec::new();
+        let mut truncated = false;
+        loop {
+            let chunk = match reader.fill_buf().await {
+                Ok([]) | Err(_) => break, // end of the stream, or the child's end is gone
+                Ok(chunk) => chunk,
+            };
+            let read = chunk.len();
+            if !truncated {
+                for &byte in chunk {
+                    if byte == b'\n' {
+                        truncated = keep_line(&mut lines, &mut kept, &mut current, max_bytes);
+                        if truncated {
+                            break;
+                        }
+                    } else if current.len() <= max_bytes {
+                        current.push(byte); // past max_bytes the line is cut anyway
+                    }
                 }
-                lines.push(format!(
-                    "[truncated: output limit {}KB exceeded]",
-                    max_bytes / 1024
-                ));
-                break;
             }
-            total_bytes += line.len() + 1;
-            lines.push(line);
+            reader.consume(read);
+        }
+        if !truncated && !current.is_empty() {
+            keep_line(&mut lines, &mut kept, &mut current, max_bytes);
         }
         lines
     })
+}
+
+/// Add the line in `current` (its newline not included) to `lines`, or its
+/// part that fits in `max_bytes` and a `[truncated: ...]` line. Returns true
+/// once truncated: the caller then drops the rest of the stream.
+fn keep_line(
+    lines: &mut Vec<String>,
+    kept: &mut usize,
+    current: &mut Vec<u8>,
+    max_bytes: usize,
+) -> bool {
+    if current.last() == Some(&b'\r') {
+        current.pop();
+    }
+    let line = String::from_utf8_lossy(current).into_owned();
+    current.clear();
+    if *kept + line.len() < max_bytes {
+        *kept += line.len() + 1;
+        lines.push(line);
+        return false;
+    }
+    let mut cut = max_bytes.saturating_sub(*kept).min(line.len());
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if cut > 0 {
+        lines.push(line[..cut].to_string());
+    }
+    lines.push(format!(
+        "[truncated: output limit {}KB exceeded]",
+        max_bytes / 1024
+    ));
+    true
 }
 
 // ============================================================================
@@ -340,6 +371,88 @@ pub(crate) fn spawn_output_reader<R: tokio::io::AsyncRead + Unpin + Send + 'stat
 
 #[cfg(test)]
 mod tests {
+
+    // -------------------------------------------------------------------------
+    // spawn_output_reader
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_output_reader_keeps_whole_lines_then_marks_the_cut() {
+        // "abcdeé" is 7 bytes and its newline 1: it fills the 8-byte limit, so
+        // "xyz" goes and the truncation line follows
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let task = spawn_output_reader(rx, 8);
+        tokio::io::AsyncWriteExt::write_all(&mut tx, "abcdeé\nxyz\n".as_bytes())
+            .await
+            .unwrap();
+        drop(tx);
+        let lines = task.await.unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "abcdeé".to_string(),
+                "[truncated: output limit 0KB exceeded]".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_output_reader_cut_inside_a_char_does_not_panic() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let task = spawn_output_reader(rx, 4);
+        tokio::io::AsyncWriteExt::write_all(&mut tx, "abcé\n".as_bytes())
+            .await
+            .unwrap();
+        drop(tx);
+        let lines = task.await.unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "abc".to_string(),
+                "[truncated: output limit 0KB exceeded]".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_output_reader_drains_past_the_limit() {
+        // The child writes 64 KiB through a 1 KiB pipe after the limit: every
+        // write must succeed (a closed pipe would give the child EPIPE).
+        let (mut tx, rx) = tokio::io::duplex(1024);
+        let task = spawn_output_reader(rx, 16);
+        for _ in 0..1024 {
+            tokio::io::AsyncWriteExt::write_all(&mut tx, &[b'x'; 63])
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut tx, b"\n")
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        let lines = task.await.unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "x".repeat(16));
+    }
+
+    #[tokio::test]
+    async fn test_output_reader_keeps_reading_after_bytes_that_are_not_utf8() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let task = spawn_output_reader(rx, 1024);
+        tokio::io::AsyncWriteExt::write_all(&mut tx, b"a\xffb\r\nnext\nlast")
+            .await
+            .unwrap();
+        drop(tx);
+        let lines = task.await.unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "a\u{fffd}b".to_string(),
+                "next".to_string(),
+                "last".to_string()
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -499,28 +612,6 @@ mod tests {
         assert_eq!(format!("{err}"), "fatal: connection lost");
     }
 
-    #[test]
-    fn test_parse_language_valid() {
-        assert!(parse_language("python", "test").is_ok());
-        assert!(parse_language("javascript", "test").is_ok());
-        assert!(parse_language("raw", "test").is_ok());
-    }
-
-    #[test]
-    fn test_parse_language_invalid() {
-        let err = parse_language("cobol", "test").unwrap_err();
-        match err {
-            CmdError::Reply {
-                message,
-                error_type,
-            } => {
-                assert!(message.contains("cobol"));
-                assert_eq!(error_type, "code_error");
-            }
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
     // -------------------------------------------------------------------------
     // ResponseWriter
     // -------------------------------------------------------------------------
@@ -536,9 +627,11 @@ mod tests {
         serde_json::from_slice(json_bytes).unwrap()
     }
 
+    const PONG: GuestResponse = GuestResponse::Pong { version: "1.0" };
+
     #[tokio::test]
     async fn response_writer_inject_op_id_into_pong() {
-        let val = writer_send_json(Some("abc"), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some("abc"), &PONG).await;
         assert_eq!(val["op_id"], "abc");
         assert_eq!(val["type"], "pong");
     }
@@ -584,14 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_writer_inject_op_id_into_file_list() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::FileList {
-                path: "".into(),
-                entries: vec![],
-            },
-        )
-        .await;
+        let val = writer_send_json(Some("abc"), &GuestResponse::FileList { entries: vec![] }).await;
         assert_eq!(val["op_id"], "abc");
     }
 
@@ -600,7 +686,7 @@ mod tests {
         let val = writer_send_json(
             Some("abc"),
             &GuestResponse::WarmReplAck {
-                language: "python".into(),
+                language: crate::types::Language::Python,
                 status: "ok".into(),
                 message: None,
             },
@@ -610,80 +696,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_writer_preserve_existing_file_write_ack_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::FileWriteAck {
-                op_id: "orig".into(),
+    async fn response_writer_inject_op_id_into_file_transfer_messages() {
+        // The host matches each chunk and the end of a transfer by this op_id
+        for msg in [
+            GuestResponse::FileWriteAck {
                 path: "f.txt".into(),
                 bytes_written: 42,
             },
-        )
-        .await;
-        // Existing op_id preserved, not overwritten
-        assert_eq!(val["op_id"], "orig");
-    }
-
-    #[tokio::test]
-    async fn response_writer_preserve_existing_file_chunk_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::FileChunk {
-                op_id: "orig".into(),
+            GuestResponse::FileChunk {
                 data: "SGVsbG8=".into(),
             },
-        )
-        .await;
-        assert_eq!(val["op_id"], "orig");
-    }
-
-    #[tokio::test]
-    async fn response_writer_preserve_existing_file_read_complete_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::FileReadComplete {
-                op_id: "orig".into(),
+            GuestResponse::FileReadComplete {
                 path: "f.txt".into(),
                 size: 100,
             },
-        )
-        .await;
-        assert_eq!(val["op_id"], "orig");
-    }
-
-    #[tokio::test]
-    async fn response_writer_preserve_existing_error_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::Error {
-                message: "fail".into(),
-                error_type: "io_error".into(),
-                op_id: Some("orig".into()),
-                version: Some(VERSION),
-            },
-        )
-        .await;
-        assert_eq!(val["op_id"], "orig");
-    }
-
-    #[tokio::test]
-    async fn response_writer_inject_into_error_without_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::Error {
-                message: "fail".into(),
-                error_type: "io_error".into(),
-                op_id: None,
-                version: Some(VERSION),
-            },
-        )
-        .await;
-        assert_eq!(val["op_id"], "abc");
+        ] {
+            let val = writer_send_json(Some("abc"), &msg).await;
+            assert_eq!(val["op_id"], "abc", "{msg:?}");
+        }
     }
 
     #[tokio::test]
     async fn response_writer_no_op_id_writer_produces_no_op_id() {
-        let val = writer_send_json(None, &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(None, &PONG).await;
         assert!(val.get("op_id").is_none());
     }
 
@@ -701,27 +736,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_writer_error_of_a_request_with_no_op_id_has_none() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let writer = ResponseWriter::new(tx, None);
+        writer
+            .send_error("bad".into(), "request_error")
+            .await
+            .unwrap();
+        let bytes = rx.recv().await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({"type": "error", "message": "bad", "error_type": "request_error"})
+        );
+    }
+
+    #[tokio::test]
     async fn response_writer_special_chars_in_op_id() {
-        let val = writer_send_json(Some("a\"b\\c"), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some("a\"b\\c"), &PONG).await;
         assert_eq!(val["op_id"], "a\"b\\c");
     }
 
     #[tokio::test]
     async fn response_writer_unicode_op_id() {
-        let val = writer_send_json(Some("日本語"), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some("日本語"), &PONG).await;
         assert_eq!(val["op_id"], "日本語");
     }
 
     #[tokio::test]
     async fn response_writer_long_op_id() {
         let long_id = "x".repeat(1000);
-        let val = writer_send_json(Some(&long_id), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some(&long_id), &PONG).await;
         assert_eq!(val["op_id"].as_str().unwrap().len(), 1000);
     }
 
     #[tokio::test]
     async fn response_writer_empty_op_id() {
-        let val = writer_send_json(Some(""), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some(""), &PONG).await;
         assert_eq!(val["op_id"], "");
+    }
+
+    // -------------------------------------------------------------------------
+    // wait_child_bounded
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn wait_child_bounded_gives_up_on_a_child_that_keeps_running() {
+        let mut child = crate::init::WaitedChild::register(
+            tokio::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let start = std::time::Instant::now();
+
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_child_bounded(&mut child, "test", std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect("the wait must stop at its limit");
+
+        assert!(status.is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_terminate_ends_a_member_that_outlives_the_leader() {
+        // The leader (sh) ends at SIGTERM; its child ignores SIGTERM and holds the
+        // stdout pipe, so the pipe ends only when the group SIGKILL reaches it.
+        let mut spawned = tokio::process::Command::new("sh")
+            .args(["-c", "(trap '' TERM; echo ready; exec sleep 30) & wait"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut stdout = spawned.stdout.take().unwrap();
+        let mut child = crate::init::WaitedChild::register(spawned);
+        let mut ready = [0u8; 6];
+        tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut ready)
+            .await
+            .unwrap();
+        assert_eq!(&ready, b"ready\n"); // the member ignores SIGTERM from here
+
+        graceful_terminate_process_group(&mut child, 5).await;
+
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut rest),
+        )
+        .await;
+        assert!(
+            matches!(ended, Ok(Ok(0))),
+            "a member of the group still holds the pipe: {ended:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_child_bounded_returns_the_status_of_a_child_that_exits() {
+        let mut child = crate::init::WaitedChild::register(
+            tokio::process::Command::new("sh")
+                .args(["-c", "exit 3"])
+                .spawn()
+                .unwrap(),
+        );
+
+        let status =
+            wait_child_bounded(&mut child, "test", std::time::Duration::from_secs(2)).await;
+
+        assert_eq!(status.and_then(|s| s.code()), Some(3));
     }
 }

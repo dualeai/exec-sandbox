@@ -1,7 +1,9 @@
 //! Minimal init for QEMU microVMs
 //!
 //! Custom kernel (CONFIG_MODULES=n): all drivers are built-in.
-//! Handles devtmpfs, read-only rootfs mount, and switch_root.
+//! Mounts devtmpfs, /proc, /sys, /tmp and the rootfs (EROFS, with an optional
+//! ext4 snapshot layer), moves into the new root (busybox switch_root steps),
+//! formats and mounts the home disk on /home/user, then execs the guest agent.
 
 #[macro_use]
 mod sys;
@@ -30,22 +32,22 @@ fn mount_virtual_filesystems() {
     // (UID 1000) only needs read or getrandom() syscall.
     device::chmod_paths(0o644, &["/dev/urandom", "/dev/random"]);
 
-    // B4: /dev/shm mount deferred to guest-agent (only needed for Python multiprocessing).
-    // Guest-agent mounts it lazily before first use, saving ~2-5ms on critical path.
+    // The guest agent mounts /dev/shm in its phase-2 setup (setup_dev_shm).
+    // Only Python multiprocessing and similar code need it.
 
     // hidepid=2: hide /proc/[pid] entries for processes not owned by the
     // querying user. Prevents UID 1000 from reading /proc/1/maps (memory layout
     // leak). /proc/self is always exempted by the kernel. System-wide files
     // (/proc/meminfo, /proc/cpuinfo, /proc/net/*) are unaffected.
-    // MS_MOVE in switch_root() preserves this option (superblock not modified).
+    // MS_MOVE in enter_rootfs() preserves this option (superblock not modified).
     // Available since Linux 3.3; see proc(5).
     sys::mount("proc", "/proc", "proc", 0, "hidepid=2");
     sys::mount("sysfs", "/sys", "sysfs", 0, "");
 
     // Security: cgroupfs is intentionally NOT mounted.
     // Resource limits (memory, CPU, PIDs) are enforced on the host via cgroup v2
-    // on the QEMU process (see src/exec_sandbox/cgroup.py). The guest runs a
-    // single process (guest-agent), so internal cgroup subdivision is unnecessary.
+    // on the QEMU process (see src/exec_sandbox/cgroup.py). The guest runs one
+    // workload (the guest agent and its children), so it needs no cgroup split.
     //
     // Not mounting cgroupfs eliminates cgroup-based escape vectors:
     // - CVE-2022-0492: write release_agent for root code execution
@@ -72,14 +74,14 @@ fn mount_virtual_filesystems() {
         "tmpfs",
         "/tmp",
         "tmpfs",
-        sys::MS_NOSUID | sys::MS_NODEV,
+        libc::MS_NOSUID | libc::MS_NODEV,
         &format!(
             "size={half_mem_bytes},nr_inodes=16384,mode=1777,usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap"
         ),
     );
 }
 
-// B5: /dev/fd symlinks deferred to guest-agent phase 2.
+// The /dev/fd and /dev/std* symlinks: the guest agent makes them in phase 2.
 // Not needed for guest-agent startup or kernel boot. Required for bash
 // process substitution <() and /dev/std* portability.
 // See: https://gitlab.alpinelinux.org/alpine/aports/-/issues/1465
@@ -109,32 +111,66 @@ fn find_block_device_by_serial(target_serial: &str) -> Option<String> {
     None
 }
 
+/// Find a drive the host attached, retrying briefly (enumeration race on a
+/// loaded host): 6 checks, 10 ms apart. Built-in virtio-blk drivers probe
+/// before init, so a miss here is rare; a drive that stays missing is fatal
+/// (fail closed).
+fn require_block_device_by_serial(serial: &str) -> String {
+    let mut dev = None;
+    device::poll_backoff(&[10_000; 5], || {
+        dev = find_block_device_by_serial(serial);
+        dev.is_some()
+    });
+    let Some(dev) = dev else {
+        log_error!("drive serial={} not found", serial);
+        sys::fallback_shell();
+    };
+    dev
+}
+
+/// Format the blank snapshot drive `dev` as ext4 (no journal, no reserved
+/// blocks) with mkfs.ext4 from the EROFS rootfs mounted at /lower.
+///
+/// The tool's ELF interpreter resolves against the initramfs root (where /lib
+/// is empty), so bind-mount /dev into the rootfs and chroot into it first.
+fn mkfs_in_lower(dev: &str) -> bool {
+    let root_dev = "/lower/dev";
+    if sys::mount("/dev", root_dev, "", libc::MS_BIND, "") != 0 {
+        log_error!(
+            "bind mount /dev -> {} failed: errno={}",
+            root_dev,
+            sys::last_errno()
+        );
+        return false;
+    }
+    let root_c = CString::new("/lower").unwrap();
+    let status = unsafe {
+        std::process::Command::new("/sbin/mkfs.ext4")
+            .args(["-q", "-O", "^has_journal", "-m", "0", dev])
+            .pre_exec(move || {
+                let slash = CString::new("/").unwrap();
+                if libc::chroot(root_c.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::chdir(slash.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .status()
+    };
+    sys::umount(root_dev);
+    matches!(status, Ok(s) if s.success())
+}
+
 fn mount_rootfs() {
     // Discover drives by serial number (set in QEMU -device virtio-blk serial=).
     // "base" = EROFS rootfs, "snap" = ext4 snapshot overlay.
     // Cannot rely on /dev/vda ordering: ARM MMIO enumerates in reverse.
     let base_dev = find_block_device_by_serial("base").unwrap_or_else(|| "/dev/vda".to_string());
-    let mut snap_dev = find_block_device_by_serial("snap");
+    let snap_dev = sys::cmdline_has("init.snap=1").then(|| require_block_device_by_serial("snap"));
 
-    // Defense against device enumeration race: if host indicated a snap drive
-    // should exist (init.snap=1 on cmdline) but we didn't find it, retry a few
-    // times. Built-in virtio-blk drivers probe before init, so this is rarely
-    // needed, but provides a safety net for loaded hosts.
-    if snap_dev.is_none() && sys::cmdline_has("init.snap=1") {
-        for _ in 0..5 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            snap_dev = find_block_device_by_serial("snap");
-            if snap_dev.is_some() {
-                break;
-            }
-        }
-        if snap_dev.is_none() {
-            log_error!("init.snap=1 set but snap drive not found");
-            sys::fallback_shell();
-        }
-    }
-
-    let erofs_flags = sys::MS_RDONLY | sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV;
+    let erofs_flags = libc::MS_RDONLY | libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV;
     let need_rw = sys::cmdline_has("init.rw=1");
 
     if let Some(ref snap) = snap_dev {
@@ -143,10 +179,10 @@ fn mount_rootfs() {
         //   - Snapshot creation (init.rw=1): ext4 writable upper
         //   - Snapshot usage: ext4 read-only, overlayfs provides merged view
         //
-        // Mount hierarchy (on initramfs, before switch_root):
+        // Mount hierarchy (on initramfs, before enter_rootfs):
         //   /lower      ← EROFS base (always ro)
         //   /upper_dev  ← ext4 snapshot (rw or ro)
-        //   /mnt        ← overlayfs merge (switch_root target)
+        //   /mnt        ← overlayfs merge (enter_rootfs target)
 
         let _ = fs::create_dir("/lower");
         let _ = fs::create_dir("/upper_dev");
@@ -159,51 +195,16 @@ fn mount_rootfs() {
 
         // Mount ext4 overlay layer (rw for snapshot creation, ro for snapshot usage)
         if need_rw {
-            // Snapshot creation: format blank drive as ext4.
-            // Host creates a blank qcow2; we format here using mkfs.ext4 from
-            // the EROFS rootfs (already mounted at /lower).
-            //
-            // mkfs.ext4 is dynamically linked (Alpine musl). It can't execute
-            // directly from initramfs because the ELF interpreter resolves
-            // against the initramfs root (where /lib is empty). We bind-mount
-            // /dev into the EROFS rootfs and chroot so the linker resolves.
-            if sys::mount("/dev", "/lower/dev", "", sys::MS_BIND, "") != 0 {
-                log_error!(
-                    "bind mount /dev -> /lower/dev failed: errno={}",
-                    sys::last_errno()
-                );
+            // Snapshot creation: format the blank drive (EROFS rootfs already at /lower).
+            if !mkfs_in_lower(snap) {
+                log_error!("mkfs.ext4 {} failed", snap);
                 sys::fallback_shell();
-            }
-            let snap_for_chroot = snap.clone();
-            let mkfs_status = unsafe {
-                std::process::Command::new("/sbin/mkfs.ext4")
-                    .args(["-q", "-O", "^has_journal", "-m", "0", &snap_for_chroot])
-                    .pre_exec(|| {
-                        let lower = CString::new("/lower").unwrap();
-                        let root = CString::new("/").unwrap();
-                        if libc::chroot(lower.as_ptr()) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        if libc::chdir(root.as_ptr()) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    })
-                    .status()
-            };
-            sys::umount("/lower/dev");
-            match mkfs_status {
-                Ok(s) if s.success() => {}
-                _ => {
-                    log_error!("mkfs.ext4 {} failed", snap);
-                    sys::fallback_shell();
-                }
             }
         }
         let snap_flags = if need_rw {
-            sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV
+            libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV
         } else {
-            sys::MS_RDONLY | sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV
+            libc::MS_RDONLY | libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV
         };
         if sys::mount(snap, "/upper_dev", "ext4", snap_flags, "") != 0 {
             log_error!("mount {} (ext4) failed", snap);
@@ -215,7 +216,7 @@ fn mount_rootfs() {
             let _ = fs::create_dir_all("/upper_dev/upper");
             let _ = fs::create_dir_all("/upper_dev/work");
             let ovl_opts = "lowerdir=/lower,upperdir=/upper_dev/upper,workdir=/upper_dev/work";
-            if sys::mount("overlay", "/mnt", "overlay", sys::MS_NOATIME, ovl_opts) != 0 {
+            if sys::mount("overlay", "/mnt", "overlay", libc::MS_NOATIME, ovl_opts) != 0 {
                 log_error!("overlayfs mount failed (rw)");
                 sys::fallback_shell();
             }
@@ -227,7 +228,7 @@ fn mount_rootfs() {
                 "overlay",
                 "/mnt",
                 "overlay",
-                sys::MS_RDONLY | sys::MS_NOATIME,
+                libc::MS_RDONLY | libc::MS_NOATIME,
                 ovl_opts,
             ) != 0
             {
@@ -256,7 +257,67 @@ fn mount_rootfs() {
     let _ = fs::remove_dir_all("/dev/block");
 }
 
-fn switch_root() -> ! {
+/// Format the VM's home disk (serial=home) and mount it on /home/user.
+///
+/// Every VM has one: a raw sparse file the host attaches. tiny-init runs only
+/// at a cold boot (a restore or a load resumes saved RAM), so the disk is
+/// always blank here. Runs inside the new root (after enter_rootfs): mkfs runs
+/// from the rootfs directly, with no /dev bind mount, whose umount would wait a
+/// full RCU grace period (~12 ms at HZ=100 with rcu_normal_after_boot).
+///
+/// mkfs.ext4 options:
+/// - assume_storage_prezeroed: the sparse file reads as zeros, so mke2fs skips
+///   zeroing and ext4lazyinit never runs (~60 ms at any size).
+/// - root_owner: /home/user belongs to the sandbox user.
+/// - nodiscard: a blank disk has nothing to discard.
+/// - ^orphan_file: the mount reads 5 blocks, not 69 (the classic orphan list is
+///   journaled too; it only scales worse for many CPUs).
+/// - ^resize_inode: nothing grows a home filesystem online.
+/// - stdin and stdout on /dev/null: mke2fs probes for an old filesystem (libblkid)
+///   only on a tty. stderr stays on the console for errors.
+fn mount_home() {
+    let home = require_block_device_by_serial("home");
+    let status = std::process::Command::new("/sbin/mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-b",
+            "4096",
+            "-m",
+            "0",
+            "-O",
+            "^orphan_file,^resize_inode",
+            "-E",
+            "assume_storage_prezeroed=1,root_owner=1000:1000,nodiscard",
+            &home,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        log_error!("mkfs.ext4 {} failed", home);
+        sys::fallback_shell();
+    }
+    let flags = libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV;
+    if sys::mount(&home, "/home/user", "ext4", flags, "discard") != 0 {
+        log_error!(
+            "mount {} on /home/user failed: errno={}",
+            home,
+            sys::last_errno()
+        );
+        sys::fallback_shell();
+    }
+    // mke2fs makes lost+found as root 0700: uid 1000 could not read it, so
+    // tar, du or rm over /home/user would fail. Nothing runs fsck on this disk.
+    if let Err(e) = std::fs::remove_dir("/home/user/lost+found") {
+        log_warn!("remove /home/user/lost+found failed: {}", e);
+    }
+    // Same rule as the root drives: no raw device node after mount.
+    device::remove_device_node(&home);
+}
+
+/// Make the merged rootfs at /mnt the root: /dev, /proc, /sys and /tmp move into it.
+fn enter_rootfs() {
     // cd /mnt
     if std::env::set_current_dir("/mnt").is_err() {
         log_error!("chdir /mnt failed");
@@ -274,7 +335,7 @@ fn switch_root() -> ! {
     // 1. mount --move . / (overmount rootfs with new root)
     // 2. chroot .
     // 3. chdir /
-    // 4. exec new init
+    // 4. exec new init (exec_agent, after mount_home)
     // See: https://docs.kernel.org/filesystems/ramfs-rootfs-initramfs.html
 
     let dot = CString::new(".").unwrap();
@@ -286,7 +347,7 @@ fn switch_root() -> ! {
             dot.as_ptr(),
             root.as_ptr(),
             std::ptr::null(),
-            sys::MS_MOVE,
+            libc::MS_MOVE,
             std::ptr::null(),
         );
     }
@@ -302,7 +363,10 @@ fn switch_root() -> ! {
     unsafe {
         libc::chdir(root.as_ptr());
     }
+}
 
+/// Set up the environment and stdio, then exec the guest agent.
+fn exec_agent() -> ! {
     // Set minimal environment for guest-agent
     // SAFETY: called at startup before any threads are spawned
     unsafe {
@@ -310,7 +374,7 @@ fn switch_root() -> ! {
         std::env::set_var("HOME", "/root");
     }
 
-    // Stage 1: Ensure stdin is valid (open /dev/null if needed)
+    // Stage 1: point stdin at /dev/null (stage 3 replaces it when a console opens)
     let devnull = CString::new("/dev/null").unwrap();
     let stdin_fd = unsafe { libc::open(devnull.as_ptr(), libc::O_RDONLY) };
     if stdin_fd > 0 {
@@ -321,30 +385,21 @@ fn switch_root() -> ! {
     }
 
     // Stage 2: Verify stdout/stderr are valid, fix if needed
-    let stdout_valid = unsafe { libc::fcntl(1, libc::F_GETFD) } >= 0;
-    let stderr_valid = unsafe { libc::fcntl(2, libc::F_GETFD) } >= 0;
-
-    if !stdout_valid || !stderr_valid {
-        let mut fds_buf = [0i32; 2];
-        let mut count = 0;
-        if !stdout_valid {
-            fds_buf[count] = 1;
-            count += 1;
-        }
-        if !stderr_valid {
-            fds_buf[count] = 2;
-            count += 1;
-        }
+    let invalid: Vec<libc::c_int> = [1, 2]
+        .into_iter()
+        .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0)
+        .collect();
+    if !invalid.is_empty() {
         device::open_console(
             device::CONSOLE_DEVICES_WITH_FALLBACK,
             libc::O_WRONLY,
-            &fds_buf[..count],
+            &invalid,
         );
     }
 
-    // Stage 3: Redirect console for guest-agent
-    // Order: hvc0 (virtio-console), ttyS0 (ISA serial), ttyAMA0 (ARM PL011 UART)
-    // vm_manager uses hvc0 for x86 and ttyAMA0 for ARM64
+    // Stage 3: point stdin, stdout and stderr at the first console that opens.
+    // Order: hvc0 (virtio-console), ttyS0 (ISA serial), ttyAMA0 (ARM PL011 UART).
+    // The host (qemu_cmd.py) sets console=hvc0 on x86_64, console=ttyAMA0 on aarch64.
     device::open_console(device::CONSOLE_DEVICES, libc::O_RDWR, &[0, 1, 2]);
 
     // exec /usr/local/bin/guest-agent
@@ -361,21 +416,21 @@ fn switch_root() -> ! {
     sys::fallback_shell();
 }
 
+/// Log the time of one init step, from `from_us` to `to_us` (monotonic, in µs).
+fn log_timing(name: &str, from_us: u64, to_us: u64) {
+    let us = to_us - from_us;
+    log_info!("[timing] {}: {}.{}ms", name, us / 1000, (us % 1000) / 100);
+}
+
 fn main() {
     let t0 = sys::monotonic_us();
     mount_virtual_filesystems();
     let t1 = sys::monotonic_us();
 
-    // B5: /dev symlinks deferred to guest-agent
-
     device::redirect_to_console();
-    log_info!(
-        "[timing] mount_vfs: {}.{}ms",
-        (t1 - t0) / 1000,
-        ((t1 - t0) % 1000) / 100
-    );
+    log_timing("mount_vfs", t0, t1);
 
-    // B2: Wait for vda + virtio-ports in parallel (independent devices)
+    // Wait for vda and the virtio ports in parallel (independent devices)
     // /dev/vda always exists (first virtio-blk enumerated by kernel), though its
     // actual role (base vs snapshot) varies by architecture — mount_rootfs resolves
     // the correct mapping via serial numbers.
@@ -389,24 +444,17 @@ fn main() {
         device::setup_virtio_ports();
     }
     let t2 = sys::monotonic_us();
-    log_info!(
-        "[timing] wait_devices: {}.{}ms",
-        (t2 - t1) / 1000,
-        ((t2 - t1) % 1000) / 100
-    );
+    log_timing("wait_devices", t1, t2);
 
     mount_rootfs();
     let t3 = sys::monotonic_us();
-    log_info!(
-        "[timing] mount_rootfs: {}.{}ms",
-        (t3 - t2) / 1000,
-        ((t3 - t2) % 1000) / 100
-    );
+    log_timing("mount_rootfs", t2, t3);
+    // The mount_home time also counts enter_rootfs (five mount moves and a chroot).
+    enter_rootfs();
+    mount_home();
+    let t4 = sys::monotonic_us();
+    log_timing("mount_home", t3, t4);
 
-    log_info!(
-        "[timing] init_total: {}.{}ms",
-        (t3 - t0) / 1000,
-        ((t3 - t0) % 1000) / 100
-    );
-    switch_root();
+    log_timing("init_total", t0, t4);
+    exec_agent();
 }

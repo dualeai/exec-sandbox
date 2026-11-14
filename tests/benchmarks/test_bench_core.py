@@ -29,6 +29,8 @@ from exec_sandbox.system_probes import (
     probe_qemu_version,
     probe_unshare_support,
 )
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once, run_timed
 
 pytestmark = pytest.mark.benchmark
 
@@ -68,7 +70,7 @@ _CONFIG = SchedulerConfig(
 async def test_bench_cold_boot(language: Language) -> None:
     """Cold boot + execute — full VM lifecycle per language."""
     async with Scheduler(_CONFIG) as scheduler:
-        result = await scheduler.run(code=_HELLO_CODE[language], language=language)
+        result = await run_once(scheduler, VmSpec(language=language), _HELLO_CODE[language])
         assert result.exit_code == 0
 
 
@@ -82,11 +84,7 @@ async def test_bench_cold_boot(language: Language) -> None:
 async def test_bench_cold_boot_network(language: Language) -> None:
     """Cold boot with network enabled — measures gvproxy overhead."""
     async with Scheduler(_CONFIG) as scheduler:
-        result = await scheduler.run(
-            code=_HELLO_CODE[language],
-            language=language,
-            allow_network=True,
-        )
+        result = await run_once(scheduler, VmSpec(language=language, allow_network=True), _HELLO_CODE[language])
         assert result.exit_code == 0
 
 
@@ -108,10 +106,8 @@ async def test_bench_cold_boot_network(language: Language) -> None:
 async def test_bench_cold_boot_memory(memory_mb: int) -> None:
     """Cold boot Python at different memory sizes — measures memory scaling."""
     async with Scheduler(_CONFIG) as scheduler:
-        result = await scheduler.run(
-            code=_HELLO_CODE[Language.PYTHON],
-            language=Language.PYTHON,
-            memory_mb=memory_mb,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON, memory_mb=memory_mb), _HELLO_CODE[Language.PYTHON]
         )
         assert result.exit_code == 0
 
@@ -127,9 +123,9 @@ async def test_bench_warm_pool(language: Language) -> None:
     """Warm pool: fill 1 VM + serve one request from pool."""
     async with Scheduler(_CONFIG.model_copy(update={"warm_pool_size": 1})) as scheduler:
         await scheduler.wait_pool_ready()
-        result = await scheduler.run(code=_HELLO_CODE[language], language=language)
+        result, startup, _ports = await run_timed(scheduler, VmSpec(language=language), _HELLO_CODE[language])
         assert result.exit_code == 0
-        assert result.warm_pool_hit
+        assert startup.warm_pool_hit
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +139,7 @@ async def test_bench_warm_pool(language: Language) -> None:
 async def test_bench_session_exec(language: Language) -> None:
     """Session: 1 boot + 10 exec() calls — isolates REPL round-trip."""
     async with Scheduler(_CONFIG) as scheduler:
-        async with await scheduler.session(language=language) as session:
+        async with await scheduler.new(VmSpec(language=language)) as session:
             for _i in range(10):
                 result = await session.exec(_HELLO_CODE[language])
                 assert result.exit_code == 0
@@ -175,8 +171,7 @@ async def test_bench_probe_accel_type() -> None:
     probe_cache.reset("kvm")
     probe_cache.reset("hvf")
     probe_cache.reset("qemu_accels")
-    result = await detect_accel_type()
-    assert result is not None
+    await detect_accel_type()  # always an AccelType (TCG at worst): only its cost is measured
 
 
 async def test_bench_probe_io_uring() -> None:

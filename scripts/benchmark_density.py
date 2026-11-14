@@ -14,22 +14,22 @@ Answers: "How much host RAM does each additional VM actually cost?"
 Methodology:
   1. Measure host baseline memory (no VMs)
   2. Boot N VMs, keep them alive
-  3. Optionally execute a workload on each VM
-  4. Sample host memory at steady state
-  5. Compute per-VM marginal cost = (used_after - used_before) / N
+  3. Sample host memory at steady state (VMs idle, median of 5 samples)
+  4. Optionally execute a workload on each VM (its sample is printed only)
+  5. Compute per-VM marginal cost = (steady_used - baseline_used) / N
 
-Runs multiple "scenarios" to compare density techniques:
-  - Baseline (current config)
-  - With free page reporting (if supported)
-  - With balloon inflated (idle VMs)
+Each scenario is one (N, language) pair: --sweep gives more than one N,
+--lang more than one language.
 
-Supports both macOS (vm_stat) and Linux (/proc/meminfo, KSM, PSI).
+Host memory comes from psutil on macOS and Linux. Linux adds QEMU PSS, KSM
+and PSI; macOS adds the memory pressure level (sysctl).
 
 Usage:
-    uv run --script scripts/benchmark_density.py               # Quick: 5 VMs
-    uv run --script scripts/benchmark_density.py -n 10         # 10 VMs
-    uv run --script scripts/benchmark_density.py --workload     # Run code on each VM
-    uv run --script scripts/benchmark_density.py --lang python  # Python only
+    uv run --script scripts/benchmark_density.py                    # Quick: 5 VMs
+    uv run --script scripts/benchmark_density.py -n 10              # 10 VMs
+    uv run --script scripts/benchmark_density.py --workload         # Run code on each VM
+    uv run --script scripts/benchmark_density.py --lang python raw  # Python and Raw
+    uv run --script scripts/benchmark_density.py --sweep 5 10 20    # N=5, 10, 20
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ import asyncio
 import contextlib
 import json
 import math
+import mmap
 import os
 import statistics
 import subprocess
@@ -46,13 +47,12 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Self
 
 import psutil
 
-from exec_sandbox import Scheduler, SchedulerConfig
+from exec_sandbox import Scheduler, SchedulerConfig, VmSpec
 from exec_sandbox._logging import configure_logging
-from exec_sandbox.constants import DEFAULT_CPU_OVERCOMMIT_RATIO, DEFAULT_MEMORY_OVERCOMMIT_RATIO
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
@@ -92,8 +92,6 @@ SETTLE_SECONDS: Final[float] = 3.0
 class HostMemorySample:
     """Single host memory measurement."""
 
-    timestamp: float
-    total_mb: int
     available_mb: int
     used_mb: int  # total - available
     # QEMU-specific
@@ -104,8 +102,6 @@ class HostMemorySample:
     ksm_pages_sharing: int | None  # Pages saved by KSM
     ksm_pages_shared: int | None  # Unique pages being shared
     psi_some_avg10: float | None  # Memory pressure (some, avg10)
-    swap_used_mb: int | None
-    committed_mb: int | None  # Committed_AS from /proc/meminfo
 
 
 def _collect_qemu_metrics() -> tuple[int, int, int | None]:
@@ -121,16 +117,10 @@ def _collect_qemu_metrics() -> tuple[int, int, int | None]:
                 continue
             count += 1
             rss_bytes += proc.memory_info().rss
-            # PSS from smaps_rollup (Linux, may need root)
+            # PSS (Linux; psutil reads smaps_rollup, which may need root)
             if pss_bytes is not None:
-                try:
-                    smaps = Path(f"/proc/{proc.pid}/smaps_rollup").read_text()
-                    for line in smaps.splitlines():
-                        if line.startswith("Pss:"):
-                            pss_bytes += int(line.split()[1]) * 1024  # KB -> bytes
-                            break
-                except (OSError, ValueError):
-                    pass  # Permission denied or process exited
+                with contextlib.suppress(psutil.Error):
+                    pss_bytes += int(getattr(proc.memory_full_info(), "pss", 0))  # Linux only field
 
     rss_mb = rss_bytes // (1024 * 1024)
     pss_mb = pss_bytes // (1024 * 1024) if pss_bytes is not None else None
@@ -150,7 +140,7 @@ def _read_ksm_stats() -> tuple[int | None, int | None]:
 
 
 def _read_psi_memory() -> float | None:
-    """Read memory PSI some avg10 (Linux only)."""
+    """Memory pressure: Linux PSI "some" avg10 (%); on macOS, the pressure level as 0, 25 or 75."""
     if _HOST_OS != HostOS.LINUX:
         # macOS: try kern.memorystatus_vm_pressure_level
         try:
@@ -189,20 +179,7 @@ def sample_host_memory() -> HostMemorySample:
     ksm_sharing, ksm_shared = _read_ksm_stats()
     psi = _read_psi_memory()
 
-    swap_used_mb: int | None = None
-    committed_mb: int | None = None
-    if _HOST_OS == HostOS.LINUX:
-        swap = psutil.swap_memory()
-        swap_used_mb = swap.used // (1024 * 1024)
-        with contextlib.suppress(OSError, ValueError):
-            for line in Path("/proc/meminfo").read_text().splitlines():
-                if line.startswith("Committed_AS:"):
-                    committed_mb = int(line.split()[1]) // 1024
-                    break
-
     return HostMemorySample(
-        timestamp=time.monotonic(),
-        total_mb=total_mb,
         available_mb=avail_mb,
         used_mb=used_mb,
         qemu_count=qemu_count,
@@ -211,8 +188,6 @@ def sample_host_memory() -> HostMemorySample:
         ksm_pages_sharing=ksm_sharing,
         ksm_pages_shared=ksm_shared,
         psi_some_avg10=psi,
-        swap_used_mb=swap_used_mb,
-        committed_mb=committed_mb,
     )
 
 
@@ -222,23 +197,21 @@ def sample_host_memory() -> HostMemorySample:
 
 
 class MemorySampler:
-    """Background thread that samples host memory at fixed intervals."""
+    """Background thread that samples host memory at fixed intervals, while its `with` block runs."""
 
-    def __init__(self, interval: float = 0.5) -> None:
+    def __init__(self, *, interval: float) -> None:
         self.interval = interval
         self.samples: list[HostMemorySample] = []
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
 
-    def stop(self) -> None:
+    def __enter__(self) -> Self:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
+        self._thread.join(timeout=5)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -253,10 +226,6 @@ class MemorySampler:
     @property
     def peak_qemu_rss_mb(self) -> int:
         return max((s.qemu_rss_mb for s in self.samples), default=0)
-
-    @property
-    def peak_qemu_count(self) -> int:
-        return max((s.qemu_count for s in self.samples), default=0)
 
 
 # ============================================================================
@@ -279,7 +248,6 @@ class DensityResult:
     steady_available_mb: int
     steady_qemu_rss_mb: int
     steady_qemu_pss_mb: int | None
-    steady_qemu_count: int
     # Peak during lifetime
     peak_used_mb: int
     peak_qemu_rss_mb: int
@@ -323,11 +291,12 @@ class DensityResult:
 
         pages_sharing = extra virtual mappings pointing to shared physical pages (= savings).
         pages_shared = unique physical pages being shared (metadata cost, not savings).
-        Per kernel docs: savings = pages_sharing * page_size.
+        Per kernel docs: savings = pages_sharing * page_size (this host's page size:
+        4 KiB on x86_64, 16 or 64 KiB on some arm64 kernels).
         """
         if self.ksm_pages_sharing is None:
             return None
-        return self.ksm_pages_sharing * 4096 / (1024 * 1024)
+        return self.ksm_pages_sharing * mmap.PAGESIZE / (1024 * 1024)
 
     @property
     def estimated_max_vms(self) -> int | None:
@@ -368,14 +337,12 @@ async def measure_density(  # noqa: PLR0915
     language: Language,
     scenario: str,
     *,
-    run_workload: bool = False,
-    memory_mb: int = 192,
-    overcommit_cpu: float = DEFAULT_CPU_OVERCOMMIT_RATIO,
-    overcommit_mem: float = DEFAULT_MEMORY_OVERCOMMIT_RATIO,
+    config: SchedulerConfig,
+    run_workload: bool,
+    memory_mb: int,
 ) -> DensityResult:
     """Boot N VMs, hold them alive, measure host memory impact."""
-    images_dir = Path(__file__).parent.parent / "images" / "dist"
-    code = WORKLOAD_CODE.get(language, "echo ok")
+    code = WORKLOAD_CODE[language]
 
     # -- Baseline sample (no VMs from us) --
     await asyncio.sleep(SETTLE_SECONDS)
@@ -385,95 +352,83 @@ async def measure_density(  # noqa: PLR0915
         f"{baseline.qemu_count} existing QEMU processes"
     )
 
-    # -- Start background sampler --
-    sampler = MemorySampler(interval=0.25)
-    sampler.start()
-
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        auto_download_assets=False,
-        warm_pool_size=0,  # Cold boot everything for fair measurement
-        cpu_overcommit_ratio=overcommit_cpu,
-        memory_overcommit_ratio=overcommit_mem,
-        default_memory_mb=memory_mb,
-    )
-
     boot_latencies: list[int] = []
     exec_latencies: list[int] = []
     exec_wall_ms: int | None = None
 
-    async with Scheduler(config) as scheduler:
-        # -- Boot all VMs concurrently using session() --
-        # Use sessions to keep VMs alive for measurement
-        sessions: list[Session] = []
-        boot_errors = 0
-        boot_wall_start = time.monotonic()
-
-        async def boot_one(idx: int) -> None:
-            # Safe: asyncio is single-threaded cooperative multitasking.
-            # list.append() and += have no await between read and write.
-            nonlocal boot_errors
-            t0 = time.monotonic()
+    # -- Background sampler: runs until the Scheduler has stopped (also on an error or Ctrl-C) --
+    with MemorySampler(interval=0.25) as sampler:
+        async with Scheduler(config) as scheduler:
+            # The open sessions keep the VMs alive for the measurement; each is closed
+            # before the Scheduler stops, on every path
+            sessions: list[Session] = []
             try:
-                session = await scheduler.session(language=language, memory_mb=memory_mb)
-                sessions.append(session)
-                boot_latencies.append(round((time.monotonic() - t0) * 1000))
-            except Exception as e:
-                boot_errors += 1
-                print(f"    Warning: VM {idx} boot failed: {type(e).__name__}: {e}")
+                boot_errors = 0
+                boot_wall_start = time.monotonic()
 
-        await asyncio.gather(*[boot_one(i) for i in range(n_vms)])
-        boot_wall_ms = round((time.monotonic() - boot_wall_start) * 1000)
+                async def boot_one(idx: int) -> None:
+                    # Safe: asyncio is single-threaded cooperative multitasking.
+                    # list.append() and += have no await between read and write.
+                    nonlocal boot_errors
+                    t0 = time.monotonic()
+                    try:
+                        session = await scheduler.new(VmSpec(language=language, memory_mb=memory_mb))
+                        sessions.append(session)
+                        boot_latencies.append(round((time.monotonic() - t0) * 1000))
+                    except Exception as e:
+                        boot_errors += 1
+                        print(f"    Warning: VM {idx} boot failed: {type(e).__name__}: {e}")
 
-        if boot_errors:
-            print(f"    {boot_errors}/{n_vms} VMs failed to boot")
+                await asyncio.gather(*[boot_one(i) for i in range(n_vms)])
+                boot_wall_ms = round((time.monotonic() - boot_wall_start) * 1000)
 
-        n_booted = len(sessions)
-        print(f"    Booted {n_booted}/{n_vms} VMs in {boot_wall_ms}ms")
+                if boot_errors:
+                    print(f"    {boot_errors}/{n_vms} VMs failed to boot")
 
-        # -- Let memory settle --
-        await asyncio.sleep(SETTLE_SECONDS)
+                n_booted = len(sessions)
+                print(f"    Booted {n_booted}/{n_vms} VMs in {boot_wall_ms}ms")
 
-        # -- Steady-state sample (VMs alive, idle, median of 5) --
-        steady = await _median_sample()
-        print(
-            f"    Steady state: {steady.used_mb} MB used, {steady.available_mb} MB available, "
-            f"{steady.qemu_count} QEMU processes, RSS={steady.qemu_rss_mb} MB"
-            + (f", PSS={steady.qemu_pss_mb} MB" if steady.qemu_pss_mb is not None else "")
-        )
+                # -- Let memory settle --
+                await asyncio.sleep(SETTLE_SECONDS)
 
-        # -- Optional workload execution --
-        if run_workload and sessions:
-            print(f"    Executing workload on {n_booted} VMs...")
-            exec_wall_start = time.monotonic()
+                # -- Steady-state sample (VMs alive, idle, median of 5) --
+                steady = await _median_sample()
+                print(
+                    f"    Steady state: {steady.used_mb} MB used, {steady.available_mb} MB available, "
+                    f"{steady.qemu_count} QEMU processes, RSS={steady.qemu_rss_mb} MB"
+                    + (f", PSS={steady.qemu_pss_mb} MB" if steady.qemu_pss_mb is not None else "")
+                )
 
-            async def exec_one(sess: Session, idx: int) -> None:
-                t0 = time.monotonic()
-                try:
-                    result = await sess.exec(code=code)
-                    exec_latencies.append(round((time.monotonic() - t0) * 1000))
-                    if result.exit_code != 0:
-                        print(f"    Warning: VM {idx} exec failed: {result.stderr[:100]}")
-                except Exception as e:
-                    print(f"    Warning: VM {idx} exec error: {type(e).__name__}: {e}")
+                # -- Optional workload execution --
+                if run_workload and sessions:
+                    print(f"    Executing workload on {n_booted} VMs...")
+                    exec_wall_start = time.monotonic()
 
-            await asyncio.gather(*[exec_one(sess, i) for i, sess in enumerate(sessions)])
-            exec_wall_ms = round((time.monotonic() - exec_wall_start) * 1000)
+                    async def exec_one(sess: Session, idx: int) -> None:
+                        t0 = time.monotonic()
+                        try:
+                            result = await sess.exec(code=code)
+                            exec_latencies.append(round((time.monotonic() - t0) * 1000))
+                            if result.exit_code != 0:
+                                print(f"    Warning: VM {idx} exec failed: {result.stderr[:100]}")
+                        except Exception as e:
+                            print(f"    Warning: VM {idx} exec error: {type(e).__name__}: {e}")
 
-            # Settle after workload
-            await asyncio.sleep(SETTLE_SECONDS)
+                    await asyncio.gather(*[exec_one(sess, i) for i, sess in enumerate(sessions)])
+                    exec_wall_ms = round((time.monotonic() - exec_wall_start) * 1000)
 
-            # Post-workload sample
-            post_exec = sample_host_memory()
-            print(f"    Post-exec: {post_exec.used_mb} MB used, {post_exec.qemu_rss_mb} MB QEMU RSS")
+                    # Settle after workload
+                    await asyncio.sleep(SETTLE_SECONDS)
 
-        # -- Teardown: close all sessions --
-        print(f"    Tearing down {n_booted} VMs...")
-        for sess in sessions:
-            with contextlib.suppress(Exception):
-                await sess.close()
-
-    sampler.stop()
+                    # Post-workload sample
+                    post_exec = sample_host_memory()
+                    print(f"    Post-exec: {post_exec.used_mb} MB used, {post_exec.qemu_rss_mb} MB QEMU RSS")
+            finally:
+                # -- Teardown: close all sessions --
+                print(f"    Tearing down {len(sessions)} VMs...")
+                for sess in sessions:
+                    with contextlib.suppress(Exception):
+                        await sess.close()
 
     # Use the idle steady-state sample for the result, not the post-workload
     # final sample.  This ensures marginal_mb_per_vm always measures the idle
@@ -488,7 +443,6 @@ async def measure_density(  # noqa: PLR0915
         steady_available_mb=steady.available_mb,
         steady_qemu_rss_mb=steady.qemu_rss_mb,
         steady_qemu_pss_mb=steady.qemu_pss_mb,
-        steady_qemu_count=steady.qemu_count,
         peak_used_mb=sampler.peak_used_mb,
         peak_qemu_rss_mb=sampler.peak_qemu_rss_mb,
         boot_total_ms=boot_wall_ms,
@@ -576,7 +530,8 @@ def print_comparison(results: list[DensityResult]) -> None:
     print(header)
     print(f"  {'─' * 88}")
 
-    baseline_marginal = results[0].marginal_mb_per_vm if results else 0
+    baseline_marginal = results[0].marginal_mb_per_vm
+    same_n = len({res.n_vms for res in results}) == 1
 
     for r in results:
         pss_str = f"{r.pss_per_vm_mb:.1f}" if r.pss_per_vm_mb is not None else "-"
@@ -586,7 +541,6 @@ def print_comparison(results: list[DensityResult]) -> None:
 
         # Show cost change vs first result (negative = cheaper, positive = more expensive)
         savings = ""
-        same_n = len({res.n_vms for res in results}) == 1
         if same_n and baseline_marginal > 0 and r is not results[0]:
             pct = (r.marginal_mb_per_vm / baseline_marginal - 1) * 100
             savings = f" ({pct:+.0f}%)"
@@ -667,20 +621,6 @@ Examples:
     )
     parser.add_argument("--memory", type=int, default=192, metavar="MB", help="guest memory per VM (default: 192)")
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON summary")
-    parser.add_argument(
-        "--cpu-oc",
-        type=float,
-        default=DEFAULT_CPU_OVERCOMMIT_RATIO,
-        metavar="RATIO",
-        help=f"CPU overcommit ratio (default: {DEFAULT_CPU_OVERCOMMIT_RATIO})",
-    )
-    parser.add_argument(
-        "--mem-oc",
-        type=float,
-        default=DEFAULT_MEMORY_OVERCOMMIT_RATIO,
-        metavar="RATIO",
-        help=f"memory overcommit ratio (default: {DEFAULT_MEMORY_OVERCOMMIT_RATIO})",
-    )
     return parser.parse_args()
 
 
@@ -693,6 +633,13 @@ async def main() -> None:
     args = parse_args()
     languages = [Language(lang) for lang in args.lang]
     vm_counts = args.sweep if args.sweep else [args.n]
+    # Overcommit ratios: the library defaults, or EXEC_SANDBOX_CPU_OVERCOMMIT_RATIO and
+    # EXEC_SANDBOX_MEMORY_OVERCOMMIT_RATIO
+    config = SchedulerConfig(
+        images_dir=Path(__file__).parent.parent / "images" / "dist",
+        auto_download_assets=False,
+        warm_pool_size=0,  # No warm pool: every VM starts on request
+    )
 
     # System info
     vmem = psutil.virtual_memory()
@@ -706,7 +653,7 @@ async def main() -> None:
     print(f"  VM counts:  {vm_counts}")
     print(f"  Languages:  {', '.join(LANG_DISPLAY[lang] for lang in languages)}")
     print(f"  Memory/VM:  {args.memory} MB")
-    print(f"  Overcommit: CPU={args.cpu_oc}x, MEM={args.mem_oc}x")
+    print(f"  Overcommit: CPU={config.cpu_overcommit_ratio}x, MEM={config.memory_overcommit_ratio}x")
     print(f"  Workload:   {'yes' if args.workload else 'no'}")
 
     # Check KSM status (Linux only)
@@ -732,10 +679,9 @@ async def main() -> None:
                 n_vms=n_vms,
                 language=lang,
                 scenario=scenario,
+                config=config,
                 run_workload=args.workload,
                 memory_mb=args.memory,
-                overcommit_cpu=args.cpu_oc,
-                overcommit_mem=args.mem_oc,
             )
             all_results.append(result)
             print_result(result)

@@ -1,7 +1,7 @@
 """Tests for Unix socket peer credential authentication.
 
-Uses real Unix sockets - no mocks.
-Authentication is MANDATORY - no skip paths.
+Uses real Unix sockets. One test replaces the kernel's peer credentials of one socket: a
+server of another user needs a second account. Authentication is MANDATORY - no skip paths.
 """
 
 from __future__ import annotations
@@ -9,19 +9,22 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import struct
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import patch
 
 import pytest
 
+from exec_sandbox import socket_auth
 from exec_sandbox.exceptions import SocketAuthError
+from exec_sandbox.guest_channel import STREAM_BUFFER_LIMIT
 from exec_sandbox.socket_auth import (
     PeerCredentials,
     connect_and_verify,
     create_unix_socket,
     get_peer_credentials,
-    get_qemu_vm_uid,
     verify_socket_peer,
 )
 
@@ -37,6 +40,21 @@ _ClientHandler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Coroutin
 
 async def _close_writer(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
     """Minimal handler for Unix server sockets — close immediately."""
+    w.close()
+    await w.wait_closed()
+
+
+async def _hold_open(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+    """Server handler that sends nothing and keeps the connection until the client closes it."""
+    await r.read()
+    w.close()
+    await w.wait_closed()
+
+
+async def _echo_line(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+    """Server handler that sends back the first line it reads, then closes."""
+    w.write(await r.readline())
+    await w.drain()
     w.close()
     await w.wait_closed()
 
@@ -91,22 +109,18 @@ class TestGetPeerCredentials:
             get_peer_credentials(sock)
         sock.close()
 
-    def test_peer_credentials_dataclass(self) -> None:
-        """PeerCredentials dataclass works correctly."""
-        creds = PeerCredentials(uid=1000, gid=1000, pid=12345)
-        assert creds.uid == 1000
-        assert creds.gid == 1000
-        assert creds.pid == 12345
 
-        # Test with defaults
-        creds2 = PeerCredentials(uid=500)
-        assert creds2.uid == 500
-        assert creds2.gid is None
-        assert creds2.pid is None
+def test_macos_peer_uid_is_unsigned() -> None:
+    """uid_t is unsigned: a uid of 2^31 or more (macOS nobody is 4294967294) comes back as is,
+    not negative. Private level: no socket of this host has a peer with such a uid."""
 
-        # Test frozen (immutable)
-        with pytest.raises(AttributeError):
-            creds.uid = 2000  # type: ignore[misc]
+    class _Peer:
+        def getsockopt(self, level: int, option: int, size: int) -> bytes:
+            del level, option, size
+            return struct.pack("=IIh2x16I", 0, 4294967294, 1, *([0] * 16))
+
+    creds = socket_auth._get_peer_credentials_macos(cast("socket.socket", _Peer()))  # pyright: ignore[reportPrivateUsage]
+    assert creds.uid == 4294967294
 
 
 class TestVerifySocketPeer:
@@ -145,9 +159,9 @@ class TestVerifySocketPeer:
         with pytest.raises(SocketAuthError) as exc:
             verify_socket_peer(client, wrong_uid, str(path))
 
-        assert exc.value.expected_uid == wrong_uid
-        assert exc.value.actual_uid == os.getuid()
-        assert "socket_path" in exc.value.context
+        assert exc.value.context["expected_uid"] == wrong_uid
+        assert exc.value.context["actual_uid"] == os.getuid()
+        assert exc.value.context["socket_path"] == str(path)
 
         client.close()
         conn.close()
@@ -158,52 +172,43 @@ class TestConnectAndVerify:
     """Tests for connect_and_verify async function."""
 
     async def test_connect_with_verification(self, short_tmp_dir: Path) -> None:
-        """connect_and_verify succeeds with matching UID."""
+        """With the right uid, connect_and_verify gives streams connected to the server."""
         path = short_tmp_dir / "test.sock"
 
-        async with _unix_server(path):
-            reader, writer = await connect_and_verify(str(path), expected_uid=os.getuid(), timeout=5.0)
-            assert reader is not None
-            assert writer is not None
+        async with _unix_server(path, handler=_echo_line):
+            reader, writer = await connect_and_verify(
+                str(path), expected_uid=os.getuid(), timeout=5.0, buffer_limit=STREAM_BUFFER_LIMIT
+            )
+            writer.write(b"ping\n")
+            assert await reader.readline() == b"ping\n"
             writer.close()
             await writer.wait_closed()
 
-    async def test_connect_wrong_uid_closes_socket(self, short_tmp_dir: Path) -> None:
-        """connect_and_verify closes socket on auth failure."""
+    async def test_connect_wrong_uid_fails_at_connect_and_closes_socket(self, short_tmp_dir: Path) -> None:
+        """A wrong uid fails connect_and_verify itself, not a later read, though the server sends
+        nothing: the error names the socket path and both uids. connect_and_verify sends nothing
+        and closes the socket: the server reads end of file with no byte."""
         path = short_tmp_dir / "test.sock"
+        received: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
 
-        async def handle_client(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            await asyncio.sleep(1)
+        async def handle_client(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+            received.set_result(await r.read())
             w.close()
             await w.wait_closed()
 
         async with _unix_server(path, handler=handle_client):
             wrong_uid = os.getuid() + 1000
-            with pytest.raises(SocketAuthError):
-                await connect_and_verify(str(path), expected_uid=wrong_uid, timeout=5.0)
-
-    async def test_connect_timeout(self, short_tmp_dir: Path) -> None:
-        """connect_and_verify raises TimeoutError on connection timeout."""
-        path = short_tmp_dir / "nonexistent.sock"
-
-        with pytest.raises((asyncio.TimeoutError, OSError)):
-            await connect_and_verify(str(path), expected_uid=os.getuid(), timeout=0.1)
-
-
-class TestHelpers:
-    """Tests for helper functions."""
-
-    def test_get_qemu_vm_uid(self) -> None:
-        """get_qemu_vm_uid returns int or None."""
-        result = get_qemu_vm_uid()
-        assert result is None or isinstance(result, int)
-
-    def test_get_qemu_vm_uid_cached(self) -> None:
-        """get_qemu_vm_uid result is cached."""
-        # Call twice, should return same result
-        result1 = get_qemu_vm_uid()
-        result2 = get_qemu_vm_uid()
-        assert result1 == result2
+            with pytest.raises(SocketAuthError) as exc:
+                await connect_and_verify(
+                    str(path), expected_uid=wrong_uid, timeout=5.0, buffer_limit=STREAM_BUFFER_LIMIT
+                )
+            context = exc.value.context
+            assert (context["socket_path"], context["expected_uid"], context["actual_uid"]) == (
+                str(path),
+                wrong_uid,
+                os.getuid(),
+            )
+            assert await asyncio.wait_for(received, timeout=1.0) == b""
 
 
 class TestUnixSocketChannelIntegration:
@@ -215,17 +220,12 @@ class TestUnixSocketChannelIntegration:
 
         path = short_tmp_dir / "test.sock"
 
-        async def handle_client(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            await asyncio.sleep(0.1)
-            w.close()
-            await w.wait_closed()
-
-        async with _unix_server(path, handler=handle_client):
+        async with _unix_server(path, handler=_hold_open):
             channel = UnixSocketChannel(str(path), expected_uid=os.getuid())
             await channel.connect(timeout_seconds=5)
-            assert channel._reader is not None
-            assert channel._writer is not None
+            assert channel.is_connected()
             await channel.close()
+            assert not channel.is_connected()
 
     async def test_channel_connect_with_wrong_uid_fails(self, short_tmp_dir: Path) -> None:
         """UnixSocketChannel.connect() raises SocketAuthError with wrong expected_uid."""
@@ -233,64 +233,72 @@ class TestUnixSocketChannelIntegration:
 
         path = short_tmp_dir / "test.sock"
 
-        async def handle_client(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            await asyncio.sleep(1)
-            w.close()
-            await w.wait_closed()
-
-        async with _unix_server(path, handler=handle_client):
+        async with _unix_server(path, handler=_hold_open):
             wrong_uid = os.getuid() + 1000
             channel = UnixSocketChannel(str(path), expected_uid=wrong_uid)
 
             with pytest.raises(SocketAuthError) as exc:
                 await channel.connect(timeout_seconds=5)
 
-            assert exc.value.expected_uid == wrong_uid
-            assert exc.value.actual_uid == os.getuid()
+            assert exc.value.context["expected_uid"] == wrong_uid
+            assert exc.value.context["actual_uid"] == os.getuid()
 
 
 class TestDualPortChannelIntegration:
     """Integration tests for DualPortChannel with socket authentication."""
 
-    async def test_dual_channel_passes_expected_uid_to_both_channels(self, short_tmp_dir: Path) -> None:
-        """DualPortChannel passes expected_uid to both cmd and event channels."""
+    async def test_dual_channel_connects_both_ports(self, short_tmp_dir: Path) -> None:
+        """With the right uid, connect() opens the command port and the event port."""
         from exec_sandbox.guest_channel import DualPortChannel
 
         cmd_path = short_tmp_dir / "cmd.sock"
         event_path = short_tmp_dir / "event.sock"
+        accepted: list[str] = []
 
-        async def handle_client(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            await asyncio.sleep(0.1)
-            w.close()
-            await w.wait_closed()
+        def handler(name: str) -> _ClientHandler:
+            async def handle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+                accepted.append(name)
+                await r.read()
+                w.close()
+                await w.wait_closed()
 
-        async with _unix_server(cmd_path, handler=handle_client), _unix_server(event_path, handler=handle_client):
+            return handle
+
+        async with _unix_server(cmd_path, handler("cmd")), _unix_server(event_path, handler("event")):
             channel = DualPortChannel(str(cmd_path), str(event_path), expected_uid=os.getuid())
             await channel.connect(timeout_seconds=5)
-
-            assert channel._cmd_channel.expected_uid == os.getuid()
-            assert channel._event_channel.expected_uid == os.getuid()
-
             await channel.close()
 
-    async def test_dual_channel_fails_if_cmd_channel_auth_fails(self, short_tmp_dir: Path) -> None:
-        """DualPortChannel.connect() fails if cmd channel auth fails."""
+        assert sorted(accepted) == ["cmd", "event"]
+
+    @pytest.mark.parametrize("foreign", ["cmd", "event"])
+    async def test_a_foreign_peer_on_either_port_fails_connect(self, short_tmp_dir: Path, foreign: str) -> None:
+        """Each port is verified on its own: a server of another user on the command port, or on
+        the event port alone, fails connect(). A server of another user needs a second account:
+        the kernel's answer for that one socket is replaced (get_peer_credentials)."""
+        from exec_sandbox import socket_auth
         from exec_sandbox.guest_channel import DualPortChannel
 
-        cmd_path = short_tmp_dir / "cmd.sock"
-        event_path = short_tmp_dir / "event.sock"
+        paths = {"cmd": short_tmp_dir / "cmd.sock", "event": short_tmp_dir / "event.sock"}
+        real_credentials = socket_auth.get_peer_credentials
 
-        async def handle_client(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            await asyncio.sleep(1)
-            w.close()
-            await w.wait_closed()
+        def credentials(sock: socket.socket) -> PeerCredentials:
+            creds = real_credentials(sock)
+            if sock.getpeername() == str(paths[foreign]):
+                return PeerCredentials(uid=creds.uid + 1000, gid=creds.gid, pid=creds.pid)
+            return creds
 
-        async with _unix_server(cmd_path, handler=handle_client), _unix_server(event_path, handler=handle_client):
-            wrong_uid = os.getuid() + 1000
-            channel = DualPortChannel(str(cmd_path), str(event_path), expected_uid=wrong_uid)
-
-            with pytest.raises(SocketAuthError):
+        async with _unix_server(paths["cmd"], _hold_open), _unix_server(paths["event"], _hold_open):
+            channel = DualPortChannel(str(paths["cmd"]), str(paths["event"]), expected_uid=os.getuid())
+            with (
+                patch("exec_sandbox.socket_auth.get_peer_credentials", side_effect=credentials),
+                pytest.raises(SocketAuthError) as exc,
+            ):
                 await channel.connect(timeout_seconds=5)
+            await channel.close()
+
+        assert exc.value.context["socket_path"] == str(paths[foreign])
+        assert (exc.value.context["expected_uid"], exc.value.context["actual_uid"]) == (os.getuid(), os.getuid() + 1000)
 
 
 class TestRootAuthentication:
@@ -329,14 +337,12 @@ class TestRootAuthentication:
 
         path = short_tmp_dir / "test.sock"
 
-        async def handle_client(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            await asyncio.sleep(0.1)
-            w.close()
-            await w.wait_closed()
-
-        async with _unix_server(path, handler=handle_client):
-            reader, writer = await connect_and_verify(str(path), expected_uid=0, timeout=5.0)
-            assert reader is not None
+        async with _unix_server(path, handler=_echo_line):
+            reader, writer = await connect_and_verify(
+                str(path), expected_uid=0, timeout=5.0, buffer_limit=STREAM_BUFFER_LIMIT
+            )
+            writer.write(b"ping\n")
+            assert await reader.readline() == b"ping\n"
             writer.close()
             await writer.wait_closed()
 
@@ -358,9 +364,8 @@ class TestRootAuthentication:
             with pytest.raises(SocketAuthError) as exc:
                 verify_socket_peer(client, 0, str(path))
 
-            assert exc.value.expected_uid == 0
-            assert exc.value.actual_uid == os.getuid()
-            assert exc.value.actual_uid != 0
+            assert exc.value.context["expected_uid"] == 0
+            assert exc.value.context["actual_uid"] == os.getuid()
         finally:
             client.close()
             conn.close()
@@ -370,55 +375,6 @@ class TestRootAuthentication:
 class TestSecurityEdgeCases:
     """Security-focused edge case tests."""
 
-    async def test_both_dual_channels_are_verified(self, short_tmp_dir: Path) -> None:
-        """Both cmd and event channels must be verified, not just one."""
-        from exec_sandbox.guest_channel import DualPortChannel
-
-        cmd_path = short_tmp_dir / "cmd.sock"
-        event_path = short_tmp_dir / "event.sock"
-
-        connections_made = {"cmd": False, "event": False}
-
-        async def handle_cmd(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            connections_made["cmd"] = True
-            await asyncio.sleep(0.5)
-            w.close()
-            await w.wait_closed()
-
-        async def handle_event(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            connections_made["event"] = True
-            await asyncio.sleep(0.5)
-            w.close()
-            await w.wait_closed()
-
-        async with _unix_server(cmd_path, handler=handle_cmd), _unix_server(event_path, handler=handle_event):
-            wrong_uid = os.getuid() + 1000
-            channel = DualPortChannel(str(cmd_path), str(event_path), expected_uid=wrong_uid)
-
-            with pytest.raises(SocketAuthError):
-                await channel.connect(timeout_seconds=5)
-
-            assert connections_made["cmd"] or connections_made["event"]
-
-    async def test_auth_happens_immediately_after_connect(self, short_tmp_dir: Path) -> None:
-        """Auth check must happen immediately, not lazily on first use."""
-        path = short_tmp_dir / "test.sock"
-
-        async def handle_client(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            await asyncio.sleep(5)
-            w.close()
-            await w.wait_closed()
-
-        async with _unix_server(path, handler=handle_client):
-            wrong_uid = os.getuid() + 1000
-
-            start = asyncio.get_event_loop().time()
-            with pytest.raises(SocketAuthError):
-                await connect_and_verify(str(path), expected_uid=wrong_uid, timeout=5.0)
-            elapsed = asyncio.get_event_loop().time() - start
-
-            assert elapsed < 1.0
-
     def test_socket_auth_error_inherits_from_communication_error(self) -> None:
         """SocketAuthError should be catchable as CommunicationError."""
         from exec_sandbox.exceptions import CommunicationError
@@ -427,6 +383,7 @@ class TestSecurityEdgeCases:
             message="Test",
             expected_uid=1000,
             actual_uid=2000,
+            context=None,
         )
 
         assert isinstance(exc, CommunicationError)
@@ -454,84 +411,34 @@ class TestSecurityEdgeCases:
 class TestSocketAuthError:
     """Tests for SocketAuthError exception."""
 
-    def test_exception_attributes(self) -> None:
-        """SocketAuthError has expected attributes."""
+    def test_exception_context(self) -> None:
+        """SocketAuthError adds both uids to the caller's context."""
         exc = SocketAuthError(
             message="Test error",
             expected_uid=1000,
             actual_uid=2000,
             context={"socket_path": "/tmp/test.sock"},
         )
-        assert exc.expected_uid == 1000
-        assert exc.actual_uid == 2000
-        assert exc.context["socket_path"] == "/tmp/test.sock"
-        assert exc.context["expected_uid"] == 1000
-        assert exc.context["actual_uid"] == 2000
+        assert exc.context == {"socket_path": "/tmp/test.sock", "expected_uid": 1000, "actual_uid": 2000}
         assert str(exc) == "Test error"
 
     def test_exception_without_context(self) -> None:
-        """SocketAuthError works without context."""
+        """SocketAuthError works with no context (None)."""
         exc = SocketAuthError(
             message="Test error",
             expected_uid=1000,
             actual_uid=2000,
+            context=None,
         )
-        assert exc.expected_uid == 1000
-        assert exc.actual_uid == 2000
-        assert exc.context["expected_uid"] == 1000
-        assert exc.context["actual_uid"] == 2000
+        assert exc.context == {"expected_uid": 1000, "actual_uid": 2000}
 
 
 class TestEdgeCases:
     """Edge case and boundary tests for socket authentication."""
 
     # =========================================================================
-    # Boundary value tests
-    # =========================================================================
-
-    def test_peer_credentials_uid_zero(self) -> None:
-        """PeerCredentials handles UID 0 (root)."""
-        creds = PeerCredentials(uid=0, gid=0, pid=1)
-        assert creds.uid == 0
-        assert creds.gid == 0
-
-    def test_peer_credentials_large_uid(self) -> None:
-        """PeerCredentials handles large UID values."""
-        large_uid = 4294967295
-        creds = PeerCredentials(uid=large_uid, gid=large_uid, pid=99999)
-        assert creds.uid == large_uid
-
-    def test_verify_against_uid_zero(self, short_tmp_dir: Path) -> None:
-        """verify_socket_peer works when expecting UID 0."""
-        path = short_tmp_dir / "test.sock"
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(path))
-        server.listen(1)
-
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.connect(str(path))
-        conn, _ = server.accept()
-
-        if os.getuid() != 0:
-            with pytest.raises(SocketAuthError) as exc:
-                verify_socket_peer(client, 0, str(path))
-            assert exc.value.expected_uid == 0
-            assert exc.value.actual_uid == os.getuid()
-
-        client.close()
-        conn.close()
-        server.close()
-
-    # =========================================================================
     # Socket type edge cases
     # =========================================================================
-
-    def test_raises_for_udp_socket(self) -> None:
-        """get_peer_credentials raises SocketAuthError for UDP sockets."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        with pytest.raises(SocketAuthError):
-            get_peer_credentials(sock)
-        sock.close()
 
     def test_raises_for_unconnected_unix_socket(self) -> None:
         """get_peer_credentials raises SocketAuthError for unconnected Unix socket."""
@@ -545,59 +452,43 @@ class TestEdgeCases:
     # =========================================================================
 
     async def test_connect_to_nonexistent_socket(self, short_tmp_dir: Path) -> None:
-        """connect_and_verify raises OSError for nonexistent socket."""
+        """connect_and_verify raises FileNotFoundError for a socket path that does not exist."""
         path = short_tmp_dir / "nonexistent.sock"
 
-        with pytest.raises((OSError, asyncio.TimeoutError)):
-            await connect_and_verify(str(path), expected_uid=os.getuid(), timeout=1.0)
+        with pytest.raises(FileNotFoundError):
+            await connect_and_verify(str(path), expected_uid=os.getuid(), timeout=1.0, buffer_limit=STREAM_BUFFER_LIMIT)
 
     async def test_connect_to_regular_file_fails(self, short_tmp_dir: Path) -> None:
         """connect_and_verify fails when path is a regular file."""
         path = short_tmp_dir / "regular_file"
         path.write_text("not a socket")
 
-        with pytest.raises((OSError, ConnectionRefusedError)):
-            await connect_and_verify(str(path), expected_uid=os.getuid(), timeout=1.0)
-
-    async def test_socket_closed_by_server_during_connect(self, short_tmp_dir: Path) -> None:
-        """Handle server closing connection immediately."""
-        path = short_tmp_dir / "test.sock"
-
-        async with _unix_server(path):
-            _reader, writer = await connect_and_verify(str(path), expected_uid=os.getuid(), timeout=5.0)
-            writer.close()
-            await writer.wait_closed()
+        with pytest.raises(OSError):  # Linux: ECONNREFUSED; macOS: ENOTSOCK
+            await connect_and_verify(str(path), expected_uid=os.getuid(), timeout=1.0, buffer_limit=STREAM_BUFFER_LIMIT)
 
     # =========================================================================
     # Context and error message tests
     # =========================================================================
 
-    async def test_error_message_includes_socket_path(self, short_tmp_dir: Path) -> None:
-        """SocketAuthError includes socket path in context."""
+    def test_error_message_with_unknown_uid(self, short_tmp_dir: Path) -> None:
+        """A uid with no user database entry is named by its number in the message."""
         path = short_tmp_dir / "test.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(1)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(str(path))
+        conn, _ = server.accept()
 
-        async def handle_client(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            await asyncio.sleep(1)
-            w.close()
-            await w.wait_closed()
-
-        async with _unix_server(path, handler=handle_client):
-            wrong_uid = os.getuid() + 1000
+        try:
             with pytest.raises(SocketAuthError) as exc:
-                await connect_and_verify(str(path), expected_uid=wrong_uid, timeout=5.0)
-
-            assert exc.value.context["socket_path"] == str(path)
-            assert "expected" in str(exc.value).lower() or exc.value.expected_uid == wrong_uid
-
-    def test_error_message_with_unknown_uid(self) -> None:
-        """SocketAuthError handles UIDs without passwd entries."""
-        fake_uid = 99999999
-        exc = SocketAuthError(
-            message=f"UID mismatch: expected {fake_uid}",
-            expected_uid=fake_uid,
-            actual_uid=os.getuid(),
-        )
-        assert exc.expected_uid == fake_uid
+                verify_socket_peer(client, 99999999, str(path))
+            assert "expected 99999999 (99999999), got " in str(exc.value)
+            assert str(exc.value).endswith(f"({os.getuid()})")
+        finally:
+            client.close()
+            conn.close()
+            server.close()
 
     # =========================================================================
     # Concurrency tests
@@ -609,70 +500,32 @@ class TestEdgeCases:
 
         connection_count = 0
 
-        async def handle_client(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        async def handle_client(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
             nonlocal connection_count
             connection_count += 1
-            await asyncio.sleep(0.1)
-            w.close()
-            await w.wait_closed()
+            await _hold_open(r, w)
 
         async with _unix_server(path, handler=handle_client):
-            tasks = [connect_and_verify(str(path), expected_uid=os.getuid(), timeout=5.0) for _ in range(5)]
+            tasks = [
+                connect_and_verify(str(path), expected_uid=os.getuid(), timeout=5.0, buffer_limit=STREAM_BUFFER_LIMIT)
+                for _ in range(5)
+            ]
             results = await asyncio.gather(*tasks)
 
             assert len(results) == 5
-            for reader, writer in results:
-                assert reader is not None
+            for _reader, writer in results:
                 writer.close()
                 await writer.wait_closed()
 
-    # =========================================================================
-    # Verification timing tests
-    # =========================================================================
-
-    async def test_verification_happens_before_data_exchange(self, short_tmp_dir: Path) -> None:
-        """Verification must complete before any data is sent."""
-        path = short_tmp_dir / "test.sock"
-
-        data_received = False
-
-        async def handle_client(reader: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-            nonlocal data_received
-            try:
-                data = await asyncio.wait_for(reader.read(100), timeout=0.5)
-                if data:
-                    data_received = True
-            except TimeoutError:
-                pass
-            w.close()
-            await w.wait_closed()
-
-        async with _unix_server(path, handler=handle_client):
-            wrong_uid = os.getuid() + 1000
-            with pytest.raises(SocketAuthError):
-                await connect_and_verify(str(path), expected_uid=wrong_uid, timeout=5.0)
-
-            await asyncio.sleep(0.6)
-
-            assert not data_received
+        assert connection_count == 5
 
 
 class TestSocketActivation:
     """Integration tests for socket activation flow using real sockets."""
 
-    async def test_socket_activation_real_server(self, short_tmp_dir: Path) -> None:
-        """Pre-created listening socket accepts client connections."""
-        path = short_tmp_dir / "qmp.sock"
-        sock = create_unix_socket(str(path))
-        try:
-            _reader, writer = await asyncio.open_unix_connection(str(path))
-            writer.close()
-            await writer.wait_closed()
-        finally:
-            sock.close()
-
-    async def test_socket_activation_no_toctou(self, short_tmp_dir: Path) -> None:
-        """Pre-bound socket survives sequential connect-close-reopen cycles."""
+    async def test_pre_bound_socket_takes_connections_before_any_accept(self, short_tmp_dir: Path) -> None:
+        """create_unix_socket binds and listens: clients connect, one after the other, before
+        any process accepts (QEMU gets the socket later)."""
         path = short_tmp_dir / "qmp.sock"
         sock = create_unix_socket(str(path))
         try:
@@ -683,27 +536,16 @@ class TestSocketActivation:
         finally:
             sock.close()
 
-    async def test_socket_activation_accept_after_parent_close(self, short_tmp_dir: Path) -> None:
-        """Closing the parent socket fd prevents new connections."""
+    async def test_closed_pre_bound_socket_refuses_connections(self, short_tmp_dir: Path) -> None:
+        """When the last holder closes the socket, a connect to its path is refused."""
         path = short_tmp_dir / "qmp.sock"
         sock = create_unix_socket(str(path))
         sock.close()
-        with pytest.raises((ConnectionRefusedError, ConnectionResetError, OSError)):
+        with pytest.raises(ConnectionRefusedError):
             await asyncio.wait_for(
                 asyncio.open_unix_connection(str(path)),
                 timeout=1.0,
             )
-
-    async def test_create_unix_socket_backlog(self, short_tmp_dir: Path) -> None:
-        """create_unix_socket with custom backlog accepts connections."""
-        path = short_tmp_dir / "qmp.sock"
-        sock = create_unix_socket(str(path), backlog=1)
-        try:
-            _reader, writer = await asyncio.open_unix_connection(str(path))
-            writer.close()
-            await writer.wait_closed()
-        finally:
-            sock.close()
 
     async def test_create_unix_socket_existing_path_fails(self, short_tmp_dir: Path) -> None:
         """create_unix_socket raises OSError when path is already bound."""

@@ -21,7 +21,6 @@ from dataclasses import dataclass
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import SocketAuthError
-from exec_sandbox.permission_utils import get_qemu_vm_uid
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 logger = get_logger(__name__)
@@ -31,19 +30,8 @@ _SO_PEERCRED = 17  # Linux socket option
 _UCRED_SIZE = 12  # struct ucred: pid(i), uid(I), gid(I)
 
 # Platform constants for LOCAL_PEERCRED (macOS)
-_LOCAL_PEERCRED = 0x001  # macOS SOL_LOCAL value
+_LOCAL_PEERCRED = 0x001  # macOS LOCAL_PEERCRED option (at level SOL_LOCAL, which is 0)
 _XUCRED_SIZE = 76  # struct xucred size
-
-# Re-export SocketAuthError for convenience
-__all__ = [
-    "PeerCredentials",
-    "SocketAuthError",
-    "connect_and_verify",
-    "create_unix_socket",
-    "get_peer_credentials",
-    "get_qemu_vm_uid",
-    "verify_socket_peer",
-]
 
 
 @dataclass(frozen=True)
@@ -57,8 +45,8 @@ class PeerCredentials:
     """
 
     uid: int
-    gid: int | None = None
-    pid: int | None = None
+    gid: int | None
+    pid: int | None
 
 
 def get_peer_credentials(sock: socket.socket) -> PeerCredentials:
@@ -146,9 +134,9 @@ def _get_peer_credentials_macos(sock: socket.socket) -> PeerCredentials:
         # uint32_t cr_version (offset 0)
         # uid_t cr_uid (offset 4)
         # short cr_ngroups (offset 8)
-        # gid_t cr_groups[NGROUPS] (offset 10)
+        # gid_t cr_groups[NGROUPS] (offset 12, after 2 bytes of padding; 16 groups: 76 bytes)
         data = sock.getsockopt(0, _LOCAL_PEERCRED, _XUCRED_SIZE)  # 0 = SOL_LOCAL
-        _, uid = struct.unpack_from("Ii", data, 0)  # First field is cr_version (unused)
+        _, uid = struct.unpack_from("II", data, 0)  # cr_version (unused), cr_uid: uid_t is unsigned
         return PeerCredentials(uid=uid, gid=None, pid=None)
     except (OSError, struct.error) as e:
         raise SocketAuthError(
@@ -159,17 +147,13 @@ def _get_peer_credentials_macos(sock: socket.socket) -> PeerCredentials:
         ) from e
 
 
-def verify_socket_peer(
-    sock: socket.socket,
-    expected_uid: int,
-    socket_path: str | None = None,
-) -> None:
+def verify_socket_peer(sock: socket.socket, expected_uid: int, socket_path: str) -> None:
     """Verify socket peer is running as expected user.
 
     Args:
         sock: Connected Unix domain socket
         expected_uid: Expected UID of peer process
-        socket_path: Socket path for error context (optional)
+        socket_path: Socket path for error context
 
     Raises:
         SocketAuthError: Peer UID doesn't match expected, or credentials
@@ -204,8 +188,9 @@ def verify_socket_peer(
 async def connect_and_verify(
     path: str,
     expected_uid: int,
-    timeout: float = 5.0,
-    buffer_limit: int = 16 * 1024 * 1024,
+    timeout: float,
+    *,
+    buffer_limit: int,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """Connect to Unix socket and verify peer credentials.
 
@@ -223,7 +208,7 @@ async def connect_and_verify(
 
     Raises:
         SocketAuthError: Peer verification failed or credentials unavailable
-        asyncio.TimeoutError: Connection timed out
+        TimeoutError: Connection timed out
         OSError: Connection failed
     """
     reader, writer = await asyncio.wait_for(
@@ -252,8 +237,8 @@ async def connect_and_verify(
     return reader, writer
 
 
-def create_unix_socket(path: str, backlog: int = 128) -> socket.socket:
-    """Create and bind a Unix domain socket (socket activation pattern).
+def create_unix_socket(path: str) -> socket.socket:
+    """Create, bind and listen on a Unix domain socket, backlog 128 (socket activation pattern).
 
     Creates a listening socket that can be passed to a child process via
     file descriptor inheritance. This eliminates polling latency - the
@@ -261,7 +246,6 @@ def create_unix_socket(path: str, backlog: int = 128) -> socket.socket:
 
     Args:
         path: Unix socket path
-        backlog: Listen backlog (default 128)
 
     Returns:
         Bound and listening socket. Caller is responsible for closing it
@@ -279,7 +263,7 @@ def create_unix_socket(path: str, backlog: int = 128) -> socket.socket:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.bind(path)
-        sock.listen(backlog)
+        sock.listen(128)
         return sock
     except OSError:
         sock.close()

@@ -1,14 +1,14 @@
-# pyright: reportPrivateUsage=false
 """Integration tests for IO[bytes] buffer support in file CRUD interfaces.
 
 Tests that write_file accepts IO[bytes] (e.g. BytesIO) as content and
 read_file accepts IO[bytes] as destination, with full roundtrip integrity.
+bytes content is sent as a BytesIO: the roundtrips across chunk sizes are in
+test_file_io_integrity.py, make_executable in its TestFileIoBasicOperations.
 
 All tests require a real VM via the scheduler fixture.
 """
 
 import asyncio
-import hashlib
 import io
 import os
 import tempfile
@@ -16,12 +16,9 @@ from pathlib import Path
 
 import pytest
 
-from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-
-_CHUNK = FILE_TRANSFER_CHUNK_SIZE
-
+from exec_sandbox.vm_spec import VmSpec
 
 # =============================================================================
 # Roundtrip integrity — IO[bytes] combinations
@@ -35,65 +32,25 @@ class TestBufferRoundtrip:
     async def test_write_bytesio_read_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Write from BytesIO, read to Path — verify content match."""
         content = os.urandom(4096)
-        expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / "out.bin"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", io.BytesIO(content))
             await session.read_file("test.bin", destination=dest)
 
-        actual_hash = hashlib.sha256(dest.read_bytes()).hexdigest()
-        assert actual_hash == expected_hash
+        assert dest.read_bytes() == content
 
     async def test_write_bytes_read_bytesio(self, scheduler: Scheduler) -> None:
-        """Write from bytes, read to BytesIO — verify buf.getvalue()."""
+        """Write from bytes, read to BytesIO — verify buf.getvalue(). The caller's buffer
+        stays open after read_file (getvalue() raises on a closed BytesIO)."""
         content = os.urandom(4096)
         buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", content)
             await session.read_file("test.bin", destination=buf)
 
         assert buf.getvalue() == content
-
-    async def test_bytesio_full_roundtrip(self, scheduler: Scheduler) -> None:
-        """Write from BytesIO, read to BytesIO — full buffer roundtrip, SHA256."""
-        content = os.urandom(4096)
-        expected_hash = hashlib.sha256(content).hexdigest()
-        read_buf = io.BytesIO()
-
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.write_file("test.bin", io.BytesIO(content))
-            await session.read_file("test.bin", destination=read_buf)
-
-        actual_hash = hashlib.sha256(read_buf.getvalue()).hexdigest()
-        assert actual_hash == expected_hash
-
-    @pytest.mark.parametrize(
-        ("size", "label"),
-        [
-            (0, "0B"),
-            (1, "1B"),
-            (_CHUNK - 1, "chunk-1"),
-            (_CHUNK, "chunk"),
-            (_CHUNK + 1, "chunk+1"),
-            (1024 * 1024, "1MB"),
-        ],
-        ids=["0B", "1B", "chunk-1", "chunk", "chunk+1", "1MB"],
-    )
-    async def test_bytesio_roundtrip_sizes(self, scheduler: Scheduler, size: int, label: str) -> None:
-        """Parametrized BytesIO roundtrip across boundary sizes."""
-        content = os.urandom(size) if size > 0 else b""
-        expected_hash = hashlib.sha256(content).hexdigest()
-        read_buf = io.BytesIO()
-
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.write_file(f"size_{label}.bin", io.BytesIO(content))
-            await session.read_file(f"size_{label}.bin", destination=read_buf)
-
-        actual_hash = hashlib.sha256(read_buf.getvalue()).hexdigest()
-        assert len(read_buf.getvalue()) == size, f"[{label}] Size mismatch"
-        assert actual_hash == expected_hash, f"[{label}] SHA256 mismatch"
 
 
 # =============================================================================
@@ -112,7 +69,7 @@ class TestBufferEdgeCases:
         buf.seek(6)  # Skip "prefix"
         read_buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", buf)
             await session.read_file("test.bin", destination=read_buf)
 
@@ -124,50 +81,11 @@ class TestBufferEdgeCases:
         dest = io.BytesIO(b"old")
         dest.seek(3)  # Position at end of "old"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", content)
             await session.read_file("test.bin", destination=dest)
 
         assert dest.getvalue() == b"old" + content
-
-    async def test_empty_bytesio_write(self, scheduler: Scheduler) -> None:
-        """Empty BytesIO write creates empty file, list_files shows size=0."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.write_file("empty.bin", io.BytesIO(b""))
-            files = await session.list_files()
-            matching = [f for f in files if f.name == "empty.bin"]
-            assert len(matching) == 1
-            assert matching[0].size == 0
-
-    async def test_make_executable_via_bytesio(self, scheduler: Scheduler) -> None:
-        """Write shell script from BytesIO with make_executable, exec succeeds."""
-        script = b"#!/bin/sh\necho hello_from_bytesio"
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.write_file("run.sh", io.BytesIO(script), make_executable=True)
-            result = await session.exec(
-                "import subprocess; print(subprocess.check_output('./run.sh').decode().strip())"
-            )
-            assert "hello_from_bytesio" in result.stdout
-
-    async def test_concurrent_buffers(self, scheduler: Scheduler) -> None:
-        """asyncio.gather with multiple BytesIO writes/reads — no cross-contamination."""
-        contents = {f"file_{i}.bin": os.urandom(1024) for i in range(4)}
-
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            # Write all files
-            for name, data in contents.items():
-                await session.write_file(name, io.BytesIO(data))
-
-            # Read all files concurrently
-            bufs: dict[str, io.BytesIO] = {name: io.BytesIO() for name in contents}
-
-            async def read_one(name: str) -> None:
-                await session.read_file(name, destination=bufs[name])
-
-            await asyncio.gather(*(read_one(name) for name in contents))
-
-        for name, expected in contents.items():
-            assert bufs[name].getvalue() == expected, f"Cross-contamination in {name}"
 
     async def test_concurrent_mixed_buffer_and_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Concurrent writes (BytesIO + bytes) and reads (BytesIO + Path) — no cross-contamination."""
@@ -176,7 +94,7 @@ class TestBufferEdgeCases:
         data_c = os.urandom(2048)
         data_d = os.urandom(2048)
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Concurrent writes: 2 from BytesIO, 2 from bytes
             await asyncio.gather(
                 session.write_file("a.bin", io.BytesIO(data_a)),
@@ -214,7 +132,7 @@ class TestNonStandardStreams:
     """Tests with non-seekable and SpooledTemporaryFile streams."""
 
     async def test_non_seekable_write(self, scheduler: Scheduler) -> None:
-        """Non-seekable stream write succeeds (size validation skipped)."""
+        """A non-seekable stream (no size known before the read) writes every byte."""
         from tests.conftest import NonSeekableIO
 
         content = os.urandom(256)
@@ -222,26 +140,25 @@ class TestNonStandardStreams:
         stream = io.BufferedReader(raw)
         read_buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", stream)  # type: ignore[arg-type]
             await session.read_file("test.bin", destination=read_buf)
 
         assert read_buf.getvalue() == content
 
     async def test_spooled_temporary_file(self, scheduler: Scheduler) -> None:
-        """SpooledTemporaryFile: seekable, size-validated, roundtrip works."""
+        """A SpooledTemporaryFile (seekable, held in memory under max_size) writes every byte."""
         content = os.urandom(256)
-        spool = tempfile.SpooledTemporaryFile(max_size=1024)
-        spool.write(content)
-        spool.seek(0)
         read_buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.write_file("test.bin", spool)  # type: ignore[arg-type]
-            await session.read_file("test.bin", destination=read_buf)
+        with tempfile.SpooledTemporaryFile(max_size=1024) as spool:
+            spool.write(content)
+            spool.seek(0)
+            async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+                await session.write_file("test.bin", spool)  # type: ignore[arg-type]
+                await session.read_file("test.bin", destination=read_buf)
 
         assert read_buf.getvalue() == content
-        spool.close()
 
 
 # =============================================================================
@@ -254,20 +171,24 @@ class TestBufferErrors:
     """Error cases for IO[bytes] buffer support."""
 
     async def test_closed_bytesio_write(self, scheduler: Scheduler) -> None:
-        """Closed BytesIO write raises ValueError."""
+        """Closed BytesIO write raises InvalidInputError ARGUMENT_INVALID before any transfer: the
+        guest has no file at the path."""
+        from exec_sandbox.exceptions import ErrorCode, InvalidInputError
+
         buf = io.BytesIO(b"data")
         buf.close()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises(ValueError):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
                 await session.write_file("test.bin", buf)
+            assert "test.bin" not in {f.name for f in await session.list_files()}
 
     async def test_path_traversal_bytesio(self, scheduler: Scheduler) -> None:
-        """Path traversal with BytesIO content raises VmPermanentError."""
-        from exec_sandbox.exceptions import VmPermanentError
+        """Path traversal with BytesIO content raises InvalidInputError PATH_INVALID."""
+        from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises(VmPermanentError):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
                 await session.write_file("../escape.txt", io.BytesIO(b"x"))
 
 
@@ -284,21 +205,9 @@ class TestBufferOwnership:
         """After write_file, caller's BytesIO is still usable."""
         buf = io.BytesIO(b"hello")
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", buf)
 
         # Buffer should still be open and readable
         buf.seek(0)
         assert buf.read() == b"hello"
-
-    async def test_read_does_not_close_caller_buffer(self, scheduler: Scheduler) -> None:
-        """After read_file, caller's BytesIO is still usable."""
-        dest = io.BytesIO()
-
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.write_file("test.bin", b"hello")
-            await session.read_file("test.bin", destination=dest)
-
-        # Buffer should still be open and readable
-        dest.seek(0)
-        assert dest.read() == b"hello"

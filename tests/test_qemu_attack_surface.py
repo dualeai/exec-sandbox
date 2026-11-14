@@ -25,25 +25,32 @@ CVE references:
 Principle: No unnecessary emulated devices = No unnecessary attack surface.
 
 Test categories:
-- Normal: verify minimal device set (only virtio-blk, virtio-net, virtio-serial)
+- Normal: verify minimal device set (only virtio-blk, virtio-net, virtio-serial, virtio-rng)
 - Edge: no USB, sound, display, graphics, floppy, parallel, SCSI, legacy NIC devices
-- Weird: verify SLiRP is not used (gvproxy instead), no PCI passthrough
-- Out of bounds: no device hotplug, no live migration support
+- Weird: the network is gvproxy's, not SLiRP's
+- Out of bounds: only known device nodes, a virtio-net without the risky features, no nested
+  virtualization
 """
 
-from exec_sandbox.models import Language
+from exec_sandbox.models import Language, PortMapping
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
+
+_NETWORK_DEVICE = VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)])
+"""A VM with the virtio-net device and no outbound access (an exposed port, mode 1)."""
 
 
 # =============================================================================
 # Normal: Only essential virtio devices present
 # =============================================================================
 class TestMinimalDeviceSet:
-    """Guest should expose only virtio-blk, virtio-net, virtio-serial, and
-    optionally virtio-balloon. No legacy emulated hardware."""
+    """Guest should expose only virtio-blk, virtio-net, virtio-serial and
+    virtio-rng (no balloon). No legacy emulated hardware."""
 
     async def test_only_virtio_devices(self, scheduler: Scheduler) -> None:
-        """PCI/MMIO devices should be exclusively virtio."""
+        """The guest has exactly the virtio devices of a VM without a network: entropy (rng),
+        console (virtio-serial), and two block devices (the root image and the home disk)."""
         code = """\
 import os, glob
 devices = []
@@ -62,10 +69,12 @@ for d in devices:
 if not devices:
     print("NO_VIRTIO_DEVICES")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        # Should have virtio devices (blk, net, serial, optionally balloon)
-        assert "VIRTIO:" in result.stdout, f"Expected at least one virtio device. stdout: {result.stdout}"
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
+        assert result.exit_code == 0, result.stderr
+        # virtio IDs: 0x0002 block, 0x0003 console (virtio-serial), 0x0004 entropy (rng).
+        # Any other is extra attack surface: balloon 0x0005, virtio-snd 0x0019 (CVE-2024-7730).
+        device_ids = sorted(line.rsplit(":", 1)[-1] for line in result.stdout.splitlines())
+        assert device_ids == ["0x0002", "0x0002", "0x0003", "0x0004"], result.stdout
 
     async def test_no_pci_non_virtio_devices(self, scheduler: Scheduler) -> None:
         """No legacy PCI devices (IDE, AHCI, e1000, rtl8139, AC97, etc.).
@@ -91,13 +100,9 @@ if non_virtio:
 else:
     print("ONLY_VIRTIO")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # microvm may not even have a PCI bus, which is fine
-        # If PCI exists, only virtio drivers should be loaded
-        assert "NON_VIRTIO:" not in result.stdout, (
-            f"Non-virtio PCI devices found — potential attack surface. stdout: {result.stdout}"
-        )
+        assert result.stdout == "ONLY_VIRTIO\n"  # no PCI device bound to a driver other than virtio
 
 
 # =============================================================================
@@ -117,9 +122,9 @@ import os
 usb_exists = os.path.isdir('/sys/bus/usb')
 print(f"USB_BUS:{usb_exists}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "USB_BUS:False" in result.stdout, f"USB bus should not exist in minimal VM. stdout: {result.stdout}"
+        assert result.stdout == "USB_BUS:False\n"
 
     async def test_no_usb_devices_in_dev(self, scheduler: Scheduler) -> None:
         """No /dev/bus/usb or USB-related device nodes."""
@@ -131,9 +136,9 @@ checks = [
 ]
 print(f"USB_DEV:{any(checks)}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "USB_DEV:False" in result.stdout
+        assert result.stdout == "USB_DEV:False\n"
 
 
 # =============================================================================
@@ -159,9 +164,9 @@ print(f"SOUND:{bool(sound_evidence)}")
 if sound_evidence:
     print(f"EVIDENCE:{sound_evidence}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "SOUND:False" in result.stdout, f"Sound devices should not exist. stdout: {result.stdout}"
+        assert result.stdout == "SOUND:False\n"
 
     async def test_no_graphics_devices(self, scheduler: Scheduler) -> None:
         """No framebuffer or DRM graphics devices.
@@ -179,9 +184,9 @@ checks = [
 ]
 print(f"GRAPHICS:{any(checks)}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "GRAPHICS:False" in result.stdout, f"Graphics devices should not exist. stdout: {result.stdout}"
+        assert result.stdout == "GRAPHICS:False\n"
 
 
 # =============================================================================
@@ -197,9 +202,9 @@ import os
 floppy = os.path.exists('/dev/fd0') or os.path.exists('/dev/fd1')
 print(f"FLOPPY:{floppy}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "FLOPPY:False" in result.stdout
+        assert result.stdout == "FLOPPY:False\n"
 
     async def test_no_parallel_port(self, scheduler: Scheduler) -> None:
         """No parallel port device nodes."""
@@ -208,9 +213,9 @@ import os, glob
 parports = glob.glob('/dev/parport*') + glob.glob('/dev/lp*')
 print(f"PARPORT:{len(parports)}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "PARPORT:0" in result.stdout
+        assert result.stdout == "PARPORT:0\n"
 
 
 # =============================================================================
@@ -232,10 +237,9 @@ scsi_devices = glob.glob('/sys/bus/scsi/devices/*')
 print(f"SCSI_HOSTS:{len(scsi_hosts)}")
 print(f"SCSI_DEVICES:{len(scsi_devices)}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "SCSI_HOSTS:0" in result.stdout, f"SCSI hosts should not exist. stdout: {result.stdout}"
-        assert "SCSI_DEVICES:0" in result.stdout, f"SCSI devices should not exist. stdout: {result.stdout}"
+        assert result.stdout == "SCSI_HOSTS:0\nSCSI_DEVICES:0\n"
 
 
 # =============================================================================
@@ -249,7 +253,7 @@ class TestNoLegacyNicDevices:
     """
 
     async def test_no_legacy_nic_drivers(self, scheduler: Scheduler) -> None:
-        """Only virtio-net driver should be loaded for networking."""
+        """A VM with a network device: each network interface with a device uses virtio_net."""
         code = """\
 import os, glob
 net_drivers = []
@@ -267,44 +271,9 @@ if net_drivers:
 else:
     print("NO_NET_DRIVERS")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        stdout = result.stdout
-        # Only virtio_net is acceptable; e1000, rtl8139, etc. are not
-        for line in stdout.strip().split("\n"):
-            if line.startswith("NET_DRIVER:"):
-                driver = line.split(":")[1]
-                assert "virtio" in driver, f"Legacy NIC driver found: {driver}. Only virtio-net should be used."
-
-
-# =============================================================================
-# Edge: No sound devices in QEMU (CVE-2024-7730)
-# =============================================================================
-class TestNoVirtioSndDevice:
-    """Virtio-snd device adds unnecessary attack surface.
-
-    CVE-2024-7730: Virtio-snd heap buffer overflow in hw/audio/virtio-snd.c.
-    Code execution sandboxes have no need for sound devices.
-    """
-
-    async def test_no_virtio_snd_device_id(self, scheduler: Scheduler) -> None:
-        """No virtio-snd device (device ID 0x0019) should be present."""
-        code = """\
-import os, glob
-for dev_path in sorted(glob.glob('/sys/bus/virtio/devices/*')):
-    try:
-        with open(os.path.join(dev_path, 'device')) as f:
-            device_id = f.read().strip()
-        # virtio-snd device ID is 0x0019
-        if device_id == '0x0019':
-            print(f"VIRTIO_SND_FOUND:{os.path.basename(dev_path)}")
-    except (OSError, PermissionError):
-        continue
-print("DONE")
-"""
-        result = await scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        assert "VIRTIO_SND_FOUND" not in result.stdout, f"Virtio-snd device should not exist. stdout: {result.stdout}"
+        result = await run_once(scheduler, _NETWORK_DEVICE, code)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == "NET_DRIVER:virtio_net\n"
 
 
 # =============================================================================
@@ -317,8 +286,9 @@ class TestNetworkingSecure:
     packet reassembly. exec-sandbox uses gvproxy instead.
     """
 
-    async def test_gateway_is_gvproxy(self, scheduler: Scheduler) -> None:
-        """Default gateway should be 192.168.127.1 (gvproxy), not 10.0.2.2 (SLiRP)."""
+    async def test_network_is_gvproxy_not_slirp(self, scheduler: Scheduler) -> None:
+        """A VM with a network device: its address is 192.168.127.2 and its default gateway
+        192.168.127.1 (gvproxy), not 10.0.2.15 and 10.0.2.2 (SLiRP)."""
         code = """\
 import socket, struct
 with open('/proc/net/route') as f:
@@ -334,50 +304,26 @@ with open('/proc/net/route') as f:
             break
     else:
         print("NO_DEFAULT_ROUTE")
+# A UDP connect sends nothing: it only picks the source address of the route
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+    probe.connect(('192.168.127.1', 9))
+    print(f"ADDRESS:{probe.getsockname()[0]}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        # gvproxy gateway is 192.168.127.1; SLiRP default is 10.0.2.2
-        assert "10.0.2.2" not in stdout, f"SLiRP gateway detected — should use gvproxy. stdout: {stdout}"
-        assert "GATEWAY:" in stdout or "NO_DEFAULT_ROUTE" in stdout, f"Unexpected output: {stdout}"
-
-    async def test_ip_address_is_gvproxy_range(self, scheduler: Scheduler) -> None:
-        """Guest IP should be in 192.168.127.0/24 (gvproxy range)."""
-        code = """\
-import socket, struct
-with open('/proc/net/if_inet6', 'r') as f:
-    pass  # Just checking if networking exists
-# Check IPv4 address on eth0
-with open('/proc/net/fib_trie') as f:
-    content = f.read()
-    if '192.168.127' in content:
-        print("GVPROXY_RANGE:True")
-    elif '10.0.2' in content:
-        print("SLIRP_RANGE:True")
-    else:
-        print("OTHER_RANGE")
-"""
-        result = await scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        assert "SLIRP_RANGE" not in result.stdout, f"SLiRP IP range detected. stdout: {result.stdout}"
+        result = await run_once(scheduler, _NETWORK_DEVICE, code)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == "GATEWAY:192.168.127.1\nADDRESS:192.168.127.2\n"
 
 
 # =============================================================================
 # Out of bounds: QEMU process-level protections
 # =============================================================================
 class TestQemuSandboxFlags:
-    """QEMU seccomp sandbox flags should restrict the QEMU process itself.
+    """What the guest can reach of QEMU: device nodes, virtio-net features, and CPU
+    virtualization."""
 
-    These are validated indirectly — the guest can check that certain
-    host-facing operations are blocked.
-    """
-
-    async def test_no_device_hotplug_capability(self, scheduler: Scheduler) -> None:
-        """Guest should not be able to trigger device hotplug events.
-
-        No QMP (QEMU Machine Protocol) socket should be reachable from guest.
-        """
+    async def test_dev_holds_only_known_device_nodes(self, scheduler: Scheduler) -> None:
+        """Each node in /dev is a known one: the guest gets no node of another emulated device
+        (a QMP channel among them)."""
         code = """\
 import os, glob
 # Check for any unusual character devices that might indicate QMP access
@@ -407,14 +353,13 @@ if unusual:
 else:
     print("MINIMAL_DEVICES")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "UNUSUAL_DEV:" not in result.stdout, (
-            f"Unusual devices found — potential attack surface. stdout: {result.stdout}"
-        )
+        assert result.stdout == "MINIMAL_DEVICES\n"
 
     async def test_virtio_net_minimal_features(self, scheduler: Scheduler) -> None:
-        """Virtio-net should have minimal features enabled.
+        """The virtio-net device of a VM with a network device has the features QEMU turns off,
+        off: the guest reads them from its features bits (bit N of the virtio spec at index N).
 
         CVE-2023-6693: Stack buffer overflow in flush_tx when MRG_RXBUF is
         enabled. Our config sets mrg_rxbuf=off to prevent this.
@@ -440,13 +385,16 @@ for dev_path in sorted(glob.glob('/sys/bus/virtio/devices/*')):
     except (OSError, PermissionError):
         continue
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        # Verify we got feature output (no hard assertion on specific bits,
-        # since feature sets vary by QEMU version and config)
-        assert "NET_FEATURES:" in result.stdout or "VIRTIO:" not in result.stdout, (
-            f"Expected net features output or no virtio-net device. stdout: {result.stdout}"
-        )
+        result = await run_once(scheduler, _NETWORK_DEVICE, code)
+        assert result.exit_code == 0, result.stderr
+        (line,) = result.stdout.splitlines()
+        features = line.removeprefix("NET_FEATURES:")
+        assert len(features) >= 64, line  # one char per bit: 64, or 128 on kernels with more feature bits
+        # virtio-net feature bits: CSUM 0, GSO 6, HOST_TSO4 11, HOST_TSO6 12, MRG_RXBUF 15,
+        # CTRL_RX 18, GUEST_ANNOUNCE 21, MQ 22, RSS 60
+        bits = {"CSUM": 0, "GSO": 6, "HOST_TSO4": 11, "HOST_TSO6": 12, "MRG_RXBUF": 15}
+        bits |= {"CTRL_RX": 18, "GUEST_ANNOUNCE": 21, "MQ": 22, "RSS": 60}
+        assert {name: features[bit] for name, bit in bits.items()} == dict.fromkeys(bits, "0")
 
     async def test_no_nested_virtualization(self, scheduler: Scheduler) -> None:
         """Nested virtualization must be disabled.
@@ -467,8 +415,6 @@ has_svm = 'svm' in cpuinfo
 print(f"VMX:{has_vmx}")
 print(f"SVM:{has_svm}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "KVM_IN_GUEST:False" in result.stdout, f"/dev/kvm should not exist in guest. stdout: {result.stdout}"
-        assert "VMX:False" in result.stdout, f"VMX flag should not be exposed to guest. stdout: {result.stdout}"
-        assert "SVM:False" in result.stdout, f"SVM flag should not be exposed to guest. stdout: {result.stdout}"
+        assert result.stdout == "KVM_IN_GUEST:False\nVMX:False\nSVM:False\n"

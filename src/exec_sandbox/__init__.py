@@ -1,52 +1,41 @@
-"""exec-sandbox: Secure code execution in microVMs.
+"""exec-sandbox: run untrusted code in QEMU microVMs, from Python or the sbx command line.
 
-A standalone Python library for executing untrusted code in isolated QEMU microVMs.
-
-Quick Start (single execution):
+Quick Start:
     ```python
-    from exec_sandbox import Scheduler
+    from exec_sandbox import Scheduler, VmSpec
 
     async with Scheduler() as scheduler:
-        result = await scheduler.run(
-            code="print('hello')",
-            language="python",
-        )
-        print(result.stdout)  # "hello\\n"
-    ```
-
-Session (stateful multi-step execution):
-    ```python
-    from exec_sandbox import Scheduler
-
-    async with Scheduler() as scheduler:
-        async with await scheduler.session(language="python") as session:
+        async with await scheduler.new(VmSpec(language="python")) as session:
             await session.exec("x = 42")
-            result = await session.exec("print(x)")
+            result = await session.exec("print(x)")  # state stays across exec() calls
             print(result.stdout)  # "42\\n"
     ```
 
-With Configuration:
+VmSpec says what a VM is made of (defaults included); keep a catalog of specs:
     ```python
-    from exec_sandbox import Scheduler, SchedulerConfig
+    from exec_sandbox import Scheduler, SchedulerConfig, VmSpec
 
-    config = SchedulerConfig(
-        s3_bucket="my-snapshots",  # Enable S3 cache
-    )
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code="import pandas; print(pandas.__version__)",
-            language="python",
-            packages=["pandas==2.2.0"],
-        )
+    DATA = VmSpec(language="python", memory_mb=1024, packages=("pandas==3.0.1",))
+    async with Scheduler(SchedulerConfig(s3_bucket="my-snapshots")) as scheduler:
+        async with await scheduler.new(DATA) as session:
+            result = await session.exec("import pandas; print(pandas.__version__)")
     ```
 
-Requirements:
-    - QEMU 8.0+ with KVM (Linux) or HVF (macOS) acceleration
-    - VM images from GitHub Releases
-    - Python 3.12+
+Saved instances: Session.save(), Scheduler.reuse() (with SchedulerConfig.instance_store).
+Errors: exec_sandbox.exceptions (one error class per action).
 
-For S3 snapshot caching:
-    pip install exec-sandbox[s3]
+Requirements:
+    - QEMU 8.0 or later; QEMU 11.0 or later for L1 memory snapshots and saved
+      instances; QEMU 9.0.4 or later on ARM64 without KVM or HVF
+    - KVM (Linux) or HVF (macOS) recommended: without it, QEMU uses software
+      emulation (TCG), about 5-8x slower
+    - VM images from GitHub Releases
+    - Python 3.12 or later
+
+For the L3 snapshot cache (S3) and the "s3" instance store:
+    pip install 'exec-sandbox[s3]'
+For the "local" instance store (and the sbx command line):
+    pip install 'exec-sandbox[cli]'
 """
 
 # ---------------------------------------------------------------------------
@@ -54,128 +43,98 @@ For S3 snapshot caching:
 # ---------------------------------------------------------------------------
 # exec-sandbox is deeply POSIX-specific: Unix domain sockets (AF_UNIX),
 # signals (SIGKILL/SIGTERM/SIGSTOP), cgroups v2, /proc, fcntl file locking,
-# termios, os.getuid(), unshare namespaces, and QEMU with KVM (Linux) or
+# os.getuid(), unshare namespaces, and QEMU with KVM (Linux) or
 # HVF (macOS) acceleration.  None of these are available on Windows.
 #
 # We detect the platform via psutil (see platform_utils.detect_host_os) and
-# raise PermanentError — a SandboxError subclass — so that cross-platform
-# orchestrators can handle the rejection gracefully:
-#
-#     from exec_sandbox.exceptions import PermanentError
+# raise ConfigError (code PLATFORM_UNSUPPORTED), a SandboxError, so that
+# cross-platform orchestrators can handle the rejection gracefully. Python runs
+# this file before any exec_sandbox module, so no import of the error classes
+# can come before this check: catch Exception and test its code (ErrorCode is
+# a str enum).
 #
 #     try:
 #         from exec_sandbox import Scheduler
-#     except PermanentError:
-#         # Fall back to another execution backend
-#         pass
-#
-# The exceptions module is pure Python with no POSIX dependencies, so it
-# imports successfully on any platform.
+#     except Exception as e:
+#         if getattr(e, "code", None) != "PLATFORM_UNSUPPORTED":
+#             raise
+#         ...  # fall back to another execution backend
 # ---------------------------------------------------------------------------
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 if detect_host_os() == HostOS.UNKNOWN:
     import platform
 
-    from exec_sandbox.exceptions import PermanentError
+    from exec_sandbox.exceptions import ConfigError, ErrorCode
 
-    raise PermanentError(
-        "exec-sandbox requires Linux or macOS. "
-        f"Detected platform '{platform.system()}' is not supported because "
-        "exec-sandbox relies on QEMU with KVM/HVF acceleration, Unix domain sockets, "
-        "and POSIX process management (signals, cgroups, overlayfs). "
-        "Consider running inside WSL2 on Windows.",
+    raise ConfigError(
+        f"exec-sandbox runs on Linux or macOS, not on '{platform.system()}' (it needs QEMU with "
+        "KVM or HVF, Unix sockets and POSIX processes). On Windows, run it in WSL2.",
+        code=ErrorCode.PLATFORM_UNSUPPORTED,
         context={"platform": platform.system()},
+        hint=None,
+        instance_id=None,
     )
 
-from importlib.metadata import PackageNotFoundError, version
-
-try:
-    __version__ = version("exec-sandbox")
-except PackageNotFoundError:
-    __version__ = "0.0.0.dev0"
-
 from exec_sandbox._logging import configure_logging
+from exec_sandbox._version import __version__ as __version__
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
-    AssetChecksumError,
-    AssetDownloadError,
-    AssetError,
-    AssetNotFoundError,
-    BalloonTransientError,
-    CodeValidationError,
-    CommunicationError,
-    CommunicationOutcomeUnknownError,
-    EnvVarValidationError,
-    GuestAgentError,
-    InputValidationError,
-    OutputLimitError,
-    PackageNotAllowedError,
-    PermanentError,
-    SandboxDependencyError,
+    ConfigError,
+    ErrorAction,
+    ErrorCode,
+    InstanceGoneError,
+    InstanceNotSavedWarning,
+    InternalError,
+    InvalidInputError,
+    OutcomeUnknownError,
+    RouteError,
     SandboxError,
     SessionClosedError,
-    SnapshotError,
-    SocketAuthError,
     TransientError,
-    VmBootError,
-    VmBootTimeoutError,
-    VmCapacityError,
-    VmConfigError,
-    VmDependencyError,
-    VmError,
-    VmGvproxyError,
-    VmOverlayError,
-    VmPermanentError,
-    VmQemuCrashError,
-    VmTimeoutError,
-    VmTransientError,
 )
-from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, PortMapping, TimingBreakdown
+from exec_sandbox.instance.models import HostFacts, InstanceInfo, RecentCommit
+from exec_sandbox.models import (
+    ExecutionResult,
+    ExposedPort,
+    FileInfo,
+    InstanceRef,
+    Language,
+    PortMapping,
+    StartupTiming,
+    TimingBreakdown,
+)
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.session import Session
+from exec_sandbox.vm_spec import VmSpec
 
 __all__ = [
-    "AssetChecksumError",
-    "AssetDownloadError",
-    "AssetError",
-    "AssetNotFoundError",
-    "BalloonTransientError",
-    "CodeValidationError",
-    "CommunicationError",
-    "CommunicationOutcomeUnknownError",
-    "EnvVarValidationError",
+    "ConfigError",
+    "ErrorAction",
+    "ErrorCode",
     "ExecutionResult",
     "ExposedPort",
     "FileInfo",
-    "GuestAgentError",
-    "InputValidationError",
+    "HostFacts",
+    "InstanceGoneError",
+    "InstanceInfo",
+    "InstanceNotSavedWarning",
+    "InstanceRef",
+    "InternalError",
+    "InvalidInputError",
     "Language",
-    "OutputLimitError",
-    "PackageNotAllowedError",
-    "PermanentError",
+    "OutcomeUnknownError",
     "PortMapping",
-    "SandboxDependencyError",
+    "RecentCommit",
+    "RouteError",
     "SandboxError",
     "Scheduler",
     "SchedulerConfig",
     "Session",
     "SessionClosedError",
-    "SnapshotError",
-    "SocketAuthError",
+    "StartupTiming",
     "TimingBreakdown",
     "TransientError",
-    "VmBootError",
-    "VmBootTimeoutError",
-    "VmCapacityError",
-    "VmConfigError",
-    "VmDependencyError",
-    "VmError",
-    "VmGvproxyError",
-    "VmOverlayError",
-    "VmPermanentError",
-    "VmQemuCrashError",
-    "VmTimeoutError",
-    "VmTransientError",
+    "VmSpec",
     "configure_logging",
 ]

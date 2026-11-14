@@ -1,20 +1,28 @@
-"""Tests for port forwarding functionality.
-
-Tests the port allocation, mapping resolution, and models for port forwarding.
+"""Tests for port forwarding: the models, host port allocation, the gvproxy arguments, and
+host-to-guest connections through a VM's exposed port.
 """
 
+import asyncio
+import errno
 import json
+import re
 import socket
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
+from exec_sandbox.asset_downloader import get_gvproxy_suffix
+from exec_sandbox.exceptions import ErrorCode, TransientError
+from exec_sandbox.gvproxy import start_gvproxy
 from exec_sandbox.models import ExposedPort, Language, PortMapping
-from exec_sandbox.port_forward import (
-    allocate_ephemeral_ports,
-    normalize_port_mappings,
-    resolve_port_mappings,
-)
+from exec_sandbox.platform_utils import get_arch_name
+from exec_sandbox.port_forward import allocate_ephemeral_ports, resolve_port_mappings
+from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 from .conftest import (
     NET_OP_TIMEOUT_S,
@@ -101,12 +109,12 @@ class TestAllocateEphemeralPort:
 
     def test_allocate_ephemeral_port_returns_valid_port(self) -> None:
         """Test that allocated port is in valid range."""
-        (port,) = allocate_ephemeral_ports(1)
+        (port,) = allocate_ephemeral_ports(1, protocol="tcp", exclude=frozenset())
         assert 1024 <= port <= 65535
 
     def test_allocate_ephemeral_port_is_available(self) -> None:
         """Test that allocated port can be bound."""
-        (port,) = allocate_ephemeral_ports(1)
+        (port,) = allocate_ephemeral_ports(1, protocol="tcp", exclude=frozenset())
 
         # Try to bind to the allocated port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -116,52 +124,53 @@ class TestAllocateEphemeralPort:
 
     def test_allocate_multiple_ports_are_different(self) -> None:
         """Test that multiple allocations return different ports."""
-        ports = allocate_ephemeral_ports(5)
+        ports = allocate_ephemeral_ports(5, protocol="tcp", exclude=frozenset())
         assert len(set(ports)) == len(ports)
 
-
-class TestNormalizePortMappings:
-    """Tests for normalizing port mappings."""
-
-    def test_normalize_integer_to_port_mapping(self) -> None:
-        """Test that integers are converted to PortMapping."""
-        result = normalize_port_mappings([8080, 3000])
-        assert len(result) == 2
-        assert all(isinstance(p, PortMapping) for p in result)
-        assert result[0].internal == 8080
-        assert result[0].external is None
-        assert result[1].internal == 3000
-        assert result[1].external is None
-
-    def test_normalize_port_mapping_passthrough(self) -> None:
-        """Test that PortMapping objects pass through unchanged."""
-        mapping = PortMapping(internal=8080, external=3000)
-        result = normalize_port_mappings([mapping])
-        assert len(result) == 1
-        assert result[0] is mapping
-
-    def test_normalize_mixed_input(self) -> None:
-        """Test normalizing mixed integers and PortMapping objects."""
-        mapping = PortMapping(internal=80, external=8080)
-        result = normalize_port_mappings([8080, mapping, 3000])
-        assert len(result) == 3
-        assert result[0].internal == 8080
-        assert result[0].external is None
-        assert result[1] is mapping
-        assert result[2].internal == 3000
-
-    def test_normalize_empty_list(self) -> None:
-        """Test normalizing empty list."""
-        result = normalize_port_mappings([])
-        assert result == []
+    def test_many_udp_ports_are_different(self) -> None:
+        """600 UDP ports in one call are all different. On Linux two UDP sockets with
+        SO_REUSEADDR share a port, so bind(0) would give a held port again (about 6 repeats
+        in 600, measured) and one UDP forward would be lost."""
+        ports = allocate_ephemeral_ports(600, protocol="udp", exclude=frozenset())
+        assert len(set(ports)) == 600
 
 
 class TestResolvePortMappings:
     """Tests for resolving port mappings."""
 
+    def test_os_picked_port_skips_a_fixed_port_of_the_same_vm(self) -> None:
+        """The OS hands out a port that another mapping of the spec fixes (nothing binds it
+        before gvproxy): the dynamic mapping gets the next port, held apart from the first,
+        and gvproxy gets two forwards. A fake socket module: the OS port choice cannot be
+        steered."""
+        picked = iter([5000, 5001])
+        sockets: list[SimpleNamespace] = []
+
+        def new_socket(*_args: object) -> SimpleNamespace:
+            port = next(picked)
+            fake = SimpleNamespace(closed=False, setsockopt=lambda *_a: None, bind=lambda _addr: None)
+            fake.getsockname = lambda: ("127.0.0.1", port)
+            fake.close = lambda: setattr(fake, "closed", True)
+            sockets.append(fake)
+            return fake
+
+        fake_module = SimpleNamespace(
+            socket=new_socket,
+            AF_INET=socket.AF_INET,
+            SOCK_STREAM=socket.SOCK_STREAM,
+            SOCK_DGRAM=socket.SOCK_DGRAM,
+            SOL_SOCKET=socket.SOL_SOCKET,
+            SO_REUSEADDR=socket.SO_REUSEADDR,
+        )
+        with patch("exec_sandbox.port_forward.socket", fake_module):
+            ports = resolve_port_mappings([PortMapping(internal=80, external=5000), PortMapping(internal=81)])
+
+        assert [(p.internal, p.external) for p in ports] == [(80, 5000), (81, 5001)]
+        assert [s.closed for s in sockets] == [True, True]  # both held until the end, then closed
+
     def test_resolve_allocates_external_ports(self) -> None:
         """Test that missing external ports are allocated."""
-        result = resolve_port_mappings([8080, 3000])
+        result = resolve_port_mappings([PortMapping(internal=8080), PortMapping(internal=3000)])
         assert len(result) == 2
         assert all(isinstance(p, ExposedPort) for p in result)
         assert result[0].internal == 8080
@@ -179,12 +188,6 @@ class TestResolvePortMappings:
         assert result[0].internal == 8080
         assert result[0].external == 3000
 
-    def test_resolve_too_many_ports_raises_error(self) -> None:
-        """Test that too many ports raises ValueError."""
-        # MAX_EXPOSED_PORTS is 10
-        with pytest.raises(ValueError, match="Too many exposed ports"):
-            resolve_port_mappings(list(range(1000, 1020)))  # 20 ports
-
     def test_resolve_preserves_protocol(self) -> None:
         """Test that protocol is preserved through resolution."""
         mapping = PortMapping(internal=53, protocol="udp")
@@ -196,7 +199,7 @@ class TestResolvePortMappings:
         mappings = [
             PortMapping(internal=80, external=8080),
             PortMapping(internal=443),
-            8000,
+            PortMapping(internal=8000),
         ]
         result = resolve_port_mappings(mappings)
         assert len(result) == 3
@@ -236,11 +239,6 @@ class TestPortMappingEdgeCases:
         with pytest.raises(ValueError):
             PortMapping(internal=8080, protocol="")  # type: ignore[arg-type]
 
-    def test_internal_port_zero_rejected(self) -> None:
-        """Test that port 0 is rejected for internal."""
-        with pytest.raises(ValueError):
-            PortMapping(internal=0)
-
     def test_external_port_zero_rejected(self) -> None:
         """Test that port 0 is rejected for external."""
         with pytest.raises(ValueError):
@@ -251,29 +249,21 @@ class TestExposedPortEdgeCases:
     """Edge case tests for ExposedPort."""
 
     def test_udp_port_url_still_returns_http(self) -> None:
-        """Test that UDP port URL returns http (known limitation)."""
-        # This is a known limitation - url property always returns http://
-        # For UDP services, users should construct their own connection string
+        """url is the HTTP URL of the host port for each protocol, UDP too."""
         port = ExposedPort(internal=53, external=5300, protocol="udp")
         assert port.url == "http://127.0.0.1:5300"
-        # Document that this is expected behavior for UDP
 
 
 class TestResolvePortMappingsBoundary:
     """Boundary tests for resolve_port_mappings."""
 
-    def test_exactly_max_ports_succeeds(self) -> None:
-        """Test that exactly MAX_EXPOSED_PORTS (10) succeeds."""
-        # Create exactly 10 port mappings
+    def test_max_exposed_ports_all_get_a_host_port(self) -> None:
+        """10 mappings (MAX_EXPOSED_PORTS, which VmSpec enforces) all get a host port."""
         mappings = [PortMapping(internal=8000 + i) for i in range(10)]
         result = resolve_port_mappings(mappings)
-        assert len(result) == 10
-
-    def test_one_over_max_ports_fails(self) -> None:
-        """Test that MAX_EXPOSED_PORTS + 1 (11) fails."""
-        mappings = [PortMapping(internal=8000 + i) for i in range(11)]
-        with pytest.raises(ValueError, match="Too many exposed ports"):
-            resolve_port_mappings(mappings)
+        assert [port.internal for port in result] == [8000 + i for i in range(10)]
+        assert len({port.external for port in result}) == 10
+        assert all(port.external > 0 for port in result)
 
     def test_external_port_at_min_boundary(self) -> None:
         """Test external port at minimum boundary (1024)."""
@@ -294,7 +284,7 @@ class TestPortMappingWeirdCases:
     def test_duplicate_internal_ports_allowed(self) -> None:
         """Test that duplicate internal ports are allowed (user's responsibility)."""
         # Same internal port twice - this is technically allowed at model level
-        # The behavior depends on what QEMU/gvproxy does with duplicates
+        # The behavior depends on what gvproxy does with duplicates
         mappings = [
             PortMapping(internal=8080, external=3000),
             PortMapping(internal=8080, external=3001),
@@ -304,173 +294,116 @@ class TestPortMappingWeirdCases:
         assert result[0].internal == result[1].internal == 8080
         assert result[0].external != result[1].external
 
-    def test_duplicate_external_ports_allowed_at_model_level(self) -> None:
-        """Test that duplicate external ports pass model validation.
+    def test_no_free_host_port_is_gvproxy_failed(self) -> None:
+        """No socket for a port probe (out of file handles): TransientError GVPROXY_FAILED (it
+        can pass later), never a raw OSError out of the VM start."""
 
-        Note: This will fail at runtime when QEMU tries to bind the same port twice.
-        The model doesn't prevent this - it's caught at bind time.
-        """
+        def no_socket(*_args: object) -> socket.socket:
+            raise OSError(errno.EMFILE, "Too many open files")
+
+        with (
+            patch("exec_sandbox.port_forward.socket.socket", no_socket),
+            pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GVPROXY_FAILED) as exc,
+        ):
+            resolve_port_mappings([PortMapping(internal=8080)])
+        assert exc.value.context["errno"] == errno.EMFILE
+
+    def test_duplicate_external_ports_allowed_at_model_level(self) -> None:
+        """The model and resolve_port_mappings accept two mappings on one host port: both come
+        back as given."""
         mappings = [
             PortMapping(internal=8080, external=3000),
-            PortMapping(internal=8081, external=3000),  # Same external!
+            PortMapping(internal=8081, external=3000),
         ]
         result = resolve_port_mappings(mappings)
-        assert len(result) == 2
-        # Both have same external - will fail at runtime, not validation
-
-    def test_internal_equals_external(self) -> None:
-        """Test that internal == external is allowed."""
-        # internal 8080 -> external 8080 is valid (both unprivileged)
-        mapping = PortMapping(internal=8080, external=8080)
-        result = resolve_port_mappings([mapping])
-        assert result[0].internal == result[0].external == 8080
-
-    def test_privileged_internal_unprivileged_external(self) -> None:
-        """Test mapping privileged internal to unprivileged external."""
-        # Guest can listen on port 80, host exposes on 8080
-        mapping = PortMapping(internal=80, external=8080)
-        result = resolve_port_mappings([mapping])
-        assert result[0].internal == 80
-        assert result[0].external == 8080
-
-    def test_single_port_mapping(self) -> None:
-        """Test single port mapping works correctly."""
-        result = resolve_port_mappings([8080])
-        assert len(result) == 1
-        assert result[0].internal == 8080
-        assert result[0].external >= 1024
+        assert [(port.internal, port.external) for port in result] == [(8080, 3000), (8081, 3000)]
 
 
-class TestQemuHostfwdRuleGeneration:
-    """Tests for QEMU hostfwd rule generation (Mode 1).
+class TestGvproxyPortForwardArguments:
+    """The port forwards start_gvproxy gives gvproxy-wrapper (-port-forward, -block-outbound).
 
-    These tests verify the format of hostfwd rules that would be passed to QEMU.
-    The actual format is: hostfwd={protocol}:{host}:{external}-:{internal}
+    The gvproxy-wrapper here is a sh script that writes its arguments, then prints the line
+    that tells start_gvproxy it is ready: the real spawn and readiness wait run, no VM.
     """
 
-    def test_hostfwd_rule_format_tcp(self) -> None:
-        """Test TCP hostfwd rule format."""
-        port = ExposedPort(internal=8080, external=3000, host="127.0.0.1", protocol="tcp")
-        rule = f"hostfwd={port.protocol}:{port.host}:{port.external}-:{port.internal}"
-        assert rule == "hostfwd=tcp:127.0.0.1:3000-:8080"
+    @staticmethod
+    async def _arguments(
+        tmp_path: Path, short_tmp_dir: Path, *, ports: list[ExposedPort] | None, block_outbound: bool
+    ) -> list[str]:
+        """The arguments of a start_gvproxy for `ports` (a raw VM: no outbound filter). The
+        fake gvproxy-wrapper sits in the images folder under the real binary's name: the VM
+        start searches that folder first."""
+        fake = tmp_path / f"gvproxy-wrapper-{get_gvproxy_suffix(get_arch_name())}"
+        fake.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$@" > "$(dirname "$0")/args"\necho "Listening on QEMU socket"\nexec sleep 3600\n'
+        )
+        fake.chmod(0o755)
+        workdir = SimpleNamespace(gvproxy_socket=short_tmp_dir / "gv.sock")
+        proc, log_task, wait_ready = await start_gvproxy(
+            "vm-ports",
+            allowed_domains=[],
+            language="raw",
+            workdir=workdir,  # type: ignore[arg-type]
+            images_dir=tmp_path,
+            expose_ports=ports,
+            block_outbound=block_outbound,
+            on_process_started=None,
+        )
+        try:
+            await wait_ready()  # the fake wrote its arguments before its ready line
+            return (tmp_path / "args").read_text().splitlines()
+        finally:
+            await cleanup_process(proc, "gvproxy", "vm-ports", term_timeout=3.0, kill_timeout=2.0, kill_first=False)
+            log_task.cancel()
+            await asyncio.gather(log_task, return_exceptions=True)
 
-    def test_hostfwd_rule_format_udp(self) -> None:
-        """Test UDP hostfwd rule format."""
-        port = ExposedPort(internal=53, external=5300, host="127.0.0.1", protocol="udp")
-        rule = f"hostfwd={port.protocol}:{port.host}:{port.external}-:{port.internal}"
-        assert rule == "hostfwd=udp:127.0.0.1:5300-:53"
-
-    def test_hostfwd_multiple_ports(self) -> None:
-        """Test multiple hostfwd rules joined correctly."""
-        ports = [
-            ExposedPort(internal=80, external=8080, host="127.0.0.1", protocol="tcp"),
-            ExposedPort(internal=443, external=8443, host="127.0.0.1", protocol="tcp"),
-            ExposedPort(internal=53, external=5300, host="127.0.0.1", protocol="udp"),
-        ]
-        rules = ",".join(f"hostfwd={p.protocol}:{p.host}:{p.external}-:{p.internal}" for p in ports)
-        expected = "hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:8443-:443,hostfwd=udp:127.0.0.1:5300-:53"
-        assert rules == expected
-
-    def test_hostfwd_netdev_opts_format(self) -> None:
-        """Test the complete netdev options string format."""
-        ports = [ExposedPort(internal=8080, external=3000, host="127.0.0.1", protocol="tcp")]
-        hostfwd_rules = ",".join(f"hostfwd={p.protocol}:{p.host}:{p.external}-:{p.internal}" for p in ports)
-        netdev_opts = f"user,id=portfwd,restrict=on,{hostfwd_rules}"
-        assert netdev_opts == "user,id=portfwd,restrict=on,hostfwd=tcp:127.0.0.1:3000-:8080"
-        assert "restrict=on" in netdev_opts  # No internet access
-
-
-class TestGvproxyPortForwardConfig:
-    """Tests for gvproxy port forwarding configuration (Mode 2).
-
-    These tests verify the JSON format passed to gvproxy-wrapper via -port-forward flag.
-    The format is: {"host:external": "guest_ip:internal", ...}
-    Guest IP in gvproxy is always 192.168.127.2
-    """
-
-    def test_gvproxy_forward_json_single_port(self) -> None:
-        """Test single port forward JSON format."""
-        port = ExposedPort(internal=8080, external=3000, host="127.0.0.1", protocol="tcp")
-        forwards_dict = {f"{port.host}:{port.external}": f"192.168.127.2:{port.internal}"}
-        port_forward_json = json.dumps(forwards_dict)
-
-        # Verify JSON is valid and has correct structure
-        parsed = json.loads(port_forward_json)
-        assert parsed == {"127.0.0.1:3000": "192.168.127.2:8080"}
-
-    def test_gvproxy_forward_json_multiple_ports(self) -> None:
-        """Test multiple port forwards in JSON format."""
+    async def test_forwards_from_the_host_to_the_guest_ip(self, tmp_path: Path, short_tmp_dir: Path) -> None:
+        """Each exposed port: host:external to 192.168.127.2:internal (gvproxy's fixed guest IP)."""
         ports = [
             ExposedPort(internal=80, external=8080, host="127.0.0.1", protocol="tcp"),
             ExposedPort(internal=443, external=8443, host="127.0.0.1", protocol="tcp"),
             ExposedPort(internal=3000, external=3000, host="127.0.0.1", protocol="tcp"),
         ]
-        forwards_dict = {f"{p.host}:{p.external}": f"192.168.127.2:{p.internal}" for p in ports}
-        port_forward_json = json.dumps(forwards_dict)
 
-        parsed = json.loads(port_forward_json)
-        assert parsed["127.0.0.1:8080"] == "192.168.127.2:80"
-        assert parsed["127.0.0.1:8443"] == "192.168.127.2:443"
-        assert parsed["127.0.0.1:3000"] == "192.168.127.2:3000"
-        assert len(parsed) == 3
+        args = await self._arguments(tmp_path, short_tmp_dir, ports=ports, block_outbound=False)
 
-    def test_gvproxy_guest_ip_is_fixed(self) -> None:
-        """Test that guest IP is always 192.168.127.2."""
-        # This is gvproxy's default guest IP, hardcoded in gvisor-tap-vsock
-        port = ExposedPort(internal=5000, external=5000, host="127.0.0.1")
-        guest_ip = "192.168.127.2"
-        forward = f"{guest_ip}:{port.internal}"
-        assert forward == "192.168.127.2:5000"
+        assert json.loads(args[args.index("-port-forward") + 1]) == {
+            "127.0.0.1:8080": "192.168.127.2:80",
+            "127.0.0.1:8443": "192.168.127.2:443",
+            "127.0.0.1:3000": "192.168.127.2:3000",
+        }
+        assert "-block-outbound" not in args
 
-    def test_gvproxy_udp_forward_format(self) -> None:
-        """Test UDP forward format (protocol is in forward key for gvproxy)."""
-        # Note: gvproxy uses "udp:host:port" prefix for UDP forwards
-        port = ExposedPort(internal=53, external=5300, host="127.0.0.1", protocol="udp")
-        # For UDP, gvproxy expects "udp:" prefix on the local address
-        local_key = f"udp:{port.host}:{port.external}" if port.protocol == "udp" else f"{port.host}:{port.external}"
-        forwards_dict = {local_key: f"192.168.127.2:{port.internal}"}
+    async def test_a_udp_port_gets_a_udp_forward(self, tmp_path: Path, short_tmp_dir: Path) -> None:
+        """gvisor-tap-vsock forwards UDP only for a key with the "udp:" prefix; a key without it
+        is TCP. A UDP and a TCP port on the same number are two forwards."""
+        ports = [
+            ExposedPort(internal=53, external=5353, host="127.0.0.1", protocol="udp"),
+            ExposedPort(internal=53, external=5353, host="127.0.0.1", protocol="tcp"),
+        ]
 
-        assert forwards_dict == {"udp:127.0.0.1:5300": "192.168.127.2:53"}
+        args = await self._arguments(tmp_path, short_tmp_dir, ports=ports, block_outbound=False)
 
+        assert json.loads(args[args.index("-port-forward") + 1]) == {
+            "udp:127.0.0.1:5353": "192.168.127.2:53",
+            "127.0.0.1:5353": "192.168.127.2:53",
+        }
 
-class TestPortForwardingModeSelection:
-    """Tests for mode selection logic."""
+    @pytest.mark.parametrize("block_outbound", [True, False], ids=["port-forward-only", "with-internet"])
+    async def test_block_outbound_flag(self, tmp_path: Path, short_tmp_dir: Path, block_outbound: bool) -> None:
+        """Ports without network access (mode 1): -block-outbound stops every connection the
+        guest opens; with network access (mode 2) the flag is absent."""
+        ports = [ExposedPort(internal=8080, external=3000, host="127.0.0.1", protocol="tcp")]
 
-    def test_mode1_conditions(self) -> None:
-        """Test Mode 1: expose_ports=True, allow_network=False."""
-        expose_ports = [ExposedPort(internal=8080, external=3000)]
-        allow_network = False
+        args = await self._arguments(tmp_path, short_tmp_dir, ports=ports, block_outbound=block_outbound)
 
-        # Mode 1 is triggered when: expose_ports AND NOT allow_network
-        is_mode1 = bool(expose_ports) and not allow_network
-        assert is_mode1 is True
+        assert ("-block-outbound" in args) is block_outbound
 
-    def test_mode2_conditions(self) -> None:
-        """Test Mode 2: expose_ports=True, allow_network=True."""
-        expose_ports = [ExposedPort(internal=8080, external=3000)]
-        allow_network = True
+    async def test_no_ports_no_forward(self, tmp_path: Path, short_tmp_dir: Path) -> None:
+        """No exposed port: no -port-forward argument."""
+        args = await self._arguments(tmp_path, short_tmp_dir, ports=None, block_outbound=False)
 
-        # Mode 2 is triggered when: expose_ports AND allow_network
-        is_mode2 = bool(expose_ports) and allow_network
-        assert is_mode2 is True
-
-    def test_mode3_conditions(self) -> None:
-        """Test Mode 3: expose_ports=False, allow_network=True."""
-        expose_ports: list[ExposedPort] = []
-        allow_network = True
-
-        # Mode 3 (internet only, no port forwarding)
-        is_mode3 = not expose_ports and allow_network
-        assert is_mode3 is True
-
-    def test_no_network_mode(self) -> None:
-        """Test no network: expose_ports=False, allow_network=False."""
-        expose_ports: list[ExposedPort] = []
-        allow_network = False
-
-        # No network mode (no ports, no internet)
-        has_no_network = not expose_ports and not allow_network
-        assert has_no_network is True
+        assert "-port-forward" not in args
 
 
 # =============================================================================
@@ -480,82 +413,19 @@ class TestPortForwardingModeSelection:
 
 @pytest.mark.slow
 class TestPortForwardingMode1Integration:
-    """Integration tests for Mode 1: port forwarding without internet (QEMU hostfwd)."""
-
-    async def test_mode1_http_server_reachable_from_host(self, scheduler: Scheduler) -> None:
-        """Test that HTTP server in VM is reachable from host via exposed port.
-
-        Mode 1: expose_ports=True, allow_network=False
-        Uses QEMU user-mode networking with hostfwd.
-        """
-        # Start a simple HTTP server in the VM on port 8080
-        # Use dynamic external port allocation
-        result = await scheduler.run(
-            code="""
-import http.server
-import socketserver
-import threading
-
-# Start server in background thread
-handler = http.server.SimpleHTTPRequestHandler
-with socketserver.TCPServer(("", 8080), handler) as httpd:
-    # Run for just 2 seconds - enough for test to connect
-    thread = threading.Thread(target=httpd.handle_request)
-    thread.start()
-    thread.join(timeout=5)
-print("server_started")
-""",
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-            allow_network=False,
-        )
-
-        # Verify the result has exposed ports
-        assert len(result.exposed_ports) == 1
-        assert result.exposed_ports[0].internal == 8080
-        assert result.exposed_ports[0].external >= 1024
-        assert result.exposed_ports[0].host == "127.0.0.1"
-
-    async def test_mode1_explicit_external_port(self, scheduler: Scheduler) -> None:
-        """Test Mode 1 with explicit external port mapping."""
-        # Use a specific external port
-        (external_port,) = allocate_ephemeral_ports(1)
-
-        result = await scheduler.run(
-            code="print('hello')",
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080, external=external_port)],
-            allow_network=False,
-        )
-
-        assert len(result.exposed_ports) == 1
-        assert result.exposed_ports[0].internal == 8080
-        assert result.exposed_ports[0].external == external_port
-
-    async def test_mode1_multiple_ports(self, scheduler: Scheduler) -> None:
-        """Test Mode 1 with multiple port mappings."""
-        result = await scheduler.run(
-            code="print('multi-port test')",
-            language=Language.PYTHON,
-            expose_ports=[
-                PortMapping(internal=8080),
-                PortMapping(internal=8081),
-                PortMapping(internal=9000),
-            ],
-            allow_network=False,
-        )
-
-        assert len(result.exposed_ports) == 3
-        internals = {p.internal for p in result.exposed_ports}
-        assert internals == {8080, 8081, 9000}
-        # All external ports should be unique
-        externals = [p.external for p in result.exposed_ports]
-        assert len(set(externals)) == 3
+    """Mode 1: port forwarding without network access (gvproxy -block-outbound)."""
 
     async def test_mode1_no_internet_access(self, scheduler: Scheduler) -> None:
-        """Verify Mode 1 blocks outbound internet (restrict=on)."""
-        result = await scheduler.run(
-            code="""
+        """Mode 1 blocks each connection the guest opens: the HTTP request fails and the code
+        ends normally."""
+        result = await run_once(
+            scheduler,
+            VmSpec(
+                language=Language.PYTHON,
+                allow_network=False,  # No internet!
+                expose_ports=[PortMapping(internal=8080)],
+            ),
+            """
 import urllib.request
 import socket
 socket.setdefaulttimeout(3)
@@ -565,40 +435,29 @@ try:
 except Exception as e:
     print(f'BLOCKED: {type(e).__name__}')
 """,
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-            allow_network=False,  # No internet!
         )
 
-        # Should be blocked - no internet in Mode 1
-        assert "BLOCKED" in result.stdout or result.exit_code != 0
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.startswith("BLOCKED: "), result.stdout
 
 
 @pytest.mark.slow
 class TestPortForwardingMode2Integration:
     """Integration tests for Mode 2: port forwarding with internet (gvproxy)."""
 
-    async def test_mode2_port_forwarding_with_internet(self, scheduler: Scheduler) -> None:
-        """Test Mode 2: expose_ports + allow_network both enabled."""
-        result = await scheduler.run(
-            code="print('mode2 test')",
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=5000)],
-            allow_network=True,
-            allowed_domains=["example.com"],
-        )
-
-        # Should have exposed port
-        assert len(result.exposed_ports) == 1
-        assert result.exposed_ports[0].internal == 5000
-        assert result.exposed_ports[0].external >= 1024
-
     async def test_mode2_can_reach_allowed_domain(self, scheduler: Scheduler) -> None:
         """Verify Mode 2 allows outbound internet to allowed domains."""
         # Planet-scale connectivity-check (NCSI) endpoint — no rate limits,
         # no bot challenges, no scheduled downtime.
-        result = await scheduler.run(
-            code=PY_SAFETY
+        result = await run_once(
+            scheduler,
+            VmSpec(
+                language=Language.PYTHON,
+                allow_network=True,
+                allowed_domains=["cp.cloudflare.com"],
+                expose_ports=[PortMapping(internal=8080)],
+            ),
+            PY_SAFETY
             + f"""
 import urllib.error, urllib.request, time
 for attempt in range({NET_RETRY_COUNT + 1}):
@@ -616,71 +475,68 @@ for attempt in range({NET_RETRY_COUNT + 1}):
             continue
         print(f'ERROR:{{type(e).__name__}}:{{e}}')
 """,
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-            allow_network=True,
-            allowed_domains=["cp.cloudflare.com"],
         )
 
         # Any HTTP status = outbound path works end-to-end (DNS, SNI filter, TLS)
-        assert "STATUS:" in result.stdout
+        assert result.exit_code == 0, result.stderr
+        assert re.fullmatch(r"STATUS:\d{3}", result.stdout.strip()), result.stdout
+
+
+_ECHO_SERVER = """
+import socket
+import threading
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("0.0.0.0", 9999))
+server.listen(1)
+
+def serve():
+    conn, _ = server.accept()
+    conn.sendall(b"ECHO:" + conn.recv(1024))
+    conn.close()
+
+threading.Thread(target=serve, daemon=True).start()
+print("LISTENING")
+"""
+"""A TCP server on guest port 9999 in a thread of the REPL: it outlives the exec and answers one
+client with ECHO: and the bytes it got."""
 
 
 @pytest.mark.slow
 class TestPortForwardingConnectivity:
-    """Tests that actually verify host can connect to exposed ports."""
+    """The host reaches a server in the guest through the exposed port."""
 
-    async def test_host_can_connect_to_exposed_tcp_port(self, scheduler: Scheduler) -> None:
-        """Start a TCP server in VM and verify host can connect."""
-        # Start a simple echo server
-        result = await scheduler.run(
-            code="""
-import socket
-import sys
-
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(('0.0.0.0', 9999))
-server.listen(1)
-server.settimeout(5)  # 5 second timeout
-
-print('LISTENING', flush=True)
-sys.stdout.flush()
-
-try:
-    conn, addr = server.accept()
-    data = conn.recv(1024)
-    conn.send(b'ECHO:' + data)
-    conn.close()
-    print('HANDLED')
-except socket.timeout:
-    print('TIMEOUT')
-finally:
-    server.close()
-""",
+    @pytest.mark.parametrize(
+        ("allow_network", "allowed_domains"),
+        [
+            pytest.param(False, None, id="mode1-block-outbound"),
+            pytest.param(True, ["example.com"], id="mode2-with-network"),
+        ],
+    )
+    async def test_host_reaches_a_guest_server_through_the_exposed_port(
+        self, scheduler: Scheduler, allow_network: bool, allowed_domains: list[str] | None
+    ) -> None:
+        """A host client on 127.0.0.1:external sends "ping" and reads the guest server's answer,
+        with -block-outbound (mode 1) and with network access (mode 2)."""
+        spec = VmSpec(
             language=Language.PYTHON,
+            allow_network=allow_network,
+            allowed_domains=allowed_domains,
             expose_ports=[PortMapping(internal=9999)],
-            allow_network=False,
         )
-
-        # The server started and listened
-        assert "LISTENING" in result.stdout
-        # Verify we got the exposed port info
-        assert len(result.exposed_ports) == 1
-        assert result.exposed_ports[0].internal == 9999
-
-    async def test_result_contains_url_helper(self, scheduler: Scheduler) -> None:
-        """Test that ExposedPort.url property works correctly."""
-        result = await scheduler.run(
-            code="print('url test')",
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=3000)],
-            allow_network=False,
-        )
-
-        assert len(result.exposed_ports) == 1
-        port = result.exposed_ports[0]
-        assert port.url == f"http://127.0.0.1:{port.external}"
+        async with await scheduler.new(spec) as session:
+            started = await session.exec(_ECHO_SERVER)
+            assert (started.exit_code, started.stdout) == (0, "LISTENING\n"), started.stderr
+            (port,) = session.exposed_ports
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(port.host, port.external), timeout=10)
+            try:
+                writer.write(b"ping")
+                await writer.drain()
+                assert await asyncio.wait_for(reader.read(), timeout=10) == b"ECHO:ping"
+            finally:
+                writer.close()
+                await writer.wait_closed()
 
 
 # =============================================================================
@@ -697,10 +553,10 @@ class TestSessionExposedPorts:
     # ------------------------------------------------------------------
 
     async def test_session_single_port(self, scheduler: Scheduler) -> None:
-        """Session with one exposed port has correct exposed_ports."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
+        """A session with one exposed port lists it before any exec: the guest port, a host port
+        the OS picked, and the loopback address."""
+        async with await scheduler.new(
+            VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)])
         ) as session:
             assert len(session.exposed_ports) == 1
             assert session.exposed_ports[0].internal == 8080
@@ -709,13 +565,15 @@ class TestSessionExposedPorts:
 
     async def test_session_multiple_ports(self, scheduler: Scheduler) -> None:
         """Session with multiple exposed ports has all entries with unique externals."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[
-                PortMapping(internal=8080),
-                PortMapping(internal=8081),
-                PortMapping(internal=9000),
-            ],
+        async with await scheduler.new(
+            VmSpec(
+                language=Language.PYTHON,
+                expose_ports=[
+                    PortMapping(internal=8080),
+                    PortMapping(internal=8081),
+                    PortMapping(internal=9000),
+                ],
+            )
         ) as session:
             assert len(session.exposed_ports) == 3
             internals = {p.internal for p in session.exposed_ports}
@@ -725,24 +583,13 @@ class TestSessionExposedPorts:
 
     async def test_session_explicit_external_port(self, scheduler: Scheduler) -> None:
         """Session with explicit external port preserves it."""
-        (external_port,) = allocate_ephemeral_ports(1)
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080, external=external_port)],
+        (external_port,) = allocate_ephemeral_ports(1, protocol="tcp", exclude=frozenset())
+        async with await scheduler.new(
+            VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080, external=external_port)])
         ) as session:
             assert len(session.exposed_ports) == 1
             assert session.exposed_ports[0].internal == 8080
             assert session.exposed_ports[0].external == external_port
-
-    async def test_session_ports_available_before_exec(self, scheduler: Scheduler) -> None:
-        """Exposed ports are populated immediately, before any exec() call."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-        ) as session:
-            # Check before any exec()
-            assert len(session.exposed_ports) == 1
-            assert session.exposed_ports[0].internal == 8080
 
     # ------------------------------------------------------------------
     # Edge cases
@@ -750,14 +597,13 @@ class TestSessionExposedPorts:
 
     async def test_session_no_ports_returns_empty(self, scheduler: Scheduler) -> None:
         """Session without expose_ports has empty exposed_ports."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             assert session.exposed_ports == []
 
     async def test_session_ports_stable_across_execs(self, scheduler: Scheduler) -> None:
         """Exposed ports remain the same across multiple exec() calls."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
+        async with await scheduler.new(
+            VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)])
         ) as session:
             ports_before = session.exposed_ports
             await session.exec("x = 1")
@@ -771,11 +617,13 @@ class TestSessionExposedPorts:
 
     async def test_session_ports_with_network(self, scheduler: Scheduler) -> None:
         """Session with expose_ports and allow_network=True (Mode 2) has correct ports."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-            allow_network=True,
-            allowed_domains=["example.com"],
+        async with await scheduler.new(
+            VmSpec(
+                language=Language.PYTHON,
+                allow_network=True,
+                allowed_domains=["example.com"],
+                expose_ports=[PortMapping(internal=8080)],
+            )
         ) as session:
             assert len(session.exposed_ports) == 1
             assert session.exposed_ports[0].internal == 8080
@@ -787,10 +635,7 @@ class TestSessionExposedPorts:
 
     async def test_session_ports_after_close(self, scheduler: Scheduler) -> None:
         """Exposed ports are still readable after session is closed."""
-        session = await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-        )
+        session = await scheduler.new(VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)]))
         try:
             ports_before_close = session.exposed_ports
             assert len(ports_before_close) == 1

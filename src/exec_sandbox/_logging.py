@@ -12,7 +12,7 @@ CLI output format (httpx convention):
 Non-blocking logging:
     Uses QueueHandler + QueueListener (stdlib) to decouple log emission
     from stderr I/O.  A bounded FIFO queue absorbs bursts; a daemon
-    thread drains records to click.echo(err=True).  When the queue is
+    thread drains records to stderr.  When the queue is
     full or stderr saturated, records are silently dropped instead of
     raising BlockingIOError on the caller's coroutine.
 
@@ -27,8 +27,7 @@ import logging
 import logging.handlers
 import os
 import queue
-
-import click
+import sys
 
 LIBRARY_LOGGER_NAME: str = "exec_sandbox"
 
@@ -48,14 +47,14 @@ _DATEFMT = "%Y-%m-%d %H:%M:%S"
 # Bounded queue capacity -- large enough to absorb bursts from
 # concurrent VMs, small enough to bound memory under sustained load.
 _QUEUE_CAPACITY = 4096
+_DIM, _RESET = "\x1b[2m", "\x1b[0m"
 
 
-class _ClickHandler(logging.Handler):
-    """Target handler: writes to stderr via click.echo with dim styling.
+class _StderrHandler(logging.Handler):
+    """Target handler: writes to stderr, dim when stderr is a terminal.
 
     Runs on the QueueListener's daemon thread, never on the caller's
-    thread/coroutine.  Using click.echo() ensures ANSI codes are
-    automatically stripped when stderr is not a TTY.
+    thread/coroutine.  No ANSI codes when stderr is not a TTY (files, pipes).
     """
 
     def __init__(self) -> None:
@@ -65,7 +64,9 @@ class _ClickHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
-            click.echo(click.style(msg, dim=True), err=True)
+            stream = sys.stderr
+            stream.write(f"{_DIM}{msg}{_RESET}\n" if stream.isatty() else f"{msg}\n")
+            stream.flush()
         except BlockingIOError:
             pass  # Stderr buffer full -- silently drop
         except Exception:  # noqa: BLE001
@@ -76,14 +77,18 @@ class _NonBlockingHandler(logging.handlers.QueueHandler):
     """Queue-backed handler that never blocks the caller.
 
     Records are enqueued via put_nowait() into a bounded FIFO.  A
-    QueueListener daemon thread drains them to _ClickHandler.  When
+    QueueListener daemon thread drains them to _StderrHandler.  When
     the queue is full, records are silently dropped (backpressure).
+    close() stops the thread once (logging.shutdown at exit closes the
+    handler again); after it, records are dropped.
     """
 
     def __init__(self) -> None:
         q: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=_QUEUE_CAPACITY)
         super().__init__(q)
-        self._listener = logging.handlers.QueueListener(q, _ClickHandler(), respect_handler_level=False)
+        self._listener: logging.handlers.QueueListener | None = logging.handlers.QueueListener(
+            q, _StderrHandler(), respect_handler_level=False
+        )
         self._listener.start()
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
@@ -91,11 +96,16 @@ class _NonBlockingHandler(logging.handlers.QueueHandler):
         return record
 
     def enqueue(self, record: logging.LogRecord) -> None:
+        if self._listener is None:  # closed: no thread drains the queue
+            return
         with contextlib.suppress(queue.Full):
             self.queue.put_nowait(record)
 
     def close(self) -> None:
-        self._listener.stop()
+        # QueueListener.stop() fails on a second call before Python 3.13
+        listener, self._listener = self._listener, None
+        if listener is not None:
+            listener.stop()
         super().close()
 
 
@@ -113,16 +123,17 @@ def configure_logging(
     level: int | str | None = None,
     quiet: bool = False,
 ) -> None:
-    """Configure library logging for CLI / application entry points.
+    """Add a stderr handler to the exec_sandbox logger, then set its level.
 
-    Adds a _NonBlockingHandler if none exists (idempotent), then sets the
-    log level.  Library consumers who configure their own handlers are
-    unaffected -- the guard ensures we never stack duplicate handlers.
+    Call it from a command line tool or an application entry point. A second
+    call adds no second handler. Without this call, the library adds no handler.
+    The handler never blocks: when its queue is full, it drops records.
 
     Args:
-        level: Log level (e.g. logging.DEBUG, "WARNING"). Overrides env var.
-        quiet: If True, set level to ERROR (suppress WARNING/INFO).
-               Takes precedence over level.
+        level: Log level (for example logging.DEBUG, "WARNING"). It wins over
+            EXEC_SANDBOX_LOG_LEVEL.
+        quiet: If True, set the level to ERROR (hide WARNING and INFO). It wins
+            over level.
     """
     lib_logger = logging.getLogger(LIBRARY_LOGGER_NAME)
 

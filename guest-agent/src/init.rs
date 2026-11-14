@@ -1,19 +1,156 @@
 //! Init-time setup: PID 1 environment, mounts, network, zombie reaping.
 
-use std::process::Command as StdCommand;
-use std::sync::atomic::Ordering;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::constants::{
-    NETWORK_FAILED, NETWORK_NOTIFY, NETWORK_PENDING, NETWORK_READY, NETWORK_SETUP_TIMEOUT_SECONDS,
-    NETWORK_STATE, SANDBOX_GID, SANDBOX_UID, ZRAM_FAILED, ZRAM_READY, ZRAM_STATE,
-};
+use tokio::sync::SetOnce;
+
+use crate::constants::NETWORK_SETUP_TIMEOUT_SECONDS;
+
+/// Network readiness gate: the outcome of network setup, set once within
+/// NETWORK_SETUP_TIMEOUT_SECONDS of boot (Ok also for an intentionally offline
+/// VM). ExecuteCode, InstallPackages and WarmRepl wait on it; Ping and file I/O
+/// respond immediately.
+static NETWORK_STATE: SetOnce<Result<(), &'static str>> = SetOnce::const_new();
+
+/// Capped-zram safety gate: true once zram swap is active with its pressure
+/// guard and /dev is sealed. Untrusted process spawning is blocked until then.
+/// Production has no intentional no-swap mode: every setup failure makes the VM
+/// unavailable. main.rs awaits zram setup before the virtio listener starts, so
+/// the gate is final when a command reads it.
+static ZRAM_READY: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Zombie reaping
 // ============================================================================
 
-/// Reap zombie processes when running as PID 1.
+/// The children that agent code waits for (REPLs, package managers): one entry
+/// per spawn, by registration number, with the PID and, once the PID 1 reaper
+/// collected that child, its raw wait status. waitpid(-1) in the reaper can
+/// collect such a child before tokio does. Its PID can then come back as
+/// another process (an orphan is a child of PID 1 too), which waitpid on that
+/// PID would find: a later child with the same PID gets its own entry.
+static WAITED_CHILDREN: std::sync::Mutex<BTreeMap<u64, (u32, Option<libc::c_int>)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+static NEXT_WAITED_CHILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn waited_children() -> std::sync::MutexGuard<'static, BTreeMap<u64, (u32, Option<libc::c_int>)>> {
+    // A panic while held cannot leave the map half written: use it as it is.
+    WAITED_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn register_waited(pid: u32) -> u64 {
+    let key = NEXT_WAITED_CHILD.fetch_add(1, Ordering::Relaxed);
+    waited_children().insert(key, (pid, None));
+    key
+}
+
+/// Keep the status that the reaper collected for the newest entry of `pid`
+/// (an older entry of that PID is a child that ended before).
+fn keep_waited_exit(pid: u32, status: libc::c_int) {
+    let mut children = waited_children();
+    if let Some((_, slot)) = children.values_mut().rev().find(|(p, _)| *p == pid)
+        && slot.is_none()
+    {
+        *slot = Some(status);
+    }
+}
+
+fn reaped_status(key: u64) -> Option<std::process::ExitStatus> {
+    use std::os::unix::process::ExitStatusExt;
+    waited_children()
+        .get(&key)
+        .and_then(|(_, status)| *status)
+        .map(std::process::ExitStatus::from_raw)
+}
+
+/// A child that agent code waits for, with its entry in WAITED_CHILDREN.
+///
+/// Every wait reads the status that the reaper kept first, and no signal goes
+/// to a child that the reaper collected: its PID may belong to another process.
+pub(crate) struct WaitedChild {
+    child: tokio::process::Child,
+    /// Key in WAITED_CHILDREN; None for a child that tokio had collected at once.
+    key: Option<u64>,
+}
+
+impl WaitedChild {
+    /// Register right after the spawn, with no await between: the runtime has
+    /// one thread, so the reaper cannot collect the child before it is known.
+    pub(crate) fn register(child: tokio::process::Child) -> Self {
+        let key = child.id().map(register_waited);
+        Self { child, key }
+    }
+
+    fn reaped(&self) -> Option<std::process::ExitStatus> {
+        self.key.and_then(reaped_status)
+    }
+
+    /// Keep the status that tokio collected in the entry: keep_waited_exit then
+    /// skips it when the PID comes back as another process that PID 1 reaps.
+    fn collected(&self, status: std::process::ExitStatus) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(key) = self.key
+            && let Some((_, slot)) = waited_children().get_mut(&key)
+            && slot.is_none()
+        {
+            *slot = Some(status.into_raw());
+        }
+        status
+    }
+
+    /// The PID while the child can get a signal: None once tokio or the PID 1
+    /// reaper collected it.
+    pub(crate) fn id(&self) -> Option<u32> {
+        match self.reaped() {
+            Some(_) => None,
+            None => self.child.id(),
+        }
+    }
+
+    /// The exit status if the child ended, else None.
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self.reaped() {
+            Some(status) => Ok(Some(status)),
+            None => Ok(self.child.try_wait()?.map(|status| self.collected(status))),
+        }
+    }
+
+    /// Wait for the child to end.
+    pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if let Some(status) = self.reaped() {
+            return Ok(status);
+        }
+        match self.child.wait().await {
+            // The reaper collected it during the wait.
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => self.reaped().ok_or(e),
+            waited => waited.map(|status| self.collected(status)),
+        }
+    }
+
+    /// Send SIGKILL, unless the child was collected.
+    pub(crate) fn start_kill(&mut self) -> std::io::Result<()> {
+        match self.reaped() {
+            Some(_) => Ok(()),
+            None => self.child.start_kill(),
+        }
+    }
+}
+
+impl Drop for WaitedChild {
+    fn drop(&mut self) {
+        if let Some(key) = self.key {
+            waited_children().remove(&key);
+        }
+    }
+}
+
+/// Reap zombie processes when running as PID 1. The wait status of a
+/// registered child goes into its WAITED_CHILDREN entry.
 pub(crate) async fn reap_zombies() {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -28,11 +165,12 @@ pub(crate) async fn reap_zombies() {
     loop {
         sigchld.recv().await;
         loop {
-            let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-            match pid {
-                p if p > 0 => continue,
-                _ => break,
+            let mut status: libc::c_int = 0;
+            let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            if pid <= 0 {
+                break;
             }
+            keep_waited_exit(pid as u32, status);
         }
     }
 }
@@ -41,7 +179,7 @@ pub(crate) async fn reap_zombies() {
 // Init environment setup
 // ============================================================================
 
-/// A1: Phase 1 — minimal setup for Ping response (fast, <1ms).
+/// Phase 1 — minimal setup for Ping response (fast, <1ms).
 /// Sets environment variables only. Called before listen_virtio_serial().
 pub(crate) fn setup_phase1() {
     // SAFETY: called at startup before any threads are spawned
@@ -50,9 +188,10 @@ pub(crate) fn setup_phase1() {
 }
 
 /// Phase 2 core — sync init: chmod, mounts, sysctl hardening, dev setup (~10ms).
-/// Called from spawn_blocking before port is opened. Network and zram run in background.
+/// Called from spawn_blocking before the ports open. After it, network setup
+/// runs in the background, and main.rs awaits zram setup before it opens the ports.
 pub(crate) fn setup_phase2_core() {
-    // CIS Benchmark 6.1.x compliance (A2: libc::chmod, no fork/exec)
+    // CIS Benchmark 6.1.x compliance (libc::chmod, no fork/exec)
     chmod_paths(0o755, &["/etc", "/usr", "/var", "/sbin", "/bin"]);
     chmod_paths(
         0o644,
@@ -65,12 +204,11 @@ pub(crate) fn setup_phase2_core() {
     );
     chmod_paths(0o640, &["/etc/shadow"]);
 
-    mount_home_tmpfs();
+    // /home/user: ext4 home disk, mounted by tiny-init before the agent starts.
     // ALL /proc/sys writes MUST happen before mount_readonly_paths() which
     // makes /proc/sys read-only. This includes sysctl hardening AND zram
     // VM tuning (swappiness, page-cluster, etc.).
-    apply_sysctl_critical();
-    apply_sysctl_non_critical();
+    apply_sysctls();
     apply_zram_vm_tuning();
     // Readahead tuning for virtio-blk + EROFS.
     //
@@ -93,8 +231,8 @@ pub(crate) fn setup_phase2_core() {
             let _ = std::fs::write(path, "16");
         }
     }
-    // /dev writes (symlinks, shm mount) must happen before mount_readonly_paths()
-    // which now makes /dev read-only.
+    // /dev writes (symlinks, shm mount) happen here, before /dev becomes
+    // read-only in setup_zram_and_seal_dev().
     setup_dev_symlinks();
     setup_dev_shm();
     mount_readonly_paths();
@@ -104,8 +242,8 @@ pub(crate) fn setup_phase2_core() {
 /// opens its long-lived ports (main.rs awaits this). No guest-side deadline:
 /// the blocking worker cannot be cancelled, and abandoning it would leave an
 /// armed pressure guard and live swap inside a VM already published as failed.
-/// A wedged worker is the host boot watchdog's failure to own — it discards
-/// the VM. There is no no-swap path.
+/// If the worker hangs, the host boot timeout discards the VM. There is no
+/// no-swap path.
 pub(crate) async fn setup_zram_and_seal_dev() {
     let zram_active = match tokio::task::spawn_blocking(setup_zram_swap).await {
         Ok(ZramSetupOutcome::Active) => true,
@@ -122,16 +260,11 @@ pub(crate) async fn setup_zram_and_seal_dev() {
     if !dev_read_only {
         log_warn!("[zram] failed to seal /dev read-only; marking VM unavailable");
     }
-    let state = if zram_active && dev_read_only {
-        ZRAM_READY
-    } else {
-        ZRAM_FAILED
-    };
-    ZRAM_STATE.store(state, Ordering::Release);
+    ZRAM_READY.store(zram_active && dev_read_only, Ordering::Release);
 }
 
-/// Background network setup: ip config + gvproxy verification.
-/// Runs on spawn_blocking (uses StdCommand for ip, I/O-bound). The blocking
+/// Background network setup: interface config + gvproxy verification.
+/// Runs on spawn_blocking (blocking netlink and probe I/O). The blocking
 /// worker cannot be cancelled, so publish a terminal failure if it exceeds the
 /// deadline; the host will discard the VM instead of leaving a request waiting.
 pub(crate) async fn setup_network_background() {
@@ -142,26 +275,27 @@ pub(crate) async fn setup_network_background() {
     )
     .await
     {
-        Ok(Ok(Ok(()))) => NETWORK_READY,
+        Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(error))) => {
             log_warn!("network setup failed: {error}");
-            NETWORK_FAILED
+            Err("network setup failed")
         }
         Ok(Err(error)) => {
             log_warn!("network setup worker failed: {error}");
-            NETWORK_FAILED
+            Err("network setup failed")
         }
         Err(_) => {
             log_warn!(
                 "network setup exceeded {}s; marking VM unavailable",
                 NETWORK_SETUP_TIMEOUT_SECONDS
             );
-            NETWORK_FAILED
+            Err("network setup failed")
         }
     };
-    publish_network_state(state);
+    // The only setter: it runs once, at boot.
+    let _ = NETWORK_STATE.set(state);
     let t_done = crate::monotonic_ms();
-    if state == NETWORK_READY {
+    if state.is_ok() {
         log_info!(
             "[timing] network_ready: {}ms ({}ms elapsed)",
             t_done,
@@ -176,110 +310,26 @@ pub(crate) async fn setup_network_background() {
     }
 }
 
-fn publish_network_state(state: u8) {
-    NETWORK_STATE.store(state, Ordering::Release);
-    NETWORK_NOTIFY.notify_waiters();
-}
-
-fn current_network_state() -> Result<bool, &'static str> {
-    decode_network_state(NETWORK_STATE.load(Ordering::Acquire))
-}
-
-fn decode_network_state(state: u8) -> Result<bool, &'static str> {
-    match state {
-        NETWORK_READY => Ok(true),
-        NETWORK_FAILED => Err("network setup failed"),
-        NETWORK_PENDING => Ok(false),
-        _ => Err("network setup entered an invalid state"),
-    }
-}
-
-/// Wait until network setup reaches a terminal state. Intentionally offline VMs
-/// are ready after loopback setup; a failed/stuck worker is an infrastructure
-/// error so the host can destroy and replace the VM.
-pub(crate) async fn wait_for_network() -> Result<(), &'static str> {
-    if current_network_state()? {
-        return Ok(());
-    }
-
-    // Re-check after registering the notified future to avoid TOCTOU race
-    let notified = NETWORK_NOTIFY.notified();
-    if current_network_state()? {
-        return Ok(());
-    }
-
-    tokio::time::timeout(
-        Duration::from_secs(NETWORK_SETUP_TIMEOUT_SECONDS + 1),
-        notified,
-    )
-    .await
-    .map_err(|_| "network setup readiness timed out")?;
-
-    if current_network_state()? {
+/// Capped-zram setup ends before the virtio listener starts (main.rs awaits
+/// it), so commands check it synchronously and fail closed on anything but
+/// active swap. In particular, `swapon` cannot overlap untrusted process
+/// execution before monitor startup.
+fn require_memory_safety() -> Result<(), &'static str> {
+    if ZRAM_READY.load(Ordering::Acquire) {
         Ok(())
     } else {
-        Err("network setup notification arrived without a terminal state")
+        Err("zram safety setup failed")
     }
-}
-
-fn decode_zram_state(state: u8) -> Result<(), &'static str> {
-    match state {
-        ZRAM_READY => Ok(()),
-        ZRAM_FAILED => Err("zram safety setup failed"),
-        _ => Err("zram safety state is not terminal"),
-    }
-}
-
-/// Capped-zram setup publishes a terminal state before the virtio listener
-/// starts (main.rs awaits it), so commands check it synchronously and fail
-/// closed on anything but active swap. In particular, `swapon` cannot overlap
-/// untrusted process execution before monitor startup.
-pub(crate) fn require_memory_safety() -> Result<(), &'static str> {
-    decode_zram_state(ZRAM_STATE.load(Ordering::Acquire))
 }
 
 /// Process-spawning commands require both boot workers' outcomes. Zram is
-/// terminal before the listener starts; only network setup is still concurrent.
+/// final before the listener starts; only network setup is still concurrent
+/// (setup_network_background sets its outcome within its deadline).
+/// Intentionally offline VMs are ready after loopback setup; a failed or stuck
+/// worker is an infrastructure error so the host can destroy and replace the VM.
 pub(crate) async fn wait_for_untrusted_readiness() -> Result<(), &'static str> {
     require_memory_safety()?;
-    wait_for_network().await
-}
-
-/// Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
-///
-/// Sized to 40% of RAM with per-UID quota enforcement (`usrquota` +
-/// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
-/// Quota must be set at initial mount time — cannot be added via remount.
-///
-/// 40% (vs 50% prior): most sandbox code uses <30MB; 40% of 192MB = 77MB
-/// which provides ample headroom while reducing tmpfs metadata overhead.
-fn mount_home_tmpfs() {
-    // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
-    let page_mask = !(page_size() - 1);
-    // 40% of RAM: mem_kb * 1024 * 2 / 5 = mem_kb * 2048 / 5
-    let tmpfs_bytes = (read_mem_total_kb() * 2048 / 5) & page_mask;
-    let ret = unsafe {
-        let source = std::ffi::CString::new("tmpfs").unwrap();
-        let target = std::ffi::CString::new("/home/user").unwrap();
-        let fstype = std::ffi::CString::new("tmpfs").unwrap();
-        let data = std::ffi::CString::new(format!(
-            "mode=0755,uid={SANDBOX_UID},gid={SANDBOX_GID},size={tmpfs_bytes},usrquota,usrquota_block_hardlimit={tmpfs_bytes},noswap"
-        ))
-        .unwrap();
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            fstype.as_ptr(),
-            libc::MS_NOSUID | libc::MS_NODEV,
-            data.as_ptr() as *const libc::c_void,
-        )
-    };
-    if ret != 0 {
-        log_warn!(
-            "tmpfs mount on /home/user failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    *NETWORK_STATE.wait().await
 }
 
 /// Read-only bind remounts for CIS hardening.
@@ -297,7 +347,7 @@ fn mount_readonly_paths() {
         }
     }
 
-    // A5: Removed per-mount log_info! calls — each is an expensive serial write
+    // No log line per mount: each serial write is slow.
     // /dev is sealed by setup_zram_and_seal_dev() only after zram has removed its
     // setup-only block-device node. Untrusted execution remains gated until that
     // read-only remount succeeds.
@@ -326,30 +376,33 @@ fn mount_readonly_paths() {
         // (already EPERM via dmesg_restrict, mask as defense-in-depth)
         c"/proc/timer_list",
     ] {
-        let _ = mount_mask(path);
+        mount_mask(path);
     }
 }
 
 /// Configure loopback and eth0 network interfaces.
 /// No wait loop for eth0 — configure if present, skip if not.
 /// Called from spawn_blocking in setup_network_background().
+///
+/// The agent sends the rtnetlink requests of `ip` itself: each `ip` command
+/// would fork and run a binary from the rootfs (3 ms on HVF, 10 ms on KVM), on
+/// the path of the first exec.
 fn setup_network() -> Result<(), String> {
-    run_ip("loopback_up", &["link", "set", "lo", "up"])?;
+    let rtnl = Rtnetlink::open().map_err(|e| format!("stage=netlink_socket error={e}"))?;
+    network_stage("loopback_up", || rtnl.link_up(c"lo"))?;
 
     if std::path::Path::new("/sys/class/net/eth0").exists() {
-        run_ip("eth0_up", &["link", "set", "eth0", "up"])?;
-        run_ip(
-            "eth0_address",
-            &["addr", "add", "192.168.127.2/24", "dev", "eth0"],
-        )?;
-        run_ip(
-            "default_route",
-            &["route", "add", "default", "via", "192.168.127.1"],
-        )?;
+        network_stage("eth0_up", || rtnl.link_up(c"eth0"))?;
+        network_stage("eth0_address", || {
+            rtnl.add_address(c"eth0", [192, 168, 127, 2], 24)
+        })?;
+        network_stage("default_route", || {
+            rtnl.add_default_route([192, 168, 127, 1])
+        })?;
 
-        // Verify gvproxy connectivity. ExecuteCode/InstallPackages gate on the
-        // untrusted-readiness check (network + zram), so a failure here makes
-        // every code/package op fail rather than run without networking.
+        // Verify gvproxy connectivity. ExecuteCode, InstallPackages and
+        // WarmRepl gate on the untrusted-readiness check (network + zram), so
+        // a failure here makes each of them fail rather than run without networking.
         verify_gvproxy().map_err(str::to_string)?;
     } else {
         log_info!("eth0 not found, intentionally offline network is ready");
@@ -357,33 +410,227 @@ fn setup_network() -> Result<(), String> {
     Ok(())
 }
 
-fn run_ip(stage: &str, args: &[&str]) -> Result<(), String> {
+fn network_stage(stage: &str, step: impl FnOnce() -> std::io::Result<()>) -> Result<(), String> {
     let started = crate::monotonic_ms();
     log_info!("[network] stage={stage} action=start at={started}ms");
-    match StdCommand::new("ip").args(args).status() {
-        Ok(status) if status.success() => {
+    match step() {
+        Ok(()) => {
             log_info!(
                 "[network] stage={stage} action=complete elapsed={}ms",
                 crate::monotonic_ms() - started
             );
             Ok(())
         }
-        Ok(status) => Err(format!(
-            "stage={stage} status={status} elapsed={}ms",
-            crate::monotonic_ms() - started
-        )),
         Err(error) => Err(format!(
-            "stage={stage} spawn_failed={error} elapsed={}ms",
+            "stage={stage} error={error} elapsed={}ms",
             crate::monotonic_ms() - started
         )),
     }
 }
 
+/// A NETLINK_ROUTE socket: one request at a time, each acknowledged by the
+/// kernel. The requests are those that `ip` (iproute2) sends.
+struct Rtnetlink {
+    fd: std::os::fd::OwnedFd,
+    seq: std::cell::Cell<u32>,
+}
+
+impl Rtnetlink {
+    const HEADER_LEN: usize = 16; // struct nlmsghdr
+
+    fn open() -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: a plain syscall; the result is checked before use.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            // SAFETY: `fd` is a new descriptor that nothing else owns.
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            seq: std::cell::Cell::new(0),
+        })
+    }
+
+    /// `ip link set <name> up`.
+    fn link_up(&self, name: &std::ffi::CStr) -> std::io::Result<()> {
+        let body = link_up_body(interface_index(name)?);
+        self.request(libc::RTM_NEWLINK, 0, &body)
+    }
+
+    /// `ip addr add <address>/<prefix_len> dev <name>` (no broadcast address).
+    fn add_address(
+        &self,
+        name: &std::ffi::CStr,
+        address: [u8; 4],
+        prefix_len: u8,
+    ) -> std::io::Result<()> {
+        let body = address_body(interface_index(name)?, address, prefix_len);
+        self.request(libc::RTM_NEWADDR, Self::CREATE_EXCL, &body)
+    }
+
+    /// `ip route add default via <gateway>`.
+    fn add_default_route(&self, gateway: [u8; 4]) -> std::io::Result<()> {
+        self.request(
+            libc::RTM_NEWROUTE,
+            Self::CREATE_EXCL,
+            &default_route_body(gateway),
+        )
+    }
+
+    const CREATE_EXCL: u16 = (libc::NLM_F_CREATE | libc::NLM_F_EXCL) as u16;
+
+    /// Send one request and wait for its acknowledgement: Ok, or the kernel's error.
+    fn request(&self, kind: u16, flags: u16, body: &[u8]) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let seq = self.seq.get().wrapping_add(1);
+        self.seq.set(seq);
+        let len = Self::HEADER_LEN + body.len();
+        let flags = (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16 | flags;
+        let mut message = Vec::with_capacity(len);
+        message.extend_from_slice(&(len as u32).to_ne_bytes());
+        message.extend_from_slice(&kind.to_ne_bytes());
+        message.extend_from_slice(&flags.to_ne_bytes());
+        message.extend_from_slice(&seq.to_ne_bytes());
+        message.extend_from_slice(&0u32.to_ne_bytes()); // port id: the kernel sets it
+        message.extend_from_slice(body);
+
+        // SAFETY: sockaddr_nl is plain data; zero is its default for every field.
+        let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        // SAFETY: valid buffer and address, with their lengths.
+        let sent = unsafe {
+            libc::sendto(
+                self.fd.as_raw_fd(),
+                message.as_ptr().cast(),
+                message.len(),
+                0,
+                (&kernel as *const libc::sockaddr_nl).cast(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut reply = [0u8; 4096];
+        loop {
+            // SAFETY: `reply` is valid for writes of its full length.
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    reply.as_mut_ptr().cast(),
+                    reply.len(),
+                    0,
+                )
+            };
+            if n < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if let Some(result) = netlink_ack(&reply[..n as usize], seq) {
+                return result;
+            }
+        }
+    }
+}
+
+/// The acknowledgement of request `seq` among the netlink messages of `reply`
+/// (an NLMSG_ERROR message: error 0 is success), or None if it is not there.
+fn netlink_ack(reply: &[u8], seq: u32) -> Option<std::io::Result<()>> {
+    let field = |at: usize| -> [u8; 4] { reply[at..at + 4].try_into().unwrap() };
+    let mut at = 0;
+    while at + Rtnetlink::HEADER_LEN <= reply.len() {
+        let len = u32::from_ne_bytes(field(at)) as usize;
+        let kind = u16::from_ne_bytes([reply[at + 4], reply[at + 5]]);
+        let message_seq = u32::from_ne_bytes(field(at + 8));
+        if len < Rtnetlink::HEADER_LEN || at + len > reply.len() {
+            return None;
+        }
+        if kind == libc::NLMSG_ERROR as u16
+            && message_seq == seq
+            && len >= Rtnetlink::HEADER_LEN + 4
+        {
+            let error = i32::from_ne_bytes(field(at + Rtnetlink::HEADER_LEN));
+            return Some(if error == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(-error))
+            });
+        }
+        at += len.next_multiple_of(4);
+    }
+    None
+}
+
+/// struct ifinfomsg that sets IFF_UP: family, padding, type, index, flags, change.
+fn link_up_body(index: i32) -> Vec<u8> {
+    let up = libc::IFF_UP as u32;
+    let mut body = vec![libc::AF_UNSPEC as u8, 0, 0, 0];
+    body.extend_from_slice(&index.to_ne_bytes());
+    body.extend_from_slice(&up.to_ne_bytes());
+    body.extend_from_slice(&up.to_ne_bytes());
+    body
+}
+
+/// struct ifaddrmsg (family, prefix length, flags, scope, index), then the
+/// local address and the address, as `ip addr add` sends them with no peer.
+fn address_body(index: i32, address: [u8; 4], prefix_len: u8) -> Vec<u8> {
+    let mut body = vec![libc::AF_INET as u8, prefix_len, 0, libc::RT_SCOPE_UNIVERSE];
+    body.extend_from_slice(&index.to_ne_bytes());
+    push_route_attr(&mut body, libc::IFA_LOCAL, &address);
+    push_route_attr(&mut body, libc::IFA_ADDRESS, &address);
+    body
+}
+
+/// struct rtmsg (family, dst_len, src_len, tos, table, protocol, scope, type,
+/// flags) of a default route in the main table, then its gateway.
+fn default_route_body(gateway: [u8; 4]) -> Vec<u8> {
+    let mut body = vec![
+        libc::AF_INET as u8,
+        0,
+        0,
+        0,
+        libc::RT_TABLE_MAIN,
+        libc::RTPROT_BOOT,
+        libc::RT_SCOPE_UNIVERSE,
+        libc::RTN_UNICAST,
+    ];
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    push_route_attr(&mut body, libc::RTA_GATEWAY, &gateway);
+    body
+}
+
+/// Append a route attribute (struct rtattr and its data, padded to 4 bytes).
+fn push_route_attr(body: &mut Vec<u8>, kind: u16, data: &[u8]) {
+    body.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+    body.extend_from_slice(&kind.to_ne_bytes());
+    body.extend_from_slice(data);
+    body.resize(body.len().next_multiple_of(4), 0);
+}
+
+fn interface_index(name: &std::ffi::CStr) -> std::io::Result<i32> {
+    // SAFETY: a NUL-terminated name.
+    match unsafe { libc::if_nametoindex(name.as_ptr()) } {
+        0 => Err(std::io::Error::last_os_error()),
+        index => Ok(index as i32),
+    }
+}
+
 // ============================================================================
-// Deferred operations (B4, B5 — moved off tiny-init critical path)
+// /dev setup done by the agent, not by tiny-init (off its critical path)
 // ============================================================================
 
-/// B5: Create /dev/fd and /dev/std* symlinks.
+/// Create /dev/fd and /dev/std* symlinks.
 /// Required for bash process substitution <() and /dev/std* portability.
 fn setup_dev_symlinks() {
     use std::os::unix::fs::symlink;
@@ -393,7 +640,7 @@ fn setup_dev_symlinks() {
     let _ = symlink("/proc/self/fd/2", "/dev/stderr");
 }
 
-/// B4: Mount /dev/shm for POSIX shared memory / semaphores.
+/// Mount /dev/shm for POSIX shared memory / semaphores.
 /// Only needed for Python multiprocessing and similar use cases.
 ///
 /// Sized to 40% of RAM with per-UID quota enforcement (`usrquota` +
@@ -402,7 +649,7 @@ fn setup_dev_symlinks() {
 fn setup_dev_shm() {
     // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
     let page_mask = !(page_size() - 1);
-    // 40% of RAM (matching /home/user sizing)
+    // 40% of RAM
     let shm_bytes = (read_mem_total_kb() * 2048 / 5) & page_mask;
     let opts = format!("size={shm_bytes},usrquota,usrquota_block_hardlimit={shm_bytes},noswap");
 
@@ -469,16 +716,7 @@ fn setup_zram_swap() -> ZramSetupOutcome {
     use std::thread;
     use std::time::Duration;
 
-    // Syscall numbers for swapon(2)
-    #[cfg(target_arch = "x86_64")]
-    const SYS_SWAPON: libc::c_long = 167;
-    #[cfg(target_arch = "aarch64")]
-    const SYS_SWAPON: libc::c_long = 224;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_SWAPOFF: libc::c_long = 168;
-    #[cfg(target_arch = "aarch64")]
-    const SYS_SWAPOFF: libc::c_long = 225;
-    const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
+    const SWAP_FLAG_PREFER: libc::c_int = 0x8000; // <sys/swap.h>
 
     fn reset_zram() {
         let _ = std::fs::write("/sys/block/zram0/reset", "1");
@@ -486,21 +724,15 @@ fn setup_zram_swap() -> ZramSetupOutcome {
 
     // Wait for the built-in zram device to appear.
     // Exponential backoff: 0.5+1+2+4+8+16 = 31.5ms max
-    let delays_us = [500, 1000, 2000, 4000, 8000, 16000];
-    let found = {
-        let mut ok = false;
-        for &delay_us in &delays_us {
-            if Path::new("/sys/block/zram0").exists() {
-                ok = true;
-                break;
-            }
-            thread::sleep(Duration::from_micros(delay_us));
+    let zram_exists = || Path::new("/sys/block/zram0").exists();
+    let mut found = zram_exists();
+    for delay_us in [500, 1000, 2000, 4000, 8000, 16000] {
+        if found {
+            break;
         }
-        if !ok {
-            ok = Path::new("/sys/block/zram0").exists();
-        }
-        ok
-    };
+        thread::sleep(Duration::from_micros(delay_us));
+        found = zram_exists();
+    }
     if !found {
         log_warn!("[zram] setup failed: device not found");
         return ZramSetupOutcome::Failed;
@@ -555,7 +787,7 @@ fn setup_zram_swap() -> ZramSetupOutcome {
 
             // swapon with high priority. Returning 0 attests activation; no
             // /proc/swaps readback needed.
-            if unsafe { libc::syscall(SYS_SWAPON, dev.as_ptr(), SWAP_FLAG_PREFER | 100) } < 0 {
+            if unsafe { libc::swapon(dev.as_ptr(), SWAP_FLAG_PREFER | 100) } < 0 {
                 return Err(format!("swapon: {}", std::io::Error::last_os_error()));
             }
             Ok((oom_guard, geometry))
@@ -574,7 +806,7 @@ fn setup_zram_swap() -> ZramSetupOutcome {
     // capped geometry active without its pressure guard.
     if let Err(e) = oom_guard.spawn() {
         log_warn!("[zram] setup failed: could not start OOM guard: {e}");
-        let swapoff_rc = unsafe { libc::syscall(SYS_SWAPOFF, dev.as_ptr()) };
+        let swapoff_rc = unsafe { libc::swapoff(dev.as_ptr()) };
         let reset_result = std::fs::write("/sys/block/zram0/reset", "1");
         if swapoff_rc != 0 || reset_result.is_err() {
             log_warn!("[zram] cleanup after guard failure failed, powering off guest");
@@ -634,7 +866,7 @@ fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
 // Sysctl hardening
 // ============================================================================
 
-/// E3: Critical sysctl — must be applied before any request handling.
+/// Critical sysctl — must be applied before any request handling.
 /// These block privilege escalation and info-leak vectors that sandbox
 /// code could exploit immediately.
 const SYSCTL_CRITICAL: &[(&str, &str)] = &[
@@ -657,7 +889,7 @@ const SYSCTL_CRITICAL: &[(&str, &str)] = &[
     ("/proc/sys/kernel/yama/ptrace_scope", "2"),
 ];
 
-/// E3: Non-critical sysctl — defense-in-depth settings applied synchronously
+/// Non-critical sysctl — defense-in-depth settings applied synchronously
 /// in phase 2 core (before port open). These harden filesystem and limit
 /// attack surface but aren't exploitable during early boot.
 const SYSCTL_NON_CRITICAL: &[(&str, &str)] = &[
@@ -674,21 +906,15 @@ const SYSCTL_NON_CRITICAL: &[(&str, &str)] = &[
     ("/proc/sys/kernel/threads-max", "1200"),
 ];
 
-fn apply_sysctl_critical() {
-    for &(path, value) in SYSCTL_CRITICAL {
-        let _ = std::fs::write(path, value);
-    }
-}
-
-fn apply_sysctl_non_critical() {
-    for &(path, value) in SYSCTL_NON_CRITICAL {
+fn apply_sysctls() {
+    for &(path, value) in SYSCTL_CRITICAL.iter().chain(SYSCTL_NON_CRITICAL) {
         let _ = std::fs::write(path, value);
     }
 }
 
 /// Pre-apply zram VM tuning sysctls before /proc/sys is made read-only.
-/// These values are safe to set even before zram device setup completes:
-/// the kernel uses defaults until swapon, then these take effect.
+/// These values are safe to set before zram device setup completes: they
+/// apply at once, and the swap-related ones have no effect until swapon.
 ///
 /// Refs:
 ///   - https://docs.kernel.org/admin-guide/sysctl/vm.html
@@ -755,8 +981,8 @@ fn page_size() -> u64 {
 }
 
 /// Verify gvproxy connectivity with exponential backoff.
-/// Runs inside the background network worker; ExecuteCode/InstallPackages wait
-/// on the untrusted-readiness gate, which reflects this probe's outcome.
+/// Runs inside the background network worker; ExecuteCode, InstallPackages and
+/// WarmRepl wait on the untrusted-readiness gate, which reflects this probe's outcome.
 ///
 /// DNS-first verification (no fork/exec):
 /// UDP DNS query to gateway:53 — any response proves both L3 routing AND DNS proxy
@@ -815,7 +1041,7 @@ fn verify_gvproxy() -> Result<(), &'static str> {
     }
 }
 
-/// A2: Set file mode on multiple paths using libc::chmod (no fork/exec overhead).
+/// Set file mode on multiple paths using libc::chmod (no fork/exec overhead).
 fn chmod_paths(mode: libc::mode_t, paths: &[&str]) {
     for path in paths {
         if let Ok(cpath) = std::ffi::CString::new(*path) {
@@ -825,24 +1051,22 @@ fn chmod_paths(mode: libc::mode_t, paths: &[&str]) {
 }
 
 /// Mask a path by bind-mounting /dev/null over it (returns empty on read).
-fn mount_mask(path: &std::ffi::CStr) -> bool {
-    unsafe {
-        let ret = libc::mount(
+fn mount_mask(path: &std::ffi::CStr) {
+    let ret = unsafe {
+        libc::mount(
             c"/dev/null".as_ptr(),
             path.as_ptr(),
             std::ptr::null(),
             libc::MS_BIND,
             std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        log_warn!(
+            "mask mount {} failed: {}",
+            path.to_string_lossy(),
+            std::io::Error::last_os_error()
         );
-        if ret != 0 {
-            log_warn!(
-                "mask mount {} failed: {}",
-                path.to_string_lossy(),
-                std::io::Error::last_os_error()
-            );
-            return false;
-        }
-        true
     }
 }
 
@@ -886,21 +1110,237 @@ fn mount_readonly(path: &std::ffi::CStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::ZRAM_PENDING;
+    use crate::error::{
+        exit_code_from_status, graceful_terminate_process_group, wait_child_bounded,
+    };
 
-    #[test]
-    fn network_state_decoder_distinguishes_all_terminal_states() {
-        assert_eq!(decode_network_state(NETWORK_PENDING), Ok(false));
-        assert_eq!(decode_network_state(NETWORK_READY), Ok(true));
+    /// Collect `child` before tokio and keep its status, as the PID 1 reaper does.
+    fn reap_first(child: &WaitedChild) {
+        let pid = child.child.id().unwrap() as libc::pid_t;
+        let mut status: libc::c_int = 0;
+        // SAFETY: waits for this test's own child only (waitpid(-1) would take
+        // the children of the tests that run in parallel).
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        keep_waited_exit(pid as u32, status);
+    }
+
+    #[tokio::test]
+    async fn a_child_that_the_reaper_collected_first_keeps_its_exit_code() {
+        let spawned = tokio::process::Command::new("sh")
+            .args(["-c", "kill -9 $$"])
+            .spawn()
+            .unwrap();
+        let mut child = WaitedChild::register(spawned);
+        reap_first(&child);
+
+        // tokio alone loses the status: the REPL would look alive-then-gone.
+        let lost = child.child.try_wait().unwrap_err();
+        assert_eq!(lost.raw_os_error(), Some(libc::ECHILD));
+        let status = child.try_wait().unwrap().unwrap();
+        assert_eq!(exit_code_from_status(status), 137);
+        let status = child.wait().await.unwrap();
+        assert_eq!(exit_code_from_status(status), 137);
+        assert_eq!(child.id(), None);
+    }
+
+    #[tokio::test]
+    async fn a_collected_child_whose_pid_came_back_gets_no_wait_and_no_signal() {
+        // The REPL ended (exit 3) and the reaper kept its status; another process
+        // now has its PID. The live `sleep` plays that process: waitpid on the
+        // PID finds it, and a signal to the PID would reach it.
+        let spawned = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0) // as a REPL: the group gets the signals of a timeout
+            .spawn()
+            .unwrap();
+        let pid = spawned.id().unwrap();
+        let mut child = WaitedChild::register(spawned);
+        keep_waited_exit(pid, 3 << 8);
+
+        assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(3));
+        assert_eq!(child.id(), None);
+        child.start_kill().unwrap();
+        graceful_terminate_process_group(&mut child, 0).await;
+        let status =
+            wait_child_bounded(&mut child, "test", std::time::Duration::from_secs(2)).await;
+        assert_eq!(status.and_then(|s| s.code()), Some(3));
+        // The first fatal signal sets the exit status: SIGINT from here, unless the
+        // agent signalled first (SIGKILL from start_kill, SIGTERM from the group).
+        // SAFETY: the test's own child.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
+        let mut status: libc::c_int = 0;
         assert_eq!(
-            decode_network_state(NETWORK_FAILED),
-            Err("network setup failed")
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+        assert_eq!(
+            libc::WTERMSIG(status),
+            libc::SIGINT,
+            "the agent signalled the PID"
         );
     }
 
+    /// Block until `pid` exits, without collecting it (WNOWAIT): tokio collects it next.
+    fn wait_exit_uncollected(pid: u32) {
+        // SAFETY: `info` is valid for writes; waits for this test's own child only.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0);
+    }
+
+    #[tokio::test]
+    async fn a_child_that_tokio_collected_keeps_its_status_when_its_pid_comes_back() {
+        // tokio collects each child first (try_wait, then wait); later the reaper
+        // collects another process with the same PID (played by the call below).
+        let spawn = || {
+            tokio::process::Command::new("sh")
+                .args(["-c", "exit 3"])
+                .spawn()
+                .unwrap()
+        };
+        let mut by_try_wait = WaitedChild::register(spawn());
+        let pid = by_try_wait.child.id().unwrap();
+        wait_exit_uncollected(pid);
+        assert_eq!(
+            by_try_wait.try_wait().unwrap().and_then(|s| s.code()),
+            Some(3)
+        );
+        keep_waited_exit(pid, 7 << 8);
+        assert_eq!(
+            by_try_wait.try_wait().unwrap().and_then(|s| s.code()),
+            Some(3)
+        );
+
+        let mut by_wait = WaitedChild::register(spawn());
+        let pid = by_wait.child.id().unwrap();
+        assert_eq!(by_wait.wait().await.unwrap().code(), Some(3));
+        keep_waited_exit(pid, 7 << 8);
+        assert_eq!(by_wait.wait().await.unwrap().code(), Some(3));
+        assert_eq!(by_wait.id(), None);
+    }
+
     #[test]
-    fn network_state_decoder_rejects_unknown_values() {
-        assert!(decode_network_state(200).is_err());
+    fn a_new_child_with_the_pid_of_an_ended_one_keeps_its_own_status() {
+        let pid = u32::MAX - 7; // no real process: only the map is used
+        let first = register_waited(pid);
+        keep_waited_exit(pid, 3 << 8); // the first child ended, unread
+        let second = register_waited(pid); // the PID came back for a new child
+        assert_eq!(reaped_status(first).and_then(|s| s.code()), Some(3));
+        assert_eq!(reaped_status(second), None);
+
+        keep_waited_exit(pid, 5 << 8);
+        assert_eq!(reaped_status(second).and_then(|s| s.code()), Some(5));
+        assert_eq!(reaped_status(first).and_then(|s| s.code()), Some(3));
+        waited_children().remove(&first);
+        assert_eq!(reaped_status(second).and_then(|s| s.code()), Some(5));
+        waited_children().remove(&second);
+    }
+
+    #[test]
+    fn the_reaper_keeps_no_status_of_a_child_that_nobody_waits_for() {
+        let pid = u32::MAX - 8;
+        let key = register_waited(pid);
+        waited_children().remove(&key); // the registration dropped
+        keep_waited_exit(pid, 3 << 8);
+        assert!(waited_children().values().all(|(p, _)| *p != pid));
+    }
+
+    // -------------------------------------------------------------------------
+    // rtnetlink requests of the network setup
+    // -------------------------------------------------------------------------
+
+    fn ne16(v: u16) -> [u8; 2] {
+        v.to_ne_bytes()
+    }
+
+    #[test]
+    fn link_up_body_is_an_ifinfomsg_that_sets_iff_up() {
+        let mut expected = vec![0u8, 0, 0, 0]; // AF_UNSPEC, padding, type
+        expected.extend_from_slice(&7i32.to_ne_bytes());
+        expected.extend_from_slice(&1u32.to_ne_bytes()); // IFF_UP
+        expected.extend_from_slice(&1u32.to_ne_bytes());
+        assert_eq!(link_up_body(7), expected);
+    }
+
+    #[test]
+    fn address_body_is_ip_addr_add_with_no_peer() {
+        // ifaddrmsg (AF_INET=2, /24, flags 0, universe), index 3,
+        // IFA_LOCAL=2 then IFA_ADDRESS=1, each 8 bytes (4 header + 4 address)
+        let mut expected = vec![2u8, 24, 0, 0];
+        expected.extend_from_slice(&3i32.to_ne_bytes());
+        for kind in [2u16, 1] {
+            expected.extend_from_slice(&ne16(8));
+            expected.extend_from_slice(&ne16(kind));
+            expected.extend_from_slice(&[192, 168, 127, 2]);
+        }
+        assert_eq!(address_body(3, [192, 168, 127, 2], 24), expected);
+    }
+
+    #[test]
+    fn default_route_body_is_ip_route_add_default_via() {
+        // rtmsg: AF_INET, dst/src len 0, tos 0, main table 254, RTPROT_BOOT 3,
+        // universe 0, RTN_UNICAST 1, flags 0; then RTA_GATEWAY=5
+        let mut expected = vec![2u8, 0, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
+        expected.extend_from_slice(&ne16(8));
+        expected.extend_from_slice(&ne16(5));
+        expected.extend_from_slice(&[192, 168, 127, 1]);
+        assert_eq!(default_route_body([192, 168, 127, 1]), expected);
+    }
+
+    #[test]
+    fn route_attrs_are_padded_to_four_bytes() {
+        let mut body = Vec::new();
+        push_route_attr(&mut body, 6, &[1, 2, 3, 4, 5]);
+        // rta_len counts the header and the data, not the padding
+        let mut expected = [ne16(9), ne16(6)].concat();
+        expected.extend_from_slice(&[1, 2, 3, 4, 5, 0, 0, 0]);
+        assert_eq!(body, expected);
+    }
+
+    /// An NLMSG_ERROR message for `seq` with `error`, and a request header after.
+    fn ack(seq: u32, error: i32) -> Vec<u8> {
+        let mut message = Vec::new();
+        message.extend_from_slice(&36u32.to_ne_bytes());
+        message.extend_from_slice(&(libc::NLMSG_ERROR as u16).to_ne_bytes());
+        message.extend_from_slice(&0u16.to_ne_bytes());
+        message.extend_from_slice(&seq.to_ne_bytes());
+        message.extend_from_slice(&0u32.to_ne_bytes());
+        message.extend_from_slice(&error.to_ne_bytes());
+        message.extend_from_slice(&[0u8; 16]);
+        message
+    }
+
+    #[test]
+    fn netlink_ack_reads_success_and_kernel_errors_of_its_request_only() {
+        assert!(matches!(netlink_ack(&ack(4, 0), 4), Some(Ok(()))));
+        let error = netlink_ack(&ack(4, -libc::EEXIST), 4).unwrap().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
+        // The ack of another request is skipped; the next message is read
+        assert!(netlink_ack(&ack(3, 0), 4).is_none());
+        let both = [ack(3, -libc::EINVAL), ack(4, 0)].concat();
+        assert!(matches!(netlink_ack(&both, 4), Some(Ok(()))));
+        // A cut message is not read past its end
+        assert!(netlink_ack(&ack(4, 0)[..18], 4).is_none());
+    }
+
+    #[test]
+    fn link_up_of_loopback_gets_an_ack_from_the_kernel() {
+        // The full path: socket, request, ack. Without CAP_NET_ADMIN (a test
+        // container), the kernel refuses with EPERM; lo is up, so with it: Ok.
+        let rtnl = Rtnetlink::open().unwrap();
+        match rtnl.link_up(c"lo") {
+            Ok(()) => {}
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{e}"),
+        }
+        let missing = rtnl.link_up(c"nosuchif0").unwrap_err();
+        assert_eq!(missing.raw_os_error(), Some(libc::ENODEV));
     }
 
     #[test]
@@ -926,24 +1366,14 @@ mod tests {
 
     #[tokio::test]
     async fn untrusted_readiness_fails_closed_on_zram_before_network() {
-        // NETWORK_STATE stays PENDING: if the zram check did not run first,
-        // this call would block on the network waiter instead of erroring.
-        ZRAM_STATE.store(ZRAM_FAILED, Ordering::Release);
-        let result = wait_for_untrusted_readiness().await;
+        // ZRAM_READY and NETWORK_STATE stay unset in tests: if the zram check
+        // did not run first, this call would wait for the network instead.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_untrusted_readiness(),
+        )
+        .await
+        .expect("the zram check must not wait for the network");
         assert_eq!(result, Err("zram safety setup failed"));
-        ZRAM_STATE.store(ZRAM_PENDING, Ordering::Release);
-    }
-
-    #[test]
-    fn zram_state_decoder_fails_closed_on_anything_but_active() {
-        assert_eq!(decode_zram_state(ZRAM_READY), Ok(()));
-        assert_eq!(
-            decode_zram_state(ZRAM_FAILED),
-            Err("zram safety setup failed")
-        );
-        assert_eq!(
-            decode_zram_state(ZRAM_PENDING),
-            Err("zram safety state is not terminal")
-        );
     }
 }

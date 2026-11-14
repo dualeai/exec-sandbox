@@ -3,8 +3,11 @@
 Verifies the streaming contract:
 - Callbacks fire in real-time as chunks arrive from the guest agent
 - "".join(chunks) == result.stdout/stderr (within guest-enforced limits)
-- Output exceeding limits raises OutputLimitError (guest-enforced)
+- Output exceeding limits raises InvalidInputError OUTPUT_LIMIT (guest-enforced)
 - Buffer boundaries (64KB flush), timing (50ms flush interval), and edge cases
+
+The guest sends the first output of an exec at once, then a chunk each 50 ms or when its
+buffer reaches 64 KiB: a 64 KiB write arrives in more than one chunk.
 """
 
 import time
@@ -12,10 +15,11 @@ import time
 import pytest
 
 from exec_sandbox.constants import DEFAULT_TIMEOUT_SECONDS
-from exec_sandbox.exceptions import OutputLimitError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_hwaccel
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once, skip_unless_hwaccel
 
 
 # =============================================================================
@@ -29,15 +33,10 @@ class TestStreamingContract:
         stdout_chunks: list[str] = []
 
         code = "\n".join(f'print("line {i}")' for i in range(100))
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert joined == result.stdout
+        assert "".join(stdout_chunks) == result.stdout == "".join(f"line {i}\n" for i in range(100))
 
     async def test_stderr_callbacks_match_result(self, scheduler: Scheduler) -> None:
         """Joined stderr chunks must equal result.stderr for output under limits."""
@@ -48,15 +47,10 @@ import sys
 for i in range(100):
     print(f"err {i}", file=sys.stderr)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stderr=stderr_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stderr=stderr_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stderr_chunks)
-        assert joined == result.stderr
+        assert "".join(stderr_chunks) == result.stderr == "".join(f"err {i}\n" for i in range(100))
 
     @skip_unless_hwaccel
     async def test_multi_chunk_via_sleep(self, scheduler: Scheduler) -> None:
@@ -78,11 +72,7 @@ for i in range(5):
     print(f"chunk {i}", flush=True)
     time.sleep(0.1)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=on_stdout,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=on_stdout)
 
         assert result.exit_code == 0
         # Multiple chunks arrived
@@ -102,22 +92,17 @@ for i in range(10):
     print(f"out {i}")
     print(f"err {i}", file=sys.stderr)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            code,
             on_stdout=stdout_chunks.append,
             on_stderr=stderr_chunks.append,
         )
 
         assert result.exit_code == 0
-        assert len(stdout_chunks) >= 1
-        assert len(stderr_chunks) >= 1
-        assert "".join(stdout_chunks) == result.stdout
-        assert "".join(stderr_chunks) == result.stderr
-        # Verify all lines present
-        for i in range(10):
-            assert f"out {i}" in result.stdout
-            assert f"err {i}" in result.stderr
+        assert "".join(stdout_chunks) == result.stdout == "".join(f"out {i}\n" for i in range(10))
+        assert "".join(stderr_chunks) == result.stderr == "".join(f"err {i}\n" for i in range(10))
 
     @skip_unless_hwaccel
     async def test_streaming_delivers_before_completion(self, scheduler: Scheduler) -> None:
@@ -141,11 +126,7 @@ time.sleep(1.0)
 print("late")
 """
         start = time.monotonic()
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=on_stdout,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=on_stdout)
         end = time.monotonic()
 
         assert result.exit_code == 0
@@ -167,7 +148,7 @@ class TestStreamingBoundaries:
     """Test buffer boundary conditions and output limit enforcement."""
 
     async def test_output_just_under_64kb(self, scheduler: Scheduler) -> None:
-        """65535 bytes fits in a single buffer flush."""
+        """65535 bytes, one under the 64 KiB buffer: every byte reaches the callback and the result."""
         stdout_chunks: list[str] = []
 
         code = """
@@ -175,18 +156,13 @@ import sys
 sys.stdout.write("A" * 65535)
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert len(joined) == 65535
+        assert "".join(stdout_chunks) == result.stdout == "A" * 65535
 
     async def test_output_exactly_64kb(self, scheduler: Scheduler) -> None:
-        """65536 bytes hits the exact buffer boundary."""
+        """65536 bytes, the size that flushes the buffer: every byte arrives once."""
         stdout_chunks: list[str] = []
 
         code = """
@@ -194,15 +170,10 @@ import sys
 sys.stdout.write("A" * 65536)
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert len(joined) == 65536
+        assert "".join(stdout_chunks) == result.stdout == "A" * 65536
 
     async def test_output_just_over_64kb_splits(self, scheduler: Scheduler) -> None:
         """65537 bytes exceeds buffer, should split into >= 2 chunks."""
@@ -213,19 +184,18 @@ import sys
 sys.stdout.write("A" * 65537)
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert len(joined) == 65537
+        assert "".join(stdout_chunks) == result.stdout == "A" * 65537
         assert len(stdout_chunks) >= 2
 
     async def test_stdout_exceeds_max_raises_output_limit(self, scheduler: Scheduler) -> None:
-        """1.2MB stdout raises OutputLimitError; partial output delivered via callbacks."""
+        """1.2MB stdout raises InvalidInputError OUTPUT_LIMIT; the callbacks got the output up to the limit.
+
+        The guest drops the whole read that crosses the 1 MB limit (8 KiB reads), and can hold back
+        the start of a possible end marker: the callbacks get at most 1 MB and less than 9,000 B
+        under it."""
         stdout_chunks: list[str] = []
         target_size = 1_200_000  # 1.2MB — over 1MB limit
 
@@ -234,46 +204,47 @@ import sys
 sys.stdout.write("X" * {target_size})
 sys.stdout.flush()
 """
-        with pytest.raises(OutputLimitError, match="output_limit_error"):
-            await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                on_stdout=stdout_chunks.append,
-            )
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT, match="output_limit_error"
+        ):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
-        # Callbacks received partial output up to the limit
         joined = "".join(stdout_chunks)
-        assert len(joined) <= 1_000_000 + 8192  # limit + one read buffer margin
+        assert 1_000_000 - 9_000 < len(joined) <= 1_000_000
+        assert joined == "X" * len(joined)
 
     async def test_stderr_exceeds_max_raises_output_limit(self, scheduler: Scheduler) -> None:
-        """120KB stderr raises OutputLimitError; partial output delivered via callbacks."""
+        """120KB stderr raises InvalidInputError OUTPUT_LIMIT; the callbacks got the output up to the limit.
+
+        The guest sends stderr by whole lines (it reads them for its end marker), up to and with the
+        read that crossed the 100 KB limit (8 KiB reads): more than the limit less one line, at most
+        the limit and one read."""
         stderr_chunks: list[str] = []
-        target_size = 120_000  # 120KB — over 100KB limit
+        line = "E" * 99 + "\n"
 
         code = f"""
 import sys
-sys.stderr.write("E" * {target_size})
+sys.stderr.write({line!r} * 1200)  # 120KB: over the 100KB limit
 sys.stderr.flush()
 """
-        with pytest.raises(OutputLimitError, match="output_limit_error"):
-            await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                on_stderr=stderr_chunks.append,
-            )
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT, match="output_limit_error"
+        ):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stderr=stderr_chunks.append)
 
-        # Callbacks received partial output up to the limit
         joined = "".join(stderr_chunks)
-        assert len(joined) <= 100_000 + 8192  # limit + one read buffer margin
+        assert 100_000 - 100 < len(joined) <= 100_000 + 8192
+        assert joined == line * (len(joined) // 100)
 
     async def test_no_output_callbacks_never_fire(self, scheduler: Scheduler) -> None:
         """Silent code produces no callback invocations."""
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
 
-        result = await scheduler.run(
-            code="x = 42",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            "x = 42",
             on_stdout=stdout_chunks.append,
             on_stderr=stderr_chunks.append,
         )
@@ -291,32 +262,34 @@ sys.stderr.flush()
 import sys
 print("error line", file=sys.stderr)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            code,
             on_stdout=stdout_chunks.append,
             on_stderr=stderr_chunks.append,
         )
 
         assert result.exit_code == 0
-        assert len(stdout_chunks) == 0
-        assert len(stderr_chunks) >= 1
-        assert "error line" in "".join(stderr_chunks)
+        assert stdout_chunks == []
+        assert "".join(stderr_chunks) == result.stderr == "error line\n"
 
     async def test_only_stdout_no_stderr(self, scheduler: Scheduler) -> None:
-        """When only stdout is written, stderr callbacks don't fire."""
+        """When only stdout is written, stderr callbacks don't fire. Fast code (under 5 ms)
+        still delivers its output to the callback (the final flush)."""
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
 
-        result = await scheduler.run(
-            code='print("hello")',
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            'print("hello")',
             on_stdout=stdout_chunks.append,
             on_stderr=stderr_chunks.append,
         )
 
         assert result.exit_code == 0
-        assert len(stdout_chunks) >= 1
+        assert "".join(stdout_chunks) == "hello\n"
         assert len(stderr_chunks) == 0
 
     @skip_unless_hwaccel
@@ -335,15 +308,10 @@ import sys
 sys.stderr.write("no-newline")
 sys.stderr.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stderr=stderr_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stderr=stderr_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stderr_chunks)
-        assert "no-newline" in joined
+        assert "".join(stderr_chunks) == result.stderr == "no-newline"
 
 
 # =============================================================================
@@ -353,84 +321,60 @@ class TestStreamingWeirdCases:
     """Test unusual inputs that might confuse the streaming protocol."""
 
     async def test_callback_exception_disabled_stdout_still_completes(self, scheduler: Scheduler) -> None:
-        """on_stdout that raises is disabled; output still collected in result."""
+        """on_stdout that raises is disabled: it gets no later chunk (200,000 bytes come in at least
+        3 chunks of at most 64 KiB), and the result still holds all the output."""
+        calls: list[str] = []
 
-        def exploding_callback(_chunk: str) -> None:
+        def exploding_callback(chunk: str) -> None:
+            calls.append(chunk)
             raise RuntimeError("callback boom")
 
-        result = await scheduler.run(
-            code='print("hello from stdout")',
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            'import sys; sys.stdout.write("O" * 200_000)',
             on_stdout=exploding_callback,
         )
         assert result.exit_code == 0
-        assert "hello from stdout" in result.stdout
+        assert result.stdout == "O" * 200_000
+        assert len(calls) == 1
 
     async def test_callback_exception_disabled_stderr_still_completes(self, scheduler: Scheduler) -> None:
-        """on_stderr that raises is disabled; output still collected in result."""
+        """on_stderr that raises is disabled: it gets no later chunk (90,000 bytes, under the 100 KB
+        limit, come in at least 2 chunks), and the result still holds all the output."""
+        calls: list[str] = []
 
-        def exploding_callback(_chunk: str) -> None:
+        def exploding_callback(chunk: str) -> None:
+            calls.append(chunk)
             raise RuntimeError("callback boom")
 
-        result = await scheduler.run(
-            code='import sys; print("hello from stderr", file=sys.stderr)',
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            'import sys; sys.stderr.write("E" * 90_000)',
             on_stderr=exploding_callback,
         )
         assert result.exit_code == 0
-        assert "hello from stderr" in result.stderr
+        assert result.stderr == "E" * 90_000
+        assert len(calls) == 1
 
     async def test_callback_exception_on_later_chunk(self, scheduler: Scheduler) -> None:
-        """Callback raises on 2nd chunk; all output still collected."""
-        call_count = 0
+        """Callback raises on the 2nd chunk (200,000 bytes come in at least 3 chunks): it gets no
+        3rd, the first chunk it took is the start of the output, and the result holds all of it."""
+        stdout_chunks: list[str] = []
 
         def explode_on_second(chunk: str) -> None:
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 2:
+            stdout_chunks.append(chunk)
+            if len(stdout_chunks) == 2:
                 raise RuntimeError("boom on second chunk")
 
-        code = """
-import sys
-for i in range(5):
-    print(f"line-{i}", flush=True)
-"""
-
-        def collecting_callback(chunk: str) -> None:
-            stdout_chunks.append(chunk)
-            explode_on_second(chunk)
-
-        stdout_chunks: list[str] = []
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=collecting_callback,
-        )
+        code = 'import sys; sys.stdout.write("".join(f"{i:07d}" for i in range(200_000 // 7)))'
+        expected = "".join(f"{i:07d}" for i in range(200_000 // 7))
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=explode_on_second)
         assert result.exit_code == 0
-        # All lines collected in result regardless of callback failure
-        for i in range(5):
-            assert f"line-{i}" in result.stdout
-
-    async def test_extremely_long_single_line(self, scheduler: Scheduler) -> None:
-        """128KB with no newlines splits into >= 2 chunks."""
-        stdout_chunks: list[str] = []
-        target = 128 * 1024
-
-        code = f"""
-import sys
-sys.stdout.write("A" * {target})
-sys.stdout.flush()
-"""
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
-
-        assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert len(joined) == target
-        assert len(stdout_chunks) >= 2
+        assert result.stdout == expected
+        assert len(stdout_chunks) == 2
+        assert expected.startswith("".join(stdout_chunks))
 
     async def test_output_containing_json_protocol_strings(self, scheduler: Scheduler) -> None:
         """Fake JSON protocol messages in output don't confuse parser."""
@@ -447,18 +391,15 @@ fake_msgs = [
 for msg in fake_msgs:
     print(json.dumps(msg))
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        # All fake messages should appear as plain text in stdout
-        assert '"type": "stdout"' in joined
-        assert '"type": "execution_complete"' in joined
-        assert '"type": "streaming_error"' in joined
+        assert "".join(stdout_chunks) == result.stdout
+        assert result.stdout.splitlines() == [
+            '{"type": "stdout", "chunk": "fake"}',
+            '{"type": "execution_complete", "exit_code": 0}',
+            '{"type": "streaming_error", "message": "fake error"}',
+        ]
 
     async def test_various_newline_forms(self, scheduler: Scheduler) -> None:
         r"""Different newline forms (\r\n, \r, \n) are preserved verbatim."""
@@ -472,20 +413,13 @@ sys.stdout.write("lf\n")
 sys.stdout.write("mixed\r\n\n\r")
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert "crlf\r\n" in joined
-        assert "lf\n" in joined
-        assert "mixed\r\n\n\r" in joined
+        assert "".join(stdout_chunks) == result.stdout == "crlf\r\ncr\rlf\nmixed\r\n\n\r"
 
     async def test_output_with_null_bytes(self, scheduler: Scheduler) -> None:
-        r"""Null bytes (\x00) in output are handled without data loss."""
+        r"""Null bytes (\x00) in output reach the callback and the result unchanged."""
         stdout_chunks: list[str] = []
 
         code = r"""
@@ -493,17 +427,10 @@ import sys
 sys.stdout.write("before\x00after\n")
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        # Null bytes should be present or replaced, but both "before" and "after" must appear
-        assert "before" in joined
-        assert "after" in joined
+        assert "".join(stdout_chunks) == result.stdout == "before\x00after\n"
 
     async def test_unicode_and_emoji_output(self, scheduler: Scheduler) -> None:
         """Multi-byte UTF-8 (emoji, CJK, combining chars) not corrupted."""
@@ -515,18 +442,10 @@ print("中文测试")
 print("café résumé naïve")
 print("a\\u0301")  # a + combining accent
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert joined == result.stdout
-        assert "🌍🚀" in joined
-        assert "中文测试" in joined
-        assert "café" in joined
+        assert "".join(stdout_chunks) == result.stdout == "Hello 🌍🚀\n中文测试\ncafé résumé naïve\na\u0301\n"
 
     async def test_alternating_small_and_large_outputs(self, scheduler: Scheduler) -> None:
         """Alternating 1B and 32KB writes maintain total integrity."""
@@ -539,17 +458,10 @@ for i in range(10):
     sys.stdout.write("Y" * 32768)
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        expected_len = 10 * (1 + 32768)
-        assert len(joined) == expected_len
-        assert joined == result.stdout
+        assert "".join(stdout_chunks) == result.stdout == ("X" + "Y" * 32768) * 10
 
 
 # =============================================================================
@@ -569,31 +481,12 @@ print("before-timeout", flush=True)
 time.sleep({timeout * 4})
 print("after-timeout")
 """
-        await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=timeout,
-            on_stdout=stdout_chunks.append,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=timeout, on_stdout=stdout_chunks.append
         )
 
-        joined = "".join(stdout_chunks)
-        assert "before-timeout" in joined
-        assert "after-timeout" not in joined
-
-    async def test_very_fast_code_delivers_data(self, scheduler: Scheduler) -> None:
-        """Sub-5ms code still delivers output via final flush."""
-        stdout_chunks: list[str] = []
-
-        result = await scheduler.run(
-            code='print("fast")',
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
-
-        assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert "fast" in joined
-        assert len(stdout_chunks) >= 1
+        assert result.exit_code == -1  # a timeout
+        assert "".join(stdout_chunks) == result.stdout == "before-timeout\n"
 
     async def test_crash_after_output_captures_partial(self, scheduler: Scheduler) -> None:
         """os._exit(42) after print — pre-crash output is captured."""
@@ -604,15 +497,10 @@ import os
 print("before-crash", flush=True)
 os._exit(42)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 42
-        joined = "".join(stdout_chunks)
-        assert "before-crash" in joined
+        assert "".join(stdout_chunks) == result.stdout == "before-crash\n"
 
     async def test_high_output_rate_no_data_loss(self, scheduler: Scheduler) -> None:
         """500KB burst with no sleeps — all data received."""
@@ -624,20 +512,14 @@ import sys
 sys.stdout.write("D" * {target_size})
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert len(joined) == target_size
-        assert joined == result.stdout
+        assert "".join(stdout_chunks) == result.stdout == "D" * target_size
 
     async def test_session_streaming_isolation(self, scheduler: Scheduler) -> None:
         """Session exec 1 chunks don't leak into exec 2."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # First execution
             chunks_1: list[str] = []
             result_1 = await session.exec(
@@ -657,44 +539,17 @@ sys.stdout.flush()
             joined_2 = "".join(chunks_2)
 
             # No cross-contamination
-            assert "exec-one" in joined_1
-            assert "exec-two" not in joined_1
-            assert "exec-two" in joined_2
-            assert "exec-one" not in joined_2
-
-    async def test_mixed_stdout_over_stderr_under_raises_output_limit(self, scheduler: Scheduler) -> None:
-        """stdout over limit raises OutputLimitError; stderr under limit is fine."""
-        stdout_chunks: list[str] = []
-        stderr_chunks: list[str] = []
-
-        stdout_size = 1_200_000  # 1.2MB — over 1MB limit
-        stderr_size = 50_000  # 50KB — well under 100KB limit
-
-        code = f"""
-import sys
-sys.stdout.write("O" * {stdout_size})
-sys.stdout.flush()
-sys.stderr.write("E" * {stderr_size})
-sys.stderr.flush()
-"""
-        with pytest.raises(OutputLimitError, match="output_limit_error"):
-            await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                on_stdout=stdout_chunks.append,
-                on_stderr=stderr_chunks.append,
-            )
+            assert (joined_1, joined_2) == ("exec-one\n", "exec-two\n")
 
     async def test_session_reuse_after_output_limit_error(self, scheduler: Scheduler) -> None:
-        """REPL session survives OutputLimitError — next exec works normally."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        """REPL session survives InvalidInputError OUTPUT_LIMIT — next exec works normally."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # First execution: exceed stdout limit
-            with pytest.raises(OutputLimitError):
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
                 await session.exec(
                     "import sys; sys.stdout.write('X' * 1_200_000); sys.stdout.flush()",
                 )
 
             # Second execution: normal output works (REPL preserved)
             result = await session.exec('print("after-limit")')
-            assert result.exit_code == 0
-            assert "after-limit" in result.stdout
+            assert (result.exit_code, result.stdout) == (0, "after-limit\n")

@@ -10,6 +10,7 @@ Usage: uv run scripts/ci_diagnose.py [status|diagnose] [run_id]
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -44,9 +45,9 @@ _JOB_RE = re.compile(r"Test / Python (\S+) / (\S+) \((.+)\)")
 class Failure:
     title: str
     context: str = ""
-    jobs: list[str] = field(default_factory=list)  # pyright: ignore[reportUnknownVariableType]
+    jobs: list[str] = field(default_factory=list[str])
     error_line: str = ""
-    monitors: list[str] = field(default_factory=list)  # pyright: ignore[reportUnknownVariableType]
+    monitors: list[str] = field(default_factory=list[str])
 
 
 async def gh(*args: str) -> str:
@@ -64,13 +65,21 @@ async def gh(*args: str) -> str:
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await proc.communicate()
+    except BaseException:
+        # Cancelled (Ctrl-C): gh ends with this call
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        raise
     if proc.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)}: {stderr.decode().strip()}")
     return stdout.decode()
 
 
 async def gh_json(*args: str) -> Any:
+    """Run a gh CLI command and parse its JSON stdout."""
     return json.loads(await gh(*args))
 
 
@@ -184,7 +193,7 @@ def _parse_log(raw_log: str) -> tuple[dict[str, Failure], str]:
 async def _parse_annotations(repo: str, job_id: int) -> dict[str, Failure]:
     """Fetch check-run annotations (runner crashes, OOM)."""
     try:
-        raw: Any = json.loads(await gh("api", f"repos/{repo}/check-runs/{job_id}/annotations"))
+        raw = await gh_json("api", f"repos/{repo}/check-runs/{job_id}/annotations")
     except (RuntimeError, json.JSONDecodeError):
         return {}
     if not isinstance(raw, list):
@@ -205,10 +214,7 @@ async def _process_job(repo: str, job_id: int) -> tuple[dict[str, Failure], str]
     except RuntimeError:
         log = ""
 
-    if log:
-        failures, monitor = _parse_log(log)
-    else:
-        failures, monitor = {}, ""
+    failures, monitor = _parse_log(log)  # an empty log gives ({}, "")
 
     # Fallback: check-run annotations (runner crashes, OOM)
     if not failures:
@@ -275,6 +281,7 @@ async def _load_run(run_id: str | None) -> tuple[str, str, list[dict[str, Any]]]
 
 
 async def cmd_status(run_id: str | None) -> None:
+    """Print each job of the run (default: the latest run) with its state."""
     _, _, jobs = await _load_run(run_id)
     for j in jobs:
         icon = {"success": "✅", "failure": "❌", "cancelled": "🚫"}.get(
@@ -284,6 +291,7 @@ async def cmd_status(run_id: str | None) -> None:
 
 
 async def cmd_diagnose(run_id: str | None) -> None:
+    """Print the failures of the failed jobs of the run, grouped across jobs, most frequent first."""
     repo, status, jobs = await _load_run(run_id)
 
     failed = [j for j in jobs if j.get("conclusion") == "failure"]

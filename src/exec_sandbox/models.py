@@ -2,64 +2,59 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 
 class FileInfo(BaseModel):
-    """File entry from directory listing in the sandbox.
+    """One entry of Session.list_files()."""
 
-    Returned by Session.list_files() and QemuVM.list_files().
-    """
-
-    name: str = Field(description="File or directory name")
-    is_dir: bool = Field(description="True if entry is a directory")
-    size: int = Field(description="File size in bytes (0 for directories)")
+    name: str = Field(description="File or folder name")
+    is_dir: bool = Field(description="True if the entry is a folder")
+    size: int = Field(description="File size in bytes (0 for folders)")
 
 
 class PortMapping(BaseModel):
-    """Port mapping configuration: internal (guest) → external (host).
-
-    Used to specify which ports to expose from the guest VM to the host.
+    """A guest port (internal) to expose on a host port (external). Give it to VmSpec.expose_ports.
 
     Examples:
         # Expose guest port 8080 on host port 3000
         PortMapping(internal=8080, external=3000)
 
-        # Expose guest port 5000 on a dynamically allocated host port
-        PortMapping(internal=5000)  # external will be auto-assigned
+        # Expose guest port 5000 on a host port that the OS picks
+        PortMapping(internal=5000)
     """
 
-    internal: int = Field(ge=1, le=65535, description="Port inside VM (guest listens on)")
+    model_config = ConfigDict(frozen=True)
+
+    internal: int = Field(ge=1, le=65535, description="Port that the guest listens on")
     external: int | None = Field(
         default=None,
         ge=1024,
         le=65535,
-        description="Port on host (None=dynamic, auto-assigned by OS)",
+        description="Port on the host (None: the OS picks one)",
     )
     protocol: Literal["tcp", "udp"] = Field(default="tcp", description="Transport protocol")
 
 
 class ExposedPort(BaseModel):
-    """Active port mapping after allocation.
+    """A port mapping with its host port (for a dynamic port, the one the OS picked)."""
 
-    Represents a resolved port mapping with the actual allocated host port.
-    """
-
-    internal: int = Field(description="Port inside VM")
-    external: int = Field(description="Allocated port on host")
+    internal: int = Field(description="Port in the VM")
+    external: int = Field(description="Port on the host")
     host: str = Field(default="127.0.0.1", description="Host bind address")
     protocol: Literal["tcp", "udp"] = Field(default="tcp", description="Transport protocol")
 
+    @computed_field
     @property
     def url(self) -> str:
-        """Get HTTP URL for this exposed port."""
+        """HTTP URL of this exposed port (also in serialized output)."""
         return f"http://{self.host}:{self.external}"
 
 
-class Language(str, Enum):
+class Language(StrEnum):
     """Supported programming languages."""
 
     PYTHON = "python"
@@ -68,85 +63,65 @@ class Language(str, Enum):
 
 
 class TimingBreakdown(BaseModel):
-    """Detailed timing breakdown for VM cold start and execution.
+    """Host-measured time of one execution (Session.exec). Startup is in Session.startup_timing."""
 
-    All times are in milliseconds, measured from the host side.
-    Follows Firecracker/AWS Lambda SnapStart conventions for phase separation.
+    execute_ms: int = Field(description="Code execution time (connect + run + response)")
+    connect_ms: int | None = Field(description="Time to connect to the guest agent (None when not measured)")
 
-    Phase coverage (non-overlapping):
-    - admission_ms: Time blocked in admission queue (0 for warm pool hits)
-    - setup_ms: Infra setup (cache lookup, overlay, cgroup) — excludes admission
-    - boot_ms: VM boot (QEMU start + kernel + initramfs + guest-agent ready)
-    - execute_ms: Code execution (connect + run + response)
-    - teardown_ms: Post-execute cleanup (VM destroy, workdir cleanup, admission release)
-    - total_ms = admission + setup + boot + execute + teardown (true end-to-end)
 
-    For warm pool hits, boot_ms and admission_ms are 0.  setup_ms
-    reflects the pool lookup time (typically <1ms).
+class StartupTiming(BaseModel):
+    """How the session's VM started (Session.startup_timing). All times in ms, host-measured.
 
-    Granular boot timing note: The sum of (qemu_cmd_build_ms + gvproxy_start_ms +
-    qemu_fork_ms + guest_wait_ms) will be ~20-30ms less than boot_ms due to
-    unmeasured overhead between QEMU fork and guest wait (crash-check sleep,
-    console log setup, VM registration, state transitions).
+    total_ms covers the new() or reuse() call only; each exec() has its own
+    time (ExecutionResult.timing.execute_ms).
+
+    Phases do not overlap: total_ms = admission_ms + setup_ms + boot_ms
+    (+ instance_load_ms after reuse()); setup_ms is the rest of total_ms. A warm pool hit
+    has admission_ms = boot_ms = 0; an L1 restore has boot_ms = 0 and
+    l1_restore_ms set; reuse() has boot_ms = 0 and setup_ms = the restore of the
+    saved state.
+
+    After a cold boot, the first exec() starts the interpreter: its execute_ms
+    includes that start (about 0.2-0.7 s with KVM or HVF, 3-5 s under TCG) and
+    can be longer than total_ms. A warm-pool or L1 VM has its REPL started.
+
+    The cold-boot parts add up to about 20-30 ms less than boot_ms, because some
+    steps are not measured.
     """
 
-    setup_ms: int = Field(description="Infra setup time (cache lookup, overlay, cgroup) — excludes admission wait")
-    boot_ms: int = Field(description="VM boot time (QEMU start + kernel + initramfs + guest-agent ready)")
-    execute_ms: int = Field(description="Code execution time (connect + run + response)")
-    total_ms: int = Field(description="Total end-to-end time (admission + setup + boot + execute + teardown)")
-    connect_ms: int | None = Field(
-        default=None,
-        description="Time for channel.connect() in milliseconds (host-measured)",
+    model_config = ConfigDict(frozen=True)
+
+    total_ms: int = Field(description="The whole new() or reuse() call (exec() calls not included)")
+    admission_ms: int = Field(description="Wait for a resource slot (0 for warm pool hits)")
+    setup_ms: int = Field(
+        description="Cache lookup, overlay, cgroup (after reuse(): the restore of the saved state); "
+        "excludes admission and boot"
     )
-    # Granular setup timing (for tracing/profiling)
-    admission_ms: int | None = Field(
-        default=None,
-        description="Time blocked in admission queue waiting for a resource slot (0 for warm pool hits)",
+    boot_ms: int = Field(description="QEMU start + kernel + guest agent (0 for warm pool, L1 and reuse())")
+    warm_pool_hit: bool = Field(description="The VM came from the warm pool")
+    l1_cache_hit: bool = Field(description="The VM was restored from the L1 memory snapshot")
+    l1_restore_ms: int | None = Field(description="L1 restore time (None unless l1_cache_hit)")
+    overlay_ms: int = Field(description="Overlay acquisition (cold boot only, else 0)")
+    qemu_cmd_build_ms: int = Field(description="QEMU command build (cold boot only, else 0)")
+    gvproxy_start_ms: int = Field(
+        description="gvproxy start up to its process (cold boot with network only; its ready wait is in guest_wait_ms)"
     )
-    overlay_ms: int | None = Field(
-        default=None,
-        description="Time for overlay acquisition (pool hit <1ms, on-demand 30-400ms)",
-    )
-    # Granular boot timing (for tracing/profiling)
-    qemu_cmd_build_ms: int | None = Field(
-        default=None,
-        description="Time for pre-launch setup (command build, socket cleanup, channel creation)",
-    )
-    gvproxy_start_ms: int | None = Field(
-        default=None,
-        description="Time to start gvproxy (0 if network disabled)",
-    )
-    qemu_fork_ms: int | None = Field(
-        default=None,
-        description="Time for QEMU process fork/exec (subprocess creation)",
-    )
-    guest_wait_ms: int | None = Field(
-        default=None,
-        description="Time waiting for guest agent to become ready (kernel + initramfs + agent init)",
-    )
-    # L1 memory snapshot timing
-    l1_restore_ms: int | None = Field(
-        default=None,
-        description="L1 memory snapshot restore time in milliseconds",
-    )
-    # Post-execute teardown
-    teardown_ms: int | None = Field(
-        default=None,
-        description="VM teardown time (process shutdown, workdir cleanup, admission release)",
-    )
-    # Retry tracking (for CPU contention resilience)
-    boot_retries: int = Field(
-        default=0,
-        description="Number of boot retries (0=first attempt succeeded or warm pool, 1+=retries needed due to CPU contention)",
+    qemu_fork_ms: int = Field(description="QEMU process fork/exec (cold boot only)")
+    guest_wait_ms: int = Field(description="Wait for the guest agent (cold boot only)")
+    boot_retries: int = Field(description="Boot retries after CPU contention (0 = first try or no boot)")
+    instance_load_ms: int | None = Field(
+        description="reuse(): head read, host checks, download and rebuild of the saved state (None for new())"
     )
 
 
 class ExecutionResult(BaseModel):
-    """Result from code execution inside microVM."""
+    """The result of one exec() call."""
 
-    stdout: str = Field(description="Standard output (guest-enforced 1MB limit)")
-    stderr: str = Field(description="Standard error (guest-enforced 100KB limit)")
-    exit_code: int = Field(description="Process exit code (0=success)")
+    stdout: str = Field(description="Standard output (at most 1 MB, a limit of the guest)")
+    stderr: str = Field(description="Standard error (at most 100 KB, a limit of the guest)")
+    exit_code: int = Field(
+        description="Process status 0-255 (0 = success, 128+N = usually killed by signal N), or -1 for a timeout"
+    )
     execution_time_ms: int | None = Field(default=None, description="Execution time in ms (guest-reported)")
     external_cpu_time_ms: int | None = Field(default=None, description="CPU time in ms (host cgroup)")
     external_memory_peak_mb: int | None = Field(default=None, description="Peak memory in MB (host cgroup)")
@@ -154,20 +129,25 @@ class ExecutionResult(BaseModel):
         default=None,
         description="Number of CFS bandwidth throttle events (host cgroup cpu.stat nr_throttled)",
     )
-    timing: TimingBreakdown = Field(description="Detailed timing breakdown (setup, boot, execute, total)")
-    warm_pool_hit: bool = Field(default=False, description="True if VM was allocated from warm pool (instant start)")
-    l1_cache_hit: bool = Field(default=False, description="VM restored from L1 memory snapshot")
+    timing: TimingBreakdown = Field(description="Execution timing (startup is in Session.startup_timing)")
     # Guest-reported granular timing (pass-through from guest agent)
     spawn_ms: int | None = Field(
         default=None,
-        description="Time to acquire REPL process in milliseconds (guest-reported). Includes fork/exec on cold start, ~0ms on cache hit.",
+        description="Time to get the REPL process in milliseconds (guest-reported)",
     )
     process_ms: int | None = Field(
         default=None,
         description="Time from spawn to process exit in milliseconds (guest-reported)",
     )
-    # Port forwarding: exposed ports accessible from host
-    exposed_ports: list[ExposedPort] = Field(
-        default_factory=lambda: [],  # noqa: PIE807 - lambda needed for pyright type inference
-        description="List of ports exposed from guest to host (empty if no port forwarding configured)",
+
+
+class InstanceRef(BaseModel):
+    """A saved instance and its generation, returned by Session.save(). Keep the id and pass it to Scheduler.reuse()."""
+
+    model_config = ConfigDict(frozen=True)
+
+    instance_id: str = Field(
+        description="The id given to Scheduler.new(instance_id=...), else one the library made at the "
+        "first save (32 lowercase hex characters)"
     )
+    generation: int = Field(description="1 after the first save; +1 for each later save by any caller")

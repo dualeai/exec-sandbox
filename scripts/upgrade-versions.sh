@@ -16,7 +16,7 @@
 #                       named linux-6.19.tar.xz, never linux-6.19.0.tar.xz)
 #   KERNEL_SHA256       sha256 of linux-<tarball_ver>.tar.xz from kernel.org sha256sums.asc
 #
-# Supply-chain quarantine (mirrors uv's exclude-newer, commit c6b54393):
+# Supply-chain quarantine (the rule of uv's exclude-newer in pyproject.toml):
 # reject upstream releases distributed after the cutoff (now minus
 # QUARANTINE_DAYS; on/before the cutoff passes), so every adopted release has
 # survived a public quarantine window.
@@ -259,8 +259,8 @@ for v in sorted(versions, reverse=True):
 # channel-rust-X.Y.toml tracks that minor's newest patch — the exact artifact
 # the rust:X.Y-slim image tag ships, so its date gates what is consumed).
 # Output: "<major.minor> <channel-date>". When the walk exhausts (cap, major
-# rollover, or missing manifest) the newest too-young pair is returned and
-# the CALLER's gate freezes to the previous lock pin.
+# rollover, or missing manifest) the last (oldest) too-young pair it fetched
+# is returned and the CALLER's gate freezes to the previous lock pin.
 #
 # Section-scoped parse: manifests list sections alphabetically and
 # [pkg.cargo] carries a version line (0.x) BEFORE [pkg.rust]. Each ~850KB
@@ -370,6 +370,10 @@ resolve_qemu_sha256() {
     local url="https://download.qemu.org/qemu-${qemu_ver}.tar.xz"
     local tmp
     tmp=$(mktemp)
+    # Called in a $(...) subshell: these traps end with it. Ctrl-C leaves no ~130 MB file.
+    # shellcheck disable=SC2064 # expand now: tmp is local to this function
+    trap "rm -f '$tmp'" EXIT
+    trap 'exit 130' INT TERM
     echo "Downloading $url for sha256 pinning..." >&2
     curl -sfL --retry 3 -o "$tmp" "$url" || { rm -f "$tmp"; die "Could not download $url"; }
     local sha

@@ -1,13 +1,13 @@
-"""Tests for image tool availability.
-
-Verifies each image has the expected tools installed and working.
-Uses a parameterized matrix for easy maintenance.
+"""The tools of each guest image: each one is installed and runs, and the runtimes are the
+versions the image names give (python-3.14, node-1.4 for Bun 1.4).
 """
 
 import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 # =============================================================================
 # Tool availability tests using Language.RAW (shell commands)
@@ -20,6 +20,7 @@ RAW_IMAGE_TOOLS = [
     ("curl", "curl --version"),
     ("git", "git --version"),
     ("jq", "jq --version"),
+    ("openssl", "openssl version"),
     ("bash", "bash --version"),
     ("tar", "tar --version"),
     ("gzip", "gzip --version"),
@@ -40,10 +41,7 @@ RAW_IMAGE_TOOLS = [
 @pytest.mark.parametrize("tool,command", RAW_IMAGE_TOOLS, ids=[t[0] for t in RAW_IMAGE_TOOLS])
 async def test_raw_tool_available(scheduler: Scheduler, tool: str, command: str) -> None:
     """Tool is installed in RAW image and returns exit code 0."""
-    result = await scheduler.run(
-        code=command,
-        language=Language.RAW,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.RAW), command)
 
     assert result.exit_code == 0, (
         f"Tool '{tool}' failed in raw image.\n"
@@ -56,7 +54,7 @@ async def test_raw_tool_available(scheduler: Scheduler, tool: str, command: str)
 
 # Python image tool tests - use Python subprocess to verify tools
 PYTHON_IMAGE_TOOLS = [
-    ("python", "import sys; print(sys.version)"),
+    ("python", "import sys; print(sys.version); exit(0 if sys.version_info[:2] == (3, 14) else 1)"),
     (
         "uv",
         "import subprocess; r = subprocess.run(['uv', '--version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
@@ -69,16 +67,17 @@ PYTHON_IMAGE_TOOLS = [
         "git",
         "import subprocess; r = subprocess.run(['git', '--version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
     ),
+    (
+        "openssl",
+        "import subprocess; r = subprocess.run(['openssl', 'version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
+    ),
 ]
 
 
 @pytest.mark.parametrize("tool,code", PYTHON_IMAGE_TOOLS, ids=[t[0] for t in PYTHON_IMAGE_TOOLS])
 async def test_python_tool_available(scheduler: Scheduler, tool: str, code: str) -> None:
     """Tool is installed in Python image."""
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
     assert result.exit_code == 0, (
         f"Tool '{tool}' failed in python image.\n"
@@ -91,19 +90,17 @@ async def test_python_tool_available(scheduler: Scheduler, tool: str, code: str)
 
 # JavaScript image tool tests - use Bun to verify tools
 JAVASCRIPT_IMAGE_TOOLS = [
-    ("bun", "console.log(Bun.version)"),
+    ("bun", "console.log(Bun.version); process.exit(Bun.version.startsWith('1.4.') ? 0 : 1)"),
     ("curl", "const p = Bun.spawn(['curl', '--version']); await p.exited; process.exit(p.exitCode)"),
     ("git", "const p = Bun.spawn(['git', '--version']); await p.exited; process.exit(p.exitCode)"),
+    ("openssl", "const p = Bun.spawn(['openssl', 'version']); await p.exited; process.exit(p.exitCode)"),
 ]
 
 
 @pytest.mark.parametrize("tool,code", JAVASCRIPT_IMAGE_TOOLS, ids=[t[0] for t in JAVASCRIPT_IMAGE_TOOLS])
 async def test_javascript_tool_available(scheduler: Scheduler, tool: str, code: str) -> None:
     """Tool is installed in JavaScript image."""
-    result = await scheduler.run(
-        code=code,
-        language=Language.JAVASCRIPT,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
     assert result.exit_code == 0, (
         f"Tool '{tool}' failed in javascript image.\n"
@@ -128,15 +125,14 @@ RAW_FUNCTIONAL_TESTS = [
 @pytest.mark.parametrize("name,command,expected", RAW_FUNCTIONAL_TESTS, ids=[t[0] for t in RAW_FUNCTIONAL_TESTS])
 async def test_raw_functional(scheduler: Scheduler, name: str, command: str, expected: str) -> None:
     """Shell command works correctly in RAW image."""
-    result = await scheduler.run(
-        code=command,
-        language=Language.RAW,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.RAW), command)
 
     assert result.exit_code == 0, (
         f"Command failed: {name}\nCommand: {command}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
     )
-    assert expected in result.stdout, f"Expected '{expected}' in output.\nCommand: {command}\nStdout: {result.stdout}"
+    assert result.stdout.strip() == expected, (
+        f"Expected '{expected}' as output.\nCommand: {command}\nStdout: {result.stdout}"
+    )
 
 
 # Python functional tests (native Python code)
@@ -149,15 +145,12 @@ PYTHON_FUNCTIONAL_TESTS = [
 @pytest.mark.parametrize("name,code,expected", PYTHON_FUNCTIONAL_TESTS, ids=[t[0] for t in PYTHON_FUNCTIONAL_TESTS])
 async def test_python_functional(scheduler: Scheduler, name: str, code: str, expected: str) -> None:
     """Python code works correctly in Python image."""
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
     assert result.exit_code == 0, (
         f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
     )
-    assert expected in result.stdout, f"Expected '{expected}' in output.\nCode: {code}\nStdout: {result.stdout}"
+    assert result.stdout.strip() == expected, f"Expected '{expected}' as output.\nCode: {code}\nStdout: {result.stdout}"
 
 
 # JavaScript functional tests (native Bun/JS code)
@@ -172,12 +165,9 @@ JAVASCRIPT_FUNCTIONAL_TESTS = [
 )
 async def test_javascript_functional(scheduler: Scheduler, name: str, code: str, expected: str) -> None:
     """JavaScript code works correctly in JavaScript image."""
-    result = await scheduler.run(
-        code=code,
-        language=Language.JAVASCRIPT,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
     assert result.exit_code == 0, (
         f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
     )
-    assert expected in result.stdout, f"Expected '{expected}' in output.\nCode: {code}\nStdout: {result.stdout}"
+    assert result.stdout.strip() == expected, f"Expected '{expected}' as output.\nCode: {code}\nStdout: {result.stdout}"

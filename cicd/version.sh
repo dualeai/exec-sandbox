@@ -1,4 +1,11 @@
 #!/bin/bash
+# Print the project version: the latest git tag without its "v" prefix, or
+# 0.0.0.dev0 when the repository has no tag.
+#
+# Usage: cicd/version.sh [-g <repo dir>] [-c] [-m]
+#   -g  repository directory (default: .)
+#   -c  append "-<short commit hash>"
+#   -m  append "+<branch>.<local time as YYYYMMDDHHMMSS>"
 
 # Parse arguments
 GIT_DIR="."
@@ -14,7 +21,7 @@ while getopts "g:cm" opt; do
     esac
 done
 
-# Get version from git tag or default
+# Run git in the target repository
 cd "$GIT_DIR" || exit 1
 
 # Try to get version from git tag

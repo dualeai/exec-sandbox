@@ -9,6 +9,9 @@
 # Usage: ./scripts/extract-vmlinux.sh <bzImage> > vmlinux
 
 set -euo pipefail
+# Byte-oriented tr/grep: under a UTF-8 locale, BSD tr (macOS) rejects binary
+# input with "Illegal byte sequence".
+export LC_ALL=C
 
 if [ $# -lt 1 ] || [ ! -f "$1" ]; then
     echo "Usage: $0 <bzImage>" >&2
@@ -56,7 +59,7 @@ try_decompress() {
     return 1
 }
 
-# Try gzip (most common for Alpine, CONFIG_KERNEL_GZIP=y)
+# Try gzip (Alpine's stock linux-virt kernel uses CONFIG_KERNEL_GZIP=y)
 try_decompress '\037\213\010' xy    gunzip      && exit 0
 # Try xz
 try_decompress '\3757zXZ\000' abcde unxz        && exit 0
@@ -66,7 +69,7 @@ try_decompress 'BZh'          xy    bunzip2      && exit 0
 try_decompress '\135\0\0\0'   xxx   unlzma       && exit 0
 # Try lzop
 try_decompress '\211\114\132' xy    lzop -d      && exit 0
-# Try LZ4
+# Try LZ4 (the custom kernel sets CONFIG_KERNEL_LZ4=y in exec-sandbox.config)
 try_decompress '\002!L\030'   xxx   lz4 -d       && exit 0
 # Try zstd
 try_decompress '(\265/\375'   xxx   unzstd       && exit 0

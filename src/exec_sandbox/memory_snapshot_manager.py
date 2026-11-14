@@ -1,326 +1,376 @@
 """L1 memory snapshot cache manager.
 
 Captures full VM state (CPU + RAM + device state) after REPL warm-up and
-package import. On restore, the VM resumes at the exact instruction — ~100ms
+package import. On restore, the VM resumes at the exact instruction — ~50-60 ms
 regardless of packages.
 
-Cache structure:
-    {cache_dir}/{key}.vmstate       # QEMU migration stream (sparse, ~50-140MB on disk)
+Cache structure (the names next to the vmstate: memory_snapshot_files):
+    {cache_dir}/{key}.vmstate       # QEMU migration stream (sparse: ~140MB apparent, ~3MB on disk)
     {cache_dir}/{key}.vmstate.meta  # JSON metadata sidecar
-    {cache_dir}/{key}.vmstate.lock  # flock for cross-process deduplication
+    {cache_dir}/{key}.vmstate.lock  # flock for cross-process deduplication of saves
+    {cache_dir}/{key}.vmstate.use.lock  # record lock (fcntl) each restored VM holds shared (no eviction)
+    {cache_dir}/{key}.ram           # guest RAM of a template (memory-backend-file; see open_live_ram_dir)
+    {cache_dir}/{key}.home          # home disk at the save point (cloned per restore)
 
 Cache key includes ALL parameters that affect VM state:
-    crc64(language, sorted_packages, exec_sandbox_version, img_hash,
-          qemu_version, arch, accel_type, memory_mb, cpu_cores,
-          allow_network, format_version, kernel_hash, initramfs_hash)
+    sha256 fingerprint(language, *sorted_packages, exec_sandbox_version, img_hash,
+          qemu_version, arch, accel_type, cpu_model, memory_mb, cpu_cores, disk_mb,
+          network_device, format_version, kernel_hash, initramfs_hash
+          [, l2_image_hash when there are packages])
 
-Format: 'l1-{language}-v{major.minor}-{16char_hash}'
+Format: 'l1-{language}-v{major.minor}-{sha256}'
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
+import functools
 import hashlib
-import json
-from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, ClassVar
+import os
+import time
+import weakref
+from typing import TYPE_CHECKING, ClassVar, Final
 
-from exec_sandbox import __version__, constants
+from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox._version import __version__
+from exec_sandbox.aio_utils import run_stoppable, run_to_end
 from exec_sandbox.base_cache_manager import BaseCacheManager
+from exec_sandbox.exceptions import ConfigError, ErrorCode, InternalError, SandboxError
+from exec_sandbox.files.disk import (
+    clone_sparse,
+    create_file,
+    create_sparse,
+    data_ranges,
+    file_stamp,
+    flush_to_disk,
+    pwrite_all,
+)
+from exec_sandbox.files.locks import CacheEntry, EntryLease
 from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
-from exec_sandbox.hash_utils import crc64
-from exec_sandbox.migration_client import MigrationClient
-from exec_sandbox.permission_utils import get_expected_socket_uid, grant_qemu_vm_file_access
-from exec_sandbox.platform_utils import HostArch, detect_host_arch
+from exec_sandbox.hash_utils import fingerprint
+from exec_sandbox.images import key_part
+from exec_sandbox.memory_snapshot_files import (
+    SnapshotMetadata,
+    home_path_from_vmstate,
+    meta_path_from_vmstate,
+    open_live_ram_dir,
+    ram_path_from_vmstate,
+)
+from exec_sandbox.migration_client import MigrationClient, migration_timeout, rejected_by_qemu
+from exec_sandbox.permission_utils import get_expected_socket_uid, grant_qemu_vm_acl, probe_qemu_as_qemu_vm
+from exec_sandbox.platform_utils import detect_host_arch
+from exec_sandbox.qemu_cmd import guest_cpu_model
 from exec_sandbox.system_probes import detect_accel_type, probe_qemu_version
 
 if TYPE_CHECKING:
+    import threading
+    from collections.abc import Iterator
     from pathlib import Path
 
-    from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
-    from exec_sandbox.models import Language
+    from exec_sandbox.admission import ResourceReservation
+    from exec_sandbox.models import ExposedPort
+    from exec_sandbox.private_run_dir import PrivateRunDir
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.settings import Settings
     from exec_sandbox.vm_manager import VmManager
+    from exec_sandbox.vm_spec import VmSpec
 
 logger = get_logger(__name__)
 
 
-def _sha256_file(path: Path) -> str:
-    """Compute SHA-256 hex digest of a file in 1 MB chunks.
+_BLOCK = 64 * 1024
+_ZERO_BLOCK = bytes(_BLOCK)
 
-    Sync function, meant to be called via ``asyncio.to_thread`` so the
-    event loop stays responsive (~0.1 ms blocked instead of ~60 ms for a
-    typical 100 MB vmstate file).
+_PUBLISH_FLUSH_BYTES: Final = 32 * 1024 * 1024
+"""_publish_ram writes the RAM through to the disk after each this many bytes."""
+
+
+def _nonzero_blocks(fd: int, size: int) -> Iterator[tuple[int, bytes]]:
+    """(offset, block) of each 64 KiB block below `size` of the file open at `fd` that
+    holds a non-zero byte, in order. Holes are skipped (SEEK_DATA), not read; without
+    SEEK_DATA every block is read. Sync."""
+    try:
+        ranges = list(data_ranges(fd, size, grain=_BLOCK))
+    except OSError:
+        ranges = [(0, size)]
+    for start, end in ranges:
+        for offset in range(start, end, _BLOCK):
+            block = os.pread(fd, _BLOCK, offset)
+            if block != _ZERO_BLOCK[: len(block)]:
+                yield offset, block
+
+
+def _vmstate_digest(path: Path) -> str:
+    """SHA-256 hex digest of the file's size, then of each non-zero 64 KiB block
+    with its offset (the size fixes each block's length).
+
+    A mapped-ram vmstate is sparse (a 140 MB file can hold 3 MB of data): holes
+    are skipped (SEEK_DATA), not read. A hole and a zero block hash alike, so a
+    copy that changes the hole layout keeps the digest. Without SEEK_DATA every
+    block is read. Sync: callers use asyncio.to_thread.
     """
     sha256 = hashlib.sha256()
     with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            sha256.update(chunk)
+        fd = f.fileno()
+        size = os.fstat(fd).st_size
+        sha256.update(size.to_bytes(8, "big"))
+        for offset, block in _nonzero_blocks(fd, size):
+            sha256.update(offset.to_bytes(8, "big") + block)
     return sha256.hexdigest()
 
 
-@dataclass(frozen=True)
-class SnapshotMetadata:
-    """Typed L1 memory snapshot metadata sidecar.
+def _flush_files(paths: list[Path]) -> None:
+    """flush_to_disk each file (this process made each one). Sync: callers use asyncio.to_thread."""
+    for path in paths:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            flush_to_disk(fd)
+        finally:
+            os.close(fd)
 
-    Serialized to JSON alongside the vmstate file.  All fields that affect
-    VM state compatibility are included so stale cache entries are detected.
+
+def _new_entry_file(path: Path, *, size: int) -> None:
+    """A new private (0600) file of this process for QEMU to write (a stale one goes:
+    unlinked, never truncated, as a restored VM may still map it). Sync."""
+    path.unlink(missing_ok=True)
+    create_sparse(path, size)
+
+
+class _LiveRam:
+    """The RAM file of a template save VM (_new_live_ram): `path`, in `folder` in memory,
+    with `fd` open on it for _publish_ram; else {key}.ram itself (no folder, no fd).
+    systemd-logind (RemoveIPC=yes, its default) removes the /dev/shm files of a user that is
+    not a system user when its last login session ends, also during a save; an open file
+    keeps its pages. `close` frees the memory (the fd, then the folder), also when an owner
+    is lost (garbage collection): up to a whole guest RAM stays in tmpfs while the fd is open."""
+
+    def __init__(self, *, folder: PrivateRunDir | None, path: Path, fd: int | None) -> None:
+        self.path = path
+        self.fd = fd
+        self._finalizer = weakref.finalize(self, _close_live_ram, folder, live_fd=fd)
+
+    def close(self) -> None:
+        """Idempotent. Blocking (the folder's removal): async callers use a worker thread."""
+        self._finalizer()
+
+
+def _new_live_ram(ram_path: Path, *, size: int, owner: list[_LiveRam]) -> _LiveRam:
+    """A new RAM file of `size` bytes for a template save VM (_new_entry_file), in the folder
+    from open_live_ram_dir, else at `ram_path`. Put in `owner` as soon as it is made, so a
+    caller whose await was cancelled (run_to_end waits for this job) still closes it. Sync."""
+    live_dir = open_live_ram_dir(size=size)
+    live_ram = ram_path if live_dir is None else live_dir.path / ram_path.name
+    try:
+        _new_entry_file(live_ram, size=size)
+        live_fd = None if live_dir is None else os.open(live_ram, os.O_RDONLY | os.O_NOFOLLOW)
+    except BaseException:
+        if live_dir is not None:
+            live_dir.close()
+        raise
+    owner.append(_LiveRam(folder=live_dir, path=live_ram, fd=live_fd))
+    return owner[-1]
+
+
+def _close_live_ram(live_dir: PrivateRunDir | None, *, live_fd: int | None) -> None:
+    """_LiveRam's cleanup: the fd, then the folder in memory, the RAM with it, the folder
+    even when the fd's close fails. Blocking."""
+    try:
+        if live_fd is not None:
+            os.close(live_fd)
+    finally:
+        if live_dir is not None:
+            live_dir.close()
+
+
+def _publish_ram(stop: threading.Event, *, src_fd: int, dst: Path) -> None:
+    """Copy the RAM file open at `src_fd` of a template save VM to a new file `dst`: only
+    its non-zero 64 KiB blocks; the others stay holes, which read as zeros (a Python template
+    has 68 of 192 MiB non-zero). Writes through to the disk after each 32 MiB, so the
+    dirty page cache of this process stays small whatever the RAM size. A stale `dst`
+    goes as in _new_entry_file. Ends at the next block once `stop` is set (a cancel: the
+    caller removes the partial `dst`). Blocking: a job of aio_utils.run_stoppable, which
+    waits for its end before the caller closes `src_fd`."""
+    size = os.fstat(src_fd).st_size
+    _new_entry_file(dst, size=size)
+    fd = os.open(dst, os.O_WRONLY)
+    try:
+        unflushed = 0
+        for offset, block in _nonzero_blocks(src_fd, size):
+            if stop.is_set():
+                return
+            pwrite_all(fd, block, offset)
+            unflushed += len(block)
+            if unflushed >= _PUBLISH_FLUSH_BYTES:
+                flush_to_disk(fd)
+                unflushed = 0
+    finally:
+        os.close(fd)
+
+
+async def _grant_entry_files(paths: list[Path], *, perms: str, key: str) -> None:
+    """qemu-vm gets `perms` on L1 entry files by ACL: "rw" while a save VM writes them,
+    "r" once published (no QEMU may change a shared template).
+
+    Raises:
+        ConfigError: HOST_DEPENDENCY: setfacl failed, or a folder above them could not be
+            made traversable (a+x)
     """
-
-    qemu_version: list[int] | None
-    arch: str
-    accel: str
-    memory_mb: int
-    cpu_cores: int
-    language: str
-    packages: list[str]
-    allow_network: bool
-    exec_sandbox_version: str
-    vmstate_sha256: str
-    vmstate_size: int
-    use_template: bool = False
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self))
-
-    @classmethod
-    def from_json(cls, text: str) -> SnapshotMetadata | None:
-        """Parse JSON text into SnapshotMetadata, or None on failure."""
-        try:
-            parsed = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        return cls._from_dict(parsed)  # type: ignore[arg-type]  # json.loads returns Any
-
-    @staticmethod
-    def _from_dict(d: dict[str, object]) -> SnapshotMetadata | None:  # type: ignore[override]
-        """Construct from a typed dict. Separate method to isolate Any boundary."""
-        try:
-            return SnapshotMetadata(
-                qemu_version=list(d["qemu_version"]) if d.get("qemu_version") else None,  # type: ignore[arg-type]
-                arch=str(d.get("arch", "")),
-                accel=str(d.get("accel", "")),
-                memory_mb=int(d.get("memory_mb", 0)),  # type: ignore[arg-type]
-                cpu_cores=int(d.get("cpu_cores", 0)),  # type: ignore[arg-type]
-                language=str(d.get("language", "")),
-                packages=list(d.get("packages", [])),  # type: ignore[arg-type]
-                allow_network=bool(d.get("allow_network", False)),
-                exec_sandbox_version=str(d.get("exec_sandbox_version", "")),
-                vmstate_sha256=str(d.get("vmstate_sha256", "")),
-                vmstate_size=int(d.get("vmstate_size", 0)),  # type: ignore[arg-type]
-                use_template=bool(d.get("use_template", False)),
-            )
-        except (TypeError, KeyError, ValueError):
-            return None
+    if not await grant_qemu_vm_acl(paths, perms=perms):
+        raise ConfigError(
+            f"Could not give qemu-vm {perms} access to the L1 entry files (needs setfacl, package acl, "
+            "and a+x on the folders above the cache folder)",
+            code=ErrorCode.HOST_DEPENDENCY,
+            context={"key": key, "paths": [str(path) for path in paths]},
+            hint=None,
+            instance_id=None,
+        )
 
 
 class MemorySnapshotManager(BaseCacheManager):
     """L1 memory snapshot cache. Manages vmstate files + metadata sidecars.
 
     Uses file-based flock for cross-process deduplication of saves.
-    Composable API — separate check_cache() + save_snapshot() +
-    schedule_background_save().
+    Composable API — compute_cache_key() once per request, then check_cache(),
+    lease() (its lease goes to restore()) or schedule_background_save() with that key.
     """
 
     _cache_ext: ClassVar[str] = ".vmstate"
-    _sidecar_exts: ClassVar[tuple[str, ...]] = (".vmstate.meta", ".ram")
+    _sidecar_exts: ClassVar[tuple[str, ...]] = (".vmstate.meta", ".ram", ".home")
 
-    def __init__(
-        self,
-        settings: Settings,
-        vm_manager: VmManager,
-        snapshot_manager: DiskSnapshotManager,
-    ):
-        super().__init__(settings.memory_snapshot_cache_dir)
+    def __init__(self, settings: Settings, vm_manager: VmManager):
+        """Make the cache folder (memory_snapshot_cache_dir).
+
+        Raises:
+            ConfigError: SETTING_INVALID: the cache folder cannot be made, or is not private
+            TransientError: LOCAL_DISK: a host error on the cache folder (disk full, I/O error)
+        """
+        super().__init__(settings.memory_snapshot_cache_dir, setting="memory_snapshot_cache_dir")
         self.settings = settings
         self.vm_manager = vm_manager
-        self.snapshot_manager = snapshot_manager
-        # In-process deduplication for background saves.
-        # flock works cross-process but not intra-process on macOS (BSD semantics).
+        # In-process deduplication of background saves: one task per key, so a second
+        # call for a key in flight returns at once, without a task (the save lock
+        # stops a save of another process).
         self._in_flight_saves: dict[str, asyncio.Task[None]] = {}
 
     def _cache_paths(self, key: str) -> tuple[Path, Path]:
         """Return (vmstate_path, meta_path) for a given cache key."""
         vmstate_path = self._cache_path(key)
-        return (vmstate_path, vmstate_path.with_suffix(".vmstate.meta"))
+        return (vmstate_path, meta_path_from_vmstate(vmstate_path))
 
-    @staticmethod
-    def ram_path_from_vmstate(vmstate_path: Path) -> Path:
-        """Derive RAM template file path from vmstate path.
-
-        The RAM file is a sibling of the vmstate with ``.ram`` extension.
-        Used by vm_manager to pass mem_path to build_qemu_cmd for COW restore.
-        """
-        # vmstate_path = /cache/l1-python-v1.2-abcd1234.vmstate
-        # ram_path     = /cache/l1-python-v1.2-abcd1234.ram
-        return vmstate_path.with_suffix(".ram")
-
-    async def compute_cache_key(
-        self,
-        language: Language,
-        packages: list[str],
-        memory_mb: int,
-        cpu_cores: int = constants.DEFAULT_VM_CPU_CORES,
-        allow_network: bool = False,
-    ) -> str:
+    async def compute_cache_key(self, spec: VmSpec, *, l2_path: Path | None) -> str:
         """Compute L1 cache key. Includes ALL parameters that affect VM state.
 
         memory_mb IS in L1 key (unlike L2) because the migration stream
         encodes physical address layout. qemu_version and accel_type are included
         because different QEMU versions produce incompatible migration streams and
-        different accelerators (KVM/HVF/TCG) have different CPU state.
-        allow_network is included because it changes device topology (-nic none
-        vs -device virtio-net).
+        different accelerators (KVM/HVF/TCG) have different CPU state; the -cpu value
+        too (a restore onto other CPU features fails).
+        The network device (network access or exposed ports) is included because
+        it changes device topology (-nic none vs -device virtio-net).
+        `l2_path` is the L2 layer the VM boots with (None without packages).
+
+        Raises:
+            ConfigError: ASSET_NOT_FOUND: the base image of `spec` is missing
+            TransientError: LOCAL_DISK: an image of the key cannot be read (images.key_part)
         """
         version_parts = __version__.split(".")
         version = f"{version_parts[0]}.{version_parts[1]}"
 
         # Collect all state-affecting parameters
         arch = detect_host_arch()
-        base_image = self.vm_manager.get_base_image(language)
-        img_hash = self.image_hash(base_image)
+        # Base image, then the kernel + initramfs QEMU actually boots
+        guest = self.vm_manager.images
+        images = [guest.base_image(spec.language), guest.kernel, guest.initramfs]
+        # Pin the L2 layer by content: an L1 template resumes a guest whose page
+        # cache refers to the exact L2 bytes it was saved with; a rebuilt L2
+        # (different bytes for the same package specs) must not reuse it.
+        if l2_path is not None:
+            images.append(l2_path)
+        # One worker-thread job for every digest (a stat each once known, a full read the first time)
+        img_hash, *boot_and_l2_hashes = await asyncio.to_thread(lambda: [key_part(path) for path in images])
         qemu_version = await probe_qemu_version()
         accel_type = await detect_accel_type(force_emulation=self.settings.force_emulation)
+        cpu_model = await guest_cpu_model(arch, accel_type)
 
         parts = [
-            str(language.value),
-            ",".join(sorted(packages)),
+            str(spec.language.value),
+            *spec.packages,
             str(__version__),
             img_hash,
             ".".join(str(v) for v in qemu_version) if qemu_version else "unknown",
             arch.name,
             accel_type.value,
-            str(memory_mb),
-            str(cpu_cores),
-            "net" if allow_network else "nonet",
+            cpu_model,
+            str(spec.memory_mb),
+            str(spec.cpu_cores),
+            f"disk{spec.disk_mb}",
+            "net" if spec.has_network_device else "nonet",
             f"fmt{constants.MEMORY_SNAPSHOT_FORMAT_VERSION}",
+            *boot_and_l2_hashes,
         ]
 
-        # Add kernel + initramfs hashes
-        arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
-        kernel_path = self.settings.kernel_path / f"vmlinuz-{arch_suffix}"
-        initramfs_path = self.settings.kernel_path / f"initramfs-{arch_suffix}"
-        parts.append(self.image_hash(kernel_path))
-        parts.append(self.image_hash(initramfs_path))
+        return f"l1-{spec.language.value}-v{version}-{fingerprint(*parts)}"
 
-        fingerprint = "|".join(parts)
-        key_hash = crc64(fingerprint)
-        return f"l1-{language.value}-v{version}-{key_hash}"
+    async def check_cache(self, key: str) -> Path | None:
+        """Check L1 cache for a key from compute_cache_key(). Returns vmstate path or None.
 
-    async def check_cache(
-        self,
-        language: Language,
-        packages: list[str],
-        memory_mb: int,
-        cpu_cores: int = constants.DEFAULT_VM_CPU_CORES,
-        allow_network: bool = False,
-    ) -> Path | None:
-        """Check L1 cache. Returns vmstate path or None.
-
-        Validates: file exists, non-zero size, metadata sidecar parses.
-        Updates atime for LRU tracking.
+        Validates: file exists, non-zero size, metadata sidecar parses, the vmstate digest,
+        the RAM template and the home disk. Updates the access time (eviction removes the
+        entry with the oldest one first). A broken entry is removed as an eviction removes
+        one (BaseCacheManager._remove_broken); the miss returns after it (a cancel leaves
+        the job running).
         """
-        key = await self.compute_cache_key(language, packages, memory_mb, cpu_cores, allow_network)
+        checked = await self._check_entry(key, lease=None)
+        return checked[0] if checked is not None else None
+
+    async def _check_entry(self, key: str, *, lease: EntryLease | None) -> tuple[Path, str] | None:
+        """check_cache itself: the vmstate path and the version of it checked (file_stamp),
+        or None. `lease`, the caller's own lease of the entry, goes before a broken entry is
+        removed (another lease keeps it: its VM runs on it)."""
         vmstate_path, meta_path = self._cache_paths(key)
-
-        if not vmstate_path.exists() or not meta_path.exists():
-            return None
-
-        # Validate non-zero size
         try:
             stat = vmstate_path.stat()
-            if stat.st_size == 0:
-                logger.warning("L1 cache entry has zero size, removing", extra={"key": key})
-                vmstate_path.unlink(missing_ok=True)
-                meta_path.unlink(missing_ok=True)
-                return None
         except OSError:
             return None
+        if not meta_path.exists():
+            return None
+        stamp = file_stamp(stat)
+        problem = await self._entry_problem(vmstate_path, meta_path, size=stat.st_size)
+        if problem is not None:
+            logger.warning(f"{problem}, removing", extra={"key": key})
+            await self._remove_broken(vmstate_path, stamp=stamp, lease=lease)
+            return None
+        # Access time for eviction (best effort). The mtime stays: the stamp of this version
+        # does not change. utime never makes a file (Path.touch would, after an eviction).
+        with contextlib.suppress(OSError):
+            os.utime(vmstate_path, ns=(time.time_ns(), stat.st_mtime_ns))
+        logger.debug("L1 cache hit", extra={"key": key, "size_mb": stat.st_size // (1024 * 1024)})
+        return vmstate_path, stamp
 
-        # Validate metadata sidecar parses into typed structure
+    async def _entry_problem(self, vmstate_path: Path, meta_path: Path, *, size: int) -> str | None:
+        """What makes the entry of `vmstate_path` (of `size` bytes) broken, or None."""
+        if size == 0:
+            return "L1 cache entry has zero size"
         try:
             meta = SnapshotMetadata.from_json(meta_path.read_text())
         except OSError:
             meta = None
         if meta is None:
-            logger.warning("L1 cache metadata invalid, removing", extra={"key": key})
-            vmstate_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
-            return None
-
-        # Verify vmstate SHA-256 integrity
+            return "L1 cache metadata invalid"
         if meta.vmstate_sha256:
             try:
-                actual_sha256 = await asyncio.to_thread(_sha256_file, vmstate_path)
-                if actual_sha256 != meta.vmstate_sha256:
-                    logger.warning("L1 cache vmstate integrity check failed, removing", extra={"key": key})
-                    vmstate_path.unlink(missing_ok=True)
-                    meta_path.unlink(missing_ok=True)
-                    return None
+                if await asyncio.to_thread(_vmstate_digest, vmstate_path) != meta.vmstate_sha256:
+                    return "L1 cache vmstate integrity check failed"
             except OSError:
-                logger.warning("L1 cache vmstate unreadable during integrity check, removing", extra={"key": key})
-                vmstate_path.unlink(missing_ok=True)
-                meta_path.unlink(missing_ok=True)
-                return None
-
-        # Validate RAM template file exists (for v3+ template format)
-        if meta.use_template:
-            ram_path = self.ram_path_from_vmstate(vmstate_path)
-            if not ram_path.exists():
-                logger.warning("L1 cache RAM template missing, removing", extra={"key": key})
-                vmstate_path.unlink(missing_ok=True)
-                meta_path.unlink(missing_ok=True)
-                return None
-
-        # Update atime for LRU tracking
-        vmstate_path.touch(exist_ok=True)
-
-        logger.debug("L1 cache hit", extra={"key": key, "size_mb": stat.st_size // (1024 * 1024)})
-        return vmstate_path
-
-    async def save_snapshot(
-        self,
-        vm: QemuVM,
-        language: Language,
-        packages: list[str],
-        memory_mb: int,
-        cpu_cores: int = constants.DEFAULT_VM_CPU_CORES,
-        allow_network: bool = False,
-    ) -> Path | None:
-        """Save L1 from a running warmed VM. TERMINATES the VM.
-
-        Acquires file lock, then delegates to _do_save().
-        Returns vmstate path, or None on failure / lock contention.
-        After this call, the VM is dead (QEMU process exited).
-        Caller is responsible for cleaning up the dead VM.
-        """
-        key = await self.compute_cache_key(language, packages, memory_mb, cpu_cores, allow_network)
-        vmstate_path, meta_path = self._cache_paths(key)
-
-        try:
-            async with self._save_lock(key) as should_save:
-                if not should_save:
-                    logger.debug("L1 cache already exists (race avoided)", extra={"key": key})
-                    return vmstate_path
-                return await self._do_save(
-                    vm,
-                    key,
-                    vmstate_path,
-                    meta_path,
-                    language,
-                    packages,
-                    memory_mb,
-                    cpu_cores,
-                    allow_network=allow_network,
-                )
-        except BlockingIOError:
-            logger.debug("L1 save already in progress by another process", extra={"key": key})
-            return None
+                return "L1 cache vmstate unreadable during integrity check"
+        if meta.use_template and not ram_path_from_vmstate(vmstate_path).exists():
+            return "L1 cache RAM template missing"
+        if not home_path_from_vmstate(vmstate_path).exists():
+            return "L1 cache home disk missing"
+        return None
 
     async def _do_save(
         self,
@@ -328,72 +378,97 @@ class MemorySnapshotManager(BaseCacheManager):
         key: str,
         vmstate_path: Path,
         meta_path: Path,
-        language: Language,
-        packages: list[str],
-        memory_mb: int,
-        cpu_cores: int,
+        spec: VmSpec,
         *,
-        allow_network: bool = False,
+        live_ram: Path,
+        live_ram_fd: int | None,
     ) -> Path | None:
-        """Raw save — caller must hold the file lock.
+        """Raw save of the template VM `vm`, whose guest RAM is the file `live_ram`
+        (memory-backend-file, share=on), open at `live_ram_fd` when it is in memory
+        (_new_live_ram) — caller must hold the file lock.
+
+        The host makes and owns every file of the entry; QEMU only writes into them
+        (as qemu-vm by ACL), so any QEMU identity of this host can restore the entry.
 
         Sequence:
-        1. Save VM state via MigrationClient to tmp file (terminates QEMU).
-        2. Write JSON metadata sidecar.
-        3. Atomic rename tmp → final (commit point).
-        On ENOSPC: evict oldest entry, clean up, return None.
-        On any error (including CancelledError): clean up partial files.
+        1. Make the tmp file, then save the device state via MigrationClient into it
+           (x-ignore-shared: no RAM; terminates QEMU).
+        2. The RAM template: `live_ram` when it is {key}.ram, else (in memory) written
+           to {key}.ram by _publish_ram.
+        3. Clone the home disk to {key}.home (QEMU has quit, so the disk matches
+           the saved RAM).
+        4. Digest the vmstate, then flush the RAM template and the home copy to
+           the disk (the digest covers the vmstate only).
+        5. qemu-vm keeps read access only (when it wrote them).
+        6. Write JSON metadata sidecar.
+        7. Atomic rename tmp → final (commit point).
+        On ENOSPC: clean up, evict the oldest entry, return None.
+        On any error (including CancelledError): clean up partial files (one
+        worker-thread job, waited for even on a cancel).
         """
         tmp_path = vmstate_path.parent / f"{vmstate_path.name}.tmp"
+
+        def discard() -> None:
+            """A failed save's files (up to the RAM size) in one worker-thread job. Its
+            caller waits for it even when cancelled: the files go before the save lock."""
+            tmp_path.unlink(missing_ok=True)
+            self._remove_entry(vmstate_path)
+
         try:
             qemu_version = await probe_qemu_version()
             expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
 
-            # If QEMU runs as qemu-vm, pre-create tmp file and grant write
-            # access so the migrate command can write the vmstate.
+            # QEMU opens the file the host made (O_CREAT without O_EXCL, then
+            # ftruncate): the host owns it, qemu-vm writes it by ACL.
+            await asyncio.to_thread(_new_entry_file, tmp_path, size=0)
             if vm.use_qemu_vm_user:
-                tmp_path.touch()
-                await grant_qemu_vm_file_access(tmp_path, writable=True)
+                await _grant_entry_files([tmp_path], perms="rw", key=key)
 
             # VM Templating: with x-ignore-shared, migration saves only device
-            # state (~340KB).  RAM stays in the memory-backend-file (share=on).
-            # Only enable if the VM was started with file-backed memory (mem_path
-            # passed to ephemeral_vm), indicated by the .ram file existing.
-            ram_path = self.ram_path_from_vmstate(vmstate_path)
-            use_template = (
-                ram_path.exists()
-                and qemu_version is not None
-                and qemu_version >= constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION
-            )
+            # state (~340KB). RAM stays in the memory-backend-file (share=on).
             async with MigrationClient(vm.qmp_socket, expected_uid) as client:
-                await client.save_snapshot(tmp_path, qemu_version=qemu_version, use_template=use_template)
+                await client.save_snapshot(
+                    tmp_path,
+                    qemu_version=qemu_version,
+                    timeout=migration_timeout(spec.memory_mb),
+                    use_template=True,
+                    keep_running=False,
+                    while_paused=None,  # QEMU quits: the home disk is cloned after
+                    memory_limited=vm.cgroup is not None,
+                )
 
-            # Verify RAM template file still exists after save
-            if use_template and not ram_path.exists():
-                logger.warning("RAM template file not created by QEMU", extra={"ram_path": str(ram_path)})
-                use_template = False  # Fall back to full vmstate
+            # The vmstate has no RAM (x-ignore-shared): without its template it is no entry. In
+            # memory, its pages are there through the fd even when the file is gone (logind).
+            ram_path = ram_path_from_vmstate(vmstate_path)
+            if live_ram_fd is not None:
+                # A cancel stops the copy at its next block and waits for its end: the caller
+                # then closes the fd, whose number the next open takes (a job still running
+                # would read that other file)
+                await run_stoppable(functools.partial(_publish_ram, src_fd=live_ram_fd, dst=ram_path), undo=None)
+            elif not live_ram.exists():
+                raise FileNotFoundError(errno.ENOENT, "RAM template removed during the save", str(live_ram))
 
-            # Compute SHA-256 of vmstate for integrity verification on restore.
-            vmstate_sha256 = await asyncio.to_thread(_sha256_file, tmp_path)
+            # Home disk at the save point (the VM is stopped): a restored VM's
+            # page cache refers to these blocks.
+            home_path = home_path_from_vmstate(vmstate_path)
+            home_path.unlink(missing_ok=True)
+            await run_stoppable(lambda stop: clone_sparse(vm.workdir.home_disk, home_path, stop=stop), undo=None)
+
+            # Digest of the vmstate (SHA-256 of its size and non-zero blocks); check_cache
+            # verifies it before each restore.
+            vmstate_sha256 = await asyncio.to_thread(_vmstate_digest, tmp_path)
+            # The digest covers the vmstate only; restores trust the RAM template and
+            # the home disk as they are. Write both through to the disk before the
+            # entry is published, or a power loss can leave them torn under it.
+            await asyncio.to_thread(_flush_files, [ram_path, home_path])
+            if vm.use_qemu_vm_user:
+                await _grant_entry_files([tmp_path, ram_path], perms="r", key=key)
 
             # Write typed metadata sidecar before atomic rename
-            arch = detect_host_arch()
-            accel_type = await detect_accel_type(force_emulation=self.settings.force_emulation)
-            meta = SnapshotMetadata(
-                qemu_version=list(qemu_version) if qemu_version else None,
-                arch=arch.name,
-                accel=accel_type.value,
-                memory_mb=memory_mb,
-                cpu_cores=cpu_cores,
-                language=language.value,
-                packages=sorted(packages),
-                allow_network=allow_network,
-                exec_sandbox_version=__version__,
-                vmstate_sha256=vmstate_sha256,
-                vmstate_size=tmp_path.stat().st_size,
-                use_template=use_template,
-            )
-            meta_path.write_text(meta.to_json())
+            meta = SnapshotMetadata(vmstate_sha256=vmstate_sha256, use_template=True)
+            meta_path.unlink(missing_ok=True)  # left by a failed save
+            with create_file(meta_path, mode=0o600, dir_fd=None) as f:  # QEMU never reads it
+                f.write(meta.to_json().encode())
 
             # Atomic commit: rename is atomic on POSIX
             tmp_path.rename(vmstate_path)
@@ -401,19 +476,15 @@ class MemorySnapshotManager(BaseCacheManager):
             size_mb = vmstate_path.stat().st_size / (1024 * 1024)
             logger.info(
                 "L1 snapshot saved",
-                extra={"key": key, "size_mb": f"{size_mb:.1f}", "language": language.value},
+                extra={"key": key, "size_mb": f"{size_mb:.1f}", "language": spec.language.value},
             )
             return vmstate_path
 
         except OSError as e:
-            ram_path = self.ram_path_from_vmstate(vmstate_path)
+            await run_to_end(discard)
             if e.errno == errno.ENOSPC:
-                # Disk full — evict oldest and retry once
-                tmp_path.unlink(missing_ok=True)
-                vmstate_path.unlink(missing_ok=True)
-                meta_path.unlink(missing_ok=True)
-                ram_path.unlink(missing_ok=True)
-                await self._evict_oldest_snapshot()
+                # Disk full — evict oldest; the next request saves again
+                await self.evict_oldest()
                 logger.info("L1 evicted oldest on ENOSPC, will retry on next request", extra={"key": key})
                 return None
             logger.warning(
@@ -421,15 +492,11 @@ class MemorySnapshotManager(BaseCacheManager):
                 extra={"key": key, "error": str(e)},
                 exc_info=True,
             )
-            tmp_path.unlink(missing_ok=True)
-            vmstate_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
             return None
 
         except BaseException as e:
             # Catch BaseException (not just Exception) to handle CancelledError too.
             # Prevents orphaned partial files on SIGTERM / task cancellation.
-            ram_path_cleanup = self.ram_path_from_vmstate(vmstate_path)
             if not isinstance(e, Exception):
                 logger.info("L1 snapshot save cancelled, cleaning up", extra={"key": key})
             else:
@@ -438,40 +505,123 @@ class MemorySnapshotManager(BaseCacheManager):
                     extra={"key": key, "error": str(e)},
                     exc_info=True,
                 )
-            tmp_path.unlink(missing_ok=True)
-            vmstate_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
-            ram_path_cleanup.unlink(missing_ok=True)
+            await run_to_end(discard)
             if isinstance(e, Exception):
                 return None
             raise
 
+    async def can_save(self) -> bool:
+        """QEMU on this host can save L1 templates (at or above the migration floor).
+
+        Checked before booting a sacrificial VM: below the floor every save fails.
+        """
+        qemu_version = await probe_qemu_version()
+        return qemu_version is not None and qemu_version >= constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION
+
+    async def lease(self, key: str) -> EntryLease | None:
+        """A lease on the L1 entry `key` (compute_cache_key), or None: no entry, or its use
+        lock cannot be opened (logged; the caller cold boots). Take it before admission,
+        which may evict cache entries for disk space: never a leased one. restore() takes
+        it over."""
+        try:
+            return await CacheEntry(self._cache_path(key)).lease()
+        except OSError as e:
+            logger.warning("L1 entry not leased", extra={"key": key, "error": str(e)})
+            return None
+
+    async def restore(
+        self,
+        spec: VmSpec,
+        *,
+        entry: EntryLease,
+        tenant_id: str,
+        task_id: str,
+        snapshot_drive: EntryLease | None,
+        expose_ports: list[ExposedPort] | None,
+        reservation: ResourceReservation,
+    ) -> QemuVM | None:
+        """Restore a VM from the L1 entry `entry` leases (lease() of the compute_cache_key of
+        `spec` and of the L2 layer `snapshot_drive` leases). Releases `entry` before it
+        returns: the VM, if any, holds its own share.
+
+        None on a miss (a broken entry) or on any failed restore: the caller cold boots
+        with the same reservation. An entry QEMU refused (incompatible or corrupt:
+        MIGRATION_REJECTED or MIGRATION_UNSUPPORTED in the cause chain), or whose guest
+        never answered after its state loaded (GUEST_SILENT_AFTER_RESTORE), is removed with
+        all its files, as an eviction removes one (BaseCacheManager._remove_broken: not while
+        another lease holds it); otherwise every later restore of it fails again. A host
+        problem (no access to a file or a socket) keeps the entry.
+
+        Raises:
+            InternalError: CLEANUP_UNCONFIRMED: the failed restore's QEMU may still run
+                and keeps the reservation, so no cold boot may use it
+        """
+        checked: tuple[Path, str] | None = None
+        try:
+            checked = await self._check_entry(entry.path.name.removesuffix(self._cache_ext), lease=entry)
+            if checked is None:
+                return None
+            return await self.vm_manager.restore_vm(
+                spec,
+                tenant_id=tenant_id,
+                task_id=task_id,
+                vmstate_path=checked[0],
+                base_image=self.vm_manager.images.base_image(spec.language),
+                snapshot_drive=snapshot_drive.path if snapshot_drive is not None else None,
+                cache_leases=(entry,) if snapshot_drive is None else (entry, snapshot_drive),
+                expose_ports=expose_ports,
+                reservation=reservation,
+            )
+        except InternalError as e:
+            if e.code is ErrorCode.CLEANUP_UNCONFIRMED:
+                raise
+            failure: Exception = e
+        except Exception as e:  # noqa: BLE001 - every failed restore cold boots
+            failure = e
+        finally:
+            entry.release()  # the VM, if any, holds its own share
+        logger.warning(
+            "L1 restore failed, falling back to cold boot",
+            extra={"language": spec.language, "task_id": task_id, "error": f"{type(failure).__name__}: {failure}"},
+        )
+        logger.debug("L1 restore traceback", exc_info=failure)
+        refused = rejected_by_qemu(failure) or (
+            isinstance(failure, SandboxError) and failure.code is ErrorCode.GUEST_SILENT_AFTER_RESTORE
+        )
+        if refused and checked is not None:
+            await self._remove_broken(checked[0], stamp=checked[1], lease=None)
+            logger.info("L1 entry refused by QEMU, removed unless in use", extra={"vmstate_path": str(checked[0])})
+        return None
+
     async def schedule_background_save(
         self,
-        language: Language,
-        packages: list[str],
-        memory_mb: int,
-        cpu_cores: int = constants.DEFAULT_VM_CPU_CORES,
-        snapshot_drive: Path | None = None,
-        allow_network: bool = False,
+        spec: VmSpec,
+        *,
+        key: str,
+        snapshot_drive: EntryLease | None,
     ) -> asyncio.Task[None] | None:
         """Schedule background L1 save: boot sacrificial VM, warm REPL, save, kill.
 
+        `key` is compute_cache_key of `spec` and of the L2 layer `snapshot_drive` leases.
+        The task holds its own share of that lease until it ends: no eviction removes the
+        layer before its VM opens it.
         Returns the background task handle so callers can optionally await or
-        monitor completion. Returns None if cache already exists (no-op).
+        monitor completion. Returns None (no-op) when QEMU is below the migration
+        floor (can_save), the entry exists, or a save of the key runs in this process.
 
-        Used by scheduler after first cold boot with packages.
-        File lock prevents duplicate work — concurrent callers that try to save
-        the same key will get BlockingIOError and skip.
+        Used by the scheduler after a cold boot, and by the warm pool at start.
+        The save lock prevents duplicate work: while another process saves the
+        same key, the task skips (BlockingIOError, logged at debug level).
         """
-        existing = await self.check_cache(
-            language, packages, memory_mb, cpu_cores=cpu_cores, allow_network=allow_network
-        )
-        if existing:
+        if not await self.can_save():
+            return None
+        if await self.check_cache(key):
             return None
 
-        key = await self.compute_cache_key(
-            language, packages, memory_mb, cpu_cores=cpu_cores, allow_network=allow_network
+        # The template VM runs no user code: same device set as the spec (a
+        # network device if it has one), without its ports or domain policy.
+        template_spec = spec.model_copy(
+            update={"allow_network": spec.has_network_device, "allowed_domains": None, "expose_ports": ()}
         )
 
         # In-process dedup: skip if a task for this key is already running
@@ -484,96 +634,118 @@ class MemorySnapshotManager(BaseCacheManager):
             try:
                 # Acquire file lock for entire save lifecycle (VM boot + warm + save).
                 # Prevents duplicate work: concurrent callers skip on BlockingIOError.
-                async with self._save_lock(key) as should_save:
+                # False: another process saved the entry meanwhile. The folder is made
+                # again first (a tmp cleaner may have removed it).
+                self._make_cache_dir()
+                with CacheEntry(self._cache_path(key)).try_saving() as should_save:
                     if not should_save:
                         logger.debug("L1 background save skipped (already exists)", extra={"key": key})
                         return
 
-                    # Compute RAM file path for template save.
-                    # The sacrificial VM uses memory-backend-file,share=on so QEMU
-                    # writes guest RAM to this file.  After migration with x-ignore-shared,
-                    # the vmstate contains only device state; the RAM file is the template.
-                    vmstate_path_for_ram, _meta = self._cache_paths(key)
-                    ram_path = self.ram_path_from_vmstate(vmstate_path_for_ram)
-
-                    # Boot sacrificial VM — ephemeral_vm handles lifecycle
-                    async with self.vm_manager.ephemeral_vm(
-                        language=language,
-                        tenant_id=constants.L1_SAVE_TENANT_ID,
-                        task_id=f"l1-save-{language.value}",
-                        memory_mb=memory_mb,
-                        allow_network=allow_network,
-                        snapshot_drive=snapshot_drive,
-                        retry_profile=constants.RETRY_BACKGROUND,
-                        mem_path=str(ram_path),
-                        mem_path_share=True,  # Template save: QEMU writes RAM to file
-                    ) as vm:
-                        # Warm REPL (Python takes 10-15s on HVF, needs dedicated timeout)
-                        response = await vm.channel.send_request(
-                            WarmReplRequest(language=language),
-                            timeout=constants.WARM_REPL_TIMEOUT_SECONDS,
+                    # RAM file of the template save. The sacrificial VM uses
+                    # memory-backend-file,share=on so QEMU writes guest RAM to this file.
+                    # After migration with x-ignore-shared, the vmstate contains only
+                    # device state; the RAM file is the template. The file is in memory
+                    # when the host can (open_live_ram_dir), else {key}.ram itself. The
+                    # host makes it (sparse, the RAM size: QEMU opens it O_RDWR and keeps
+                    # its size), so qemu-vm needs no write access to its folder.
+                    vmstate_path, meta_path = self._cache_paths(key)
+                    result: Path | None = None
+                    live_rams: list[_LiveRam] = []  # filled in its job, before a cancel reaches this task
+                    try:
+                        live_ram = await run_to_end(
+                            functools.partial(
+                                _new_live_ram,
+                                ram_path_from_vmstate(vmstate_path),
+                                size=template_spec.memory_mb * 1024 * 1024,
+                                owner=live_rams,
+                            )
                         )
-                        if not (isinstance(response, WarmReplAckMessage) and response.status == "ok"):
-                            logger.warning("L1 background save: REPL warm failed", extra={"response": str(response)})
-                            return
+                        if await probe_qemu_as_qemu_vm():  # the identity of the save VM's QEMU
+                            await _grant_entry_files([live_ram.path], perms="rw", key=key)
 
-                        # Save L1 (terminates VM) — call _do_save directly (we already hold the lock)
-                        # After _do_save, QEMU process is dead; ephemeral_vm's destroy_vm cleans up resources.
-                        vmstate_path, meta_path = self._cache_paths(key)
-                        result = await self._do_save(
-                            vm,
-                            key,
-                            vmstate_path,
-                            meta_path,
-                            language,
-                            packages,
-                            memory_mb,
-                            cpu_cores,
-                            allow_network=allow_network,
-                        )
+                        # Boot sacrificial VM — ephemeral_vm handles lifecycle
+                        async with self.vm_manager.ephemeral_vm(
+                            template_spec,
+                            tenant_id=constants.L1_SAVE_TENANT_ID,
+                            task_id=f"l1-save-{spec.language.value}",
+                            direct_write_target=None,
+                            snapshot_drive=layer.path if layer is not None else None,
+                            cache_leases=(layer,) if layer is not None else (),
+                            retry_profile=constants.RETRY_BACKGROUND,
+                            mem_path=str(live_ram.path),
+                            mem_path_share=True,  # Template save: QEMU writes RAM to file
+                        ) as vm:
+                            # Warm REPL (the interpreter start: 0.2-0.7 s with KVM or HVF, 3-5 s
+                            # under TCG; it has its own timeout)
+                            response = await vm.channel.send_request(
+                                WarmReplRequest(language=spec.language),
+                                timeout=constants.WARM_REPL_TIMEOUT_SECONDS,
+                            )
+                            if isinstance(response, WarmReplAckMessage) and response.status == "ok":
+                                # Save L1 (terminates VM) — call _do_save directly (we already hold the lock)
+                                # After _do_save, QEMU process is dead; ephemeral_vm's destroy_vm cleans up.
+                                result = await self._do_save(
+                                    vm,
+                                    key,
+                                    vmstate_path,
+                                    meta_path,
+                                    spec,
+                                    live_ram=live_ram.path,
+                                    live_ram_fd=live_ram.fd,
+                                )
+                            else:
+                                logger.warning(
+                                    "L1 background save: REPL warm failed", extra={"response": str(response)}
+                                )
+                    finally:  # one job, waited for on a cancel; its error never replaces the first one (a cancel)
+                        try:
+                            await run_to_end(
+                                functools.partial(
+                                    self._end_save, vmstate_path, published=result is not None, live_rams=live_rams
+                                )
+                            )
+                        except Exception:
+                            logger.warning("L1 background save: its files could not be removed", exc_info=True)
 
                     elapsed_ms = round((asyncio.get_running_loop().time() - start_time) * 1000)
                     if result:
                         logger.info(
                             "L1 background save completed",
-                            extra={"key": key, "language": language.value, "elapsed_ms": elapsed_ms},
+                            extra={"key": key, "language": spec.language.value, "elapsed_ms": elapsed_ms},
                         )
                     else:
                         logger.warning(
                             "L1 background save produced no result",
-                            extra={"key": key, "language": language.value, "elapsed_ms": elapsed_ms},
+                            extra={"key": key, "language": spec.language.value, "elapsed_ms": elapsed_ms},
                         )
 
             except BlockingIOError:
                 logger.debug("L1 background save already in-flight", extra={"key": key})
-            except Exception as e:  # noqa: BLE001 - background task, must not propagate
+            except Exception as e:
                 elapsed_ms = round((asyncio.get_running_loop().time() - start_time) * 1000)
                 logger.warning(
                     "L1 background save failed",
-                    extra={"language": language.value, "error": str(e), "elapsed_ms": elapsed_ms},
+                    extra={"language": spec.language.value, "error": str(e), "elapsed_ms": elapsed_ms},
                     exc_info=True,
                 )
 
+        layer = snapshot_drive.share() if snapshot_drive is not None else None
         task = asyncio.create_task(_background_save())
+        if layer is not None:  # also when the task is cancelled before it starts
+            task.add_done_callback(lambda _t: layer.release())
         self._in_flight_saves[key] = task
         task.add_done_callback(lambda _t: self._in_flight_saves.pop(key, None))
-        self._track_task(task, name=f"l1-save-{language.value}-{key}")
+        self._track_task(task, name=f"l1-save-{spec.language.value}-{key}")
         return task
 
-    async def get_l2_for_l1(self, language: Language, packages: list[str]) -> Path | None:
-        """Get the L2 disk snapshot path for an L1 restore.
-
-        For packages=[], returns None (base image only).
-        For packages=["pandas"], returns L2 qcow2 path via snapshot_manager.
-        """
-        if not packages:
-            return None
-
-        return await self.snapshot_manager.check_cache(
-            language=language,
-            packages=packages,
-        )
-
-    async def stop(self) -> None:
-        """Wait for background save tasks."""
-        await super().stop()
+    def _end_save(self, vmstate_path: Path, *, published: bool, live_rams: list[_LiveRam]) -> None:
+        """A save's end (blocking): when nothing was published, the entry's files (the RAM
+        file is the RAM size); then the RAM in memory, published or not, also when the
+        removal fails (a read-only or failing disk)."""
+        try:
+            if not published:
+                self._remove_entry(vmstate_path)
+        finally:
+            for live_ram in live_rams:
+                live_ram.close()

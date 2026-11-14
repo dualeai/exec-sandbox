@@ -1,8 +1,10 @@
 //! REPL wrapper scripts loaded via `include_str!()`.
 //!
 //! Each language has a wrapper script that implements the sentinel protocol:
+//!   Start:  __REPL_READY__\n on stderr, before the first read of stdin
 //!   Input:  "{sentinel_id} {code_len}\n" + code_bytes on stdin
-//!   Output: stdout/stderr from user code, then __SENTINEL_{id}_{exit_code}__\n on stderr
+//!   Output: stdout/stderr from user code, then __STDOUT_END_{id}__\n on stdout,
+//!           then __SENTINEL_{id}_{exit_code}__\n on stderr
 
 pub(crate) const PYTHON_REPL_WRAPPER: &str = include_str!("scripts/python_repl.py");
 pub(crate) const JS_REPL_WRAPPER: &str = include_str!("scripts/js_repl.mjs");

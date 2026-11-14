@@ -1,22 +1,40 @@
-"""Unit tests for subprocess utilities.
+"""Unit tests for subprocess utilities, with real subprocesses."""
 
-Tests drain_subprocess_output with real subprocesses.
-No mocks - spawns actual processes.
-"""
-
+import ast
 import asyncio
+import contextlib
+import errno
+import logging
+import os
+import select
+import signal
+import struct
+import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
+import psutil
 import pytest
 
-from exec_sandbox.platform_utils import ProcessWrapper
-from exec_sandbox.subprocess_utils import (
+import exec_sandbox
+from exec_sandbox import subprocess_utils
+from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox.platform_utils import HostOS, ProcessWrapper
+from exec_sandbox.process_registry import get_tracked_count, unregister_process
+from exec_sandbox.subprocess_utils import (  # pyright: ignore[reportPrivateUsage]
+    _launch_command,
+    child_shell,
     communicate_managed_process,
     drain_subprocess_output,
+    exec_errno,
+    exec_failed_error,
+    start_drain,
     start_managed_process,
     wait_for_socket,
 )
+from exec_sandbox.system_probes import probe_setpriv_pdeathsig
+from tests.conftest import asyncio_with, skip_unless_linux
 
 
 async def _close_writer(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -35,183 +53,615 @@ async def create_process(cmd: list[str]) -> ProcessWrapper:
     return ProcessWrapper(proc)
 
 
+_SPAWN_CALLS = {
+    ("asyncio", "create_subprocess_exec"),
+    ("asyncio", "create_subprocess_shell"),
+    *(("subprocess", name) for name in ("run", "Popen", "check_output", "check_call", "call")),
+}
+
+
+class TestChildEnv:
+    """Child processes never inherit the instance keyring or cloud credentials."""
+
+    def test_every_spawn_site_passes_env(self) -> None:
+        """AST walk over the package: each spawn call passes env= (a new site cannot forget it)."""
+        missing: list[str] = []
+        sites = 0
+        for path in sorted(Path(exec_sandbox.__file__).parent.rglob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                    continue
+                if (ast.unparse(node.func.value), node.func.attr) not in _SPAWN_CALLS:
+                    continue
+                sites += 1
+                if not any(keyword.arg == "env" for keyword in node.keywords):
+                    missing.append(f"{path.name}:{node.lineno}")
+        assert sites > 0
+        assert missing == []
+
+    def test_every_spawn_site_sets_stdin(self) -> None:
+        """Each spawn call sets stdin= (or input=): no child gets this process's stdin, the
+        terminal of the CLI (QEMU's console chardev would read it and clear its ISIG)."""
+        missing: list[str] = []
+        for path in sorted(Path(exec_sandbox.__file__).parent.rglob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                    continue
+                if (ast.unparse(node.func.value), node.func.attr) not in _SPAWN_CALLS:
+                    continue
+                if not any(keyword.arg in ("stdin", "input") for keyword in node.keywords):
+                    missing.append(f"{path.name}:{node.lineno}")
+        assert missing == []
+
+    async def test_managed_child_does_not_see_secrets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", "secret-keyring")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-aws")
+        monkeypatch.setenv("CHILD_ENV_PROBE", "kept")
+
+        returncode, stdout, _ = await communicate_managed_process(
+            ["/usr/bin/env"], process_name="env", context_id="test-child-env"
+        )
+
+        assert returncode == 0
+        assert b"CHILD_ENV_PROBE=kept" in stdout
+        assert b"secret-keyring" not in stdout
+        assert b"secret-aws" not in stdout
+
+
 class TestStartManagedProcess:
     """Process publication is atomic with respect to caller cancellation."""
 
-    async def test_cancelled_waiter_defers_until_spawn_is_published(self) -> None:
+    async def test_cancelled_waiter_defers_until_spawn_is_published(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A cancel that comes while the child is made: the waiter ends only after the child
+        is registered and given to on_process_started, so no child is left without an owner.
+        The spawn waits on a gate before the real spawn: the window is too short to hit
+        with timing only."""
         spawn_entered = asyncio.Event()
         release_spawn = asyncio.Event()
-        async_proc = MagicMock()
-        wrapped_proc = MagicMock(spec=ProcessWrapper)
         published: list[ProcessWrapper] = []
+        real_spawn = asyncio.create_subprocess_exec
 
-        async def blocked_spawn(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        async def gated_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
             spawn_entered.set()
             await release_spawn.wait()
-            return async_proc
+            return await real_spawn(*args, **kwargs)
 
+        monkeypatch.setattr(subprocess_utils, "asyncio", asyncio_with(create_subprocess_exec=gated_spawn))
+        tracked = get_tracked_count()
+        waiter = asyncio.create_task(
+            start_managed_process(
+                ["sleep", "60"], steps=(), end_with_this_process=False, pass_fds=(), on_process_started=published.append
+            )
+        )
+        await spawn_entered.wait()
+        waiter.cancel()
+        await asyncio.sleep(0)
+
+        assert not waiter.done()
+        release_spawn.set()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        [proc] = published
+        try:
+            assert proc.returncode is None  # the child runs
+            assert get_tracked_count() == tracked + 1  # and force_kill_all reaches it
+        finally:
+            await proc.kill()
+            await proc.wait()
+            unregister_process(proc)
+
+    async def test_child_stdin_is_dev_null(self) -> None:
+        """Not the host's stdin: QEMU's console would read it into the guest. A pipe stands in
+        for the host's stdin (pytest already puts /dev/null on fd 0)."""
+        probe = "import os; print(os.fstat(0).st_rdev)"
+        read_end, write_end = os.pipe()
+        saved = os.dup(0)
+        os.dup2(read_end, 0)
+        try:
+            proc = await start_managed_process(
+                [sys.executable, "-I", "-c", probe],
+                steps=(),
+                end_with_this_process=False,
+                pass_fds=(),
+                on_process_started=None,
+            )
+        finally:
+            os.dup2(saved, 0)
+            for fd in (saved, read_end, write_end):
+                os.close(fd)
+        out, _ = await proc.communicate()
+        assert int(out) == Path(os.devnull).stat().st_rdev
+
+
+def write_foreign_elf(path: Path) -> Path:
+    """An executable ELF file for a CPU that no kernel runs (e_machine 0xBEEF): its exec
+    fails with ENOEXEC, as for a binary of another architecture, and no binfmt_misc
+    handler (qemu-user) takes it."""
+    header = b"\x7fELF\x02\x01\x01" + bytes(9)
+    header += struct.pack("<HHIQQQIHHHHHH", 2, 0xBEEF, 1, 0x400000, 64, 0, 0, 64, 56, 0, 64, 0, 0)
+    path.write_bytes(header + bytes(range(256)))
+    path.chmod(0o755)
+    return path
+
+
+_PDEATHSIG_PROBE = "import ctypes; v = ctypes.c_int(); ctypes.CDLL(None).prctl(2, ctypes.byref(v)); print(v.value)"
+"""Prints the parent-death signal of its process (2 = PR_GET_PDEATHSIG)."""
+
+_KILLED_OWNER = """
+import asyncio
+
+from exec_sandbox.subprocess_utils import start_managed_process
+
+
+async def main() -> None:
+    print((await start_managed_process(["sleep", "60"], steps=(), end_with_this_process=True, pass_fds=(), on_process_started=None)).pid, flush=True)
+    await asyncio.Event().wait()  # until the test kills this process
+
+
+asyncio.run(main())
+"""
+"""A process with a child that ends with it, killed by the test (SIGKILL: no cleanup runs)."""
+
+
+class TestChildShell:
+    """Shell steps before a command, in place of a Python preexec_fn."""
+
+    async def test_steps_run_in_order_and_no_value_is_parsed(self, tmp_path: Path) -> None:
+        """Values and arguments are positional parameters: a value that a shell would expand
+        stays as it is."""
+        trap, folder = "$(touch injected) `touch injected` *", tmp_path / "sub"
+        folder.mkdir()
+        cmd = child_shell(
+            ["/bin/sh", "-c", 'printf "%s|%s" "$0" "$1" > second', trap, "a b"],
+            steps=[('cd "$1"', str(folder)), ('printf "%s" "$1" > first', trap)],
+        )
+        proc = await asyncio.create_subprocess_exec(*cmd, cwd=tmp_path)
+        assert await proc.wait() == 0
+        assert (folder / "first").read_text() == trap
+        assert (folder / "second").read_text() == f"{trap}|a b"
+        assert sorted(path.name for path in tmp_path.rglob("*")) == ["first", "second", "sub"]
+
+    def test_no_step_is_the_command_itself(self) -> None:
+        assert child_shell(["qemu-system-missing", "-version"], steps=()) == ["qemu-system-missing", "-version"]
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            ("{tmp}/qemu-system-test", None, b"", errno.ENOENT),
+            ("{tmp}/qemu-system-test", 0o644, b"#!/bin/sh\n", errno.EACCES),
+            ("qemu-system-test", None, b"", errno.ENOENT),
+            ("qemu-system-test", 0o644, b"#!/bin/sh\n", errno.EACCES),
+            ("qemu-system-test", 0o755, b"#!/bin/sh\n", None),
+            ("{tmp}/qemu-system-test", 0o755, b"hello\n", errno.ENOEXEC),
+            ("{tmp}/qemu-system-test", 0o755, b"", errno.ENOEXEC),
+            ("{tmp}/qemu-system-test", 0o755, b"\x7fELF\x02\x01\x01", None),
+        ],
+        ids=[
+            "missing",
+            "no-exec-bit",
+            "not-on-path",
+            "on-path-no-exec-bit",
+            "on-path",
+            "text-no-shebang",
+            "empty",
+            "elf",
+        ],
+    )
+    def test_command_exec_cannot_start_raises_as_popen_would(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: tuple[str, int | None, bytes, int | None]
+    ) -> None:
+        """The shell, not Popen, runs the exec of the command: its error would only be an exit
+        status. A command that exec would not find, may not run or would refuse as no
+        program (ENOEXEC) raises first: a shell runs such a file as a shell script, and an
+        empty one "runs" with exit 0. A bare name is looked up on the PATH (here: only the
+        test folder)."""
+        name, mode, content, err = case
+        binary = tmp_path / "qemu-system-test"
+        if mode is not None:
+            binary.write_bytes(content)
+            binary.chmod(mode)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        cmd = [name.format(tmp=tmp_path), "-version"]
+        if err is None:
+            assert child_shell(cmd, steps=[(":", "x")])[-2:] == cmd
+            return
+        with pytest.raises(OSError, check=lambda e: e.errno == err and e.filename == cmd[0]):
+            child_shell(cmd, steps=[(":", "x")])
+
+
+class TestExecLookupCache:
+    """child_shell looks a binary up once per name and PATH (exec_errno), not at each launch."""
+
+    def test_one_lookup_per_name_and_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A binary found once is not looked up again for the same PATH: its removal shows at
+        the exec, not here. Another PATH is a new lookup."""
+        program = tmp_path / "qemu-system-test"
+        program.write_bytes(b"#!/bin/sh\n")
+        program.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        child_shell([program.name], steps=[(":", "x")])
+        program.unlink()
+
+        for _ in range(2):
+            assert child_shell([program.name], steps=[(":", "x")])[-1] == program.name
+
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{tmp_path / 'other'}")
+        with pytest.raises(FileNotFoundError):
+            child_shell([program.name], steps=[(":", "x")])
+
+    def test_a_binary_installed_after_a_failure_starts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failure is not kept: the binary installed after a failed launch is found at the
+        next one; each failure raises a new OSError (one raised object would grow its
+        traceback at each raise)."""
+        monkeypatch.setenv("PATH", str(tmp_path))
+        errors = []
+        for _ in range(2):
+            with pytest.raises(FileNotFoundError) as info:
+                child_shell(["qemu-system-late"], steps=[(":", "x")])
+            errors.append(info.value)
+        assert errors[0] is not errors[1]
+        program = tmp_path / "qemu-system-late"
+        program.write_bytes(b"#!/bin/sh\n")
+        program.chmod(0o755)
+        child_shell([program.name], steps=[(":", "x")])
+        assert exec_errno(program.name, str(tmp_path)) is None
+
+
+class TestBinfmtMisc:
+    """A file of no known start that an enabled binfmt_misc entry claims: the kernel runs it
+    through the entry's interpreter, so the check before the spawn takes it. A fake
+    entries folder stands in for /proc/sys/fs/binfmt_misc."""
+
+    @staticmethod
+    def _entries(folder: Path, *, status: str, entries: dict[str, str]) -> Path:
+        folder.mkdir()
+        (folder / "status").write_text(f"{status}\n")
+        (folder / "register").write_text("")  # write-only in /proc: never an entry
+        for name, body in entries.items():
+            (folder / name).write_text(body)
+        return folder
+
+    @staticmethod
+    def _program(path: Path, content: bytes) -> str:
+        path.write_bytes(content)
+        path.chmod(0o755)
+        return str(path)
+
+    _PYC = "enabled\ninterpreter /usr/bin/python3.14\nflags: \noffset 0\nmagic 2b0e0d0a\n"
+    _MASKED = "enabled\ninterpreter /usr/bin/qemu-test\nflags: F\noffset 2\nmagic aa00\nmask ff00\n"
+    _EXE = "enabled\ninterpreter /usr/bin/wine\nflags: \nextension .exe\n"
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            ("enabled", {"python3.14": _PYC}, "run.pyc", b"\x2b\x0e\x0d\x0a" + bytes(12), True),
+            ("enabled", {"python3.14": _PYC.replace("enabled", "disabled", 1)}, "run.pyc", b"\x2b\x0e\x0d\x0a", False),
+            ("disabled", {"python3.14": _PYC}, "run.pyc", b"\x2b\x0e\x0d\x0a", False),
+            ("enabled", {"python3.14": _PYC}, "run.pyc", b"\x2b\x0e\x0d\x0b", False),
+            ("enabled", {"qemu-test": _MASKED}, "tool", b"xx\xaa\x55", True),
+            ("enabled", {"qemu-test": _MASKED}, "tool", b"xx\xab\x55", False),
+            ("enabled", {"wine": _EXE}, "tool.exe", b"MZ text", True),
+            ("enabled", {"wine": _EXE}, "tool.exe.txt", b"MZ text", False),
+            ("enabled", {"broken": "enabled\nmagic zz\n"}, "tool", b"zz", False),
+        ],
+        ids=[
+            "magic",
+            "entry-disabled",
+            "binfmt-misc-disabled",
+            "other-magic",
+            "magic-under-mask",
+            "masked-mismatch",
+            "extension",
+            "other-extension",
+            "unreadable-entry",
+        ],
+    )
+    def test_an_enabled_entry_that_claims_the_file_takes_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: tuple[str, dict[str, str], str, bytes, bool]
+    ) -> None:
+        status, entries, file, content, claimed = case
+        folder = self._entries(tmp_path / "binfmt_misc", status=status, entries=entries)
+        monkeypatch.setattr(subprocess_utils, "_BINFMT_MISC", folder)
+        program = self._program(tmp_path / file, content)
+        if claimed:
+            assert child_shell([program], steps=[(":", "x")])[-1] == program
+            return
+        with pytest.raises(OSError, check=lambda e: e.errno == errno.ENOEXEC):
+            child_shell([program], steps=[(":", "x")])
+
+    @pytest.mark.parametrize(
+        ("entry", "file"),
+        [
+            (b"enabled\ninterpreter /usr/bin/\xff-interp\nflags: \noffset 0\nmagic 2b0e0d0a\n", "run.pyc"),
+            pytest.param(  # binfmt_misc is Linux only, and APFS refuses a file name that is not UTF-8
+                b"enabled\ninterpreter /usr/bin/wine\nflags: \nextension .\xe9xe\n",
+                "tool.\udce9xe",
+                marks=skip_unless_linux,
+                id="extension",
+            ),
+        ],
+        ids=["interpreter", "extension"],
+    )
+    def test_an_entry_that_is_not_utf8_still_claims(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: bytes, file: str
+    ) -> None:
+        """Entry files hold bytes (an interpreter path or an extension need not be UTF-8): the
+        kernel still runs the file through such an entry."""
+        folder = self._entries(tmp_path / "binfmt_misc", status="enabled", entries={})
+        (folder / "entry").write_bytes(entry)
+        monkeypatch.setattr(subprocess_utils, "_BINFMT_MISC", folder)
+        program = self._program(tmp_path / file, b"\x2b\x0e\x0d\x0a" + bytes(12))
+        assert child_shell([program], steps=[(":", "x")])[-1] == program
+
+    def test_magic_past_the_end_of_the_file_reads_zeros(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The kernel matches the magic in a zero-filled buffer of the file's first 256 bytes."""
+        entry = "enabled\ninterpreter /usr/bin/x\nflags: \noffset 10\nmagic 0000\n"
+        monkeypatch.setattr(
+            subprocess_utils, "_BINFMT_MISC", self._entries(tmp_path / "b", status="enabled", entries={"z": entry})
+        )
+        program = self._program(tmp_path / "short", b"abc")
+        assert child_shell([program], steps=[(":", "x")])[-1] == program
+
+    def test_no_binfmt_misc_refuses(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Not mounted (or no Linux): no entry claims anything."""
+        monkeypatch.setattr(subprocess_utils, "_BINFMT_MISC", tmp_path / "missing")
+        program = self._program(tmp_path / "run.pyc", b"\x2b\x0e\x0d\x0a")
+        with pytest.raises(OSError, check=lambda e: e.errno == errno.ENOEXEC):
+            child_shell([program], steps=[(":", "x")])
+
+
+class TestExecFailedError:
+    """A launch that ends with 126 or 127: an exec in it failed."""
+
+    @pytest.mark.parametrize(
+        ("returncode", "reason"),
+        [
+            (126, "a program of the launch cannot run: no exec bit or another CPU architecture"),
+            (127, "a program of the launch was not found, or its ELF interpreter is missing"),
+        ],
+    )
+    def test_126_and_127_are_host_dependency(self, returncode: int, reason: str) -> None:
+        """As spawn_error gives for an exec that Popen runs: no retry fixes it."""
+        error = exec_failed_error(
+            returncode,
+            binary="/opt/gvproxy",
+            detail="exec: /opt/gvproxy: not found",
+            context={"vm_id": "v"},
+            hint="install it",
+        )
+        assert error is not None
+        assert error.code is ErrorCode.HOST_DEPENDENCY
+        assert str(error) == (
+            f"Failed to start /opt/gvproxy: exit status {returncode} ({reason}): exec: /opt/gvproxy: not found"
+        )
+        assert error.context == {"vm_id": "v", "binary": "/opt/gvproxy", "exit_code": returncode}
+
+    @pytest.mark.parametrize("returncode", [None, 0, 1, 2, 125, 128, -9])
+    def test_any_other_end_is_none(self, returncode: int | None) -> None:
+        assert exec_failed_error(returncode, binary="b", detail=None, context={}, hint=None) is None
+
+    @skip_unless_linux
+    async def test_command_of_another_arch_ends_the_launch_with_126(self, tmp_path: Path) -> None:
+        """The check before the spawn takes any ELF; the kernel refuses this one (ENOEXEC)
+        and the launch shell ends with 126 (dash and bash refuse a binary file as a script)."""
+        binary = write_foreign_elf(tmp_path / "gvproxy-wrapper-test")
+        proc = await start_managed_process(
+            [str(binary)], steps=(), end_with_this_process=True, pass_fds=(), on_process_started=None
+        )
+        await proc.communicate()
+        unregister_process(proc)
+        error = exec_failed_error(proc.returncode, binary=str(binary), detail=None, context={}, hint=None)
+        assert (proc.returncode, error is not None) == (126, True)
+
+
+class TestEndWithThisProcess:
+    """A child that the kernel SIGKILLs when this process ends: setpriv --pdeathsig, no Python
+    preexec_fn, so Popen can vfork; the preexec_fn only without setpriv. Some tests read
+    the launch from _launch_command: a preexec_fn changes only how Popen makes the child (fork
+    or vfork), which no public result shows."""
+
+    @skip_unless_linux
+    async def test_child_gets_sigkill_with_no_preexec(self) -> None:
+        if not await probe_setpriv_pdeathsig():
+            pytest.skip("no setpriv --pdeathsig on this host (util-linux before 2.33)")
+        cmd, preexec_fn = await _launch_command(
+            [sys.executable, "-I", "-c", _PDEATHSIG_PROBE], steps=(), end_with_this_process=True
+        )
+        assert preexec_fn is None
+        returncode, out, _ = await communicate_managed_process(cmd, process_name="probe", context_id="test-pdeathsig")
+        assert (returncode, int(out)) == (0, signal.SIGKILL)
+
+    @skip_unless_linux
+    async def test_child_of_another_parent_stops_before_its_command(self, tmp_path: Path) -> None:
+        """A parent that ended before setpriv's prctl call sends no signal: the shell sees
+        another parent (here: another pid stands for this process) and exits first."""
+        if not await probe_setpriv_pdeathsig():
+            pytest.skip("no setpriv --pdeathsig on this host (util-linux before 2.33)")
+        marker = tmp_path / "ran"
+        with patch.object(os, "getpid", return_value=1):
+            cmd, _ = await _launch_command(["/bin/sh", "-c", f"touch {marker}"], steps=(), end_with_this_process=True)
+        returncode, _, _ = await communicate_managed_process(cmd, process_name="probe", context_id="test-ppid")
+        assert returncode == 1
+        assert not marker.exists()
+
+    @skip_unless_linux
+    async def test_without_setpriv_the_preexec_sets_the_signal(self) -> None:
+        """A host without setpriv --pdeathsig: the same signal through die_with_spawning_thread
+        (Popen then forks this process)."""
+        probe = [sys.executable, "-I", "-c", _PDEATHSIG_PROBE]
+        with patch("exec_sandbox.subprocess_utils.probe_setpriv_pdeathsig", new_callable=AsyncMock, return_value=False):
+            cmd, preexec_fn = await _launch_command(probe, steps=(), end_with_this_process=True)
+            assert cmd[0] == sys.executable
+            assert preexec_fn is not None
+            proc = await start_managed_process(
+                probe, steps=(), end_with_this_process=True, pass_fds=(), on_process_started=None
+            )
+        out, _ = await proc.communicate()
+        unregister_process(proc)
+        assert int(out) == signal.SIGKILL
+
+    async def test_no_signal_where_the_os_has_none(self) -> None:
+        """No setpriv --pdeathsig and no prctl signal (macOS): the command itself, no setpriv,
+        no preexec_fn. A capability, as the probe and the fallback answer it."""
         with (
-            patch("exec_sandbox.subprocess_utils.asyncio.create_subprocess_exec", side_effect=blocked_spawn),
-            patch("exec_sandbox.subprocess_utils.ProcessWrapper", return_value=wrapped_proc),
-            patch("exec_sandbox.subprocess_utils.register_process") as register,
+            patch("exec_sandbox.subprocess_utils.probe_setpriv_pdeathsig", new_callable=AsyncMock, return_value=False),
+            patch("exec_sandbox.subprocess_utils.detect_host_os", return_value=HostOS.MACOS),
         ):
-            waiter = asyncio.create_task(start_managed_process(["qemu-test"], on_process_started=published.append))
-            await spawn_entered.wait()
-            waiter.cancel()
-            await asyncio.sleep(0)
+            assert await _launch_command(["qemu-storage-daemon"], steps=(), end_with_this_process=True) == (
+                ["qemu-storage-daemon"],
+                None,
+            )
 
-            assert not waiter.done()
-            release_spawn.set()
-            with pytest.raises(asyncio.CancelledError):
-                await waiter
+    async def test_a_child_not_ending_with_this_process_runs_its_steps_only(self) -> None:
+        """Without end_with_this_process (a setuid launcher, a transient run): the steps, no
+        setpriv, no preexec_fn, whatever the host."""
+        assert await _launch_command(["true"], steps=[(":", "x")], end_with_this_process=False) == (
+            ["/bin/sh", "-c", ':; shift; exec "$@"', "sh", "x", "true"],
+            None,
+        )
 
-        register.assert_called_once_with(wrapped_proc)
-        assert published == [wrapped_proc]
+    @skip_unless_linux
+    async def test_child_of_a_killed_process_ends_at_once(self) -> None:
+        """No VM cgroup and no watcher reach such a child (gvproxy, qemu-storage-daemon, QEMU as
+        this user without cgroups): its process's end is its end."""
+        owner = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", _KILLED_OWNER, stdout=asyncio.subprocess.PIPE
+        )
+        pidfd: int | None = None
+        try:
+            assert owner.stdout is not None
+            pidfd = os.pidfd_open(int(await owner.stdout.readline()))  # readable once the child ends
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN)
+            assert poller.poll(0) == []  # alive while its process lives
+            owner.kill()
+            assert await owner.wait() == -signal.SIGKILL
+            start = asyncio.get_running_loop().time()
+            assert await asyncio.to_thread(poller.poll, 2000)  # ends within ms; the timeout only bounds a failure
+            assert asyncio.get_running_loop().time() - start < 1.0
+        finally:
+            if owner.returncode is None:
+                owner.kill()
+                await owner.wait()
+            if pidfd is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)  # a failed test leaves no child
+                os.close(pidfd)
 
 
 class TestCommunicateManagedProcess:
-    """Transient children retain cleanup ownership across cancellation."""
+    """Transient children retain cleanup ownership across cancellation: a real child, and the
+    real process registry. cleanup_process is wrapped only to make one attempt report a death
+    it did not confirm (an OS fault a test cannot cause)."""
 
-    async def test_cancelled_communication_kills_reaps_and_unregisters(self) -> None:
-        communicate_entered = asyncio.Event()
-        proc = MagicMock(spec=ProcessWrapper)
-        proc.returncode = None
+    @staticmethod
+    async def _child(argv: list[str]) -> psutil.Process:
+        """The child of this process with this command line, once it runs."""
+        async with asyncio.timeout(5):
+            while True:
+                for child in psutil.Process().children():
+                    with contextlib.suppress(psutil.Error):
+                        if child.cmdline() == argv:
+                            return child
+                await asyncio.sleep(0.005)
 
-        async def blocked_communicate() -> tuple[bytes, bytes]:
-            communicate_entered.set()
-            await asyncio.Event().wait()
-            return b"", b""
+    @staticmethod
+    def _unconfirmed_first(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+        """cleanup_process whose first attempt reports an unconfirmed death without acting;
+        the next ones run the real cleanup. Returns the result of each attempt."""
+        results: list[bool] = []
+        real_cleanup = subprocess_utils.cleanup_process
 
-        proc.communicate = blocked_communicate
-
-        async def publish_process(*_args, on_process_started=None, **_kwargs):  # type: ignore[no-untyped-def]
-            assert on_process_started is not None
-            on_process_started(proc)
-            return proc
-
-        with (
-            patch("exec_sandbox.subprocess_utils.start_managed_process", side_effect=publish_process),
-            patch(
-                "exec_sandbox.subprocess_utils.cleanup_process", new_callable=AsyncMock, return_value=True
-            ) as cleanup,
-            patch("exec_sandbox.subprocess_utils.unregister_process") as unregister,
-        ):
-            task = asyncio.create_task(
-                communicate_managed_process(
-                    ["qemu-img", "info"],
-                    process_name="qemu-img",
-                    context_id="cancelled",
+        async def cleanup(
+            proc: ProcessWrapper,
+            name: str,
+            context_id: str,
+            *,
+            term_timeout: float,
+            kill_timeout: float,
+            kill_first: bool,
+        ) -> bool:
+            results.append(
+                bool(results)
+                and await real_cleanup(
+                    proc,
+                    name,
+                    context_id,
+                    term_timeout=term_timeout,
+                    kill_timeout=kill_timeout,
+                    kill_first=kill_first,
                 )
             )
-            await communicate_entered.wait()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            return results[-1]
 
-        cleanup.assert_awaited_once_with(proc, "qemu-img", "cancelled")
-        unregister.assert_called_once_with(proc)
+        monkeypatch.setattr(subprocess_utils, "cleanup_process", cleanup)
+        return results
+
+    async def test_cancelled_communication_kills_reaps_and_unregisters(self) -> None:
+        argv = ["sleep", "61.5"]
+        tracked = get_tracked_count()
+        task = asyncio.create_task(communicate_managed_process(argv, process_name="sleep", context_id="cancelled"))
+        child = await self._child(argv)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not psutil.pid_exists(child.pid)  # ended and reaped
+        assert get_tracked_count() == tracked
 
     async def test_normal_completion_unregisters_after_confirmed_cleanup(self) -> None:
-        proc = MagicMock(spec=ProcessWrapper)
-        proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"out", b"err"))
+        tracked = get_tracked_count()
+        result = await communicate_managed_process(
+            ["/bin/sh", "-c", "echo out; echo err >&2"], process_name="sh", context_id="normal"
+        )
 
-        async def publish_process(*_args, on_process_started=None, **_kwargs):  # type: ignore[no-untyped-def]
-            assert on_process_started is not None
-            on_process_started(proc)
-            return proc
+        assert result == (0, b"out\n", b"err\n")
+        assert get_tracked_count() == tracked
 
-        with (
-            patch("exec_sandbox.subprocess_utils.start_managed_process", side_effect=publish_process),
-            patch("exec_sandbox.subprocess_utils.cleanup_process", new_callable=AsyncMock, return_value=True),
-            patch("exec_sandbox.subprocess_utils.unregister_process") as unregister,
-        ):
-            result = await communicate_managed_process(
-                ["qemu-img", "info"],
-                process_name="qemu-img",
-                context_id="normal",
-            )
+    async def test_unconfirmed_cleanup_blocks_return_and_retries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The first cleanup does not confirm the end: the call waits 1 s (here a stand-in
+        sleep that records it), with the child still registered, then tries again."""
+        tracked = get_tracked_count()
+        attempts = self._unconfirmed_first(monkeypatch)
+        registered_at_backoff: list[int] = []
 
-        assert result == (0, b"out", b"err")
-        unregister.assert_called_once_with(proc)
+        async def sleep(delay: float) -> None:
+            registered_at_backoff.append(get_tracked_count() - tracked)
+            assert delay == 1.0
 
-    async def test_unconfirmed_cleanup_blocks_return_and_retries(self) -> None:
-        proc = MagicMock(spec=ProcessWrapper)
-        proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"out", b""))
-        second_cleanup = asyncio.Event()
+        monkeypatch.setattr(subprocess_utils, "asyncio", asyncio_with(sleep=sleep))
+        result = await communicate_managed_process(["/bin/sh", "-c", "echo out"], process_name="sh", context_id="retry")
 
-        async def publish_process(*_args, on_process_started=None, **_kwargs):  # type: ignore[no-untyped-def]
-            assert on_process_started is not None
-            on_process_started(proc)
-            return proc
+        assert result == (0, b"out\n", b"")
+        assert attempts == [False, True]
+        assert registered_at_backoff == [1]  # unregistered only after a confirmed end
+        assert get_tracked_count() == tracked
 
-        async def cleanup(*_args, **_kwargs) -> bool:  # type: ignore[no-untyped-def]
-            if not second_cleanup.is_set():
-                second_cleanup.set()
-                return False
-            return True
-
-        with (
-            patch("exec_sandbox.subprocess_utils.start_managed_process", side_effect=publish_process),
-            patch("exec_sandbox.subprocess_utils.cleanup_process", side_effect=cleanup) as cleanup_mock,
-            patch("exec_sandbox.subprocess_utils.asyncio.sleep", new_callable=AsyncMock) as sleep,
-            patch("exec_sandbox.subprocess_utils.unregister_process") as unregister,
-        ):
-            result = await communicate_managed_process(
-                ["qemu-img", "info"],
-                process_name="qemu-img",
-                context_id="retry",
-            )
-
-        assert result == (0, b"out", b"")
-        assert cleanup_mock.await_count == 2
-        sleep.assert_awaited_once_with(1.0)
-        unregister.assert_called_once_with(proc)
-
-    async def test_cancellation_during_cleanup_backoff_still_confirms_death(self) -> None:
-        proc = MagicMock(spec=ProcessWrapper)
-        proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"", b""))
+    async def test_cancellation_during_cleanup_backoff_still_confirms_death(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tracked = get_tracked_count()
+        attempts = self._unconfirmed_first(monkeypatch)
         backoff_entered = asyncio.Event()
         release_backoff = asyncio.Event()
-        cleanup_attempts = 0
-
-        async def publish_process(*_args, on_process_started=None, **_kwargs):  # type: ignore[no-untyped-def]
-            assert on_process_started is not None
-            on_process_started(proc)
-            return proc
-
-        async def cleanup(*_args, **_kwargs) -> bool:  # type: ignore[no-untyped-def]
-            nonlocal cleanup_attempts
-            cleanup_attempts += 1
-            return cleanup_attempts >= 2
 
         async def blocked_sleep(_delay: float) -> None:
             backoff_entered.set()
             await release_backoff.wait()
 
-        with (
-            patch("exec_sandbox.subprocess_utils.start_managed_process", side_effect=publish_process),
-            patch("exec_sandbox.subprocess_utils.cleanup_process", side_effect=cleanup),
-            patch("exec_sandbox.subprocess_utils.asyncio.sleep", side_effect=blocked_sleep),
-            patch("exec_sandbox.subprocess_utils.unregister_process") as unregister,
-        ):
-            task = asyncio.create_task(
-                communicate_managed_process(
-                    ["qemu-img", "info"],
-                    process_name="qemu-img",
-                    context_id="cancel-backoff",
-                )
-            )
-            await backoff_entered.wait()
-            task.cancel()
-            release_backoff.set()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        monkeypatch.setattr(subprocess_utils, "asyncio", asyncio_with(sleep=blocked_sleep))
+        task = asyncio.create_task(
+            communicate_managed_process(["/bin/sh", "-c", "exit 0"], process_name="sh", context_id="cancel-backoff")
+        )
+        await backoff_entered.wait()
+        task.cancel()
+        release_backoff.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-        assert cleanup_attempts == 2
-        unregister.assert_called_once_with(proc)
+        assert attempts == [False, True]
+        assert get_tracked_count() == tracked
 
 
 class TestDrainSubprocessOutput:
@@ -220,44 +670,8 @@ class TestDrainSubprocessOutput:
     Uses real subprocesses - no mocking.
     """
 
-    async def test_drain_stdout_only(self) -> None:
-        """Drain stdout from a process that only writes to stdout."""
-        captured: list[str] = []
-
-        proc = await create_process(["echo", "hello world"])
-
-        await drain_subprocess_output(
-            proc,
-            process_name="echo",
-            context_id="test-1",
-            stdout_handler=captured.append,
-        )
-
-        # Wait for process to finish
-        await proc.wait()
-
-        assert "hello world" in captured
-
-    async def test_drain_stderr_only(self) -> None:
-        """Drain stderr from a process that only writes to stderr."""
-        captured_stderr: list[str] = []
-
-        # bash -c to write to stderr
-        proc = await create_process(["bash", "-c", "echo 'error message' >&2"])
-
-        await drain_subprocess_output(
-            proc,
-            process_name="bash",
-            context_id="test-2",
-            stderr_handler=captured_stderr.append,
-        )
-
-        await proc.wait()
-
-        assert "error message" in captured_stderr
-
     async def test_drain_both_stdout_stderr(self) -> None:
-        """Drain both stdout and stderr concurrently."""
+        """Each stream goes to its own handler, and to that handler only."""
         captured_stdout: list[str] = []
         captured_stderr: list[str] = []
 
@@ -266,91 +680,83 @@ class TestDrainSubprocessOutput:
 
         await drain_subprocess_output(
             proc,
-            process_name="bash",
-            context_id="test-3",
             stdout_handler=captured_stdout.append,
             stderr_handler=captured_stderr.append,
         )
 
         await proc.wait()
 
-        assert "stdout line" in captured_stdout
-        assert "stderr line" in captured_stderr
+        assert captured_stdout == ["stdout line"]
+        assert captured_stderr == ["stderr line"]
 
     async def test_drain_multiple_lines(self) -> None:
-        """Drain multiple lines from stdout."""
+        """Each line reaches the handler once, in order, without its newline."""
         captured: list[str] = []
 
         proc = await create_process(["bash", "-c", "echo line1; echo line2; echo line3"])
 
-        await drain_subprocess_output(
-            proc,
-            process_name="bash",
-            context_id="test-4",
-            stdout_handler=captured.append,
-        )
+        await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=[].append)
 
         await proc.wait()
 
-        assert len(captured) == 3
-        assert "line1" in captured
-        assert "line2" in captured
-        assert "line3" in captured
+        assert captured == ["line1", "line2", "line3"]
 
-    async def test_drain_interleaved_output(self) -> None:
-        """Drain interleaved stdout/stderr without deadlock."""
+    async def test_drain_reads_both_pipes_at_once(self) -> None:
+        """A child that writes 2 MB to stderr before it writes stdout: a drain that read stdout
+        to its end first would wait for ever. asyncio buffers 128 KiB of a pipe that nobody
+        reads, the pipe holds 64 KiB more, then the child blocks on its write."""
         captured_stdout: list[str] = []
         captured_stderr: list[str] = []
+        script = "import sys; sys.stderr.write(''.join(f'err {i}\\n' for i in range(200_000))); print('out')"
+        proc = await create_process([sys.executable, "-c", script])
 
-        # Interleaved output - this could deadlock without concurrent draining
-        proc = await create_process(
-            [
-                "bash",
-                "-c",
-                """
-            for i in 1 2 3; do
-                echo "out $i"
-                echo "err $i" >&2
-            done
-            """,
-            ]
-        )
+        async with asyncio.timeout(10):
+            await drain_subprocess_output(
+                proc,
+                stdout_handler=captured_stdout.append,
+                stderr_handler=captured_stderr.append,
+            )
+            assert await proc.wait() == 0
 
-        await drain_subprocess_output(
-            proc,
-            process_name="bash",
-            context_id="test-5",
-            stdout_handler=captured_stdout.append,
-            stderr_handler=captured_stderr.append,
-        )
-
-        await proc.wait()
-
-        # All output captured without deadlock
-        assert len(captured_stdout) == 3
-        assert len(captured_stderr) == 3
+        assert captured_stdout == ["out"]
+        assert captured_stderr == [f"err {i}" for i in range(200_000)]
 
     async def test_drain_large_output(self) -> None:
-        """Drain large output without pipe buffer exhaustion."""
+        """Output larger than a pipe (64 KiB): every line reaches the handler, in order."""
         captured: list[str] = []
 
-        # Generate 1000 lines (more than typical 64KB pipe buffer)
+        # 3000 lines of about 32 bytes: 95 KB
         proc = await create_process(
-            ["bash", "-c", 'for i in $(seq 1 1000); do echo "line $i with some padding text"; done']
+            ["bash", "-c", 'for i in $(seq 1 3000); do echo "line $i with some padding text"; done']
         )
 
-        await drain_subprocess_output(
-            proc,
-            process_name="bash",
-            context_id="test-6",
-            stdout_handler=captured.append,
-        )
+        await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=[].append)
 
         await proc.wait()
 
-        assert len(captured) == 1000
-        assert "line 1 with some padding text" in captured
-        assert "line 1000 with some padding text" in captured
+        assert captured == [f"line {i} with some padding text" for i in range(1, 3001)]
+
+    @pytest.mark.parametrize(
+        ("output", "lines"),
+        [  # the child builds its output: one argument holds at most 128 KiB on Linux
+            ("'x' * 200_000 + '\\nafter\\n' + 'y' * 300_000", ["after"]),
+            ("'short\\n' + 'z' * 300_000 + '\\nlast'", ["short", "last"]),
+            ("'a' * 300_000 + '\\n' + 'b' * 300_000 + '\\n'", []),
+        ],
+        ids=["long-then-line-then-long-at-eof", "line-long-line-at-eof", "only-long-lines"],
+    )
+    async def test_drain_drops_a_line_over_the_limit_whole(self, output: str, lines: list[str]) -> None:
+        """A line over the reader's 64 KiB limit is dropped whole (no tail comes out as a
+        line, even when the line spans several reads) and the drain reads on to EOF, so the
+        pipe never fills; stderr the same."""
+        for stream in ("stdout", "stderr"):
+            captured: list[str] = []
+            proc = await create_process(
+                [sys.executable, "-c", f"import sys; sys.{stream}.write({output}); sys.{stream}.flush()"]
+            )
+            await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=captured.append)
+            assert await proc.wait() == 0
+            assert captured == lines
 
     async def test_drain_empty_output(self) -> None:
         """Drain from process with no output."""
@@ -361,8 +767,6 @@ class TestDrainSubprocessOutput:
 
         await drain_subprocess_output(
             proc,
-            process_name="true",
-            context_id="test-7",
             stdout_handler=captured_stdout.append,
             stderr_handler=captured_stderr.append,
         )
@@ -372,71 +776,53 @@ class TestDrainSubprocessOutput:
         assert captured_stdout == []
         assert captured_stderr == []
 
-    async def test_drain_with_default_handlers(self) -> None:
-        """Drain with default handlers (logging, no capture)."""
-        proc = await create_process(["echo", "test"])
-
-        # No custom handlers - uses default logging
-        await drain_subprocess_output(
-            proc,
-            process_name="echo",
-            context_id="test-8",
-        )
-
-        await proc.wait()
-
-        # Just verify it completes without error
-        assert proc.returncode == 0
-
     async def test_drain_binary_safe(self) -> None:
-        """Drain handles non-UTF8 gracefully (ignores decode errors)."""
+        """A line that is not UTF-8 is skipped; the drain goes on to the next line."""
         captured: list[str] = []
 
-        # Output some bytes that might cause decode issues
-        proc = await create_process(["bash", "-c", "echo 'normal text'"])
+        proc = await create_process(["bash", "-c", r"printf '\377\376 bad\nnormal text\n'"])
 
-        await drain_subprocess_output(
-            proc,
-            process_name="bash",
-            context_id="test-9",
-            stdout_handler=captured.append,
-        )
+        await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=[].append)
 
         await proc.wait()
 
-        assert "normal text" in captured
+        assert captured == ["normal text"]
 
-    async def test_drain_python_subprocess(self) -> None:
-        """Drain from Python subprocess with mixed output."""
-        captured_stdout: list[str] = []
-        captured_stderr: list[str] = []
 
-        proc = await create_process(
-            [
-                "python3",
-                "-c",
-                """
-import sys
-print('stdout message')
-print('stderr message', file=sys.stderr)
-print('another stdout')
-            """,
-            ]
+class TestStartDrain:
+    """start_drain: its task is the process's drain_task (cleanup then never reads the
+    pipes), it reads both pipes, and a failure of the task is logged."""
+
+    async def test_task_is_the_drain_task_and_reads_both_pipes(self) -> None:
+        lines: list[str] = []
+        proc = await create_process(["bash", "-c", "echo out; echo err >&2"])
+
+        task = start_drain(
+            proc, process_name="bash", context_id="drain-1", stdout_handler=lines.append, stderr_handler=lines.append
         )
 
-        await drain_subprocess_output(
-            proc,
-            process_name="python",
-            context_id="test-10",
-            stdout_handler=captured_stdout.append,
-            stderr_handler=captured_stderr.append,
-        )
+        assert proc.drain_task is task
+        await task
+        await proc.wait()
+        assert sorted(lines) == ["err", "out"]
 
+    async def test_failed_task_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        proc = await create_process(["echo", "line"])
+
+        def fail(_line: str) -> None:
+            raise RuntimeError("handler failed")
+
+        with caplog.at_level(logging.ERROR, logger="exec_sandbox.subprocess_utils"):
+            task = start_drain(
+                proc, process_name="echo", context_id="drain-2", stdout_handler=fail, stderr_handler=[].append
+            )
+            with pytest.raises(ExceptionGroup):
+                await task  # the log callback was added first: it ran before this await returns
         await proc.wait()
 
-        assert "stdout message" in captured_stdout
-        assert "another stdout" in captured_stdout
-        assert "stderr message" in captured_stderr
+        assert [(r.getMessage(), getattr(r, "task_name", None)) for r in caplog.records] == [
+            ("Background task failed", "echo-drain-drain-2")
+        ]
 
 
 class TestWaitForSocket:
@@ -453,55 +839,51 @@ class TestWaitForSocket:
 
         server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
         try:
-            result = await wait_for_socket(sock_path, timeout=2.0)
+            result = await wait_for_socket(sock_path, timeout=2.0, abort_check=lambda: None, keep_connection=False)
             assert result is None
         finally:
             server.close()
             await server.wait_closed()
 
-    async def test_socket_appears_after_delay(self, short_tmp_dir: Path) -> None:
-        """Socket created by a background task after a short delay."""
+    async def test_socket_appears_after_the_wait_starts(self, short_tmp_dir: Path) -> None:
+        """The socket appears while the wait polls for its file (abort_check marks a poll): the
+        wait goes on, then connects once the socket listens."""
         sock_path = short_tmp_dir / "s.sock"
+        polled = asyncio.Event()
+        wait = asyncio.create_task(
+            wait_for_socket(sock_path, timeout=2.0, abort_check=polled.set, keep_connection=False)
+        )
+        await polled.wait()
+        assert not wait.done()  # no file yet: it polls
 
-        async def _create_server_later() -> asyncio.Server:
-            await asyncio.sleep(0.1)
-            return await asyncio.start_unix_server(_close_writer, path=str(sock_path))
-
-        task = asyncio.create_task(_create_server_later())
+        server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
         try:
-            result = await wait_for_socket(sock_path, timeout=2.0)
-            assert result is None
+            assert await wait is None
         finally:
-            server = await task
             server.close()
             await server.wait_closed()
 
     async def test_keep_connection_true_returns_streams(self, short_tmp_dir: Path) -> None:
-        """keep_connection=True returns (reader, writer) streams."""
+        """keep_connection=True returns the (reader, writer) of its connection: the server's
+        reply to "ping" comes on that reader."""
         sock_path = short_tmp_dir / "s.sock"
 
-        server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
+        async def pong(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            writer.write(b"pong to " + await reader.readline())
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_unix_server(pong, path=str(sock_path))
         try:
-            result = await wait_for_socket(sock_path, timeout=2.0, keep_connection=True)
+            result = await wait_for_socket(sock_path, timeout=2.0, keep_connection=True, abort_check=lambda: None)
             assert result is not None
             r, w = result
-            assert isinstance(r, asyncio.StreamReader)
-            assert isinstance(w, asyncio.StreamWriter)
-            w.write(b"ping")
+            w.write(b"ping\n")
+            await w.drain()
+            assert await r.read() == b"pong to ping\n"
             w.close()
             await w.wait_closed()
-        finally:
-            server.close()
-            await server.wait_closed()
-
-    async def test_keep_connection_false_returns_none(self, short_tmp_dir: Path) -> None:
-        """keep_connection=False (default) returns None."""
-        sock_path = short_tmp_dir / "s.sock"
-
-        server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
-        try:
-            result = await wait_for_socket(sock_path, timeout=2.0, keep_connection=False)
-            assert result is None
         finally:
             server.close()
             await server.wait_closed()
@@ -510,7 +892,7 @@ class TestWaitForSocket:
         """TimeoutError when socket file never appears."""
         sock_path = short_tmp_dir / "s.sock"
         with pytest.raises(TimeoutError):
-            await wait_for_socket(sock_path, timeout=0.1)
+            await wait_for_socket(sock_path, timeout=0.1, abort_check=lambda: None, keep_connection=False)
 
     async def test_socket_file_exists_but_not_listening(self, short_tmp_dir: Path) -> None:
         """Fails when path exists as regular file, not a socket.
@@ -520,8 +902,13 @@ class TestWaitForSocket:
         """
         sock_path = short_tmp_dir / "s.sock"
         sock_path.write_text("not a socket")
-        with pytest.raises((TimeoutError, OSError)):
-            await wait_for_socket(sock_path, timeout=0.2)
+        expected = (
+            pytest.raises(OSError, check=lambda e: e.errno == errno.ENOTSOCK)
+            if sys.platform == "darwin"
+            else pytest.raises(TimeoutError)
+        )
+        with expected:
+            await wait_for_socket(sock_path, timeout=0.2, abort_check=lambda: None, keep_connection=False)
 
     async def test_abort_check_raises(self, short_tmp_dir: Path) -> None:
         """abort_check exception propagates instead of TimeoutError."""
@@ -535,27 +922,14 @@ class TestWaitForSocket:
                 raise RuntimeError("process died")
 
         with pytest.raises(RuntimeError, match="process died"):
-            await wait_for_socket(sock_path, timeout=5.0, abort_check=_abort)
-
-    async def test_abort_check_called_each_iteration(self, short_tmp_dir: Path) -> None:
-        """abort_check is invoked on every poll iteration."""
-        sock_path = short_tmp_dir / "s.sock"
-        call_count = 0
-
-        def _count() -> None:
-            nonlocal call_count
-            call_count += 1
-
-        with pytest.raises(TimeoutError):
-            await wait_for_socket(sock_path, timeout=0.1, abort_check=_count)
-
-        assert call_count > 0
+            await wait_for_socket(sock_path, timeout=5.0, abort_check=_abort, keep_connection=False)
+        assert call_count == 2  # the wait ended at the first raise
 
     async def test_zero_timeout(self, short_tmp_dir: Path) -> None:
         """Zero timeout raises TimeoutError immediately."""
         sock_path = short_tmp_dir / "s.sock"
         with pytest.raises(TimeoutError):
-            await wait_for_socket(sock_path, timeout=0.0)
+            await wait_for_socket(sock_path, timeout=0.0, abort_check=lambda: None, keep_connection=False)
 
     async def test_concurrent_wait_for_socket(self, short_tmp_dir: Path) -> None:
         """Multiple concurrent waits all succeed against the same server."""
@@ -564,17 +938,29 @@ class TestWaitForSocket:
         server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
         try:
             results = await asyncio.gather(
-                wait_for_socket(sock_path, timeout=2.0, keep_connection=False),
-                wait_for_socket(sock_path, timeout=2.0, keep_connection=False),
-                wait_for_socket(sock_path, timeout=2.0, keep_connection=False),
+                wait_for_socket(sock_path, timeout=2.0, keep_connection=False, abort_check=lambda: None),
+                wait_for_socket(sock_path, timeout=2.0, keep_connection=False, abort_check=lambda: None),
+                wait_for_socket(sock_path, timeout=2.0, keep_connection=False, abort_check=lambda: None),
             )
             assert all(r is None for r in results)
         finally:
             server.close()
             await server.wait_closed()
 
-    async def test_socket_path_in_nonexistent_directory(self) -> None:
-        """TimeoutError when socket path is in a directory that does not exist."""
-        sock_path = Path("/tmp/nonexistent_dir_xyz/test.sock")
-        with pytest.raises(TimeoutError):
-            await wait_for_socket(sock_path, timeout=0.1)
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root connects to a socket of mode 0")
+    async def test_socket_this_process_may_not_use_is_host_dependency(self, short_tmp_dir: Path) -> None:
+        """connect() gives EACCES (a socket QEMU made as qemu-vm, and this process lacks the
+        group): ConfigError HOST_DEPENDENCY at once, with the socket's owner and mode, not a
+        raw PermissionError and not a wait until the timeout."""
+        sock_path = short_tmp_dir / "s.sock"
+        server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
+        sock_path.chmod(0o000)
+        try:
+            with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info:
+                await wait_for_socket(sock_path, timeout=5.0, abort_check=lambda: None, keep_connection=False)
+        finally:
+            server.close()
+            await server.wait_closed()
+        assert isinstance(exc_info.value.__cause__, PermissionError)
+        assert exc_info.value.context["mode"] == "0o0"
+        assert exc_info.value.context["owner_uid"] == os.getuid()

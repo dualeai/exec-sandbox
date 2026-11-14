@@ -1,15 +1,22 @@
 """Tests for outbound allow configuration (dns_filter.py)."""
 
 import json
+import re
 
 import pytest
 
 from exec_sandbox.dns_filter import (
-    NPM_PACKAGE_DOMAINS,
-    PYTHON_PACKAGE_DOMAINS,
     create_outbound_patterns,
     generate_outbound_allow_json,
+    validate_domain,
 )
+
+
+def _allows(patterns_json: str, host: str) -> bool:
+    """Whether gvproxy lets `host` through: it lowercases the DNS name or TLS SNI, drops a
+    trailing dot, and allows it when one pattern matches (Go regexp MatchString, which
+    Python's re.search follows for these patterns)."""
+    return any(re.search(pattern, host) for pattern in json.loads(patterns_json))
 
 
 def test_create_outbound_patterns():
@@ -22,62 +29,61 @@ def test_create_outbound_patterns():
     assert patterns[1] == r"^(.*\.)?example\.com\.?$"
 
 
-def test_generate_outbound_allow_json_python():
-    """Test JSON generation for Python defaults."""
-    json_str = generate_outbound_allow_json(None, "python")
+@pytest.mark.parametrize(
+    ("language", "allowed", "blocked"),
+    [
+        pytest.param(
+            "python",
+            ["pypi.org", "files.pythonhosted.org"],
+            ["registry.npmjs.org", "example.com"],
+            id="python-pypi",
+        ),
+        pytest.param("javascript", ["registry.npmjs.org"], ["pypi.org", "example.com"], id="javascript-npm"),
+    ],
+)
+def test_none_is_the_package_registries_of_the_language(language: str, allowed: list[str], blocked: list[str]):
+    """allowed_domains=None: the package registries of the language only."""
+    patterns = generate_outbound_allow_json(None, language)
 
-    # Verify valid JSON with correct number of patterns
-    patterns = json.loads(json_str)
-    assert len(patterns) == len(PYTHON_PACKAGE_DOMAINS)
-    # Each pattern is a regex string containing the escaped domain
-    assert all(isinstance(p, str) for p in patterns)
-    assert any("pypi" in p for p in patterns)
-    assert any("pythonhosted" in p for p in patterns)
-
-
-def test_generate_outbound_allow_json_javascript():
-    """Test JSON generation for JavaScript defaults."""
-    json_str = generate_outbound_allow_json(None, "javascript")
-
-    patterns = json.loads(json_str)
-    assert len(patterns) == len(NPM_PACKAGE_DOMAINS)
-    assert any("npmjs" in p for p in patterns)
+    assert [host for host in allowed if _allows(patterns, host)] == allowed
+    assert [host for host in blocked if _allows(patterns, host)] == []
 
 
 def test_generate_outbound_allow_json_custom():
-    """Test JSON generation with custom domains."""
-    json_str = generate_outbound_allow_json(["custom.com"], "python")
+    """Custom domains replace the language's registries."""
+    patterns = generate_outbound_allow_json(["custom.com"], "python")
 
-    patterns = json.loads(json_str)
-    assert len(patterns) == 1
-    assert "custom" in patterns[0]
-    assert "pypi" not in patterns[0]  # Custom overrides defaults
+    assert _allows(patterns, "custom.com")
+    assert _allows(patterns, "api.custom.com")
+    assert not _allows(patterns, "pypi.org")
 
 
-def test_generate_outbound_allow_json_empty_blocks_all():
-    """Test JSON generation with empty domains returns empty array.
-
-    When allowed_domains=[] (empty list), OutboundAllow is empty.
-    Actual blocking is handled by the BlockAllOutbound flag separately.
-    """
-    json_str = generate_outbound_allow_json([], "python")
-    assert json_str == "[]"
+def test_generate_outbound_allow_json_empty_means_no_filter():
+    """allowed_domains=[]: no pattern, so no domain filter (with allow_network, all outbound
+    is allowed). Blocking all outbound is the separate BlockAllOutbound flag."""
+    assert generate_outbound_allow_json([], "python") == "[]"
 
 
 def test_generate_outbound_allow_json_none_uses_defaults_or_no_filter():
-    """Test JSON generation with None uses language defaults or no filtering."""
-    # For raw language (no defaults), None means no filtering
-    json_str = generate_outbound_allow_json(None, "raw")
-    assert json_str == "[]"
+    """raw has no package registry: None means no domain filter."""
+    assert generate_outbound_allow_json(None, "raw") == "[]"
 
 
-def test_regex_pattern_escapes_dots():
-    """Test that dots in domains are properly escaped for regex."""
-    patterns = create_outbound_patterns(["example.com"])
-
-    # Should escape dots and match domain + subdomains + optional trailing dot
-    assert r"\." in patterns[0]
-    assert patterns[0] == r"^(.*\.)?example\.com\.?$"
+@pytest.mark.parametrize(
+    ("host", "allowed"),
+    [
+        ("example.com", True),
+        ("www.example.com", True),
+        ("a.b.example.com", True),
+        ("exampleXcom", False),  # an unescaped dot would match any character
+        ("notexample.com", False),  # a subdomain needs its own label
+        ("example.com.evil.org", False),
+        ("example.co", False),
+    ],
+)
+def test_pattern_matches_the_domain_and_its_subdomains_only(host: str, allowed: bool):
+    """The dots are literal: only the domain and its subdomains match."""
+    assert _allows(json.dumps(create_outbound_patterns(["example.com"])), host) is allowed
 
 
 # =============================================================================
@@ -119,10 +125,28 @@ class TestDomainValidation:
         with pytest.raises(ValueError, match="at least 2 labels"):
             create_outbound_patterns(["localhost"])
 
-    def test_invalid_domain_empty_label(self):
-        """Test that domain with empty label is rejected."""
+    @pytest.mark.parametrize("domain", ["bad..domain.com", "example.com..", "example.com..."])
+    def test_invalid_domain_empty_label(self, domain: str):
+        """An empty label is refused, also after the one final dot of the FQDN form."""
         with pytest.raises(ValueError, match="empty label"):
-            create_outbound_patterns(["bad..domain.com"])
+            create_outbound_patterns([domain])
+
+    def test_a_253_character_name_with_its_final_dot_is_valid(self):
+        """The final dot of the FQDN form is not part of the 253-character limit."""
+        name = ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 57, "com"])
+        assert len(name) == 253
+        validate_domain(name + ".")
+        with pytest.raises(ValueError, match="too long"):
+            validate_domain("e" + name)
+
+    def test_a_name_over_253_characters_is_too_long(self):
+        """254 characters of short labels: refused by the name limit itself, not by a label
+        limit."""
+        name = ".".join(["abc"] * 62) + ".commm"
+        assert len(name) == 253
+        validate_domain(name)
+        with pytest.raises(ValueError, match=r"^Domain too long"):
+            validate_domain("a" + name)
 
     def test_invalid_domain_label_too_long(self):
         """Test that domain with label > 63 chars is rejected."""
@@ -181,8 +205,20 @@ class TestDomainValidation:
         with pytest.raises(ValueError):
             create_outbound_patterns(["例え.jp"])  # Japanese characters
 
+    def test_a_domain_with_capitals_allows_its_lowercase_names(self):
+        """gvproxy lowercases DNS names and TLS SNI before its match: "GitHub.com" allows
+        github.com."""
+        patterns = json.dumps(create_outbound_patterns(["GitHub.com"]))
+        assert _allows(patterns, "github.com")
+        assert _allows(patterns, "api.github.com")
+
+    def test_a_newline_in_a_label_is_refused(self):
+        """`$` of re.match allows a final newline: a label is checked whole (fullmatch)."""
+        with pytest.raises(ValueError, match="Invalid domain label"):
+            validate_domain("example\n.com")
+
     def test_trailing_dot_handled(self):
-        """Test that domains with trailing dots are handled correctly."""
-        # FQDN format with trailing dot should be handled
-        patterns = create_outbound_patterns(["example.com."])
-        assert len(patterns) == 1
+        """A domain in FQDN form (trailing dot) allows the same names as without the dot."""
+        patterns = json.dumps(create_outbound_patterns(["example.com."]))
+        assert _allows(patterns, "example.com")
+        assert _allows(patterns, "www.example.com")

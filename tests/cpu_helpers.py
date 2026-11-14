@@ -48,42 +48,25 @@ def p95(samples: list[float]) -> float:
     return s[idx]
 
 
-async def collect_cpu_samples(
-    proc: ProcessWrapper,
-    n_samples: int = CPU_SAMPLES_DEFAULT,
-    interval_s: float = CPU_SAMPLE_INTERVAL_S,
-) -> list[float]:
-    """Collect CPU % samples using non-blocking psutil pattern.
-
-    Primes cpu_percent (first call returns 0.0, discarded),
-    then collects n_samples at interval_s intervals.
-    Each sample represents average CPU over the preceding interval.
-    """
-    assert proc.psutil_proc is not None
-    proc.psutil_proc.cpu_percent(interval=None)  # Prime (discard 0.0)
-    await asyncio.sleep(interval_s)
-
-    samples: list[float] = []
-    for _ in range(n_samples):
-        cpu = proc.psutil_proc.cpu_percent(interval=None)
-        samples.append(cpu)
-        await asyncio.sleep(interval_s)
+async def collect_cpu_samples(proc: ProcessWrapper, n_samples: int = CPU_SAMPLES_DEFAULT) -> list[float]:
+    """Collect CPU % samples of one process (collect_cpu_samples_bulk of one)."""
+    (samples,) = await collect_cpu_samples_bulk([proc], n_samples=n_samples)
     return samples
 
 
 async def collect_cpu_samples_bulk(
-    procs: list[ProcessWrapper],
-    n_samples: int = CPU_SAMPLES_DEFAULT,
-    interval_s: float = CPU_SAMPLE_INTERVAL_S,
+    procs: list[ProcessWrapper], n_samples: int = CPU_SAMPLES_DEFAULT
 ) -> list[list[float]]:
     """Collect CPU % samples from multiple processes in the same time window.
 
-    Non-blocking bulk pattern: primes all, then samples all each interval.
+    Non-blocking psutil pattern: primes cpu_percent of all (the first call returns 0.0,
+    discarded), then samples all each CPU_SAMPLE_INTERVAL_S. Each sample is the average
+    CPU over the interval before it.
     """
     for proc in procs:
         assert proc.psutil_proc is not None
         proc.psutil_proc.cpu_percent(interval=None)  # Prime all
-    await asyncio.sleep(interval_s)
+    await asyncio.sleep(CPU_SAMPLE_INTERVAL_S)
 
     all_samples: list[list[float]] = [[] for _ in procs]
     for _ in range(n_samples):
@@ -91,19 +74,17 @@ async def collect_cpu_samples_bulk(
             assert proc.psutil_proc is not None
             cpu = proc.psutil_proc.cpu_percent(interval=None)
             all_samples[i].append(cpu)
-        await asyncio.sleep(interval_s)
+        await asyncio.sleep(CPU_SAMPLE_INTERVAL_S)
     return all_samples
 
 
-def assert_cpu_idle(
-    samples: list[float],
-    *,
-    label: str = "VM",
-    median_threshold: float = CPU_MEDIAN_THRESHOLD,
-    p95_threshold: float = CPU_P95_THRESHOLD,
-) -> None:
+def assert_cpu_idle(samples: list[float], *, label: str) -> None:
     """Assert CPU samples indicate idle behavior (median + p95)."""
     med = _median(samples)
     p95_val = p95(samples)
-    assert med < median_threshold, f"{label} median CPU {med:.1f}% >= {median_threshold}% (sorted: {sorted(samples)})"
-    assert p95_val < p95_threshold, f"{label} p95 CPU {p95_val:.1f}% >= {p95_threshold}% (sorted: {sorted(samples)})"
+    assert med < CPU_MEDIAN_THRESHOLD, (
+        f"{label} median CPU {med:.1f}% >= {CPU_MEDIAN_THRESHOLD}% (sorted: {sorted(samples)})"
+    )
+    assert p95_val < CPU_P95_THRESHOLD, (
+        f"{label} p95 CPU {p95_val:.1f}% >= {CPU_P95_THRESHOLD}% (sorted: {sorted(samples)})"
+    )

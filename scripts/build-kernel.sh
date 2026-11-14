@@ -12,6 +12,13 @@
 # Cross-compilation via musl.cc toolchains (same as build-guest-agent.sh).
 # BuildKit cache mounts for kernel source, ccache, and toolchains.
 #
+# Next to vmlinuz-<arch>, the build writes vmlinuz-<arch>.map, the System.map
+# of that build. The kernel has no symbol table (KALLSYMS off), so a stack in
+# the guest's [repl-timeout] log has addresses only; look them up in this file.
+# Never published (CI and the release upload named files only; 1.3 MB for
+# aarch64): it is for developers. A cache hit keeps the map of the build that
+# made the kernel; for an older kernel, delete vmlinuz-<arch> and build again.
+#
 # Usage:
 #   ./scripts/build-kernel.sh              # Build for current arch
 #   ./scripts/build-kernel.sh x86_64       # Build for x86_64
@@ -42,10 +49,6 @@ if [ -z "$KERNEL_VERSION" ] || [ -z "$KERNEL_TARBALL_VERSION" ] || [ -z "$KERNEL
     echo "ERROR: versions.lock lacks KERNEL_VERSION/KERNEL_TARBALL_VERSION/KERNEL_SHA256 — run 'make upgrade'" >&2
     exit 1
 fi
-
-# Buildx cache configuration (for CI)
-BUILDX_CACHE_FROM="${BUILDX_CACHE_FROM:-}"
-BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 
 detect_arch() {
     case "$(uname -m)" in
@@ -122,12 +125,6 @@ build_for_arch() {
             ;;
     esac
 
-    # Scope includes arch and kernel version to avoid cache collisions
-    local cache_scope="kernel-${KERNEL_VERSION}-${arch}"
-    local cache_args=()
-    [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
-    [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
-
     # Build using buildx with cross-compilation (NO --platform flag on builder to avoid QEMU)
     DOCKER_BUILDKIT=1 docker buildx build \
         --output "type=local,dest=$OUTPUT_DIR" \
@@ -137,7 +134,6 @@ build_for_arch() {
         --build-arg KERNEL_VERSION="$KERNEL_VERSION" \
         --build-arg KERNEL_TARBALL_VERSION="$KERNEL_TARBALL_VERSION" \
         --build-arg KERNEL_SHA256="$KERNEL_SHA256" \
-        ${cache_args[@]+"${cache_args[@]}"} \
         -f - "$REPO_ROOT" <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4
 
@@ -256,6 +252,14 @@ RUN --mount=type=cache,target=/root/.ccache \
             echo "NOTE: fragment sets '${line}' but symbol is absent on this arch" >&2; \
         fi; \
     done < /tmp/frag-set.list && \
+    # A directive whose symbol no Kconfig in the tree defines does nothing: a
+    # wrong name (CONFIG_NFNETLINK for NETFILTER_NETLINK) or a symbol removed
+    # upstream leaves the feature as the base config has it, with no error.
+    find . -name 'Kconfig*' -exec sed -n 's/^[[:space:]]*\(menu\)\{0,1\}config[[:space:]]\{1,\}\([A-Za-z0-9_]\{1,\}\).*/CONFIG_\2/p' {} + \
+        | sort -u > /tmp/kconfig-symbols && \
+    sed -n 's/^# \(CONFIG_[A-Z0-9_]*\) is not set$/\1/p;s/^\(CONFIG_[A-Z0-9_]*\)=.*/\1/p' /tmp/exec-sandbox.config \
+        | sort -u | comm -23 - /tmp/kconfig-symbols \
+        | sed 's/^/UNKNOWN: fragment names a symbol no Kconfig defines: /' >> /tmp/config-violations && \
     if [ -s /tmp/config-violations ]; then \
         echo "ERROR: exec-sandbox.config did not survive merge_config.sh + olddefconfig:" >&2 && \
         cat /tmp/config-violations >&2 && \
@@ -270,9 +274,10 @@ RUN --mount=type=cache,target=/root/.ccache \
         cp arch/x86/boot/bzImage /vmlinuz-${ARCH}; \
     else \
         cp arch/${KERNEL_ARCH}/boot/${KERNEL_IMAGE} /vmlinuz-${ARCH}; \
-    fi
+    fi && \
+    cp System.map /vmlinuz-${ARCH}.map
 
-# Output stage
+# Output stage (vmlinuz-* also takes the .map)
 FROM scratch
 COPY --from=builder /vmlinuz-* .
 DOCKERFILE

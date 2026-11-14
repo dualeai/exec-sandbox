@@ -13,11 +13,14 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from exec_sandbox.exceptions import EnvVarValidationError
-from exec_sandbox.guest_agent_protocol import ExecuteCodeRequest
+from exec_sandbox import constants
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
+from exec_sandbox.guest_agent_protocol import ExecuteCodeRequest, StreamingErrorMessage
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_manager import VmManager
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -32,137 +35,72 @@ class TestEnvVarSecurityIntegration:
 
     async def test_tab_allowed_by_guest(self, dual_scheduler: Scheduler) -> None:
         """Tab character in env var value is allowed."""
-        result = await dual_scheduler.run(
-            code="import os; print(repr(os.environ.get('FOO')))",
-            language=Language.PYTHON,
+        result = await run_once(
+            dual_scheduler,
+            VmSpec(language=Language.PYTHON),
+            "import os; print(repr(os.environ.get('FOO')))",
             env_vars={"FOO": "col1\tcol2"},
         )
         assert result.exit_code == 0
-        assert "col1\\tcol2" in result.stdout
+        assert result.stdout == "'col1\\tcol2'\n"
 
     async def test_utf8_allowed_by_guest(self, dual_scheduler: Scheduler) -> None:
         """UTF-8 characters in env var value are allowed."""
-        result = await dual_scheduler.run(
-            code="import os; print(os.environ.get('GREETING'))",
-            language=Language.PYTHON,
+        result = await run_once(
+            dual_scheduler,
+            VmSpec(language=Language.PYTHON),
+            "import os; print(os.environ.get('GREETING'))",
             env_vars={"GREETING": "Hello 世界"},
         )
         assert result.exit_code == 0
-        assert "世界" in result.stdout
+        assert result.stdout == "Hello 世界\n"
 
     # =========================================================================
     # Blocked Environment Variables (Security Blocklist)
     # =========================================================================
 
-    async def test_ld_preload_blocked(self, dual_scheduler: Scheduler) -> None:
-        """LD_PRELOAD is blocked (arbitrary code execution via library injection)."""
-        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
-            await dual_scheduler.run(
-                code="print('should not run')",
-                language=Language.PYTHON,
+    async def test_blocked_env_var_refused_by_guest(self, dual_scheduler: Scheduler) -> None:
+        """A blocked name (LD_PRELOAD) reaches the caller as ENV_VAR_INVALID and runs nothing.
+        The blocked names, in any case: guest-agent/src/validation.rs tests."""
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ENV_VAR_INVALID, match=r"(?i)blocked"
+        ):
+            await run_once(
+                dual_scheduler,
+                VmSpec(language=Language.PYTHON),
+                "print('should not run')",
                 env_vars={"LD_PRELOAD": "/tmp/malicious.so"},
-            )
-
-    async def test_ld_library_path_blocked(self, dual_scheduler: Scheduler) -> None:
-        """LD_LIBRARY_PATH is blocked (library search path manipulation)."""
-        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
-            await dual_scheduler.run(
-                code="print('should not run')",
-                language=Language.PYTHON,
-                env_vars={"LD_LIBRARY_PATH": "/tmp/malicious"},
-            )
-
-    async def test_node_options_blocked(self, dual_scheduler: Scheduler) -> None:
-        """NODE_OPTIONS is blocked (Node.js runtime manipulation)."""
-        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
-            await dual_scheduler.run(
-                code="console.log('should not run')",
-                language=Language.JAVASCRIPT,
-                env_vars={"NODE_OPTIONS": "--expose-gc --max-old-space-size=8192"},
-            )
-
-    async def test_pythonstartup_blocked(self, dual_scheduler: Scheduler) -> None:
-        """PYTHONSTARTUP is blocked (arbitrary code execution on Python start)."""
-        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
-            await dual_scheduler.run(
-                code="print('should not run')",
-                language=Language.PYTHON,
-                env_vars={"PYTHONSTARTUP": "/tmp/malicious.py"},
-            )
-
-    async def test_bash_env_blocked(self, dual_scheduler: Scheduler) -> None:
-        """BASH_ENV is blocked (arbitrary code execution on bash start)."""
-        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
-            await dual_scheduler.run(
-                code="echo 'should not run'",
-                language=Language.RAW,
-                env_vars={"BASH_ENV": "/tmp/malicious.sh"},
-            )
-
-    async def test_path_blocked(self, dual_scheduler: Scheduler) -> None:
-        """PATH is blocked (executable search path manipulation)."""
-        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
-            await dual_scheduler.run(
-                code="print('should not run')",
-                language=Language.PYTHON,
-                env_vars={"PATH": "/tmp/malicious:/usr/bin"},
-            )
-
-    async def test_glibc_tunables_blocked(self, dual_scheduler: Scheduler) -> None:
-        """GLIBC_TUNABLES is blocked (CVE-2023-4911 mitigation)."""
-        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
-            await dual_scheduler.run(
-                code="print('should not run')",
-                language=Language.PYTHON,
-                env_vars={"GLIBC_TUNABLES": "glibc.tune.hwcaps=-AVX2"},
-            )
-
-    async def test_blocked_env_var_case_insensitive(self, dual_scheduler: Scheduler) -> None:
-        """Blocked env var check is case-insensitive."""
-        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
-            await dual_scheduler.run(
-                code="print('should not run')",
-                language=Language.PYTHON,
-                env_vars={"ld_preload": "/tmp/malicious.so"},  # lowercase
             )
 
     # =========================================================================
     # Valid Environment Variables (Positive Tests)
     # =========================================================================
 
-    async def test_custom_env_var_works(self, dual_scheduler: Scheduler) -> None:
-        """Custom env vars are passed to executed code."""
-        result = await dual_scheduler.run(
-            code="import os; print(os.environ.get('MY_VAR', 'not set'))",
-            language=Language.PYTHON,
-            env_vars={"MY_VAR": "hello_world"},
-        )
-        assert result.exit_code == 0
-        assert "hello_world" in result.stdout
-
     async def test_multiple_env_vars_work(self, dual_scheduler: Scheduler) -> None:
-        """Multiple custom env vars work correctly."""
-        result = await dual_scheduler.run(
-            code="""
+        """Each of three custom env vars reaches the code with its own value (an unset var prints None)."""
+        result = await run_once(
+            dual_scheduler,
+            VmSpec(language=Language.PYTHON),
+            """
 import os
 print(os.environ.get('VAR1'))
 print(os.environ.get('VAR2'))
 print(os.environ.get('VAR3'))
 """,
-            language=Language.PYTHON,
             env_vars={"VAR1": "one", "VAR2": "two", "VAR3": "three"},
         )
         assert result.exit_code == 0
-        assert "one" in result.stdout
-        assert "two" in result.stdout
-        assert "three" in result.stdout
+        assert result.stdout == "one\ntwo\nthree\n"
 
 
 class TestGuestAgentControlCharValidation:
     """Tests that Rust guest-agent rejects control characters (bypassing Pydantic).
 
-    These tests use model_construct() to bypass Pydantic validation and send
-    control characters directly to the VM, verifying the Rust defense-in-depth.
+    The host refuses these values first (Pydantic), so the guest check can only be reached on
+    the wire: model_construct() builds a request with no validation, and the test reads the
+    messages the guest sends back. Each refused character: guest-agent/src/validation.rs
+    tests. Tab is allowed on both sides: test_tab_allowed_by_guest reaches the guest through
+    the public API.
     """
 
     @pytest.fixture
@@ -171,138 +109,41 @@ class TestGuestAgentControlCharValidation:
         from exec_sandbox.qemu_vm import QemuVM  # noqa: TC001
 
         vm: QemuVM = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="test-control-char",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
+            cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
         try:
             yield vm
         finally:
             await vm_manager.destroy_vm(vm)
 
-    async def _execute_with_bypass(
-        self,
-        vm: "QemuVM",
-        env_vars: dict[str, str],
-    ) -> tuple[int, str, str]:
-        """Execute code bypassing Pydantic validation to test Rust validation.
-
-        Uses model_construct() to create request without running validators.
-        """
-        from exec_sandbox import constants
-        from exec_sandbox.guest_agent_protocol import (
-            ExecutionCompleteMessage,
-            OutputChunkMessage,
-            StreamingErrorMessage,
-        )
-
-        # Bypass Pydantic validation using model_construct
+    async def test_control_character_rejected_by_rust(self, running_vm: "QemuVM") -> None:
+        """An escape sequence in a value: the guest replies with one env_var_error and runs
+        nothing."""
+        await running_vm.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
         request = ExecuteCodeRequest.model_construct(
             action="exec",
             language=Language.PYTHON,
             code="print('should not run')",
             timeout=30,
-            env_vars=env_vars,
-        )
-
-        # Connect and send directly to guest
-        await vm.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-
-        stdout_chunks: list[str] = []
-        stderr_chunks: list[str] = []
-        exit_code = -1
-
-        async for msg in vm.channel.stream_messages(request, timeout=30):
-            if isinstance(msg, OutputChunkMessage):
-                if msg.type == "stdout":
-                    stdout_chunks.append(msg.chunk)
-                else:
-                    stderr_chunks.append(msg.chunk)
-            elif isinstance(msg, ExecutionCompleteMessage):
-                exit_code = msg.exit_code
-            elif isinstance(msg, StreamingErrorMessage):
-                stderr_chunks.append(msg.message)
-                break
-
-        return exit_code, "".join(stdout_chunks), "".join(stderr_chunks)
-
-    async def test_null_byte_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """Null byte in env var value is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "val\x00ue"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_escape_sequence_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """ANSI escape sequence is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
             env_vars={"FOO": "\x1b[31mred\x1b[0m"},
         )
-        assert exit_code != 0 or "control character" in stderr.lower()
+        messages = [msg async for msg in running_vm.channel.stream_messages(request, timeout=30)]
 
-    async def test_newline_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """Newline in env var value is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "line1\nline2"},
+        assert len(messages) == 1, messages
+        (reply,) = messages
+        assert isinstance(reply, StreamingErrorMessage), reply
+        assert (reply.error_type, reply.message) == (
+            "env_var_error",
+            "Environment variable 'FOO' value contains forbidden control character",
         )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_carriage_return_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """Carriage return is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "start\roverwrite"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_bell_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """Bell character (0x07) is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "ding\x07"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_del_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """DEL character (0x7F) is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "delete\x7f"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_tab_allowed_by_rust(self, running_vm: "QemuVM", execute_timeout: int) -> None:
-        """Tab character is allowed by Rust guest-agent."""
-        # Use model_construct to bypass Pydantic, proving Rust allows tabs
-        request = ExecuteCodeRequest.model_construct(
-            action="exec",
-            language=Language.PYTHON,
-            code="import os; print(repr(os.environ.get('FOO')))",
-            timeout=execute_timeout,
-            env_vars={"FOO": "col1\tcol2"},
-        )
-
-        from exec_sandbox import constants
-        from exec_sandbox.guest_agent_protocol import (
-            ExecutionCompleteMessage,
-            OutputChunkMessage,
-        )
-
-        await running_vm.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-
-        stdout = ""
-        exit_code = -1
-        async for msg in running_vm.channel.stream_messages(request, timeout=execute_timeout):
-            if isinstance(msg, OutputChunkMessage) and msg.type == "stdout":
-                stdout += msg.chunk
-            elif isinstance(msg, ExecutionCompleteMessage):
-                exit_code = msg.exit_code
-
-        assert exit_code == 0
-        assert "col1\\tcol2" in stdout

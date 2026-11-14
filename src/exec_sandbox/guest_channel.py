@@ -8,17 +8,20 @@ single-port building block composed by DualPortChannel.
 
 import asyncio
 import contextlib
+import socket
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Never, Protocol, runtime_checkable
+from pathlib import Path
+from typing import Never
 from uuid import uuid4
 
 from pydantic import TypeAdapter, ValidationError
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import CommunicationError, CommunicationOutcomeUnknownError
+from exec_sandbox.aio_utils import gather_or_cancel
+from exec_sandbox.exceptions import CommunicationError, ErrorCode, OutcomeUnknownError
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     GuestAgentRequest,
@@ -29,19 +32,26 @@ from exec_sandbox.guest_agent_protocol import (
     StreamingMessage,
 )
 from exec_sandbox.socket_auth import connect_and_verify
+from exec_sandbox.subprocess_utils import socket_access_error
 
 logger = get_logger(__name__)
 
-# Buffer limit for asyncio readuntil() - must exceed max JSON message size
-# Default asyncio limit is 64KB, but our protocol can send large output chunks
-# StreamReader buffer limit — controls when asyncio pauses the transport
-# (TCP backpressure).  Must exceed the largest single message:
-#   - File chunks: ~200KB (128KB compressed → base64 → JSON)
+# StreamReader buffer limit of each port socket: readuntil() fails on a line
+# longer than it (the asyncio default is 64KB), and asyncio pauses the
+# transport when the buffer holds more (backpressure). Must exceed the largest
+# single message:
+#   - File chunks: ~175KB (a 128KB chunk that does not compress → base64 → JSON)
 #   - REPL stdout: ~70KB (64KB buffer + JSON overhead)
 #   - Package output: ~55KB (50KB limit + JSON overhead)
-# 512KB provides >2x headroom for the largest message while keeping
-# memory bounded during file transfers (prevents O(file_size) buffering).
+# 512KB gives more than 2x headroom for the largest message and keeps memory
+# bounded during file transfers (no O(file_size) buffering).
 STREAM_BUFFER_LIMIT = 512 * 1024  # 512KB
+
+# Smallest kernel send buffer of each port socket: it holds the largest frame
+# (~175KB file chunk), so one send() writes it. macOS gives a Unix socket 8KB:
+# a file chunk then takes about 22 event loop turns (about 7x the host CPU).
+# Linux gives about 208KB: no change there.
+SOCKET_SEND_BUFFER_BYTES = 192 * 1024
 
 # Per-operation queue depth for op_id-routed message dispatch.
 # Must be deep enough that slow consumers (e.g., disk I/O during file reads)
@@ -54,18 +64,21 @@ OP_QUEUE_DEPTH = 64
 # the host kernel before publishing transport failure out of band.
 EVENT_TRANSPORT_DRAIN_TIMEOUT_SECONDS = 1.0
 
+# How long UnixSocketChannel.close() lets the guest read the frames still queued (a stuck
+# or paused guest reads nothing): then the socket closes at once and drops them.
+CLOSE_SEND_TIMEOUT_SECONDS = 5.0
+
 # Cached TypeAdapter for StreamingMessage discriminated union
 # Performance: Avoids rebuilding validators on every message (1000s of allocations per execution)
 # Pydantic TypeAdapter is expensive to construct - caching eliminates this overhead in hot paths
-_STREAMING_MESSAGE_ADAPTER: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+# pydantic >= 2.14 types TypeAdapter's argument as TypeForm[T]; pyright does not
+# yet infer TypeForm from an Annotated alias, so the declared type carries T.
+_STREAMING_MESSAGE_ADAPTER: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)  # pyright: ignore[reportArgumentType, reportUnknownVariableType]
 
 
 class StreamDeadlineExceededError(TimeoutError):
-    """The channel's total streaming deadline expired."""
-
-    def __init__(self, message: str, *, command_dispatched: bool = True):
-        super().__init__(message)
-        self.command_dispatched = command_dispatched
+    """The channel's total streaming deadline expired. Always after the command was handed to
+    the transport (stream_messages has no await before it): its outcome is unknown."""
 
 
 class OperationInbox:
@@ -75,24 +88,36 @@ class OperationInbox:
         self._queue: asyncio.Queue[StreamingMessage] = asyncio.Queue(maxsize=OP_QUEUE_DEPTH)
         # One-shot future carrying the failure reason as its result. It is the
         # out-of-band signal *and* the reason store, and is awaitable directly
-        # by the route/get races (no per-call wrapper task to create and cancel).
+        # by the route race (no per-call wrapper task to create and cancel).
         # All inboxes are built inside register_op under a running loop.
         self._failed: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._outcome_unknown = False
+        # One future per get() that waits: route() and fail() set them. A get() takes data
+        # only with get_nowait, so a cancelled get() loses no message, and a wait makes no
+        # task (a task and asyncio.wait per message cost about 25 µs of event loop time).
+        self._waiters: list[asyncio.Future[None]] = []
+        # time.monotonic() of the first send of the command (no wall-clock step moves
+        # it); None while nothing was sent.
+        self._sent_at: float | None = None
 
     @property
     def command_may_have_been_sent(self) -> bool:
         """Whether transport failure can no longer prove non-execution."""
-        return self._outcome_unknown
+        return self._sent_at is not None
+
+    @property
+    def command_sent_at(self) -> float | None:
+        """time.monotonic() of the first send of the command, or None."""
+        return self._sent_at
 
     def mark_command_sent(self) -> None:
         """Any later transport loss makes the command outcome unknown."""
-        self._outcome_unknown = True
+        if self._sent_at is None:
+            self._sent_at = time.monotonic()
 
     def ensure_open(self) -> None:
         """Fail before dispatch when registration raced a dead generation."""
         if self._failed.done():
-            raise CommunicationError(self._failed.result())
+            raise CommunicationError(self._failed.result(), context=None)
 
     async def route(self, message: StreamingMessage) -> bool:
         """Route with bounded, cancellation-safe backpressure.
@@ -105,9 +130,11 @@ class OperationInbox:
             return False
         try:
             self._queue.put_nowait(message)
-            return True
         except asyncio.QueueFull:
             pass
+        else:
+            self._wake_getters()
+            return True
 
         put_task = asyncio.create_task(self._queue.put(message))
         try:
@@ -118,6 +145,7 @@ class OperationInbox:
             if self._failed in done:
                 return False
             await put_task
+            self._wake_getters()
             return True
         finally:
             # Only the per-call put task is owned here; the shared failure
@@ -135,38 +163,37 @@ class OperationInbox:
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._queue.get_nowait()
         self._failed.set_result(reason or "event transport is closed")
+        self._wake_getters()
+
+    def _wake_getters(self) -> None:
+        """Wake each waiting get(): it reads the queue again, then the failure."""
+        for waiter in self._waiters:
+            if not waiter.done():
+                waiter.set_result(None)
 
     def _raise_failure(self) -> Never:
         reason = self._failed.result()
-        if self._outcome_unknown:
-            raise CommunicationOutcomeUnknownError(reason)
-        raise CommunicationError(reason)
+        if self._sent_at is not None:
+            raise OutcomeUnknownError(
+                reason, code=ErrorCode.GUEST_OUTCOME_UNKNOWN, context=None, hint=None, instance_id=None
+            )
+        raise CommunicationError(reason, context=None)
 
     async def get(self) -> StreamingMessage:
         """Receive ordered data, then raise any out-of-band transport failure."""
-        try:
-            return self._queue.get_nowait()
-        except asyncio.QueueEmpty:
-            if self._failed.done():
-                self._raise_failure()
-
-        message_task = asyncio.create_task(self._queue.get())
-        try:
-            done, _pending = await asyncio.wait(
-                {message_task, self._failed},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            # Data written before EOF preserves protocol order when both
-            # notifications become runnable in the same event-loop turn.
-            if message_task in done:
-                return message_task.result()
-            self._raise_failure()
-        finally:
-            # Only the per-call get task is owned here; the shared failure
-            # future must survive for later ops that race the same inbox.
-            if not message_task.done():
-                message_task.cancel()
-            await asyncio.gather(message_task, return_exceptions=True)
+        while True:
+            # Data written before EOF stays ahead of the failure: the queue is read first.
+            try:
+                return self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if self._failed.done():
+                    self._raise_failure()
+            waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._waiters.append(waiter)
+            try:
+                await waiter
+            finally:
+                self._waiters.remove(waiter)
 
 
 class FileOpDispatcher:
@@ -191,23 +218,33 @@ class FileOpDispatcher:
         self._task = asyncio.create_task(self._dispatch_loop())
 
     async def stop(self) -> None:
-        """Stop the dispatch loop."""
+        """Stop the dispatch loop and fail the registered ops. A cancel of the caller that
+        comes while the loop ends is raised once both are done, never hidden. A cancel
+        older than this call (stop() in a cancel handler, as destroy_vm runs it) is not raised
+        again: only a rise of the caller's cancel count counts."""
+        current = asyncio.current_task()
+        cancels_before = current.cancelling() if current is not None else 0
+        caller_cancel: asyncio.CancelledError | None = None
         if self._task:
             self._task.cancel()
             try:
                 await self._task
-            except asyncio.CancelledError:
-                pass
+            except asyncio.CancelledError as error:
+                # The loop's end from the cancel above, unless the caller was cancelled meanwhile
+                if current is not None and current.cancelling() > cancels_before:
+                    caller_cancel = error
             except Exception:
                 logger.error("Event dispatcher stopped after an unexpected failure", exc_info=True)
             self._task = None
-        await self.fail_registered_ops("event dispatcher stopped")
+        self.fail_registered_ops("event dispatcher stopped")
+        if caller_cancel is not None:
+            raise caller_cancel
 
     def is_alive(self) -> bool:
         """Check if the dispatch loop task is still running."""
         return self._task is not None and not self._task.done()
 
-    async def register_op(self, op_id: str) -> OperationInbox:
+    def register_op(self, op_id: str) -> OperationInbox:
         """Register an op_id and return its dedicated bounded queue."""
         inbox = OperationInbox()
         self._op_queues[op_id] = inbox
@@ -215,7 +252,7 @@ class FileOpDispatcher:
             inbox.fail(self._failure_reason)
         return inbox
 
-    async def unregister_op(self, op_id: str) -> None:
+    def unregister_op(self, op_id: str) -> None:
         """Unregister an op_id and release any dispatcher blocked on it."""
         inbox = self._op_queues.pop(op_id, None)
         if inbox is not None:
@@ -253,8 +290,9 @@ class FileOpDispatcher:
                             extra={"op_id": op_id, "msg_type": type(msg).__name__},
                         )
                 else:
-                    # Messages without op_id are pre-parse errors or legacy —
-                    # no consumer, so log and discard to prevent memory leak.
+                    # Messages without op_id are errors the guest sent before it
+                    # parsed the request (no op_id to echo): no consumer, so log
+                    # and discard them.
                     logger.debug(
                         "Discarding message without op_id",
                         extra={"msg_type": type(msg).__name__},
@@ -273,9 +311,9 @@ class FileOpDispatcher:
             failure_reason = f"event dispatcher failed: {type(error).__name__}: {error}"
             logger.error("Unexpected event dispatcher failure", exc_info=True)
         finally:
-            await self.fail_registered_ops(failure_reason)
+            self.fail_registered_ops(failure_reason)
 
-    async def fail_registered_ops(self, reason: str) -> None:
+    def fail_registered_ops(self, reason: str) -> None:
         """Wake every active operation exactly once when the transport dies.
 
         Buffered protocol messages remain ordered ahead of transport failure.
@@ -285,8 +323,16 @@ class FileOpDispatcher:
         if self._failure_reason is not None:
             return
         self._failure_reason = reason
-        for _op_id, inbox in tuple(self._op_queues.items()):
+        for inbox in self._op_queues.values():  # fail() is synchronous: the dict does not change
             inbox.fail(reason)
+
+    def fail_ops_sent_before(self, reason: str, *, sent_before: float) -> None:
+        """Wake, once, each operation whose command was first sent before `sent_before`
+        (time.monotonic()). The others, and later ones, are not failed."""
+        for inbox in self._op_queues.values():
+            sent_at = inbox.command_sent_at
+            if sent_at is not None and sent_at < sent_before:
+                inbox.fail(reason)
 
     async def wait_for_transport_termination(self, reason: str) -> None:
         """Let real socket EOF order accepted frames before peer failure.
@@ -299,98 +345,16 @@ class FileOpDispatcher:
         """
         task = self._task
         if task is None:
-            await self.fail_registered_ops(reason)
+            self.fail_registered_ops(reason)
             return
         # asyncio.wait observes the task without cancelling it on timeout (no
         # shield needed) and treats a cancelled dispatch task as done — so a
         # racing stop() cannot surface here as a spurious caller cancellation.
         done, _ = await asyncio.wait({task}, timeout=EVENT_TRANSPORT_DRAIN_TIMEOUT_SECONDS)
         if not done:
-            await self.fail_registered_ops(
+            self.fail_registered_ops(
                 f"{reason}; event transport did not terminate within {EVENT_TRANSPORT_DRAIN_TIMEOUT_SECONDS:g}s"
             )
-
-
-@runtime_checkable
-class GuestChannel(Protocol):
-    """Protocol for guest-host communication.
-
-    Supports Unix socket and dual-port transports.
-    Uses structural typing (Protocol) instead of inheritance.
-    """
-
-    async def connect(self, timeout_seconds: float) -> None:
-        """Establish connection to guest agent."""
-        ...
-
-    async def send_request(
-        self,
-        request: GuestAgentRequest,
-        timeout: int = constants.GUEST_REQUEST_TIMEOUT_SECONDS,
-    ) -> StreamingMessage:
-        """Send JSON request, receive JSON response.
-
-        Args:
-            request: Pydantic request model (e.g., PingRequest, ReadFileRequest, ListFilesRequest)
-            timeout: Response timeout in seconds. Default: 5.
-
-        Returns:
-            StreamingMessage (e.g., PongMessage, FileListMessage)
-        """
-        ...
-
-    async def enqueue_raw(self, data: bytes) -> None:
-        """Send raw bytes without waiting for response (for multi-message protocols).
-
-        Used for streaming file transfers where multiple messages are sent
-        before a response is expected (header, chunks, end).
-        """
-        ...
-
-    async def enqueue_registered(self, inbox: OperationInbox, data: bytes) -> None:
-        """Validate a registration and conservatively publish command dispatch."""
-        ...
-
-    async def register_op(self, op_id: str) -> OperationInbox:
-        """Register an op_id for file transfer multiplexing.
-
-        Returns a queue that will receive messages matching this op_id.
-        Must call unregister_op() when done.
-        """
-        ...
-
-    async def unregister_op(self, op_id: str) -> None:
-        """Unregister an op_id after operation completes."""
-        ...
-
-    async def fail_pending_operations(self, reason: str) -> None:
-        """Wake operations when the owning QEMU process has exited."""
-        ...
-
-    def stream_messages(
-        self,
-        request: GuestAgentRequest,
-        timeout: int,
-    ) -> AsyncGenerator[StreamingMessage]:
-        """Send request, stream multiple response messages.
-
-        For code execution, yields:
-        - OutputChunkMessage: stdout/stderr chunks (batched 64KB or 50ms)
-        - ExecutionCompleteMessage: final completion with exit code
-        - StreamingErrorMessage: error during streaming (validation, timeout)
-
-        Args:
-            request: Pydantic request model
-            timeout: Total timeout in seconds
-
-        Yields:
-            Streaming messages from guest agent
-        """
-        ...
-
-    async def close(self) -> None:
-        """Close the communication channel."""
-        ...
 
 
 class UnixSocketChannel:
@@ -402,9 +366,10 @@ class UnixSocketChannel:
     - macOS HVF (virtio-serial device)
     - All platforms with virtio-serial support
 
-    Uses QEMU virtio-serial Unix socket:
-    Host connects to /tmp/serial-{hash}.sock -> QEMU forwards to guest virtio-serial
-    (Path uses SHA-256 hash to stay under 108-byte UNIX socket limit)
+    Uses the QEMU Unix socket of one virtio-serial port:
+    Host connects to <VM working folder>/cmd.sock (or event.sock) -> QEMU forwards
+    to the guest port (VmWorkingDirectory keeps the path under the socket path limit:
+    108 bytes on Linux, 104 on macOS)
 
     Benefits:
     - No network namespace issues
@@ -413,7 +378,8 @@ class UnixSocketChannel:
 
     Queueing:
     - Decoupled read/write paths prevent deadlocks
-    - Bounded queue (32 items, ~5.5MB) provides backpressure for O(chunk_size) memory
+    - Bounded queue (HOST_WRITE_QUEUE_DEPTH frames) plus one worker batch in the
+      transport: about 13.5 MiB in flight at most
     - Background worker batches writes before drain for throughput
     - Fail-fast (5s) if queue full
     """
@@ -421,7 +387,7 @@ class UnixSocketChannel:
     def __init__(self, socket_path: str, expected_uid: int):
         """
         Args:
-            socket_path: Unix socket path (e.g., /tmp/serial-{hash}.sock)
+            socket_path: Unix socket path (e.g., <VM working folder>/cmd.sock)
             expected_uid: Expected UID of QEMU process for peer verification (required)
         """
         self.socket_path = socket_path
@@ -431,10 +397,11 @@ class UnixSocketChannel:
         # Bounded write queue for host→guest messages. Larger values let the
         # host pipeline more chunks before backpressure stalls producers
         # (e.g. file upload read+compress), improving throughput. Memory cost:
-        # 64 slots x ~175 KB per file chunk ≈ 11 MB max in-flight. Must stay
-        # bounded to prevent unbounded growth on slow guest drains. Paired with
-        # the guest-side WRITE_QUEUE_SIZE (128) to keep both ends balanced.
-        self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
+        # HOST_WRITE_QUEUE_DEPTH slots x ~175 KB ≈ 11 MB in the queue, plus up
+        # to HOST_WRITE_BATCH_FRAMES + 1 frames (~3 MB) in the transport. Must
+        # stay bounded to prevent unbounded growth on slow guest drains. Paired
+        # with the guest-side WRITE_QUEUE_SIZE (128) to keep both ends balanced.
+        self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=constants.HOST_WRITE_QUEUE_DEPTH)
         self._write_task: asyncio.Task[None] | None = None
 
     async def connect(self, timeout_seconds: float) -> None:
@@ -445,18 +412,31 @@ class UnixSocketChannel:
 
         Verifies the socket server (QEMU) is running as the expected user
         via SO_PEERCRED/LOCAL_PEERCRED before allowing communication.
+
+        Raises:
+            ConfigError: HOST_DEPENDENCY when this process may not connect (EACCES,
+                EPERM): no retry helps, the socket mode or this process's groups must change.
+            SocketAuthError: the socket's peer does not run as expected_uid
+            TimeoutError: no connection within timeout_seconds
+            OSError: no listener yet (no socket file, connection refused)
         """
-        if self._reader and self._writer:
+        if self.is_connected():
             return
+        if self._writer is not None:  # a connection that failed (a write, its transport) goes first
+            await self.close()
 
         # Connect to Unix socket with mandatory peer credential verification
         # Buffer sized for streaming zstd-compressed file chunks (see STREAM_BUFFER_LIMIT)
-        self._reader, self._writer = await connect_and_verify(
-            path=self.socket_path,
-            expected_uid=self.expected_uid,
-            timeout=float(timeout_seconds),
-            buffer_limit=STREAM_BUFFER_LIMIT,
-        )
+        try:
+            self._reader, self._writer = await connect_and_verify(
+                path=self.socket_path,
+                expected_uid=self.expected_uid,
+                timeout=float(timeout_seconds),
+                buffer_limit=STREAM_BUFFER_LIMIT,
+            )
+        except PermissionError as e:
+            raise socket_access_error(Path(self.socket_path), e) from e
+        raise_send_buffer(self._writer.get_extra_info("socket"))
 
         # Start background write worker
         self._write_task = asyncio.create_task(self._write_worker())
@@ -465,8 +445,9 @@ class UnixSocketChannel:
         """Background worker drains write queue with batched drain for throughput.
 
         Decouples writing from reading to prevent deadlocks when virtio-serial
-        buffers are full (128 descriptors per port). Batches up to 16 writes
-        before a single drain() call to amortize backpressure overhead. Blocks
+        buffers are full (128 descriptors per port). Batches up to
+        HOST_WRITE_BATCH_FRAMES writes before a single drain() call to amortize
+        backpressure overhead. Blocks
         on the queue until data arrives; close() stops it by cancelling the
         task (after draining the queue), so no wakeup poll or stop flag is
         needed. A write error is logged and breaks the loop.
@@ -480,8 +461,8 @@ class UnixSocketChannel:
                     self._writer.write(data)
                 self._write_queue.task_done()
 
-                # Greedily batch up to 15 more queued items before draining
-                for _ in range(15):
+                # Greedily batch up to HOST_WRITE_BATCH_FRAMES - 1 more queued items before draining
+                for _ in range(constants.HOST_WRITE_BATCH_FRAMES - 1):
                     try:
                         data = self._write_queue.get_nowait()
                         if self._writer:
@@ -494,151 +475,55 @@ class UnixSocketChannel:
                 if self._writer:
                     await self._writer.drain()
 
-            except RuntimeError as e:
-                if "event loop is closed" not in str(e).lower():
+            except Exception as e:
+                # The end of the loop (a RuntimeError "event loop is closed") is no error
+                if not (isinstance(e, RuntimeError) and "event loop is closed" in str(e).lower()):
                     logger.error(
                         "UnixSocketChannel write worker error - connection broken",
                         extra={"socket_path": self.socket_path, "error": str(e), "error_type": type(e).__name__},
                         exc_info=True,
                     )
-                break
-            except Exception as e:
-                # Log error with full traceback
-                logger.error(
-                    "UnixSocketChannel write worker error - connection broken",
-                    extra={"socket_path": self.socket_path, "error": str(e), "error_type": type(e).__name__},
-                    exc_info=True,
-                )
-                # Break loop to signal connection failure (clean shutdown)
-                break
-
-    async def send_request(
-        self,
-        request: GuestAgentRequest,
-        timeout: int = constants.GUEST_REQUEST_TIMEOUT_SECONDS,
-    ) -> StreamingMessage:
-        """Send JSON + newline, receive JSON + newline.
-
-        No retry at this level - caller handles retry logic.
-        Queues write to prevent blocking when virtio-serial buffer full.
-        """
-        if not self._reader or not self._writer:
-            raise RuntimeError("Channel not connected")
-
-        # Validate write worker is alive (fail-fast if crashed)
-        if self._write_task and self._write_task.done():
-            # Worker crashed - get exception for diagnostics
-            try:
-                self._write_task.result()  # Re-raises exception if any
-            except asyncio.CancelledError:
-                raise RuntimeError("Write worker was cancelled") from None
-            except Exception as e:
-                raise RuntimeError(f"Write worker crashed: {type(e).__name__}: {e}") from e
-            # Non-cancelled clean return only follows a logged write error.
-            raise RuntimeError("Write worker exited unexpectedly")
-
-        try:
-            # Serialize Pydantic model to JSON
-            request_json = request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-
-            # Queue write instead of blocking (fail-fast if queue full)
-            try:
-                await asyncio.wait_for(self._write_queue.put(request_json.encode()), timeout=5.0)
-            except TimeoutError as e:
-                raise RuntimeError("Write queue full - guest agent not draining") from e
-
-            # Receive response (read until newline)
-            response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
-
-            # Deserialize JSON to StreamingMessage (direct bytes, no decode/strip allocation)
-            return _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
-
-        except TimeoutError:
-            # TimeoutError means no data received in time, but connection is still valid.
-            # DO NOT reset - closing the socket causes QEMU to signal "host disconnected"
-            # which makes the guest read EOF. Keep connection open for retry.
-            # See: nested KVM timing issues where guest boots before host sends data.
-            raise
-        except (
-            asyncio.IncompleteReadError,
-            OSError,
-            BrokenPipeError,
-            ConnectionError,
-        ):
-            # Connection actually broken - reset state so caller reconnects on next attempt
-            self._reader = None
-            self._writer = None
-            raise
-
-    async def stream_messages(
-        self,
-        request: GuestAgentRequest,
-        timeout: int,
-    ) -> AsyncGenerator[StreamingMessage]:
-        """Stream multiple JSON messages for code execution.
-
-        Queues write to prevent blocking when virtio-serial buffer full.
-        """
-        if not self._reader or not self._writer:
-            raise RuntimeError("Channel not connected")
-
-        # Validate write worker is alive (fail-fast if crashed)
-        if self._write_task and self._write_task.done():
-            try:
-                self._write_task.result()
-            except asyncio.CancelledError:
-                raise RuntimeError("Write worker was cancelled") from None
-            except Exception as e:
-                raise RuntimeError(f"Write worker crashed: {type(e).__name__}: {e}") from e
-            raise RuntimeError("Write worker exited unexpectedly")
-
-        # Send request (queued to prevent blocking)
-        request_json = request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-
-        try:
-            await asyncio.wait_for(self._write_queue.put(request_json.encode()), timeout=5.0)
-        except TimeoutError as e:
-            raise RuntimeError("Write queue full - guest agent not draining") from e
-
-        # Read and yield messages until completion or error.
-        # Timeout wraps the entire stream (total wall-clock), not per-message.
-        timeout_context = asyncio.timeout(timeout)
-        try:
-            async with timeout_context:
-                while True:
-                    response_data = await self._reader.readuntil(b"\n")
-                    message = _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
-                    yield message
-
-                    if isinstance(message, (ExecutionCompleteMessage, StreamingErrorMessage)):
-                        break
-        except TimeoutError as error:
-            if timeout_context.expired():
-                raise StreamDeadlineExceededError(f"stream exceeded {timeout}s total deadline") from error
-            raise
+                break  # the connection failed: is_connected() is then False
 
     async def close(self) -> None:
-        """Close Unix socket connection with graceful queue drain."""
-        # Let the worker drain everything still queued (max 5s), then cancel it.
-        # The worker blocks on queue.get(), so cancellation is the authoritative
-        # stop — no shutdown flag needed.
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._write_queue.join(), timeout=5.0)
-
-        # Cancel write worker
-        if self._write_task and not self._write_task.done():
-            self._write_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._write_task
-
-        # Close connection
-        if self._writer:
-            self._writer.close()
-            await self._writer.wait_closed()
+        """Close the connection. A live connection first sends the frames still queued, and
+        the socket what it holds, while the guest reads them (CLOSE_SEND_TIMEOUT_SECONDS);
+        else the socket closes at once (abort). A frame not sent then is dropped: it never
+        goes out on a later connection. The worker stops and the socket closes on every
+        path, a cancel of the caller included; the error of a lost connection is no error of
+        the close."""
+        writer, worker = self._writer, self._write_task
+        sent = False
+        try:
+            if writer is not None and worker is not None and self.is_connected():
+                with contextlib.suppress(TimeoutError, OSError):
+                    async with asyncio.timeout(CLOSE_SEND_TIMEOUT_SECONDS):
+                        await self._write_queue.join()  # the worker gave every frame to the socket
+                        worker.cancel()  # cancellation is its only stop: it waits for a next frame
+                        writer.transport.set_write_buffer_limits(high=0)
+                        await writer.drain()  # until the socket holds nothing more to send
+                        sent = True
+        finally:
+            self._write_task = None
             self._writer = None
             self._reader = None
+            if worker is not None:
+                worker.cancel()
+            while not self._write_queue.empty():
+                self._write_queue.get_nowait()
+                self._write_queue.task_done()
+            if writer is not None:
+                if sent:
+                    writer.close()
+                else:
+                    writer.transport.abort()  # drops what the socket still holds
+        if worker is not None:
+            await asyncio.wait({worker})  # its cancel ends it in one loop turn
+        if writer is not None:
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
 
-    async def enqueue_write(self, data: bytes, timeout: float = 5.0) -> None:
+    async def enqueue_write(self, data: bytes, *, timeout: float) -> None:
         """Enqueue data for writing with timeout.
 
         Args:
@@ -656,10 +541,9 @@ class UnixSocketChannel:
     def is_connected(self) -> bool:
         """Check if channel is connected and the write path is still alive.
 
-        Without these checks, the host holds a stale connection after the
-        guest agent's 18s read timeout triggers a reconnect cycle: connect()
-        sees is_connected()=True, skips reconnection, and the next write_file
-        header is sent into a dead socket.
+        Without these checks, the host keeps a dead connection (a closed
+        writer or a crashed write worker): connect() sees is_connected()=True,
+        skips reconnection, and the next request goes into a dead socket.
         """
         if self._reader is None or self._writer is None:
             return False
@@ -671,16 +555,16 @@ class UnixSocketChannel:
         """Get the stream reader (for direct access when needed)."""
         return self._reader
 
-    async def __aenter__(self) -> "UnixSocketChannel":
-        """Enter async context manager, connecting to guest."""
-        await self.connect(timeout_seconds=5)
-        return self
 
-    async def __aexit__(
-        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
-    ) -> None:
-        """Exit async context manager, closing connection."""
-        await self.close()
+def raise_send_buffer(sock: socket.socket | None) -> None:
+    """Raise the socket's send buffer to SOCKET_SEND_BUFFER_BYTES when it is smaller (macOS
+    gives a Unix socket 8 KiB, Linux about 208 KiB). Speed only: a socket that refuses keeps
+    its size."""
+    if sock is None:
+        return
+    with contextlib.suppress(OSError):
+        if sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) < SOCKET_SEND_BUFFER_BYTES:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SEND_BUFFER_BYTES)
 
 
 class DualPortChannel:
@@ -688,12 +572,13 @@ class DualPortChannel:
     Dual virtio-serial port communication (command + event ports).
 
     Architecture:
-    - Command port (host → guest): Send commands (ping, execute, cancel)
-    - Event port (guest → host): Stream events (output, completion)
+    - Command port (host → guest): Send commands (ping, warm REPL, execute, install
+      packages, file write/read/list)
+    - Event port (guest → host): Stream events (replies, output, file chunks, completion),
+      routed to each operation by op_id (FileOpDispatcher)
 
     Benefits:
     - Concurrent read/write: Can send commands during execution
-    - Simpler protocol: No multiplexing needed
     - Independent flow control: Per-port buffers
     - Unix-like: Separate read/write channels (stdin/stdout pattern)
 
@@ -702,21 +587,22 @@ class DualPortChannel:
     - macOS HVF (virtio-serial device)
     - All platforms with virtio-serial support
 
-    Uses QEMU virtio-serial Unix sockets:
-    - Host connects to /tmp/cmd-{hash}.sock -> QEMU forwards to guest virtio-serial port 0
-    - Host connects to /tmp/event-{hash}.sock -> QEMU forwards to guest virtio-serial port 1
-    (Paths use SHA-256 hash to stay under 108-byte UNIX socket limit)
+    Uses QEMU virtio-serial Unix sockets in the VM working folder
+    (VmWorkingDirectory keeps the paths under the socket path limit):
+    - Host connects to cmd.sock -> QEMU forwards to the guest port org.dualeai.cmd
+    - Host connects to event.sock -> QEMU forwards to the guest port org.dualeai.event
 
     Usage:
         channel = DualPortChannel(
-            cmd_socket="/tmp/cmd-{hash}.sock",
-            event_socket="/tmp/event-{hash}.sock"
+            cmd_socket=workdir.cmd_socket,
+            event_socket=workdir.event_socket,
+            expected_uid=expected_uid,
         )
 
         await channel.connect(timeout_seconds=5)
 
         # Request-response (auto-assigns op_id, routes reply)
-        response = await channel.send_request(PingRequest())
+        response = await channel.send_request(PingRequest(), timeout=5)
 
         # Stream execution output (auto op_id routing)
         async for msg in channel.stream_messages(ExecuteCodeRequest(...), timeout=30):
@@ -729,12 +615,10 @@ class DualPortChannel:
     def __init__(self, cmd_socket: str, event_socket: str, expected_uid: int):
         """
         Args:
-            cmd_socket: Unix socket path for command port (e.g., /tmp/cmd-{hash}.sock)
-            event_socket: Unix socket path for event port (e.g., /tmp/event-{hash}.sock)
+            cmd_socket: Unix socket path for command port (VmWorkingDirectory.cmd_socket)
+            event_socket: Unix socket path for event port (VmWorkingDirectory.event_socket)
             expected_uid: Expected UID of QEMU process for peer verification (required)
         """
-        self.cmd_socket = cmd_socket
-        self.event_socket = event_socket
         self._cmd_channel: UnixSocketChannel = UnixSocketChannel(cmd_socket, expected_uid)
         self._event_channel: UnixSocketChannel = UnixSocketChannel(event_socket, expected_uid)
         self._dispatcher: FileOpDispatcher | None = None
@@ -746,10 +630,13 @@ class DualPortChannel:
         Connects in parallel for speed. Single connection attempt with timeout (no retry).
         Caller handles retry logic (e.g., wait_for_guest exponential backoff).
 
-        On reconnection (after a previous close()), probes the guest agent with a
-        PingRequest to ensure the guest has reopened its virtio-serial port.  QEMU
-        accepts the host socket before the guest agent is ready; data sent in that
-        window is silently dropped, causing 30s timeouts downstream.
+        On reconnection (after a previous close(), or an L1 restore), probes the
+        guest agent with a PingRequest to confirm that the guest runs and reads
+        its port before the caller sends real work.
+
+        Raises:
+            What UnixSocketChannel.connect raises; on a reconnection, TimeoutError when no
+            pong came after every probe attempt (GUEST_RECONNECT_PROBE_TIMEOUTS)
         """
         # Already connected and dispatcher healthy — nothing to do.
         # Dispatcher EOF is the earliest signal that the guest has disconnected.
@@ -767,22 +654,21 @@ class DualPortChannel:
 
         self._has_been_connected = True
 
+    def mark_restored(self) -> None:
+        """The guest of this channel was restored from a save (L1) whose ports were
+        connected: its first connect() probes the guest, as a reconnection does."""
+        self._has_been_connected = True
+
     async def _raw_connect(self, timeout_seconds: float) -> None:
         """Low-level connect: open sockets and start dispatcher."""
         # Close stale sockets: without this, connect() is a no-op (objects still exist)
         # and the new dispatcher gets a reader that immediately EOFs.
         if self._dispatcher and not self._dispatcher.is_alive():
-            await self._dispatcher.stop()
-            self._dispatcher = None
-            await asyncio.gather(
-                self._cmd_channel.close(),
-                self._event_channel.close(),
-            )
+            await self.close()
 
-        # Connect both ports in parallel for speed
-        await asyncio.gather(
-            self._cmd_channel.connect(timeout_seconds),
-            self._event_channel.connect(timeout_seconds),
+        # Both ports in parallel; a port that fails ends the other's connect
+        await gather_or_cancel(
+            [self._cmd_channel.connect(timeout_seconds), self._event_channel.connect(timeout_seconds)]
         )
 
         # Start the file operation dispatcher on the event channel
@@ -793,70 +679,53 @@ class DualPortChannel:
                 self._dispatcher.start()
 
     async def _probe_guest_ready(self, caller_timeout: float) -> None:
-        """Send PingRequest and wait for PongMessage to confirm guest is listening.
+        """Send PingRequests until a PongMessage confirms that the guest listens.
 
-        After close()+connect(), QEMU's chardev socket accepts before the guest
-        agent has reopened its virtio-serial port fds.  This probe retries until
-        the guest actually responds or the retry budget is exhausted.
+        The guest agent keeps its ports open, so QEMU and the guest kernel hold
+        a ping until the agent reads it: a ping with no answer yet is slow, not
+        lost. Each attempt sends a new ping on the same connection and waits
+        longer (GUEST_RECONNECT_PROBE_TIMEOUTS); the late pong of an earlier
+        ping has another op_id and is dropped. A timeout never closes the
+        sockets: each close shows the guest a host disconnect. Only a
+        connection that failed is closed and opened again.
         """
-        for attempt in range(constants.GUEST_RECONNECT_PROBE_MAX_RETRIES):
+        attempts = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
+        for attempt, probe_timeout in enumerate(constants.GUEST_RECONNECT_PROBE_TIMEOUTS, start=1):
             try:
                 response = await asyncio.wait_for(
-                    self.send_request(PingRequest(), timeout=int(constants.GUEST_RECONNECT_PROBE_TIMEOUT + 1)),
-                    timeout=constants.GUEST_RECONNECT_PROBE_TIMEOUT,
+                    self.send_request(PingRequest(), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS),
+                    timeout=probe_timeout,
                 )
-                if isinstance(response, PongMessage):
-                    logger.debug(
-                        "Reconnection probe succeeded",
-                        extra={"attempt": attempt + 1},
-                    )
-                    return
+            except TimeoutError:
+                logger.debug(
+                    "Reconnection probe got no pong yet, sending another ping",
+                    extra={"attempt": attempt, "max": attempts, "timeout_seconds": probe_timeout},
+                )
+                continue
             except (
-                TimeoutError,
                 OSError,
                 asyncio.IncompleteReadError,
                 ConnectionError,
                 RuntimeError,
                 CommunicationError,
-                CommunicationOutcomeUnknownError,
-            ):
-                pass
+                OutcomeUnknownError,
+            ) as error:
+                if attempt == attempts:
+                    break  # no attempt left: no reconnect to pay for
+                # The connection failed: only a new one can carry the next ping.
+                logger.debug(
+                    "Reconnection probe connection failed, reconnecting",
+                    extra={"attempt": attempt, "max": attempts, "error_type": type(error).__name__},
+                )
+                await self.close()
+                await asyncio.sleep(constants.GUEST_RECONNECT_PROBE_DELAY)
+                await self._raw_connect(caller_timeout)
+                continue
+            if isinstance(response, PongMessage):
+                logger.debug("Reconnection probe succeeded", extra={"attempt": attempt})
+                return
 
-            # Guest not ready yet — close, wait, reconnect
-            logger.debug(
-                "Reconnection probe failed, retrying",
-                extra={"attempt": attempt + 1, "max": constants.GUEST_RECONNECT_PROBE_MAX_RETRIES},
-            )
-            await self.close()
-            await asyncio.sleep(constants.GUEST_RECONNECT_PROBE_DELAY)
-            await self._raw_connect(caller_timeout)
-
-        raise TimeoutError(
-            f"Guest agent did not respond to ping after {constants.GUEST_RECONNECT_PROBE_MAX_RETRIES} "
-            f"reconnection attempts"
-        )
-
-    async def send_command(
-        self,
-        request: GuestAgentRequest,
-        timeout: int = 5,
-    ) -> None:
-        """Send command on command port (non-blocking).
-
-        Commands are serialized and queued on the command port's write worker.
-        Responses come via event port.
-
-        Args:
-            request: Pydantic request model (PingRequest, ExecuteCodeRequest, etc)
-            timeout: Write timeout in seconds (default: 5)
-
-        Raises:
-            RuntimeError: If channel not connected or write queue full
-        """
-        # Use UnixSocketChannel's queued write mechanism
-        # Serialize and enqueue the command
-        request_json = request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-        await self._cmd_channel.enqueue_write(request_json.encode(), timeout=float(timeout))
+        raise TimeoutError(f"Guest agent did not respond to ping after {attempts} attempts")
 
     async def enqueue_raw(self, data: bytes) -> None:
         """Send raw bytes on command port without waiting for response."""
@@ -868,76 +737,83 @@ class DualPortChannel:
         inbox.mark_command_sent()
         await self.enqueue_raw(data)
 
-    async def register_op(self, op_id: str) -> OperationInbox:
+    def register_op(self, op_id: str) -> OperationInbox:
         """Register an op_id for file transfer multiplexing."""
         if not self._dispatcher:
             raise RuntimeError("Dispatcher not initialized - channel not connected")
-        return await self._dispatcher.register_op(op_id)
+        return self._dispatcher.register_op(op_id)
 
-    async def unregister_op(self, op_id: str) -> None:
+    def unregister_op(self, op_id: str) -> None:
         """Unregister an op_id after operation completes."""
         if self._dispatcher:
-            await self._dispatcher.unregister_op(op_id)
+            self._dispatcher.unregister_op(op_id)
 
     async def fail_pending_operations(self, reason: str) -> None:
         """Drain accepted event frames to socket EOF after QEMU death."""
         if self._dispatcher:
             await self._dispatcher.wait_for_transport_termination(reason)
 
-    @asynccontextmanager
-    async def _with_op_id(
-        self,
-        request: GuestAgentRequest,
-    ) -> AsyncGenerator[OperationInbox]:
-        """Tag request with auto-generated op_id, send it, and yield its routed queue.
+    def abort_operations(self, reason: str) -> None:
+        """Fail every operation in flight, and every later one, at once: the guest can
+        never answer again (QEMU paused it for good). No EOF wait: the sockets stay open.
+        A dispatched operation raises OutcomeUnknownError with `reason`."""
+        if self._dispatcher:
+            self._dispatcher.fail_registered_ops(reason)
 
-        Handles op_id generation, queue registration, command dispatch, and
-        cleanup in a single context manager. Used by send_request() and
-        stream_messages() to avoid duplicating the correlation logic.
-        """
-        if not self._dispatcher:
-            raise RuntimeError("Dispatcher not initialized - channel not connected")
-
-        op_id = uuid4().hex
-        tagged_request = request.model_copy(update={"op_id": op_id})
-        op_queue = await self.register_op(op_id)
-
-        try:
-            request_json = tagged_request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-            await self.enqueue_registered(op_queue, request_json.encode())
-            yield op_queue
-        finally:
-            await self.unregister_op(op_id)
+    def fail_operations_sent_before(self, reason: str, *, sent_before: float) -> None:
+        """Fail at once every operation in flight that was sent before `sent_before`
+        (time.monotonic()): the guest closed its port then. The guest drops what it read on
+        that connection (and the bytes that its kernel held), and an operation is marked sent
+        when it is queued: its bytes may still wait on the host side (QEMU reads nothing from
+        a closed port) and run after the reopen. Its outcome is unknown: each raises
+        OutcomeUnknownError with `reason`. Operations sent at or after
+        `sent_before` are not failed: QEMU keeps their bytes in the socket until the guest
+        opens its port again (a caller that cannot place the close passes the time it
+        learned of it: the operations sent between fail too)."""
+        if self._dispatcher:
+            self._dispatcher.fail_ops_sent_before(reason, sent_before=sent_before)
 
     async def send_request(
         self,
         request: GuestAgentRequest,
-        timeout: int = constants.GUEST_REQUEST_TIMEOUT_SECONDS,
+        *,
+        timeout: int,
     ) -> StreamingMessage:
         """Send command and receive single response via op_id-routed queue.
 
         Args:
             request: Pydantic request model
-            timeout: Total timeout in seconds. Default: 5.
+            timeout: Total timeout in seconds
 
         Returns:
             First StreamingMessage matching the op_id
 
         Raises:
-            RuntimeError: If channels not connected
-            asyncio.TimeoutError: If no response within timeout
+            RuntimeError: If channels not connected, or the write queue stays full
+            TimeoutError: If no response within timeout
+            CommunicationError: The event transport failed before the request was queued
+            OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the event transport failed
+                after the request was queued
         """
-        async with self._with_op_id(request) as op_queue:
+        op_id = uuid4().hex
+        tagged_request = request.model_copy(update={"op_id": op_id})
+        op_queue = self.register_op(op_id)  # RuntimeError when not connected
+        try:
+            request_json = tagged_request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
+            await self.enqueue_registered(op_queue, request_json.encode())
             return await asyncio.wait_for(op_queue.get(), timeout=float(timeout))
+        finally:
+            self.unregister_op(op_id)
 
-    def stream_messages(
+    async def stream_messages(
         self,
         request: GuestAgentRequest,
         timeout: int,
     ) -> AsyncGenerator[StreamingMessage]:
-        """Send request and stream multiple response messages (compatibility method).
+        """Send request and stream multiple response messages.
 
         For code execution, sends command and yields all events until completion.
+        Timeout wraps the entire stream (total wall-clock), not per-message.
 
         Args:
             request: Pydantic request model
@@ -946,32 +822,19 @@ class DualPortChannel:
         Yields:
             StreamingMessage from event port
 
-        Raises:
+        Raises (while iterating, not at the call):
             RuntimeError: If channels not connected
-        """
-        return self._stream_messages_impl(request, timeout)
-
-    async def _stream_messages_impl(
-        self,
-        request: GuestAgentRequest,
-        timeout: int,
-    ) -> AsyncGenerator[StreamingMessage]:
-        """Implementation of stream_messages (async generator).
-
-        Timeout wraps the entire stream (total wall-clock), not per-message.
+            StreamDeadlineExceededError: The total deadline expired
+            CommunicationError, OutcomeUnknownError: The event transport failed (as in send_request)
         """
         timeout_context = asyncio.timeout(timeout)
-        op_queue: OperationInbox | None = None
         try:
             # Enter the timeout first so registration and command enqueue are
             # part of the advertised total stream deadline.
             async with timeout_context:
-                if not self._dispatcher:
-                    raise RuntimeError("Dispatcher not initialized - channel not connected")
-
                 op_id = uuid4().hex
                 tagged_request = request.model_copy(update={"op_id": op_id})
-                op_queue = await self.register_op(op_id)
+                op_queue = self.register_op(op_id)  # RuntimeError when not connected
                 try:
                     request_json = tagged_request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
                     await self.enqueue_registered(op_queue, request_json.encode())
@@ -981,43 +844,32 @@ class DualPortChannel:
                         if isinstance(message, (ExecutionCompleteMessage, StreamingErrorMessage)):
                             break
                 finally:
-                    await self.unregister_op(op_id)
+                    self.unregister_op(op_id)
         except TimeoutError as error:
             if timeout_context.expired():
-                raise StreamDeadlineExceededError(
-                    f"stream exceeded {timeout}s total deadline",
-                    command_dispatched=(op_queue.command_may_have_been_sent if op_queue is not None else False),
-                ) from error
+                raise StreamDeadlineExceededError(f"stream exceeded {timeout}s total deadline") from error
             raise
 
     async def close(self) -> None:
         """Close both command and event ports.
 
-        Closes both channels in parallel with graceful queue drain.
+        Stops the dispatcher first, then closes both channels in parallel with graceful queue
+        drain. The ports close also when the stop raises (a cancel of the caller).
         """
-        # Stop dispatcher first
-        if self._dispatcher:
-            try:
-                await self._dispatcher.stop()
-            finally:
-                self._dispatcher = None
-
-        # Close both ports in parallel
-        await asyncio.gather(
-            self._cmd_channel.close(),
-            self._event_channel.close(),
-        )
-
-    async def __aenter__(self) -> "DualPortChannel":
-        """Enter async context manager, connecting to guest."""
-        await self.connect(timeout_seconds=5)
-        return self
-
-    async def __aexit__(
-        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
-    ) -> None:
-        """Exit async context manager, closing connection."""
-        await self.close()
+        try:
+            if self._dispatcher:
+                try:
+                    await self._dispatcher.stop()
+                finally:
+                    self._dispatcher = None
+        finally:
+            # Each close runs to its end, also when the other fails; then the first error
+            closed = await asyncio.gather(
+                self._cmd_channel.close(), self._event_channel.close(), return_exceptions=True
+            )
+            for result in closed:
+                if isinstance(result, BaseException):
+                    raise result
 
 
 @dataclass
@@ -1029,23 +881,23 @@ class StreamResult:
     and final exit code.
     """
 
-    exit_code: int = -1
-    stdout: str = ""
-    stderr: str = ""
-    execution_time_ms: int | None = None
-    spawn_ms: int | None = None
-    process_ms: int | None = None
+    exit_code: int
+    stdout: str
+    stderr: str
+    execution_time_ms: int | None
+    spawn_ms: int | None
+    process_ms: int | None
 
 
 async def consume_stream(
-    channel: "GuestChannel",
+    channel: DualPortChannel,
     request: GuestAgentRequest,
     *,
     timeout: int,
     vm_id: str,
-    on_stdout: Callable[[str], None] | None = None,
-    on_stderr: Callable[[str], None] | None = None,
-    on_error: Callable[[StreamingErrorMessage], Awaitable[None]] | None = None,
+    on_stdout: Callable[[str], None] | None,
+    on_stderr: Callable[[str], None] | None,
+    on_error: Callable[[StreamingErrorMessage], Awaitable[None]] | None,
 ) -> StreamResult:
     """Send request via channel, consume the streaming response, return collected result.
 
@@ -1056,7 +908,7 @@ async def consume_stream(
     exception propagates immediately.
 
     Args:
-        channel: GuestChannel to stream from.
+        channel: Channel to stream from.
         request: Request to send.
         timeout: Hard timeout for the entire stream (seconds).
         vm_id: VM identifier for logging.
@@ -1072,36 +924,23 @@ async def consume_stream(
     execution_time_ms: int | None = None
     spawn_ms: int | None = None
     process_ms: int | None = None
-    stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
+    chunks: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    callbacks = {"stdout": on_stdout, "stderr": on_stderr}
 
     async with contextlib.aclosing(channel.stream_messages(request, timeout=timeout)) as stream:
         async for msg in stream:
             if isinstance(msg, OutputChunkMessage):
-                if msg.type == "stdout":
-                    stdout_chunks.append(msg.chunk)
-                    if on_stdout is not None:
-                        try:
-                            on_stdout(msg.chunk)
-                        except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
-                            logger.warning(
-                                "on_stdout callback raised, disabling",
-                                extra={"vm_id": vm_id},
-                                exc_info=True,
-                            )
-                            on_stdout = None
-                else:  # stderr
-                    stderr_chunks.append(msg.chunk)
-                    if on_stderr is not None:
-                        try:
-                            on_stderr(msg.chunk)
-                        except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
-                            logger.warning(
-                                "on_stderr callback raised, disabling",
-                                extra={"vm_id": vm_id},
-                                exc_info=True,
-                            )
-                            on_stderr = None
+                chunks[msg.type].append(msg.chunk)
+                if (callback := callbacks[msg.type]) is not None:
+                    try:
+                        callback(msg.chunk)
+                    except Exception:
+                        logger.warning(
+                            f"on_{msg.type} callback raised, disabling",
+                            extra={"vm_id": vm_id},
+                            exc_info=True,
+                        )
+                        callbacks[msg.type] = None
 
                 logger.debug(
                     "VM output",
@@ -1119,78 +958,15 @@ async def consume_stream(
                 # Let caller handle error first (may raise)
                 if on_error is not None:
                     await on_error(msg)
-                # Default handling: append error to stderr, set exit_code=-1, break
-                stderr_chunks.append(f"[{msg.error_type}] {msg.message}")
-                exit_code = -1
+                # Default handling: append error to stderr, exit_code stays -1
+                chunks["stderr"].append(f"[{msg.error_type}] {msg.message}")
                 break
 
     return StreamResult(
         exit_code=exit_code,
-        stdout="".join(stdout_chunks),
-        stderr="".join(stderr_chunks),
+        stdout="".join(chunks["stdout"]),
+        stderr="".join(chunks["stderr"]),
         execution_time_ms=execution_time_ms,
         spawn_ms=spawn_ms,
         process_ms=process_ms,
     )
-
-
-@asynccontextmanager
-async def reconnecting_channel(
-    channel: GuestChannel,
-    connect_timeout: int = 5,
-) -> AsyncGenerator[GuestChannel]:
-    """Async context manager for QEMU GA standard reconnect pattern.
-
-    Pattern: close → connect → use → (auto-cleanup on exit)
-    - Ensures clean connection state (no stale data from previous sessions)
-    - Guest agent expects disconnect after each command
-    - Industry standard (libvirt, QEMU GA reference implementation)
-
-    Use for:
-    - Health checks (ping)
-    - One-off commands
-    - Any single request-response
-
-    Don't use for:
-    - Code execution (needs persistent connection for streaming)
-    - Package installation (needs persistent connection for streaming)
-
-    Usage:
-        # GOOD - one-off command
-        async with reconnecting_channel(vm.channel) as ch:
-            response = await ch.send_request(PingRequest())
-
-        # BAD - streaming operation
-        async with reconnecting_channel(vm.channel) as ch:
-            async for msg in ch.stream_messages(...):  # Will break!
-                pass
-
-        # GOOD - streaming operation
-        await vm.channel.connect()
-        async for msg in vm.channel.stream_messages(...):
-            yield msg
-        await vm.channel.close()
-
-    Args:
-        channel: Guest channel to manage
-        connect_timeout: Connection timeout in seconds (default: 5)
-
-    Yields:
-        Connected channel ready for use
-
-    Reference:
-        - QEMU GA docs: connect-send-disconnect per command
-        - libvirt: guest-sync before every command
-    """
-    # Close existing connection (if any)
-    await channel.close()
-
-    # Establish fresh connection
-    await channel.connect(timeout_seconds=connect_timeout)
-
-    try:
-        # Yield connected channel to caller
-        yield channel
-    finally:
-        # Not closing channel here — caller owns the lifecycle
-        pass

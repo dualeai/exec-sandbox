@@ -10,7 +10,7 @@ set -euo pipefail
 # Features:
 # - tiny-init: single static Rust binary (~50-100KB vs 1MB busybox)
 # - zstd compression (~30% smaller than LZ4)
-# - Size: ~80-100KB (down from ~500KB with modules)
+# - Size: ~80-100KB
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGES_DIR="$SCRIPT_DIR/../images"
@@ -56,8 +56,8 @@ fi
 cp "$TINY_INIT" "$INITRAMFS_DIR/init"
 chmod 755 "$INITRAMFS_DIR/init"
 
-# Create essential device nodes
-# These are created before devtmpfs is mounted
+# Create essential device nodes for use before tiny-init mounts devtmpfs.
+# mknod needs root: without it, each node is skipped (|| true).
 mknod -m 622 "$INITRAMFS_DIR/dev/console" c 5 1 2>/dev/null || true
 mknod -m 666 "$INITRAMFS_DIR/dev/null" c 1 3 2>/dev/null || true
 # ttyS0 (COM1) for early serial output - major 4, minor 64
@@ -67,11 +67,8 @@ mknod -m 666 "$INITRAMFS_DIR/dev/hvc0" c 229 0 2>/dev/null || true
 # ttyAMA0 (PL011 UART) for ARM64 virt machine - major 204, minor 64
 mknod -m 666 "$INITRAMFS_DIR/dev/ttyAMA0" c 204 64 2>/dev/null || true
 
-# Custom kernel (CONFIG_MODULES=n): all drivers are built-in.
-# No kernel modules to extract — initramfs is just tiny-init + device nodes.
-
 # Create cpio archive with zstd compression (~30% smaller than LZ4)
-# Alpine's linux-virt kernel has CONFIG_RD_ZSTD=y built-in
+# The custom kernel sets CONFIG_RD_ZSTD=y (images/kernel/exec-sandbox.config)
 cd "$INITRAMFS_DIR"
 find . | cpio -o -H newc --quiet 2>/dev/null | zstd -19 > "$OUTPUT_DIR/initramfs-$ARCH_NAME"
 
@@ -85,9 +82,3 @@ fi
 # Report size (use du for portable human-readable size)
 NEW_SIZE=$(du -h "$OUTPUT_DIR/initramfs-$ARCH_NAME" | cut -f1)
 echo "Built minimal initramfs: $OUTPUT_DIR/initramfs-$ARCH_NAME ($NEW_SIZE)"
-
-# Show size comparison if old initramfs exists
-if [ -f "$OUTPUT_DIR/initramfs-$ARCH_NAME.alpine-backup" ]; then
-    OLD_SIZE=$(du -h "$OUTPUT_DIR/initramfs-$ARCH_NAME.alpine-backup" | cut -f1)
-    echo "  (was $OLD_SIZE with Alpine's stock initramfs)"
-fi

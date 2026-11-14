@@ -8,25 +8,76 @@ import random
 import sys
 import tempfile
 import time
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Callable, Generator, Iterator
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, NamedTuple, TypedDict, Unpack, cast
 from unittest.mock import AsyncMock
-from uuid import uuid4
 
+import boto3
 import pytest
 from _pytest.runner import runtestprotocol
 
+from exec_sandbox import subprocess_utils
+from exec_sandbox._logging import LIBRARY_LOGGER_NAME
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
-from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
+from exec_sandbox.exceptions import ErrorCode, TransientError
+from exec_sandbox.files.disk import file_stamp, make_private_dir, memory_filesystem
+from exec_sandbox.images import kernel_dir_of
+from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
+from exec_sandbox.models import ExecutionResult, ExposedPort, StartupTiming
+from exec_sandbox.permission_utils import _probe_cache as permission_probe_cache  # pyright: ignore[reportPrivateUsage]
+from exec_sandbox.permission_utils import get_qemu_vm_uid
+from exec_sandbox.platform_utils import (
+    HostArch,
+    HostOS,
+    UserDir,
+    detect_host_arch,
+    detect_host_os,
+    get_user_dir,
+)
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.settings import Settings
-from exec_sandbox.system_probes import check_fast_balloon_available, check_hwaccel_available, probe_cache
+from exec_sandbox.system_probes import check_tsc_deadline, detect_accel_type, probe_cache
 from exec_sandbox.vm_manager import VmManager
+from exec_sandbox.vm_spec import VmSpec
+from exec_sandbox.vm_types import AccelType
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Temp folder on disk (Linux hosts whose /tmp is tmpfs)
+# ============================================================================
+# VM tests put home disks and save files in tmp_path. On tmpfs (the default /tmp of
+# Ubuntu 25.10 and later) those pages are shared memory charged to the VM's memory
+# cgroup, so a save can be OOM-killed. Before pytest makes its temp folder, a tmpfs
+# temp folder is replaced by one on disk: tempfile.tempdir for this process, TMPDIR
+# for the xdist workers and every child (QEMU among them).
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config: pytest.Config) -> None:
+    # TMPDIR moves even with --basetemp: fixtures and children (QEMU) make files through it
+    if memory_filesystem(Path(tempfile.gettempdir())) is None:
+        return
+    disk_tmp = get_user_dir(kind=UserDir.CACHE) / "tmp"
+    try:
+        make_private_dir(disk_tmp)
+    except OSError as e:
+        raise pytest.UsageError(
+            f"The temp folder {tempfile.gettempdir()} is in memory, and {disk_tmp} cannot be made instead "
+            f"({e.strerror or e}): set TMPDIR to a folder on disk"
+        ) from e
+    if (filesystem := memory_filesystem(disk_tmp)) is not None:
+        raise pytest.UsageError(
+            f"The temp folder {tempfile.gettempdir()} and {disk_tmp} are both in memory ({filesystem}): "
+            "set TMPDIR or EXEC_SANDBOX_CACHE_DIR to a folder on disk"
+        )
+    os.environ["TMPDIR"] = str(disk_tmp)
+    tempfile.tempdir = str(disk_tmp)
+
 
 # ============================================================================
 # QEMU Crash Retry (GitHub Actions CI only)
@@ -36,22 +87,20 @@ logger = logging.getLogger(__name__)
 #      → Host runs out of threads under parallel test load (EAGAIN)
 #      → Causes SIGABRT (exit code -6). This is a host-side issue, not a test bug.
 #
-# Root cause: With TCG thread=single, each QEMU process uses ~5-8 threads at
-# steady state (main loop, vCPU, call_rcu, iothread, signal handler). However,
-# the I/O worker thread pool (QEMU util/thread-pool.c, aio=threads) can spike
-# to 64 threads *per AioContext* during heavy disk I/O. When many VMs boot
+# Root cause: With TCG, each QEMU process uses ~5-11 threads at
+# steady state (main loop, vCPU, call_rcu, signal handler), plus the
+# I/O worker threads (QEMU util/thread-pool.c, aio=threads; qemu_cmd caps the
+# pool at 8 per AioContext, QEMU's default is 64). When many VMs boot
 # simultaneously (pytest -n auto with 4 workers), these transient spikes can
-# exhaust OS thread limits. Measured locally: 5 threads (TCG minimal) to
-# 8 threads (HVF full config); QEMU maintainer docs confirm ~4-7 baseline
-# with unbounded I/O pool spikes.
+# exhaust OS thread limits.
 #
-# Note: The previous "regime_is_user: code should not be reached" crash (QEMU
-# ARM64 TCG bug in versions < 9.0.4) is now caught early by a version check in
-# qemu_cmd.py, which raises VmDependencyError before QEMU is launched. That
-# crash was deterministic (not transient) and exited with code 0, not SIGABRT.
+# Note: the "regime_is_user: code should not be reached" crash (QEMU ARM64 TCG bug
+# in versions < 9.0.4) is not retried: a version check in qemu_cmd.py raises
+# ConfigError HOST_DEPENDENCY before QEMU starts. That crash is deterministic (not
+# transient) and exits with code 0, not SIGABRT.
 #
-# We detect exact error strings and retry with backoff plus heavy jitter to
-# desynchronize parallel workers on noisy CI hardware.
+# We detect the error codes below and the SIGABRT text, and retry with backoff
+# plus heavy jitter to desynchronize parallel workers on noisy CI hardware.
 #
 # Tuning rationale:
 #   - 5 retries (not 3): thread exhaustion can persist through multiple boot
@@ -66,35 +115,46 @@ _QEMU_CRASH_MAX_RETRIES = 5
 _QEMU_CRASH_BACKOFF_BASE_S = 2  # exponential: 2s, 4s, 8s, 16s, 32s
 _QEMU_CRASH_JITTER_MAX_S = 10.0  # uniform random jitter [0, 10s)
 
-# Exact substrings from QEMU's stderr/console that indicate retryable failures.
-# Thread exhaustion: "Resource temporarily unavailable" / "SIGABRT"
-# VM timeouts under TCG contention: VmBootTimeoutError (host watchdog) and
-# VmTransientError (guest agent unresponsive). These are classified as
-# "may succeed on retry" by the exception hierarchy (exceptions.py).
-_QEMU_RETRYABLE_SIGNATURES = (
-    "Resource temporarily unavailable",
-    "SIGABRT",
-    "VmBootTimeoutError",
-    "VmTransientError",
-)
+# The one text signature: QEMU aborted (thread exhaustion ends in SIGABRT). Not the EAGAIN
+# text "Resource temporarily unavailable": any EAGAIN has it (the BlockingIOError of a held
+# file lock, for example), and a QEMU fork that hits EAGAIN is QEMU_CRASHED (by code).
+_QEMU_RETRYABLE_SIGNATURE = "SIGABRT"
+
+# VM timeouts and crashes under TCG contention or thread exhaustion: a TransientError
+# with one of these codes (boot timeout, QEMU exit, guest agent unresponsive). By code,
+# never by text: the other TransientError codes (store, disk, capacity, downloads) and a
+# wrong code under pytest.raises(check=...) fail at once. pytest_runtest_makereport
+# marks such a report with this user property.
+_QEMU_RETRYABLE_CODES = frozenset({ErrorCode.VM_BOOT_TIMEOUT, ErrorCode.QEMU_CRASHED, ErrorCode.GUEST_UNAVAILABLE})
+_QEMU_RETRYABLE_PROPERTY = "qemu_retryable_code"
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(call: pytest.CallInfo[None]) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    """Mark a report that failed with a retryable QEMU error code (read by _is_retryable_qemu_crash)."""
+    report = yield
+    error = call.excinfo.value if call.excinfo is not None else None
+    if isinstance(error, TransientError) and error.code in _QEMU_RETRYABLE_CODES:
+        report.user_properties.append((_QEMU_RETRYABLE_PROPERTY, error.code.value))
+    return report
 
 
 def _is_retryable_qemu_crash(reports: list[pytest.TestReport]) -> bool:
-    """Check if any test phase failed with a retryable QEMU crash signature."""
+    """Check if any test phase failed with a retryable QEMU error code or crash signature."""
     for report in reports:
         if not report.failed:
             continue
-        if not report.longrepr:
-            continue
-        text = str(report.longrepr)
-        if any(sig in text for sig in _QEMU_RETRYABLE_SIGNATURES):
+        if any(name == _QEMU_RETRYABLE_PROPERTY for name, _value in report.user_properties):
+            return True
+        if report.longrepr and _QEMU_RETRYABLE_SIGNATURE in str(report.longrepr):
             return True
     return False
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> bool | None:
-    """Retry tests on QEMU SIGABRT / thread exhaustion (GitHub Actions CI only).
+    """Retry tests on QEMU SIGABRT / thread exhaustion and on VM boot timeouts and crashes
+    (_QEMU_RETRYABLE_CODES) (GitHub Actions CI only).
 
     Uses exponential backoff (2^n) with full jitter ([0, 10s)) between retries
     to desynchronize parallel workers and avoid thundering herd on noisy CI.
@@ -143,7 +203,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
 # ============================================================================
 
 # Probed once at import time; used for skip markers and timeout scaling.
-_hwaccel_available: bool = asyncio.run(check_hwaccel_available())
+_hwaccel_available: bool = asyncio.run(detect_accel_type()) is not AccelType.TCG
 
 # Central test-execution timeout (seconds).
 # TCG software emulation under ``pytest -n auto`` contention can inflate
@@ -163,17 +223,26 @@ skip_unless_hwaccel = pytest.mark.skipif(
     reason="Requires hardware acceleration (KVM/HVF) - TCG too slow for timing-sensitive tests",
 )
 
-# Skip marker for tests with tight timing assertions that include balloon overhead.
-# Even with KVM available, nested virtualization (GitHub Actions runners on Azure)
-# causes balloon operations to be 50-100x slower than bare-metal. This marker
-# requires both hwaccel AND TSC_DEADLINE (x86_64) to ensure fast balloon ops.
-# See check_fast_balloon_available() docstring for full rationale and references.
-skip_unless_fast_balloon = pytest.mark.skipif(
-    not asyncio.run(check_fast_balloon_available()),
-    reason=(
-        "Requires fast balloon operations - nested virtualization (CI runners) causes "
-        "balloon timeouts. TSC_DEADLINE CPU feature missing indicates degraded nested virt."
-    ),
+
+async def _fast_virt_available() -> bool:
+    """Hardware acceleration that is not degraded nested virtualization.
+
+    Nested KVM (GitHub Actions x86 runners on Azure) lacks TSC_DEADLINE and runs
+    memory-heavy work 50-100x slower than bare metal. macOS has no nested virt;
+    arm64 Linux KVM (GIC timer) is not affected.
+    """
+    if not _hwaccel_available:
+        return False
+    host_os, host_arch = detect_host_os(), detect_host_arch()
+    if host_os == HostOS.LINUX and host_arch == HostArch.X86_64:
+        return await check_tsc_deadline()
+    return host_os == HostOS.MACOS or (host_os == HostOS.LINUX and host_arch == HostArch.AARCH64)
+
+
+# Skip marker for tests with tight timing or heavy memory pressure.
+skip_unless_fast_virt = pytest.mark.skipif(
+    not asyncio.run(_fast_virt_available()),
+    reason="Requires fast virtualization - nested virtualization (CI runners, no TSC_DEADLINE) is too slow",
 )
 
 # Skip marker for Linux-only tests (cgroups, virtual memory ulimit, etc.)
@@ -285,7 +354,7 @@ async def scheduler(scheduler_config: SchedulerConfig) -> AsyncGenerator[Schedul
 
     Usage:
         async def test_something(scheduler: Scheduler) -> None:
-            result = await scheduler.run(code="print(1)", language=Language.PYTHON)
+            result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(1)")
     """
     async with Scheduler(scheduler_config) as sched:
         yield sched
@@ -306,7 +375,7 @@ async def dual_scheduler(
 
     hwaccel gets ``_TIMEOUT_HWACCEL``; emulation gets ``_TIMEOUT_TCG``.
     The emulation budget is higher because parallel TCG VMs on CI runners
-    starve each other — trivial code that takes <1s locally consumed the
+    starve each other — trivial code that takes <1s locally can use the
     full hwaccel budget on a loaded macOS arm64 runner (cold-boot fallback
     + TCG + ``pytest -n auto`` contention).
     """
@@ -330,12 +399,9 @@ async def dual_scheduler(
 
 
 @pytest.fixture
-def vm_settings(images_dir: Path):
+def vm_settings(make_vm_settings) -> Settings:
     """Settings for VM tests (auto-detects KVM/HVF, falls back to TCG)."""
-    return Settings(
-        base_images_dir=images_dir,
-        kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-    )
+    return make_vm_settings()
 
 
 @pytest.fixture
@@ -354,23 +420,13 @@ async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
 
 
 @pytest.fixture
-def emulation_settings(images_dir: Path):
-    """Settings with forced software emulation (no KVM/HVF)."""
-    return Settings(
-        base_images_dir=images_dir,
-        kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-        force_emulation=True,
-    )
-
-
-@pytest.fixture
-async def emulation_vm_manager(emulation_settings) -> AsyncGenerator[VmManager, None]:
-    """VmManager configured for software emulation (started).
+async def emulation_vm_manager(make_vm_settings) -> AsyncGenerator[VmManager, None]:
+    """VmManager with forced software emulation (no KVM/HVF), started.
 
     Automatically calls start() to start the overlay pool daemon,
     and stop() for cleanup.
     """
-    async with VmManager(emulation_settings) as manager:  # type: ignore[arg-type]
+    async with VmManager(make_vm_settings(force_emulation=True)) as manager:
         yield manager
 
 
@@ -399,7 +455,8 @@ def unit_test_vm_manager(unit_test_settings):
 
 @pytest.fixture
 def make_vm_settings(images_dir: Path):
-    """Factory to create Settings with optional overrides.
+    """Factory to create Settings with optional overrides. The kernel folder is the one
+    Scheduler uses (kernel_dir_of): images_dir, or its kernels/ folder when that holds the files.
 
     Usage:
         def test_something(make_vm_settings, tmp_path):
@@ -407,12 +464,8 @@ def make_vm_settings(images_dir: Path):
     """
 
     def _make(**overrides: Any) -> Settings:
-        defaults: dict[str, Any] = {
-            "base_images_dir": images_dir,
-            "kernel_path": images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-        }
-        defaults.update(overrides)
-        return Settings(**defaults)
+        kernel_path = kernel_dir_of(images_dir, arch=detect_host_arch())
+        return Settings(**{"base_images_dir": images_dir, "kernel_path": kernel_path, **overrides})
 
     return _make
 
@@ -441,34 +494,66 @@ async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
 
 @pytest.fixture
 async def make_snapshot_manager(make_vm_manager):  # type: ignore[no-untyped-def]
-    """Factory to create (DiskSnapshotManager, Settings) with optional Settings overrides.
-
-    Consolidates the repeated pattern of creating settings + vm_manager +
-    DiskSnapshotManager with consistent kwargs and automatic cache dir creation.
-    Settings are created once (inside make_vm_manager) and reused, avoiding
-    the kwargs-passed-twice problem.
+    """Factory to create (DiskSnapshotManager, Settings) on a started VmManager (make_vm_manager).
+    The manager makes its cache folder. Each is stopped at teardown (its background tasks
+    awaited), before its VmManager, as Scheduler does.
 
     Usage:
         async def test_something(make_snapshot_manager, tmp_path):
-            snapshot_manager, settings = await make_snapshot_manager(
-                disk_snapshot_cache_dir=tmp_path / "cache",
-                s3_bucket=None,
-            )
+            snapshot_manager, settings = await make_snapshot_manager(disk_snapshot_cache_dir=tmp_path / "cache")
     """
+    async with AsyncExitStack() as stack:
 
-    async def _make(**overrides: Any) -> tuple[DiskSnapshotManager, Any]:
-        vm_manager = await make_vm_manager(**overrides)
-        settings = vm_manager.settings
-        if settings.disk_snapshot_cache_dir:
-            settings.disk_snapshot_cache_dir.mkdir(parents=True, exist_ok=True)
-        return DiskSnapshotManager(settings, vm_manager), settings
+        async def _make(**overrides: Any) -> tuple[DiskSnapshotManager, Settings]:
+            vm_manager = await make_vm_manager(**overrides)
+            manager = DiskSnapshotManager(vm_manager.settings, vm_manager)
+            stack.push_async_callback(manager.stop)
+            return manager, vm_manager.settings
 
-    return _make
+        yield _make
 
 
 # ============================================================================
 # Shared test helpers
 # ============================================================================
+
+
+class ExecOptions(TypedDict, total=False):
+    """Session.exec() options a test passes (only those; the public defaults apply)."""
+
+    timeout_seconds: int | None
+    env_vars: dict[str, str] | None
+    on_stdout: Callable[[str], None] | None
+    on_stderr: Callable[[str], None] | None
+
+
+class RunOnceOptions(ExecOptions, total=False):
+    """Options of run_once and run_timed: the exec() options, plus on_boot_log for new()."""
+
+    on_boot_log: Callable[[str], None] | None
+
+
+async def run_once(scheduler: Scheduler, spec: VmSpec, code: str, **options: Unpack[RunOnceOptions]) -> ExecutionResult:
+    """One VM, one exec(), then close: the one-shot pattern for tests.
+
+    Only the options a caller passes are forwarded, so the public defaults apply.
+    """
+    return (await run_timed(scheduler, spec, code, **options)).result
+
+
+class TimedRun(NamedTuple):
+    result: ExecutionResult
+    startup: StartupTiming
+    exposed_ports: list[ExposedPort]
+
+
+async def run_timed(scheduler: Scheduler, spec: VmSpec, code: str, **options: Unpack[RunOnceOptions]) -> TimedRun:
+    """run_once, plus how the VM started and its exposed ports (read before close)."""
+    on_boot_log = options.pop("on_boot_log", None)
+    exec_options = cast("ExecOptions", options)
+    async with await scheduler.new(spec, on_boot_log=on_boot_log) as vm:
+        result = await vm.exec(code, **exec_options)
+        return TimedRun(result=result, startup=vm.startup_timing, exposed_ports=vm.exposed_ports)
 
 
 def make_destroy_mock(kind: str = "confirmed") -> AsyncMock:
@@ -490,29 +575,12 @@ def make_destroy_mock(kind: str = "confirmed") -> AsyncMock:
     return AsyncMock(side_effect=destroy)
 
 
-def random_test_id() -> str:
-    """Generate a unique random identifier for test isolation.
-
-    Returns the full 32-char hex of a UUID4.  Callers add their own prefix
-    (e.g. ``f"task-{random_test_id()}"``).
-    """
-    return uuid4().hex
-
-
 async def create_test_qcow2(path: Path, size: str = "1M") -> None:
-    """Create a minimal valid qcow2 file via qemu-img."""
-    proc = await asyncio.create_subprocess_exec(
-        "qemu-img",
-        "create",
-        "-f",
-        "qcow2",
-        str(path),
-        size,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    """Create a minimal valid qcow2 file via qemu-img. A cancelled call ends qemu-img too."""
+    returncode, _stdout, stderr = await subprocess_utils.communicate_managed_process(
+        ["qemu-img", "create", "-f", "qcow2", str(path), size], process_name="qemu-img", context_id=path.name
     )
-    await proc.communicate()
-    assert proc.returncode == 0, f"qemu-img create failed for {path}"
+    assert returncode == 0, f"qemu-img create failed for {path}: {stderr.decode(errors='replace')}"
 
 
 # ============================================================================
@@ -549,27 +617,42 @@ def _reset_probe_caches() -> Iterator[None]:
     populate ``probe_cache`` via the ``@_async_cached_probe`` decorator.
     Without a post-test reset, a subsequent test on the same pytest-xdist
     worker inherits the stale value — e.g. ``qemu_version=(8,2,0)`` from a
-    mock causes real integration tests to raise ``VmDependencyError``, or
+    mock causes real integration tests to raise ``ConfigError`` HOST_DEPENDENCY, or
     ``kvm=True`` from a mock causes ``-accel kvm`` on macOS (crash).
 
     Resetting *all* attributes (not just a subset) is intentional: it
     eliminates the need for per-class fixtures and prevents future probes
-    from being forgotten.
+    from being forgotten. The qemu-vm probes too: a test that mocks one would
+    else give every later VM of the worker another QEMU identity. And the exec lookup of
+    child_shell (exec_errno): a test makes its own binaries.
     """
-    probe_cache.reset()
+    resets = (
+        probe_cache.reset,
+        permission_probe_cache.reset,
+        get_qemu_vm_uid.cache_clear,
+        subprocess_utils._runnable.clear,  # pyright: ignore[reportPrivateUsage]
+    )
+    for reset in resets:
+        reset()
     yield
-    probe_cache.reset()
+    for reset in resets:
+        reset()
 
 
 @pytest.fixture(autouse=True)
-def setup_test_environment():
-    """Set up test environment variables."""
-    os.environ["ENVIRONMENT"] = "development"
-    os.environ["LOG_LEVEL"] = "DEBUG"
+def _restore_library_logger() -> Iterator[None]:
+    """Give every test the library logger as the import left it.
+
+    CLI tests run configure_logging (a handler, and ERROR level with -q). On the same
+    pytest-xdist worker, a later caplog test would then see no record below ERROR.
+    """
+    lib_logger = logging.getLogger(LIBRARY_LOGGER_NAME)
+    level, handlers = lib_logger.level, list(lib_logger.handlers)
     yield
-    # Cleanup
-    os.environ.pop("ENVIRONMENT", None)
-    os.environ.pop("LOG_LEVEL", None)
+    lib_logger.setLevel(level)
+    for handler in [h for h in lib_logger.handlers if h not in handlers]:
+        lib_logger.removeHandler(handler)
+        handler.close()
 
 
 # ============================================================================
@@ -600,3 +683,154 @@ class NonSeekableIO(io.RawIOBase):
 
     def seekable(self) -> bool:
         return False
+
+
+# Object store (moto server, S3 API) shared by the L3 cache and instance store tests
+@pytest.fixture
+def fake_aws_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fake AWS credentials for moto, and no SDK retries (AWS_MAX_ATTEMPTS=1) for the clients the
+    test makes. A request to the local moto fails only when the test makes it fail: a retry would
+    hide that, and wait for its backoff (seconds against an endpoint that does not answer)."""
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_MAX_ATTEMPTS", "1")
+
+
+class MotoWorker(NamedTuple):
+    """The moto of one xdist worker: its HTTP endpoint, a sync boto3 client on it, and its WSGI app."""
+
+    endpoint_url: str
+    s3: Any
+    app: Any
+    """moto's WSGI app: called in this process, it serves the same buckets as the server."""
+
+
+@pytest.fixture(scope="session")
+def worker_moto_server() -> Iterator[MotoWorker]:
+    """One moto S3 server for each xdist worker. Tests use `moto_s3_server` (or `s3_proxy`).
+
+    A server per test costs 0.5 s to stop (werkzeug polls its stop flag twice a second).
+    It listens on and is reached at 127.0.0.1, never 0.0.0.0: macOS sends a connect to
+    0.0.0.0 to its first address, which may not be loopback. It binds with no name lookup
+    (s3_faults.MotoServer). No SDK retry.
+
+    moto finds the service of each request by listing its own package folder (about 180
+    stat calls, under its dispatch lock): here it lists the folder once.
+    """
+    from botocore.config import Config
+    from moto import backends
+    from moto.server import DomainDispatcherApplication, create_backend_app
+
+    from tests.s3_faults import moto_server
+
+    modules = tuple(backends.list_of_moto_modules())
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(backends, "list_of_moto_modules", lambda: modules)
+        with moto_server("127.0.0.1") as server:
+            endpoint_url = f"http://127.0.0.1:{server.server_port}"
+            s3_sync = boto3.client(
+                "s3",
+                region_name="us-east-1",
+                endpoint_url=endpoint_url,
+                aws_access_key_id="testing",
+                aws_secret_access_key="testing",  # noqa: S106 - moto takes any key
+                config=Config(retries={"total_max_attempts": 1}),
+            )
+            yield MotoWorker(endpoint_url=endpoint_url, s3=s3_sync, app=DomainDispatcherApplication(create_backend_app))
+
+
+@pytest.fixture
+def moto_s3_server(fake_aws_env, worker_moto_server: MotoWorker) -> tuple[str, Any]:
+    """The worker's moto S3 server, empty but for the default bucket: (endpoint_url, sync_client).
+
+    Each test starts on an empty moto (moto's reset API, then the bucket again; in process,
+    below 1 ms): no test sees what another test wrote.
+    """
+    from werkzeug.test import Client
+
+    moto = Client(worker_moto_server.app)
+    for method, path in (("POST", "/moto-api/reset"), ("PUT", "/test-snapshots")):
+        status = moto.open(path, method=method).status_code
+        assert status == 200, f"moto {method} {path}: HTTP {status}"
+    return worker_moto_server.endpoint_url, worker_moto_server.s3
+
+
+def l1_hit(vm_manager: Any, tmp_path: Path) -> MemorySnapshotManager:
+    """A real L1 manager (its check_cache() and restore() run) whose lookup, and the check
+    restore() runs, find an entry in tmp_path at its current version.
+
+    Two seams are replaced: compute_cache_key (it hashes the boot images, which a unit test does
+    not have) and the private entry check (_check_entry, under check_cache and restore): a valid
+    entry needs a saved VM (vmstate digest, RAM template, home disk), and no public call makes one
+    without QEMU."""
+    memory = MemorySnapshotManager(Settings(memory_snapshot_cache_dir=tmp_path), vm_manager)
+    vmstate = tmp_path / "cached.vmstate"
+    vmstate.write_bytes(b"vmstate")
+    memory.compute_cache_key = AsyncMock(return_value="cached")  # type: ignore[method-assign]
+    memory._check_entry = AsyncMock(return_value=(vmstate, file_stamp(vmstate.stat())))  # type: ignore[method-assign]
+    return memory
+
+
+async def wait_l1_saves(scheduler: Scheduler) -> None:
+    """Until the scheduler's background L1 saves have ended (the next new() can hit L1): the L1
+    manager's stop waits for them and leaves it usable. Scheduler has no public handle on its L1
+    manager: the private attribute is the one seam."""
+    manager = scheduler._memory_snapshot_manager  # pyright: ignore[reportPrivateUsage]
+    assert manager is not None
+    await manager.stop()
+
+
+@pytest.fixture
+async def s3_proxy(moto_s3_server, worker_moto_server: MotoWorker) -> AsyncGenerator[Any]:
+    """Fault-injecting S3 proxy in front of the worker's moto, in the test's event loop
+    (tests/s3_faults.py), started for each test.
+
+    Yields an S3Proxy: point a store at `proxy.endpoint_url` and `proxy.prefix` (fresh per test);
+    `proxy.bucket` reads and writes moto directly. SDK retries are off for clients made during the
+    test (fake_aws_env; the store's head client has its own setting of 1): one store call is
+    one HTTP request, so a rule applies once per call and no test waits for SDK backoff.
+    """
+    from tests.s3_faults import Bucket, S3Proxy
+
+    moto = worker_moto_server
+    async with S3Proxy.start(moto=moto.app, moto_url=moto.endpoint_url, bucket=Bucket(moto.s3)) as proxy:
+        yield proxy
+
+
+@pytest.fixture(scope="session")
+def host_accelerator():
+    """This host's accelerator (AccelType), probed once for each xdist worker. The autouse
+    probe-cache reset would make every save and load of a test probe it again (two process spawns)."""
+    return asyncio.run(detect_accel_type())
+
+
+@pytest.fixture
+async def instance_env(
+    s3_proxy, host_accelerator, short_tmp_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncGenerator[Any]:
+    """Saved instances without QEMU (tests/instance_support.py): yields an InstanceEnv, the real
+    InstanceManager on a store behind `s3_proxy`, fake VMs whose QMP sockets live under a short
+    path, and the bytes each commit saved. The host probes of the manager are replaced: the QEMU
+    version (no binary needed) and the accelerator (probed once for the worker)."""
+    from tests.instance_support import InstanceEnv, accelerator_probe, qemu_floor
+
+    monkeypatch.setattr("exec_sandbox.instance.manager.probe_qemu_version", qemu_floor)
+    monkeypatch.setattr("exec_sandbox.instance.manager.detect_accel_type", accelerator_probe(host_accelerator))
+    async with InstanceEnv.open(proxy=s3_proxy, root=short_tmp_dir, tmp=tmp_path) as env:
+        yield env
+
+
+def asyncio_with(**overrides: Any) -> SimpleNamespace:
+    """A module's own `asyncio` name with some functions replaced: patch
+    "exec_sandbox.<module>.asyncio" with it. Patching "exec_sandbox.<module>.asyncio.sleep"
+    replaces asyncio.sleep for the whole process (the event loop, pytest-asyncio)."""
+    return SimpleNamespace(**{**vars(asyncio), **overrides})
+
+
+def time_with(**overrides: Any) -> SimpleNamespace:
+    """A module's own `time` name with some functions replaced (as asyncio_with): patching
+    "exec_sandbox.<module>.time.monotonic" replaces the event loop's clock too."""
+    return SimpleNamespace(**{**vars(time), **overrides})

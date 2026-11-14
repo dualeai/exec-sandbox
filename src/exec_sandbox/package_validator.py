@@ -1,25 +1,30 @@
 """Package validation for code execution safety.
 
-Package catalogs built at development time (make upgrade → make build-catalogs).
-No runtime network calls, catalogs bundled in container.
+Package catalogs built at development time (make upgrade → make build-catalogs)
+and shipped in the package (resources/). No network call at run time.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
 
-import aiofiles
-
-from exec_sandbox.exceptions import PackageNotAllowedError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language  # noqa: TC001 - Used at runtime (language.value)
 
 # Package name extraction pattern
-# Matches: alphanumeric, underscore, hyphen, dot followed by version operator
-# Python: ==, ~=, >=, <=, !=, >, <
+# Matches: alphanumeric, underscore, hyphen, dot followed by the first character of a version operator
+# Python: ==, ~=, >=, <=, >, < (not !=: "!" is not a name character, so no match)
 # JavaScript: @
 _PACKAGE_NAME_PATTERN = re.compile(r"^([a-zA-Z0-9_\-\.]+)[@=<>~]")
+
+
+def _load_allow_lists(paths: dict[str, Path]) -> dict[str, set[str]]:
+    """The allow-list of each language value from its JSON file (a list of package names),
+    lowercase for case-insensitive matching. Blocking: create() runs it in a worker thread."""
+    return {language: {pkg.lower() for pkg in json.loads(path.read_text())} for language, path in paths.items()}
 
 
 class PackageValidator:
@@ -28,12 +33,13 @@ class PackageValidator:
     Security mechanism to prevent execution of arbitrary packages.
     Only packages from curated allow-lists are permitted.
 
-    Version validation is enforced at schema level via Pydantic.
-    This validator only checks allow-list membership.
+    It also refuses a spec with no version operator (_PACKAGE_NAME_PATTERN). It
+    does not check the version itself: the guest agent checks the whole spec.
 
-    Catalogs are built at dev time and bundled in container (no runtime fetching).
+    Catalogs are built at dev time and shipped in the package (no runtime fetching).
 
-    Use the async factory method `create()` to instantiate.
+    Use the async factory method `create()` to instantiate. It parses about
+    400 KB of JSON: create one validator and reuse it.
     """
 
     def __init__(self, allow_lists: dict[str, set[str]]):
@@ -65,43 +71,28 @@ class PackageValidator:
         pypi_path = pypi_allow_list_path or catalogs_dir / "pypi_top_10k.json"
         npm_path = npm_allow_list_path or catalogs_dir / "npm_top_10k.json"
 
-        allow_lists = {
-            "python": await cls._load_allow_list(pypi_path),
-            "javascript": await cls._load_allow_list(npm_path),
-        }
-        return cls(allow_lists)
-
-    @staticmethod
-    async def _load_allow_list(path: Path) -> set[str]:
-        """Load allow-list from bundled JSON file.
-
-        Args:
-            path: Path to JSON file containing list of package names
-
-        Returns:
-            Set of allowed package names (lowercase for case-insensitive matching)
-        """
-        async with aiofiles.open(path) as f:
-            content = await f.read()
-        packages: list[str] = json.loads(content)
-        return {pkg.lower() for pkg in packages}
+        # One worker-thread job: reading and parsing both files takes about 2 ms
+        return cls(await asyncio.to_thread(_load_allow_lists, {"python": pypi_path, "javascript": npm_path}))
 
     def validate(self, packages: list[str], language: Language) -> None:
         """Validate packages against allow-list.
-
-        Version validation is handled at schema level.
 
         Args:
             packages: List of package specifiers (e.g., ["pandas==2.0.0", "lodash@4.17.21"])
             language: Programming language to validate for
 
         Raises:
-            PackageNotAllowedError: If package not in allow-list or language has no allow-list
+            InvalidInputError: PACKAGE_NOT_ALLOWED if a package is not in the allow-list;
+                ARGUMENT_INVALID if a spec has no version or the language has no packages
         """
         if language.value not in self._allow_lists:
-            raise PackageNotAllowedError(
+            raise InvalidInputError(
                 f"Package validation not supported for '{language.value}' language. "
-                f"Supported: {', '.join(sorted(self._allow_lists))}."
+                f"Supported: {', '.join(sorted(self._allow_lists))}.",
+                code=ErrorCode.ARGUMENT_INVALID,
+                context=None,
+                hint=None,
+                instance_id=None,
             )
 
         allow_list = self._allow_lists[language.value]
@@ -109,30 +100,25 @@ class PackageValidator:
         for package_spec in packages:
             match = _PACKAGE_NAME_PATTERN.match(package_spec)
             if not match:
-                # Should never happen due to schema validation, but defensive
-                raise PackageNotAllowedError(
+                # No version operator after the name (VmSpec does not check the specs)
+                raise InvalidInputError(
                     f"Invalid package spec: '{package_spec}'. "
-                    f"Must include version specifier (e.g., pandas==2.0.0 or lodash@4.17.21)."
+                    f"Must include version specifier (e.g., pandas==2.0.0 or lodash@4.17.21).",
+                    code=ErrorCode.ARGUMENT_INVALID,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
                 )
 
-            base_name = match.group(1).strip().lower()
+            base_name = match.group(1).lower()
 
             # Check if package is in allow-list
             if base_name not in allow_list:
-                raise PackageNotAllowedError(
+                raise InvalidInputError(
                     f"Package '{base_name}' not in {language.value} allow-list. "
-                    f"Only pre-approved packages from the catalog are permitted."
+                    f"Only pre-approved packages from the catalog are permitted.",
+                    code=ErrorCode.PACKAGE_NOT_ALLOWED,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
                 )
-
-    def is_allowed(self, package_name: str, language: str) -> bool:
-        """Check if a package name is in the allow-list.
-
-        Args:
-            package_name: Package name (without version specifier)
-            language: Programming language ("python" or "javascript")
-
-        Returns:
-            True if package is in allow-list, False otherwise
-        """
-        allow_list = self._allow_lists.get(language, set())
-        return package_name.lower() in allow_list

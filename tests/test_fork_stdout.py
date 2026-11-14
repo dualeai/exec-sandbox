@@ -2,62 +2,35 @@
 
 When user code calls os.fork() inside the persistent Python REPL, the child
 process inherits the entire REPL wrapper — including the while-loop and
-sentinel-writing code. Without the PID guard, if the child doesn't call
-os._exit() (e.g., uses sys.exit(), exit(), or falls through), the child's
-copy of the REPL wrapper writes a premature sentinel to stderr. The
-guest-agent treats the first sentinel as authoritative and stops capturing,
-losing the parent's stdout.
+sentinel-writing code. If the child does not call os._exit() (it uses
+sys.exit(), exit(), or falls through), its copy of the REPL wrapper would
+write a premature sentinel to stderr. The guest agent takes the first
+sentinel as the end of the exec and stops capturing: the parent's stdout
+would be lost.
 
-The PID guard fix (in PYTHON_REPL_WRAPPER) records _repl_pid before the
-while loop. After each exec(), if getpid() != _repl_pid, the wrapper flushes
-stdout/stderr and calls os._exit(exit_code) — preventing the child from
-writing a sentinel while preserving its buffered output.
+The PID guard (PYTHON_REPL_WRAPPER, python_repl.py) records _repl_pid before
+the while loop. After each exec(), if getpid() != _repl_pid, the wrapper flushes
+stdout/stderr and calls os._exit(exit_code): the child writes no sentinel and
+keeps its buffered output.
 
 Reliability strategy:
-- waitpid() synchronization eliminates races (kernel-guaranteed ordering)
-- Assert presence of markers, not ordering (POSIX pipe atomicity for <4096B)
-- No time.sleep() for synchronization
+- waitpid() orders the writes of the child and the parent (no time.sleep())
+- Each test asserts the exact stdout: a lost or a duplicate line fails it
 - All outputs well under 64KB pipe capacity
+
+The parent's output after children that leave the REPL loop: tests/test_fork_output.py.
 
 Integration tests require QEMU + images (run 'make build-images').
 """
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 class TestForkStdoutCapture:
     """Normal: fork + stdout capture works with the PID guard."""
-
-    async def test_fork_child_sys_exit_parent_prints(self, scheduler: Scheduler) -> None:
-        """THE reported bug: child sys.exit() no longer writes premature sentinel.
-
-        Without PID guard, child's sys.exit() raises SystemExit caught by the
-        REPL wrapper, which writes a sentinel before the parent finishes.
-        """
-        code = """
-import os
-
-pid = os.fork()
-if pid == 0:
-    # Child: print and exit via sys.exit (triggers SystemExit in REPL wrapper)
-    print("CHILD_OK", flush=True)
-    import sys
-    sys.exit(0)
-
-# Parent: wait for child, then print
-os.waitpid(pid, 0)
-print("PARENT_OK")
-"""
-
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
-
-        assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "CHILD_OK" in result.stdout, f"Child output missing: {result.stdout}"
-        assert "PARENT_OK" in result.stdout, f"Parent output missing: {result.stdout}"
 
     async def test_fork_child_falls_through_no_exit(self, scheduler: Scheduler) -> None:
         """Child prints and falls through without any exit call.
@@ -78,82 +51,22 @@ else:
     print("PARENT_OK")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "CHILD_FELL_THROUGH" in result.stdout, f"Child output missing: {result.stdout}"
-        assert "PARENT_OK" in result.stdout, f"Parent output missing: {result.stdout}"
-
-    async def test_fork_child_os_exit_with_explicit_flush(self, scheduler: Scheduler) -> None:
-        """Baseline: child with flush=True + os._exit(0) already works.
-
-        This pattern works without the PID guard. Proves the fix doesn't regress it.
-        """
-        code = """
-import os
-
-pid = os.fork()
-if pid == 0:
-    print("CHILD_BASELINE", flush=True)
-    os._exit(0)
-
-os.waitpid(pid, 0)
-print("PARENT_BASELINE")
-"""
-
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
-
-        assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "CHILD_BASELINE" in result.stdout, f"Child output missing: {result.stdout}"
-        assert "PARENT_BASELINE" in result.stdout, f"Parent output missing: {result.stdout}"
+        assert result.stdout == "CHILD_FELL_THROUGH\nPARENT_OK\n"
 
 
 class TestForkStdoutEdgeCases:
     """Edge: boundary conditions for the PID guard."""
 
-    async def test_fork_child_os_exit_without_flush_loses_output(self, scheduler: Scheduler) -> None:
-        """Child print() without flush + os._exit(0) loses child output.
-
-        This documents a known CPython limitation (issue #61432, Won't Fix):
-        os._exit() skips Python buffer flush. stdout is block-buffered on pipes,
-        so unflushed output is lost. The PID guard is never reached here because
-        os._exit() terminates before the REPL wrapper code.
-        """
-        code = """
-import os
-
-pid = os.fork()
-if pid == 0:
-    # No flush=True, and os._exit skips Python buffer flush
-    print("CHILD_LOST")
-    os._exit(0)
-
-os.waitpid(pid, 0)
-print("PARENT_PRESENT")
-"""
-
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
-
-        assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        # Child output is lost because os._exit() doesn't flush Python buffers
-        assert "CHILD_LOST" not in result.stdout, f"Child output should be lost with os._exit: {result.stdout}"
-        assert "PARENT_PRESENT" in result.stdout, f"Parent output missing: {result.stdout}"
-
     async def test_fork_child_nonzero_exit_code_preserved(self, scheduler: Scheduler) -> None:
-        """Child sys.exit(42) propagates exit code through PID guard.
+        """Child sys.exit(42) propagates exit code through PID guard; the result is the parent's.
 
         The REPL wrapper's except SystemExit handler sets exit_code = e.code.
         The PID guard then calls os._exit(exit_code), preserving the code.
-        Parent uses waitpid to verify the child's exit status.
+        Parent uses waitpid to verify the child's exit status. Only the parent
+        writes the sentinel: result.exit_code is 0, not the child's 42.
         """
         code = """
 import os
@@ -169,14 +82,11 @@ print(f"CHILD_EXIT:{child_exit}")
 print("PARENT_OK")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "CHILD_EXIT:42" in result.stdout, f"Child exit code not preserved: {result.stdout}"
-        assert "PARENT_OK" in result.stdout, f"Parent output missing: {result.stdout}"
+        # Without the PID guard, the child's premature sentinel gives its own exit code (42)
+        assert result.exit_code == 0, f"Parent exit_code 0 expected, got {result.exit_code}: {result.stderr}"
+        assert result.stdout == "CHILD_EXIT:42\nPARENT_OK\n"
 
     async def test_fork_child_sys_exit_none_is_success(self, scheduler: Scheduler) -> None:
         """Child sys.exit(None) and sys.exit() are treated as success (exit 0).
@@ -209,14 +119,10 @@ print(f"EXIT_NONE:{exit_none}")
 print(f"EXIT_NOARG:{exit_noarg}")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "EXIT_NONE:0" in result.stdout, f"sys.exit(None) should be exit 0: {result.stdout}"
-        assert "EXIT_NOARG:0" in result.stdout, f"sys.exit() should be exit 0: {result.stdout}"
+        assert result.stdout == "EXIT_NONE:0\nEXIT_NOARG:0\n"
 
     async def test_fork_child_exception_parent_continues(self, scheduler: Scheduler) -> None:
         """Child raises ValueError; REPL wrapper catches it, PID guard fires.
@@ -237,44 +143,11 @@ print(f"CHILD_EXIT:{child_exit}")
 print("PARENT_CONTINUES")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "PARENT_CONTINUES" in result.stdout, f"Parent output missing: {result.stdout}"
-        assert "CHILD_EXIT:1" in result.stdout, f"Child should exit with code 1: {result.stdout}"
-        assert "child_error_marker" in result.stderr, f"Child traceback missing from stderr: {result.stderr}"
-
-    async def test_fork_sequential_three_children(self, scheduler: Scheduler) -> None:
-        """Three sequential fork+waitpid cycles, each child uses sys.exit(0).
-
-        Tests that repeated PID guard invocations don't corrupt REPL state.
-        """
-        code = """
-import os
-
-for i in range(3):
-    pid = os.fork()
-    if pid == 0:
-        print(f"CHILD_{i}", flush=True)
-        import sys
-        sys.exit(0)
-    os.waitpid(pid, 0)
-
-print("PARENT_ALL_DONE")
-"""
-
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
-
-        assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        for i in range(3):
-            assert f"CHILD_{i}" in result.stdout, f"Child {i} output missing: {result.stdout}"
-        assert "PARENT_ALL_DONE" in result.stdout, f"Parent output missing: {result.stdout}"
+        assert result.stdout == "CHILD_EXIT:1\nPARENT_CONTINUES\n"
+        assert "ValueError: child_error_marker" in result.stderr, result.stderr
 
 
 class TestForkStdoutWeirdCases:
@@ -309,15 +182,10 @@ os.waitpid(pid, 0)
 print("PARENT_OK")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "GRANDCHILD_OK" in result.stdout, f"Grandchild output missing: {result.stdout}"
-        assert "CHILD_OK" in result.stdout, f"Child output missing: {result.stdout}"
-        assert "PARENT_OK" in result.stdout, f"Parent output missing: {result.stdout}"
+        assert result.stdout == "GRANDCHILD_OK\nCHILD_OK\nPARENT_OK\n"
 
     async def test_fork_child_large_output_flushed(self, scheduler: Scheduler) -> None:
         """Child generates 200 lines (~10KB) with per-line flush.
@@ -341,16 +209,10 @@ os.waitpid(pid, 0)
 print("PARENT_AFTER_CHILD")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        # Verify all 200 lines are present
-        for i in range(200):
-            assert f"CHILD_LINE_{i}" in result.stdout, f"Child line {i} missing: stdout length={len(result.stdout)}"
-        assert "PARENT_AFTER_CHILD" in result.stdout, f"Parent output missing: {result.stdout}"
+        assert result.stdout == "".join(f"CHILD_LINE_{i}\n" for i in range(200)) + "PARENT_AFTER_CHILD\n"
 
     async def test_fork_child_writes_stderr(self, scheduler: Scheduler) -> None:
         """Child writes to both stdout and stderr. PID guard flushes both.
@@ -372,56 +234,22 @@ os.waitpid(pid, 0)
 print("PARENT_STDOUT")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "CHILD_STDOUT" in result.stdout, f"Child stdout missing: {result.stdout}"
-        assert "CHILD_STDERR" in result.stderr, f"Child stderr missing: {result.stderr}"
-        assert "PARENT_STDOUT" in result.stdout, f"Parent stdout missing: {result.stdout}"
+        assert result.stdout == "CHILD_STDOUT\nPARENT_STDOUT\n"
+        assert result.stderr == "CHILD_STDERR\n"
 
 
 class TestForkStdoutOutOfBounds:
     """Out of bounds: failure modes and limits."""
 
-    async def test_fork_result_exit_code_is_parent_not_child(self, scheduler: Scheduler) -> None:
-        """Child sys.exit(99), parent completes normally. result.exit_code must be 0.
-
-        This is the most direct test of the fix's correctness: without the PID
-        guard, the child's premature sentinel reports exit_code=99. With the
-        fix, only the parent writes the sentinel (exit_code=0).
-        """
-        code = """
-import os
-
-pid = os.fork()
-if pid == 0:
-    import sys
-    sys.exit(99)
-
-os.waitpid(pid, 0)
-print("PARENT_DONE")
-"""
-
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
-
-        assert result.exit_code == 0, (
-            f"Expected parent exit_code 0, got {result.exit_code} "
-            f"(child's code leaked via premature sentinel?): {result.stderr}"
-        )
-        assert "PARENT_DONE" in result.stdout, f"Parent output missing: {result.stdout}"
-
     async def test_fork_repl_state_survives_child_death(self, scheduler: Scheduler) -> None:
-        """REPL namespace is not corrupted by the fork+PID guard cycle.
+        """The REPL and its namespace survive the fork + PID guard cycle.
 
-        Sets x = 42 before fork. Child sys.exit()'s. Parent prints x after
-        waitpid. The child's copy of ns is destroyed with the child; the
-        parent's ns is unchanged.
+        The first exec sets x = 42, forks, and the child calls sys.exit(). The next
+        exec of the same session reads x: the parent REPL still runs, with its
+        namespace. The child's copy of the namespace goes with the child.
         """
         code = """
 import os
@@ -433,13 +261,10 @@ if pid == 0:
     sys.exit(0)
 
 os.waitpid(pid, 0)
-print(f"x:{x}")
 """
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as vm:
+            forked = await vm.exec(code)
+            after = await vm.exec('print(f"x:{x}")')
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
-
-        assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "x:42" in result.stdout, f"REPL state corrupted: {result.stdout}"
+        assert forked.exit_code == 0, f"Expected exit_code 0, got {forked.exit_code}: {forked.stderr}"
+        assert (after.exit_code, after.stdout.strip()) == (0, "x:42"), f"REPL state lost: {after}"

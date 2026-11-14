@@ -1,13 +1,37 @@
 """Unit tests for package validator."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
-from exec_sandbox.exceptions import PackageNotAllowedError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language
 from exec_sandbox.package_validator import PackageValidator
+
+
+def _no_version(spec: str) -> str:
+    """The whole message (a `match` pattern) for `spec`, which has no version operator after
+    a name."""
+    return (
+        "^"
+        + re.escape(
+            f"Invalid package spec: '{spec}'. Must include version specifier (e.g., pandas==2.0.0 or lodash@4.17.21)."
+        )
+        + r"\Z"
+    )
+
+
+def _not_allowed(name: str) -> str:
+    """The whole message (a `match` pattern) for the package `name`, not in the python allow-list."""
+    return (
+        "^"
+        + re.escape(
+            f"Package '{name}' not in python allow-list. Only pre-approved packages from the catalog are permitted."
+        )
+        + r"\Z"
+    )
 
 
 @pytest.fixture
@@ -63,55 +87,50 @@ async def test_not_in_allowlist_raises(validator: PackageValidator) -> None:
     """Test validation fails for packages not in allow-list."""
     packages = ["malicious-package==1.0.0"]
 
-    with pytest.raises(PackageNotAllowedError) as exc_info:
+    with pytest.raises(
+        InvalidInputError,
+        check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED,
+        match=_not_allowed("malicious-package"),
+    ):
         validator.validate(packages, language=Language.PYTHON)
-
-    assert "malicious-package" in str(exc_info.value)
-    assert "not in python allow-list" in str(exc_info.value)
 
 
 async def test_no_version_pinning_raises(validator: PackageValidator) -> None:
     """Test validation fails for packages without version pinning."""
     # Python without version - validator requires version specifier
-    with pytest.raises(PackageNotAllowedError) as exc_info:
+    with pytest.raises(
+        InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version("pandas")
+    ):
         validator.validate(["pandas"], language=Language.PYTHON)
 
-    assert "Invalid package spec" in str(exc_info.value)
-
     # JavaScript without version
-    with pytest.raises(PackageNotAllowedError) as exc_info:
+    with pytest.raises(
+        InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version("lodash")
+    ):
         validator.validate(["lodash"], language=Language.JAVASCRIPT)
-
-    assert "Invalid package spec" in str(exc_info.value)
 
 
 async def test_multiple_packages_first_fails(validator: PackageValidator) -> None:
-    """Test validation stops at first invalid package."""
+    """Validation stops at the first invalid package: the error names it, not a later invalid one."""
     packages = [
         "pandas==2.0.0",  # Valid
         "malicious==1.0.0",  # Invalid - not in allow-list
-        "numpy==1.24.0",  # Valid but not reached
+        "evil==1.0.0",  # Invalid too, but not reached
     ]
 
-    with pytest.raises(PackageNotAllowedError) as exc_info:
+    with pytest.raises(
+        InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed("malicious")
+    ):
         validator.validate(packages, language=Language.PYTHON)
-
-    assert "malicious" in str(exc_info.value)
 
 
 async def test_version_pinning_checked_before_allowlist(validator: PackageValidator) -> None:
-    """Test that both allow-list and version pinning are enforced."""
-    # Package in allow-list but no version
-    with pytest.raises(PackageNotAllowedError) as exc_info:
-        validator.validate(["pandas"], language=Language.PYTHON)
-
-    assert "Invalid package spec" in str(exc_info.value)
-
-    # Package not in allow-list with version - should fail on allow-list
-    with pytest.raises(PackageNotAllowedError) as exc_info:
-        validator.validate(["malicious==1.0.0"], language=Language.PYTHON)
-
-    assert "not in python allow-list" in str(exc_info.value)
+    """A spec with no version and a name not in the allow-list is ARGUMENT_INVALID, not
+    PACKAGE_NOT_ALLOWED: the format check comes first."""
+    with pytest.raises(
+        InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version("malicious")
+    ):
+        validator.validate(["malicious"], language=Language.PYTHON)
 
 
 async def test_empty_package_list(validator: PackageValidator) -> None:
@@ -129,24 +148,6 @@ async def test_case_insensitive_package_names(validator: PackageValidator) -> No
     validator.validate(["pAnDaS==2.0.0"], language=Language.PYTHON)  # Mixed case
 
 
-async def test_load_allow_list_from_real_catalogs() -> None:
-    """Test loading allow-lists from actual catalog files."""
-    # Use relative path from test file to resources
-    catalog_dir = Path(__file__).parent.parent / "src" / "exec_sandbox" / "resources"
-
-    pypi_catalog = catalog_dir / "pypi_top_10k.json"
-    npm_catalog = catalog_dir / "npm_top_10k.json"
-
-    validator = await PackageValidator.create(
-        pypi_allow_list_path=pypi_catalog,
-        npm_allow_list_path=npm_catalog,
-    )
-
-    # Test with packages from real catalogs
-    validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
-    validator.validate(["lodash@4.17.21"], language=Language.JAVASCRIPT)
-
-
 # =============================================================================
 # Python Version Specifier Tests
 # =============================================================================
@@ -154,10 +155,6 @@ async def test_load_allow_list_from_real_catalogs() -> None:
 
 class TestPythonVersionSpecifiers:
     """Test various Python version specifier formats."""
-
-    async def test_exact_version(self, validator: PackageValidator) -> None:
-        """Test exact version pin with ==."""
-        validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
 
     async def test_greater_than_or_equal(self, validator: PackageValidator) -> None:
         """Test >= version specifier."""
@@ -180,11 +177,11 @@ class TestPythonVersionSpecifiers:
         validator.validate(["pandas~=2.0.0"], language=Language.PYTHON)
 
     async def test_not_equal(self, validator: PackageValidator) -> None:
-        """Test != exclusion specifier - should fail (no = after !)."""
-        # The regex pattern is [@=<>~], so != starts with ! which doesn't match
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        """The != exclusion specifier is refused: "!" is not a name character and no version operator starts with it."""
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version("pandas!=2.0.0")
+        ):
             validator.validate(["pandas!=2.0.0"], language=Language.PYTHON)
-        assert "Invalid package spec" in str(exc_info.value)
 
     async def test_prerelease_version(self, validator: PackageValidator) -> None:
         """Test pre-release version formats."""
@@ -210,28 +207,8 @@ class TestPythonVersionSpecifiers:
 # =============================================================================
 
 
-@pytest.fixture
-def validator_with_scoped(tmp_path: Path) -> tuple[Path, Path]:
-    """Create validator with scoped npm packages in allowlist."""
-    pypi_catalog = tmp_path / "pypi.json"
-    npm_catalog = tmp_path / "npm.json"
-
-    pypi_packages = ["pandas"]
-    # Include scoped packages in allowlist
-    npm_packages = ["lodash", "@types/node", "@babel/core", "@org/pkg"]
-
-    pypi_catalog.write_text(json.dumps(pypi_packages))
-    npm_catalog.write_text(json.dumps(npm_packages))
-
-    return pypi_catalog, npm_catalog
-
-
 class TestJavaScriptEdgeCases:
     """Test JavaScript/npm specific edge cases."""
-
-    async def test_simple_package_with_at(self, validator: PackageValidator) -> None:
-        """Test simple package with @ version specifier."""
-        validator.validate(["lodash@4.17.21"], language=Language.JAVASCRIPT)
 
     async def test_scoped_package_not_supported(self, tmp_path: Path) -> None:
         """Test that scoped packages (@org/pkg) are NOT supported by current regex.
@@ -250,9 +227,12 @@ class TestJavaScriptEdgeCases:
         )
 
         # Scoped packages fail because @ at start doesn't match the pattern
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=_no_version("@types/node@18.0.0"),
+        ):
             validator.validate(["@types/node@18.0.0"], language=Language.JAVASCRIPT)
-        assert "Invalid package spec" in str(exc_info.value)
 
     async def test_double_at_passes_extracts_name(self, validator: PackageValidator) -> None:
         """Test that double @@ extracts package name before first @.
@@ -286,21 +266,24 @@ class TestMalformedInputs:
 
     async def test_empty_string(self, validator: PackageValidator) -> None:
         """Test empty string package name."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version("")
+        ):
             validator.validate([""], language=Language.PYTHON)
-        assert "Invalid package spec" in str(exc_info.value)
 
     async def test_whitespace_only(self, validator: PackageValidator) -> None:
         """Test whitespace-only package name."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version("   ")
+        ):
             validator.validate(["   "], language=Language.PYTHON)
-        assert "Invalid package spec" in str(exc_info.value)
 
     async def test_only_version_specifier(self, validator: PackageValidator) -> None:
         """Test version specifier without package name."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version("==2.0.0")
+        ):
             validator.validate(["==2.0.0"], language=Language.PYTHON)
-        assert "Invalid package spec" in str(exc_info.value)
 
     async def test_special_characters_in_name(self, validator: PackageValidator) -> None:
         """Test special characters that aren't allowed in package names."""
@@ -313,50 +296,64 @@ class TestMalformedInputs:
             "pandas*==2.0.0",  # * not allowed
         ]
         for spec in invalid_specs:
-            with pytest.raises(PackageNotAllowedError) as exc_info:
+            with pytest.raises(
+                InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version(spec)
+            ):
                 validator.validate([spec], language=Language.PYTHON)
-            assert "Invalid package spec" in str(exc_info.value), f"Failed for: {spec}"
 
     async def test_unicode_in_package_name(self, validator: PackageValidator) -> None:
         """Test unicode characters in package name."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version("pändäs==2.0.0")
+        ):
             validator.validate(["pändäs==2.0.0"], language=Language.PYTHON)
-        assert "Invalid package spec" in str(exc_info.value)
 
     async def test_emoji_in_package_name(self, validator: PackageValidator) -> None:
         """Test emoji in package name."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=_no_version("pandas🐼==2.0.0"),
+        ):
             validator.validate(["pandas🐼==2.0.0"], language=Language.PYTHON)
-        assert "Invalid package spec" in str(exc_info.value)
 
     async def test_newline_in_package_spec(self, validator: PackageValidator) -> None:
         """Test newline injection attempt."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=_no_version("pandas\n==2.0.0"),
+        ):
             validator.validate(["pandas\n==2.0.0"], language=Language.PYTHON)
-        assert "Invalid package spec" in str(exc_info.value)
 
     async def test_null_byte_in_package_spec(self, validator: PackageValidator) -> None:
         """Test null byte injection attempt."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=_no_version("pandas\x00==2.0.0"),
+        ):
             validator.validate(["pandas\x00==2.0.0"], language=Language.PYTHON)
-        assert "Invalid package spec" in str(exc_info.value)
 
     async def test_very_long_package_name(self, validator: PackageValidator) -> None:
         """Test extremely long package name."""
-        long_name = "a" * 10000 + "==1.0.0"
-        with pytest.raises(PackageNotAllowedError) as exc_info:
-            validator.validate([long_name], language=Language.PYTHON)
         # Should fail on allowlist check (not in list), not crash
-        assert "not in python allow-list" in str(exc_info.value)
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed("a" * 10000)
+        ):
+            validator.validate(["a" * 10000 + "==1.0.0"], language=Language.PYTHON)
 
     async def test_path_traversal_attempt(self, validator: PackageValidator) -> None:
         """Test path traversal in package name."""
         # Dots are allowed in package names, so ../../../ would parse
         # but wouldn't be in allowlist
-        with pytest.raises(PackageNotAllowedError) as exc_info:
-            validator.validate(["../../../etc/passwd==1.0"], language=Language.PYTHON)
         # The dots and slashes - slash not allowed, so invalid spec
-        assert "Invalid package spec" in str(exc_info.value)
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=_no_version("../../../etc/passwd==1.0"),
+        ):
+            validator.validate(["../../../etc/passwd==1.0"], language=Language.PYTHON)
 
     async def test_command_injection_attempt(self, validator: PackageValidator) -> None:
         """Test command injection patterns."""
@@ -368,9 +365,10 @@ class TestMalformedInputs:
             "pandas$(whoami)==1.0",
         ]
         for attempt in injection_attempts:
-            with pytest.raises(PackageNotAllowedError) as exc_info:
+            with pytest.raises(
+                InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version(attempt)
+            ):
                 validator.validate([attempt], language=Language.PYTHON)
-            assert "Invalid package spec" in str(exc_info.value), f"Failed for: {attempt}"
 
 
 # =============================================================================
@@ -466,10 +464,13 @@ class TestPackageNameFormats:
         Note: Current implementation doesn't handle extras - the [ character
         is not in the allowed pattern, so this will fail.
         """
-        with pytest.raises(PackageNotAllowedError) as exc_info:
-            validator.validate(["requests[security]==2.31.0"], language=Language.PYTHON)
         # [ is not in the pattern, so it fails to parse
-        assert "Invalid package spec" in str(exc_info.value)
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=_no_version("requests[security]==2.31.0"),
+        ):
+            validator.validate(["requests[security]==2.31.0"], language=Language.PYTHON)
 
 
 # =============================================================================
@@ -492,53 +493,61 @@ class TestInvalidPackageNameFormats:
 
     async def test_name_starting_with_underscore(self, validator: PackageValidator) -> None:
         """Underscores at start are invalid for PyPI/npm but pass regex."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
-            validator.validate(["_private==1.0.0"], language=Language.PYTHON)
         # Passes regex, fails allowlist
-        assert "not in python allow-list" in str(exc_info.value)
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed("_private")
+        ):
+            validator.validate(["_private==1.0.0"], language=Language.PYTHON)
 
     async def test_name_starting_with_hyphen(self, validator: PackageValidator) -> None:
         """Hyphens at start are invalid for PyPI/npm but pass regex."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed("-pkg")
+        ):
             validator.validate(["-pkg==1.0.0"], language=Language.PYTHON)
-        assert "not in python allow-list" in str(exc_info.value)
 
     async def test_name_starting_with_dot(self, validator: PackageValidator) -> None:
         """Dots at start are invalid for PyPI/npm but pass regex."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed(".hidden")
+        ):
             validator.validate([".hidden==1.0.0"], language=Language.PYTHON)
-        assert "not in python allow-list" in str(exc_info.value)
 
     async def test_name_only_dots(self, validator: PackageValidator) -> None:
         """Names with only dots are invalid but pass regex."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed("...")
+        ):
             validator.validate(["...==1.0.0"], language=Language.PYTHON)
-        assert "not in python allow-list" in str(exc_info.value)
 
     async def test_name_only_underscores(self, validator: PackageValidator) -> None:
         """Names with only underscores are invalid but pass regex."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed("___")
+        ):
             validator.validate(["___==1.0.0"], language=Language.PYTHON)
-        assert "not in python allow-list" in str(exc_info.value)
 
     async def test_name_only_hyphens(self, validator: PackageValidator) -> None:
         """Names with only hyphens are invalid but pass regex."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed("---")
+        ):
             validator.validate(["---==1.0.0"], language=Language.PYTHON)
-        assert "not in python allow-list" in str(exc_info.value)
 
     async def test_trailing_space_before_specifier(self, validator: PackageValidator) -> None:
         """Trailing space before specifier fails regex (good behavior)."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
-            validator.validate(["pandas ==1.0.0"], language=Language.PYTHON)
         # Space breaks the pattern, so "Invalid package spec"
-        assert "Invalid package spec" in str(exc_info.value)
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version("pandas ==1.0.0")
+        ):
+            validator.validate(["pandas ==1.0.0"], language=Language.PYTHON)
 
     async def test_leading_space_in_name(self, validator: PackageValidator) -> None:
         """Leading space in name fails regex."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version(" pandas==1.0.0")
+        ):
             validator.validate([" pandas==1.0.0"], language=Language.PYTHON)
-        assert "Invalid package spec" in str(exc_info.value)
 
 
 # =============================================================================
@@ -552,17 +561,18 @@ class TestSecurityCases:
     async def test_typosquatting_not_in_allowlist(self, validator: PackageValidator) -> None:
         """Test that typosquatting attempts fail (not in allowlist)."""
         typosquats = [
-            "pandass==2.0.0",  # Extra 's'
-            "panda==2.0.0",  # Missing 's'
-            "panadas==2.0.0",  # Transposed
-            "pandas2==2.0.0",  # Added number
-            "numppy==1.0.0",  # Extra 'p'
-            "requets==2.0.0",  # Missing 's'
+            "pandass",  # Extra 's'
+            "panda",  # Missing 's'
+            "panadas",  # Transposed
+            "pandas2",  # Added number
+            "numppy",  # Extra 'p'
+            "requets",  # Missing 's'
         ]
         for typo in typosquats:
-            with pytest.raises(PackageNotAllowedError) as exc_info:
-                validator.validate([typo], language=Language.PYTHON)
-            assert "not in python allow-list" in str(exc_info.value), f"Failed for: {typo}"
+            with pytest.raises(
+                InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed(typo)
+            ):
+                validator.validate([f"{typo}==2.0.0"], language=Language.PYTHON)
 
     async def test_homoglyph_attack(self, validator: PackageValidator) -> None:
         """Test homoglyph/lookalike character attacks."""
@@ -573,7 +583,7 @@ class TestSecurityCases:
             "pandаs==2.0.0",  # noqa: RUF001, RUF003 - Intentional Cyrillic 'а'
         ]
         for attack in homoglyphs:
-            with pytest.raises(PackageNotAllowedError):
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
                 validator.validate([attack], language=Language.PYTHON)
 
     async def test_allowlist_bypass_case_sensitivity(self, tmp_path: Path) -> None:
@@ -601,7 +611,7 @@ class TestSecurityCases:
 
     async def test_url_in_package_spec(self, validator: PackageValidator) -> None:
         """Test URL-based package specs are rejected."""
-        with pytest.raises(PackageNotAllowedError):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
             validator.validate(
                 ["https://evil.com/malware.tar.gz"],
                 language=Language.PYTHON,
@@ -609,7 +619,7 @@ class TestSecurityCases:
 
     async def test_git_url_in_package_spec(self, validator: PackageValidator) -> None:
         """Test git URL package specs are rejected."""
-        with pytest.raises(PackageNotAllowedError):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
             validator.validate(
                 ["git+https://github.com/user/repo.git"],
                 language=Language.PYTHON,
@@ -626,48 +636,12 @@ class TestLanguageTypeHandling:
 
     async def test_raw_language_raises_clear_error(self, validator: PackageValidator) -> None:
         """Language.RAW has no allow-list and should raise a descriptive error."""
-        with pytest.raises(PackageNotAllowedError) as exc_info:
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=r"^Package validation not supported for 'raw' language\. Supported: javascript, python\.\Z",
+        ):
             validator.validate(["some-pkg==1.0.0"], language=Language.RAW)
-
-        assert "not supported" in str(exc_info.value)
-        assert "raw" in str(exc_info.value)
-        assert "python" in str(exc_info.value)
-        assert "javascript" in str(exc_info.value)
-
-    async def test_raw_language_single_package_raises(self, validator: PackageValidator) -> None:
-        """Language.RAW with a single valid-format package should raise on missing allow-list."""
-        with pytest.raises(PackageNotAllowedError):
-            validator.validate(["pkg==1.0"], language=Language.RAW)
-
-
-# =============================================================================
-# is_allowed() Method Tests
-# =============================================================================
-
-
-class TestIsAllowedMethod:
-    """Test the is_allowed() helper method."""
-
-    async def test_is_allowed_returns_true(self, validator: PackageValidator) -> None:
-        """Test is_allowed returns True for allowed packages."""
-        assert validator.is_allowed("pandas", "python") is True
-        assert validator.is_allowed("lodash", "javascript") is True
-
-    async def test_is_allowed_returns_false(self, validator: PackageValidator) -> None:
-        """Test is_allowed returns False for non-allowed packages."""
-        assert validator.is_allowed("malicious", "python") is False
-        assert validator.is_allowed("evil-pkg", "javascript") is False
-
-    async def test_is_allowed_case_insensitive(self, validator: PackageValidator) -> None:
-        """Test is_allowed is case-insensitive."""
-        assert validator.is_allowed("PANDAS", "python") is True
-        assert validator.is_allowed("PaNdAs", "python") is True
-        assert validator.is_allowed("LODASH", "javascript") is True
-
-    async def test_is_allowed_unknown_language(self, validator: PackageValidator) -> None:
-        """Test is_allowed with unknown language returns False."""
-        assert validator.is_allowed("pandas", "rust") is False
-        assert validator.is_allowed("pandas", "unknown") is False
 
 
 # =============================================================================
@@ -699,7 +673,7 @@ class TestPackageValidatorCreate:
         )
 
         # With empty catalog, ALL packages should fail
-        with pytest.raises(PackageNotAllowedError):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED):
             validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
 
     async def test_create_with_invalid_json_raises(self, tmp_path: Path) -> None:
@@ -716,16 +690,16 @@ class TestPackageValidatorCreate:
             )
 
     async def test_create_uses_default_paths(self) -> None:
-        """Test that create() uses default bundled catalog paths."""
+        """With no paths, create() loads the catalogs shipped in the package."""
         # Should not raise - uses default bundled catalogs
         validator = await PackageValidator.create()
 
         # Should have loaded real packages from catalogs
-        assert validator.is_allowed("pandas", "python") is True
-        assert validator.is_allowed("lodash", "javascript") is True
+        validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
+        validator.validate(["lodash@4.17.21"], language=Language.JAVASCRIPT)
 
     async def test_create_with_duplicate_packages_in_catalog(self, tmp_path: Path) -> None:
-        """Test that duplicate packages in catalog are deduplicated."""
+        """A name that the catalog lists more than once, in any case, is still allowed."""
         pypi_catalog = tmp_path / "pypi.json"
         npm_catalog = tmp_path / "npm.json"
         pypi_catalog.write_text(json.dumps(["pandas", "pandas", "PANDAS"]))
@@ -738,3 +712,4 @@ class TestPackageValidatorCreate:
 
         # Should work despite duplicates
         validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
+        validator.validate(["PANDAS==2.0.0"], language=Language.PYTHON)

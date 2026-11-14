@@ -2,8 +2,8 @@
 # CI resource monitor for runner crash diagnosis
 # Prints system metrics every MONITOR_INTERVAL seconds to stderr, prefixed with [MONITOR].
 # Uses stderr to avoid interleaving with pytest stdout mid-line.
-# GitHub Actions captures both fds, so metrics printed before a crash
-# will be visible even if the runner dies (no logs survive a hard kill).
+# GitHub Actions streams both fds to the job log, so the metrics printed
+# before a runner crash stay visible; a hard kill leaves no other logs.
 #
 # Usage: ./scripts/ci-resource-monitor.sh &
 # Environment: MONITOR_INTERVAL=30 (default)
@@ -21,7 +21,13 @@ OS="$(uname -s)"
 # Cleanup
 # ============================================================================
 
+# The sleep between samples (see Main): it ends with the monitor
+sleep_pid=""
+
 cleanup() {
+    if [[ -n "$sleep_pid" ]]; then
+        kill "$sleep_pid" 2>/dev/null || true
+    fi
     exit 0
 }
 trap cleanup SIGTERM SIGINT
@@ -186,8 +192,13 @@ collect() {
     esac
 }
 
-# First sample immediately, then every INTERVAL seconds
+# First sample immediately, then every INTERVAL seconds. The sleep runs in the
+# background: bash runs a trap only once its foreground command ends, while `wait`
+# returns at once on a signal, so the caller's kill + wait takes no INTERVAL.
 collect
-while sleep "$INTERVAL"; do
+while true; do
+    sleep "$INTERVAL" &
+    sleep_pid=$!
+    wait "$sleep_pid"
     collect
 done
