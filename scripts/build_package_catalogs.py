@@ -5,8 +5,9 @@
 # ///
 """Build package allow-lists from PyPI and npm registries.
 
-Fetches top N packages by download count to create security allow-lists.
-Run during `make upgrade` to keep catalogs fresh with dependencies.
+Fetches the top N packages by download count to make security allow-lists.
+`make upgrade` runs it (target build-catalogs), which writes
+pypi_top_10k.json and npm_top_10k.json to src/exec_sandbox/resources.
 """
 
 import asyncio
@@ -16,14 +17,15 @@ from pathlib import Path
 import aiohttp
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+# Packages kept per registry (the file names say 10k).
+TOP_N = 10_000
 
-async def fetch_pypi_top_packages(limit: int = 10_000) -> list[str]:
-    """Fetch top PyPI packages by download count.
 
-    Uses pypistats.org API (BigQuery data, updated daily).
+async def fetch_pypi_top_packages() -> list[str]:
+    """Fetch the TOP_N PyPI packages by download count.
 
-    Args:
-        limit: Number of top packages to fetch
+    Uses the hugovk/top-pypi-packages list (downloads of the last 30 days,
+    from the PyPI BigQuery dataset).
 
     Returns:
         List of package names sorted by download count
@@ -47,18 +49,15 @@ async def fetch_pypi_top_packages(limit: int = 10_000) -> list[str]:
     data = await fetch_pypi_data()
 
     # Extract package names from rows
-    return [row["project"] for row in data["rows"][:limit]]
+    return [row["project"] for row in data["rows"][:TOP_N]]
 
 
-async def fetch_npm_top_packages(limit: int = 10_000) -> list[str]:
-    """Fetch top npm packages from static GitHub list.
+async def fetch_npm_top_packages() -> list[str]:
+    """Fetch the TOP_N npm packages from static GitHub list.
 
     Uses evanwashere/top-npm-packages which ranks packages by monthly downloads.
     npm's search API has restrictions (no single-letter searches, rate limits, complex pagination).
     Static list is simpler and sufficient for security allow-list (rarely changes).
-
-    Args:
-        limit: Number of top packages to fetch
 
     Returns:
         List of package names sorted by download popularity (most popular first)
@@ -90,26 +89,24 @@ async def fetch_npm_top_packages(limit: int = 10_000) -> list[str]:
         return []
 
     packages = await fetch_list()
-    return packages[:limit]
+    return packages[:TOP_N]
 
 
-async def build_catalogs(output_dir: Path, pypi_limit: int = 10_000, npm_limit: int = 10_000) -> None:
+async def build_catalogs(output_dir: Path) -> None:
     """Build package catalogs for PyPI and npm.
 
     Args:
         output_dir: Directory to write JSON catalog files
-        pypi_limit: Number of top PyPI packages
-        npm_limit: Number of top npm packages
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"📦 Fetching top {pypi_limit} PyPI packages...")
-    print(f"📦 Fetching top {npm_limit} npm packages...")
+    print(f"📦 Fetching top {TOP_N} PyPI packages...")
+    print(f"📦 Fetching top {TOP_N} npm packages...")
 
     # Fetch in parallel
     pypi_packages, npm_packages = await asyncio.gather(
-        fetch_pypi_top_packages(pypi_limit),
-        fetch_npm_top_packages(npm_limit),
+        fetch_pypi_top_packages(),
+        fetch_npm_top_packages(),
     )
 
     # Write catalogs

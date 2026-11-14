@@ -1,7 +1,7 @@
 """Package validation for code execution safety.
 
-Package catalogs built at development time (make upgrade → make build-catalogs).
-No runtime network calls, catalogs bundled in container.
+Package catalogs built at development time (make upgrade → make build-catalogs)
+and shipped in the package (resources/). No network call at run time.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language  # noqa: TC001 - Used at runtime (language.value)
 
 # Package name extraction pattern
-# Matches: alphanumeric, underscore, hyphen, dot followed by version operator
-# Python: ==, ~=, >=, <=, !=, >, <
+# Matches: alphanumeric, underscore, hyphen, dot followed by the first character of a version operator
+# Python: ==, ~=, >=, <=, >, < (not !=: "!" is not a name character, so no match)
 # JavaScript: @
 _PACKAGE_NAME_PATTERN = re.compile(r"^([a-zA-Z0-9_\-\.]+)[@=<>~]")
 
@@ -27,10 +27,10 @@ class PackageValidator:
     Security mechanism to prevent execution of arbitrary packages.
     Only packages from curated allow-lists are permitted.
 
-    Version validation is enforced at schema level via Pydantic.
-    This validator only checks allow-list membership.
+    It also refuses a spec with no version operator (_PACKAGE_NAME_PATTERN). It
+    does not check the version itself: the guest agent checks the whole spec.
 
-    Catalogs are built at dev time and bundled in container (no runtime fetching).
+    Catalogs are built at dev time and shipped in the package (no runtime fetching).
 
     Use the async factory method `create()` to instantiate. It parses about
     400 KB of JSON: create one validator and reuse it.
@@ -88,8 +88,6 @@ class PackageValidator:
     def validate(self, packages: list[str], language: Language) -> None:
         """Validate packages against allow-list.
 
-        Version validation is handled at schema level.
-
         Args:
             packages: List of package specifiers (e.g., ["pandas==2.0.0", "lodash@4.17.21"])
             language: Programming language to validate for
@@ -113,7 +111,7 @@ class PackageValidator:
         for package_spec in packages:
             match = _PACKAGE_NAME_PATTERN.match(package_spec)
             if not match:
-                # Should never happen due to schema validation, but defensive
+                # No version operator after the name (VmSpec does not check the specs)
                 raise InvalidInputError(
                     f"Invalid package spec: '{package_spec}'. "
                     f"Must include version specifier (e.g., pandas==2.0.0 or lodash@4.17.21).",
@@ -123,7 +121,7 @@ class PackageValidator:
                     instance_id=None,
                 )
 
-            base_name = match.group(1).strip().lower()
+            base_name = match.group(1).lower()
 
             # Check if package is in allow-list
             if base_name not in allow_list:

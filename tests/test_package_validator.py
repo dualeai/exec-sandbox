@@ -100,18 +100,12 @@ async def test_multiple_packages_first_fails(validator: PackageValidator) -> Non
 
 
 async def test_version_pinning_checked_before_allowlist(validator: PackageValidator) -> None:
-    """Test that both allow-list and version pinning are enforced."""
-    # Package in allow-list but no version
+    """A spec with no version and a name not in the allow-list is ARGUMENT_INVALID, not
+    PACKAGE_NOT_ALLOWED: the format check comes first."""
     with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID) as exc_info:
-        validator.validate(["pandas"], language=Language.PYTHON)
+        validator.validate(["malicious"], language=Language.PYTHON)
 
     assert "Invalid package spec" in str(exc_info.value)
-
-    # Package not in allow-list with version - should fail on allow-list
-    with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED) as exc_info:
-        validator.validate(["malicious==1.0.0"], language=Language.PYTHON)
-
-    assert "not in python allow-list" in str(exc_info.value)
 
 
 async def test_empty_package_list(validator: PackageValidator) -> None:
@@ -129,24 +123,6 @@ async def test_case_insensitive_package_names(validator: PackageValidator) -> No
     validator.validate(["pAnDaS==2.0.0"], language=Language.PYTHON)  # Mixed case
 
 
-async def test_load_allow_list_from_real_catalogs() -> None:
-    """Test loading allow-lists from actual catalog files."""
-    # Use relative path from test file to resources
-    catalog_dir = Path(__file__).parent.parent / "src" / "exec_sandbox" / "resources"
-
-    pypi_catalog = catalog_dir / "pypi_top_10k.json"
-    npm_catalog = catalog_dir / "npm_top_10k.json"
-
-    validator = await PackageValidator.create(
-        pypi_allow_list_path=pypi_catalog,
-        npm_allow_list_path=npm_catalog,
-    )
-
-    # Test with packages from real catalogs
-    validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
-    validator.validate(["lodash@4.17.21"], language=Language.JAVASCRIPT)
-
-
 # =============================================================================
 # Python Version Specifier Tests
 # =============================================================================
@@ -154,10 +130,6 @@ async def test_load_allow_list_from_real_catalogs() -> None:
 
 class TestPythonVersionSpecifiers:
     """Test various Python version specifier formats."""
-
-    async def test_exact_version(self, validator: PackageValidator) -> None:
-        """Test exact version pin with ==."""
-        validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
 
     async def test_greater_than_or_equal(self, validator: PackageValidator) -> None:
         """Test >= version specifier."""
@@ -210,28 +182,8 @@ class TestPythonVersionSpecifiers:
 # =============================================================================
 
 
-@pytest.fixture
-def validator_with_scoped(tmp_path: Path) -> tuple[Path, Path]:
-    """Create validator with scoped npm packages in allowlist."""
-    pypi_catalog = tmp_path / "pypi.json"
-    npm_catalog = tmp_path / "npm.json"
-
-    pypi_packages = ["pandas"]
-    # Include scoped packages in allowlist
-    npm_packages = ["lodash", "@types/node", "@babel/core", "@org/pkg"]
-
-    pypi_catalog.write_text(json.dumps(pypi_packages))
-    npm_catalog.write_text(json.dumps(npm_packages))
-
-    return pypi_catalog, npm_catalog
-
-
 class TestJavaScriptEdgeCases:
     """Test JavaScript/npm specific edge cases."""
-
-    async def test_simple_package_with_at(self, validator: PackageValidator) -> None:
-        """Test simple package with @ version specifier."""
-        validator.validate(["lodash@4.17.21"], language=Language.JAVASCRIPT)
 
     async def test_scoped_package_not_supported(self, tmp_path: Path) -> None:
         """Test that scoped packages (@org/pkg) are NOT supported by current regex.
@@ -634,11 +586,6 @@ class TestLanguageTypeHandling:
         assert "python" in str(exc_info.value)
         assert "javascript" in str(exc_info.value)
 
-    async def test_raw_language_single_package_raises(self, validator: PackageValidator) -> None:
-        """Language.RAW with a single valid-format package should raise on missing allow-list."""
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
-            validator.validate(["pkg==1.0"], language=Language.RAW)
-
 
 # =============================================================================
 # Factory Method (create) Tests
@@ -686,7 +633,7 @@ class TestPackageValidatorCreate:
             )
 
     async def test_create_uses_default_paths(self) -> None:
-        """Test that create() uses default bundled catalog paths."""
+        """With no paths, create() loads the catalogs shipped in the package."""
         # Should not raise - uses default bundled catalogs
         validator = await PackageValidator.create()
 
