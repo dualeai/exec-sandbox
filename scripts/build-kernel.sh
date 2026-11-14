@@ -12,6 +12,13 @@
 # Cross-compilation via musl.cc toolchains (same as build-guest-agent.sh).
 # BuildKit cache mounts for kernel source, ccache, and toolchains.
 #
+# Next to vmlinuz-<arch>, the build writes vmlinuz-<arch>.map, the System.map
+# of that build. The kernel has no symbol table (KALLSYMS off), so a stack in
+# the guest's [repl-timeout] log has addresses only; look them up in this file.
+# Never published (CI and the release upload named files only; 1.3 MB for
+# aarch64): it is for developers. A cache hit keeps the map of the build that
+# made the kernel; for an older kernel, delete vmlinuz-<arch> and build again.
+#
 # Usage:
 #   ./scripts/build-kernel.sh              # Build for current arch
 #   ./scripts/build-kernel.sh x86_64       # Build for x86_64
@@ -267,9 +274,10 @@ RUN --mount=type=cache,target=/root/.ccache \
         cp arch/x86/boot/bzImage /vmlinuz-${ARCH}; \
     else \
         cp arch/${KERNEL_ARCH}/boot/${KERNEL_IMAGE} /vmlinuz-${ARCH}; \
-    fi
+    fi && \
+    cp System.map /vmlinuz-${ARCH}.map
 
-# Output stage
+# Output stage (vmlinuz-* also takes the .map)
 FROM scratch
 COPY --from=builder /vmlinuz-* .
 DOCKERFILE
