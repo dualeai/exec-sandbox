@@ -1,7 +1,6 @@
-"""Tests for DiskSnapshotManager.
-
-Unit tests: Cache key computation, filesystem operations.
-Integration tests: Snapshot creation with QEMU (requires images).
+"""Tests for DiskSnapshotManager: the L2 cache (local qcow2 layers), the L3 cache (S3), and the
+build of a layer. Most go through check_cache and get_or_create_snapshot; the build's VM is a
+stub (no VM boots), but for one test that needs hardware acceleration.
 """
 
 import asyncio
@@ -9,12 +8,13 @@ import errno
 import hashlib
 import logging
 import os
-import platform
+import re
 import shutil
+import stat
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from botocore.loaders import Loader
 
 # Use native zstd (Python 3.14+) or backports.zstd
 if sys.version_info >= (3, 14):
@@ -29,8 +30,9 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
-from exec_sandbox import __version__, constants
-from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager, _classify_install_error
+from exec_sandbox import constants
+from exec_sandbox._imports import _api_models
+from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
@@ -39,16 +41,143 @@ from exec_sandbox.exceptions import (
     OutcomeUnknownError,
     TransientError,
 )
+from exec_sandbox.files.locks import EntryLease
 from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
-from exec_sandbox.guest_channel import StreamResult
+from exec_sandbox.guest_channel import StreamDeadlineExceededError, StreamResult
 from exec_sandbox.hash_utils import fingerprint
+from exec_sandbox.images import BASE_IMAGES, GuestImages, image_digest
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import Language
+from exec_sandbox.platform_utils import HostArch
 from exec_sandbox.settings import Settings
 from exec_sandbox.subprocess_utils import communicate_managed_process
 from exec_sandbox.vm_manager import VmManager
+from tests.s3_faults import BUCKET
 
 from .conftest import create_test_qcow2, random_test_id, skip_unless_hwaccel
+from .instance_support import NO_VM_TIMEOUT
+from .test_files_locks import evictable, leased_here, leased_in_child
+
+_VERSION = "1.22.3"
+"""The library version while a test runs (make_keyed_manager): a key holds its major.minor."""
+
+_PYTHON_BASE = b"python base image"
+"""The python base image of make_keyed_manager. SHA-256 (shasum -a 256):
+6dd92b6803cad3cd9acb764c9dc1ac30dfe0a0e4de6f608f84aebab9c06e4d90."""
+
+_NODE_BASE = b"node base image"
+"""The javascript base image of make_keyed_manager."""
+
+_PACKAGES = ["requests==2.31.0", "numpy==1.26.0"]
+
+_KEY = (
+    "python-v1.22-6dd92b6803cad3cd9acb764c9dc1ac30dfe0a0e4de6f608f84aebab9c06e4d90"
+    "-f22d59c83f988d549e792451b3b5d20807f43532befdc983ef4671596cc14f05"
+)
+"""The L2 key of python _PACKAGES on make_keyed_manager, computed by hand (shasum -a 256): the
+language, v and the library major.minor, the SHA-256 of the base image, then the SHA-256 of the
+sorted packages, each after its byte length and a colon ("13:numpy==1.26.016:requests==2.31.0")."""
+
+_BASE_KEY = "python-v1.22-6dd92b6803cad3cd9acb764c9dc1ac30dfe0a0e4de6f608f84aebab9c06e4d90-base"
+"""The L2 key of the python base image with no packages."""
+
+_L3_OBJECT = f"snapshots/{_KEY}.qcow2.zst"
+"""The S3 object of the _KEY layer (the default prefix, snapshots/)."""
+
+
+@pytest.fixture
+def make_keyed_manager(make_vm_settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    """(DiskSnapshotManager, Settings) whose keys the tests know (_KEY, _BASE_KEY): the library
+    version is _VERSION and the base images hold _PYTHON_BASE and _NODE_BASE. Its VmManager is
+    not started: a lookup, a download and an upload use only its images, and a start (host
+    probes, qemu-storage-daemon) costs ~0.15 s per test."""
+    monkeypatch.setattr("exec_sandbox.disk_snapshot_manager.__version__", _VERSION)
+    images = tmp_path / "images"
+    images.mkdir()
+
+    async def _make(**overrides: Any) -> tuple[DiskSnapshotManager, Settings]:
+        settings = make_vm_settings(
+            **{
+                "base_images_dir": images,
+                "kernel_path": images,
+                "disk_snapshot_cache_dir": tmp_path / "cache",
+                **overrides,
+            }
+        )
+        vm_manager = VmManager(settings)
+        for language, content in ((Language.PYTHON, _PYTHON_BASE), (Language.JAVASCRIPT, _NODE_BASE)):
+            image = images / BASE_IMAGES[language].file_name(vm_manager.arch)
+            if not image.exists():
+                image.write_bytes(content)
+        settings.disk_snapshot_cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return DiskSnapshotManager(settings, vm_manager), settings
+
+    return _make
+
+
+async def _checked(manager: DiskSnapshotManager, language: Language, packages: list[str]) -> Path | None:
+    """check_cache of `language` and `packages`: the image path on a hit, else None. The lease
+    goes after."""
+    lease = await manager.check_cache(language, packages)
+    if lease is None:
+        return None
+    lease.release()
+    return lease.path
+
+
+def entry_bytes(entry: Path) -> int:
+    """Disk blocks of an L2 entry and its digest sidecar, in bytes (what an eviction gives back)."""
+    sidecar = entry.with_name(f"{entry.name}.sha256")
+    return sum(p.stat().st_blocks * 512 for p in (entry, sidecar) if p.exists())
+
+
+async def _built_path(snapshot: Awaitable[EntryLease]) -> Path:
+    """The path of a snapshot that get_or_create_snapshot leased; the lease goes (no VM uses it here)."""
+    lease = await snapshot
+    lease.release()
+    return lease.path
+
+
+def _entries(cache_dir: Path) -> list[str]:
+    """The cache folder listing, without the lock files of builds and leases."""
+    return sorted(p.name for p in cache_dir.iterdir() if not p.name.endswith(".lock"))
+
+
+class _BuildStartedError(Exception):
+    """Raised by the build stub of _lookup: an L3 miss started a build."""
+
+
+async def _lookup(manager: DiskSnapshotManager) -> Path | None:
+    """get_or_create_snapshot of python _PACKAGES: the image on an L2 or L3 hit, None when the
+    lookup started a build (a stub that raises _BuildStartedError: no VM boots here)."""
+    with patch.object(manager, "_create_snapshot", AsyncMock(side_effect=_BuildStartedError)):
+        try:
+            return await _built_path(
+                manager.get_or_create_snapshot(Language.PYTHON, _PACKAGES, tenant_id="t", task_id="t", memory_mb=256)
+            )
+        except _BuildStartedError:
+            return None
+
+
+async def _build(manager: DiskSnapshotManager, packages: list[str], content: bytes) -> Path:
+    """get_or_create_snapshot of python `packages` with nothing in L2 or L3: the build (a stub
+    that writes `content` at the path of its key, no VM) and its upload, which stop() waits for."""
+
+    async def build(*_args: object, cache_key: str, **_kwargs: object) -> Path:
+        built = manager.cache_dir / f"{cache_key}.qcow2"
+        built.write_bytes(content)
+        return built
+
+    with patch.object(manager, "_create_snapshot", side_effect=build):
+        path = await _built_path(
+            manager.get_or_create_snapshot(Language.PYTHON, packages, tenant_id="t", task_id="t", memory_mb=256)
+        )
+    await manager.stop()
+    return path
+
+
+_DEADLINE_DIAGNOSTICS = {"console_log": "[WARN] last line", "qemu_status": "running", "qemu_cpu_seconds": 2.0}
+"""What QemuVM.deadline_diagnostics adds to the context of a host-deadline error."""
 
 
 def _spy_unlink(monkeypatch: pytest.MonkeyPatch, *, when: Callable[[Path], bool]) -> list[int]:
@@ -66,161 +195,107 @@ def _spy_unlink(monkeypatch: pytest.MonkeyPatch, *, when: Callable[[Path], bool]
 
 
 def _l3_miss_reasons(caplog: pytest.LogCaptureFixture) -> list[str]:
-    """The reasons of the "L3 cache miss" warnings _download_from_s3 logged."""
+    """The reasons of the "L3 cache miss" warnings of the downloads."""
     return [r.reason for r in caplog.records if r.getMessage() == "L3 cache miss"]  # type: ignore[attr-defined]
 
 
-def _get_major_minor_version() -> str:
-    """Extract major.minor from __version__ (e.g., '0.1.0' -> '0.1')."""
-    parts = __version__.split(".")
-    return f"{parts[0]}.{parts[1]}"
-
-
 # ============================================================================
-# S3 Test Fixtures
+# Cache keys
 # ============================================================================
 
 
-# ============================================================================
-# Unit Tests - Cache Key Computation
-# ============================================================================
+class TestFingerprint:
+    """fingerprint, the package part of a key: tenants choose the package specs."""
 
-
-class TestCacheKeyComputation:
-    """Tests for cache key computation logic."""
-
-    def test_cache_key_format(self) -> None:
-        """Package part of the key is a fixed-length SHA-256 fingerprint."""
-        packages = ["pandas==2.0.0", "numpy==1.24.0"]
-        packages_hash = fingerprint(*sorted(packages))
-        assert len(packages_hash) == 64  # full SHA-256 hex digest
-        assert all(c in "0123456789abcdef" for c in packages_hash)
-
-    def test_cache_key_deterministic(self) -> None:
-        """Same inputs produce same fingerprint."""
-        packages = ["pandas==2.0.0", "numpy==1.24.0"]
-        assert fingerprint(*sorted(packages)) == fingerprint(*sorted(packages))
-
-    def test_cache_key_sorted_packages(self) -> None:
-        """Package order doesn't affect the fingerprint (sorted)."""
-        packages1 = ["pandas==2.0.0", "numpy==1.24.0"]
-        packages2 = ["numpy==1.24.0", "pandas==2.0.0"]
-        assert fingerprint(*sorted(packages1)) == fingerprint(*sorted(packages2))
-
-    def test_cache_key_no_separator_ambiguity(self) -> None:
+    def test_no_separator_ambiguity(self) -> None:
         """Splitting the same characters differently gives different keys (length-prefixed parts)."""
         assert fingerprint("ab", "c") != fingerprint("a", "bc")
         assert fingerprint("pkg>=1,<2") != fingerprint("pkg>=1", "<2")
 
-    def test_cache_key_chosen_collision_resistant(self) -> None:
-        """The forged spec that collided under the old CRC key no longer collides."""
+    def test_chosen_collision_resistant(self) -> None:
+        """A spec forged to collide with a package set under a CRC key gives another fingerprint."""
         victim = sorted(["pandas==2.2.3", "requests==2.32.3", "scipy==1.14.1"])
         forged = ["numpy>=0.206762322200000000000000000000000"]
         assert fingerprint(*victim) != fingerprint(*forged)
 
-    def test_cache_key_empty_packages(self) -> None:
-        """Empty packages list produces '{language}-v{version}-base' key."""
-        version = _get_major_minor_version()
-        # L2 format: empty packages = "{language}-v{version}-{img_hash}-base"
-        # For this test, we just verify the pattern ends with "-base"
-        cache_key = f"python-v{version}-xxxxxxxx-base"
 
-        assert cache_key.startswith(f"python-v{version}-")
-        assert cache_key.endswith("-base")
+class TestCacheKey:
+    """The key names the L2 entry and its S3 object (shared by every host): the language, the
+    library major.minor, the content of the base image, and the package set. Seen through
+    check_cache: a hit gives the entry file it found."""
 
+    async def test_entry_of_packages_is_found_by_its_key_in_any_order(self, make_keyed_manager) -> None:
+        manager, settings = await make_keyed_manager()
+        entry = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
+        await create_test_qcow2(entry)
 
-class TestSettings:
-    """Tests for Settings used by DiskSnapshotManager."""
+        assert await _checked(manager, Language.PYTHON, _PACKAGES) == entry
+        assert await _checked(manager, Language.PYTHON, list(reversed(_PACKAGES))) == entry
 
-    def test_settings_disk_snapshot_cache_dir(self, make_vm_settings, tmp_path: Path) -> None:
-        """Settings has disk_snapshot_cache_dir."""
-        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+    async def test_entry_without_packages_is_the_base_key(self, make_keyed_manager) -> None:
+        manager, settings = await make_keyed_manager()
+        entry = settings.disk_snapshot_cache_dir / f"{_BASE_KEY}.qcow2"
+        await create_test_qcow2(entry)
 
-        assert settings.disk_snapshot_cache_dir == tmp_path / "cache"
+        assert await _checked(manager, Language.PYTHON, []) == entry
 
-    def test_settings_s3_config(self, make_vm_settings) -> None:
-        """Settings has S3 configuration."""
-        settings = make_vm_settings(
-            s3_bucket="my-bucket",
-            s3_region="us-west-2",
+    @pytest.mark.parametrize(
+        ("language", "packages"),
+        [
+            (Language.PYTHON, ["requests==2.31.0"]),
+            (Language.PYTHON, [*_PACKAGES, "flask==3.0.0"]),
+            (Language.PYTHON, []),
+            (Language.JAVASCRIPT, _PACKAGES),
+        ],
+        ids=["fewer-packages", "more-packages", "no-packages", "other-language"],
+    )
+    async def test_other_packages_or_language_is_a_miss(
+        self, make_keyed_manager, language: Language, packages: list[str]
+    ) -> None:
+        """Another package set or language never gets the entry of _PACKAGES, which stays."""
+        manager, settings = await make_keyed_manager()
+        entry = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
+        await create_test_qcow2(entry)
+
+        assert await _checked(manager, language, packages) is None
+        assert entry.exists()
+
+    async def test_rebuilt_base_image_is_a_miss(self, make_keyed_manager) -> None:
+        """The key holds the SHA-256 of the base image bytes, the same on every host: new bytes
+        give a new key (an entry built on the old image is never served); a new mtime with the
+        same bytes keeps the key."""
+        manager, settings = await make_keyed_manager()
+        entry = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
+        await create_test_qcow2(entry)
+        base = manager.vm_manager.images.base_image(Language.PYTHON)
+
+        st = base.stat()
+        os.utime(base, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        assert await _checked(manager, Language.PYTHON, _PACKAGES) == entry
+
+        base.write_bytes(b"python base image, rebuilt")
+        assert await _checked(manager, Language.PYTHON, _PACKAGES) is None
+        rebuilt = settings.disk_snapshot_cache_dir / (
+            "python-v1.22-54f1e4e67720e275bccab6754b475cdfafccb00b80f79610159d6d7d2ba8e766"
+            "-f22d59c83f988d549e792451b3b5d20807f43532befdc983ef4671596cc14f05.qcow2"
         )
-
-        assert settings.s3_bucket == "my-bucket"
-        assert settings.s3_region == "us-west-2"
-
-
-# ============================================================================
-# Unit Tests - Install Error Classification
-# ============================================================================
-
-
-class TestClassifyInstallError:
-    """Tests for _classify_install_error() two-phase classifier."""
+        await create_test_qcow2(rebuilt)
+        assert await _checked(manager, Language.PYTHON, _PACKAGES) == rebuilt
 
     @pytest.mark.parametrize(
-        "error_output",
-        [
-            "error: Failed to download: client error (Connect)",
-            "error: connection refused",
-            "error: connection reset by peer",
-            "error: connection timed out",
-            "error: Temporary failure in name resolution",
-            "error: Name resolution failed for files.pythonhosted.org",
-            "error: network unreachable",
-            "error: timed out waiting for response",
-            "error: reset by peer",
-            "error: request failed after 3 retries",
-        ],
+        ("version", "hit"),
+        [("1.22.9", True), ("1.22.3.dev4", True), ("1.23.0", False), ("2.22.3", False)],
     )
-    def test_transient_patterns(self, error_output: str) -> None:
-        """Known transient network patterns classify as PACKAGE_DOWNLOAD."""
-        assert _classify_install_error(error_output) is ErrorCode.PACKAGE_DOWNLOAD
+    async def test_library_major_minor_is_in_the_key(
+        self, make_keyed_manager, monkeypatch: pytest.MonkeyPatch, version: str, *, hit: bool
+    ) -> None:
+        """A patch release keeps the cache; a minor or major release starts a new one."""
+        manager, settings = await make_keyed_manager()
+        entry = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
+        await create_test_qcow2(entry)
+        monkeypatch.setattr("exec_sandbox.disk_snapshot_manager.__version__", version)
 
-    @pytest.mark.parametrize(
-        "error_output",
-        [
-            "ERROR: No matching distribution found for nonexistent-package",
-            "ERROR: Could not find a version that satisfies the requirement foo",
-            "error: 404 Not Found - GET https://registry.npmjs.org/nonexistent",
-            "error: 404 Client Error: Not Found for url: https://pypi.org/simple/nonexistent/",
-            "npm ERR! ERESOLVE could not resolve dependency tree",
-            "npm ERR! could not resolve dependency lodash@^99.0.0",
-            "ERROR: Invalid version specifier: pandas==",
-            "npm ERR! 404 Not Found - not found in registry",
-            "npm ERR! No matching version found for foo@^99.0.0",
-            "pip ERROR: version not found for package foo==99.99.99",
-        ],
-    )
-    def test_permanent_patterns(self, error_output: str) -> None:
-        """Known permanent patterns classify as PACKAGE_INSTALL_FAILED."""
-        assert _classify_install_error(error_output) is ErrorCode.PACKAGE_INSTALL_FAILED
-
-    def test_permanent_takes_priority_over_transient(self) -> None:
-        """When both permanent and transient patterns match, permanent wins."""
-        # "404 client error" contains both "404 client error" (permanent) and "client error" (transient)
-        result = _classify_install_error("HTTP 404 Client Error for url: https://pypi.org/simple/foo/")
-        assert result is ErrorCode.PACKAGE_INSTALL_FAILED
-
-    @pytest.mark.parametrize(
-        "error_output",
-        [
-            "error: package 'foo' has no attribute 'bar'",
-            "SyntaxError: invalid syntax",
-            "",
-            "some unknown error occurred",
-        ],
-    )
-    def test_no_match_returns_none(self, error_output: str) -> None:
-        """Errors matching neither permanent nor transient return None."""
-        assert _classify_install_error(error_output) is None
-
-    def test_case_insensitive(self) -> None:
-        """Pattern matching is case-insensitive."""
-        assert _classify_install_error("CONNECTION REFUSED") is ErrorCode.PACKAGE_DOWNLOAD
-        assert _classify_install_error("Client Error (Connect)") is ErrorCode.PACKAGE_DOWNLOAD
-        assert _classify_install_error("NETWORK UNREACHABLE") is ErrorCode.PACKAGE_DOWNLOAD
-        assert _classify_install_error("NO MATCHING DISTRIBUTION found") is ErrorCode.PACKAGE_INSTALL_FAILED
-        assert _classify_install_error("ERESOLVE could not resolve") is ErrorCode.PACKAGE_INSTALL_FAILED
+        assert (await _checked(manager, Language.PYTHON, _PACKAGES) == entry) is hit
 
 
 # ============================================================================
@@ -230,51 +305,6 @@ class TestClassifyInstallError:
 
 class TestDiskSnapshotManagerIntegration:
     """Integration tests for DiskSnapshotManager with real QEMU VMs."""
-
-    async def test_l2_cache_miss(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """L2 cache miss returns (None, False) for non-existent snapshot."""
-
-        snapshot_manager, _settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-        )
-
-        # Check for non-existent snapshot
-        path = await snapshot_manager._check_l2_cache("nonexistent-abc123")
-        assert path is None
-
-    async def test_compute_cache_key(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """Test actual _compute_cache_key method."""
-
-        snapshot_manager, _settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-        )
-
-        # Test with packages
-        key = snapshot_manager._compute_cache_key(
-            language=Language.PYTHON,
-            packages=["pandas==2.0.0", "numpy==1.24.0"],
-        )
-
-        # L2 format: python-v{version}-{img_hash}-{pkg_hash}
-        version = _get_major_minor_version()
-        assert key.startswith(f"python-v{version}-")
-        # Format: python-v{version}-{img_sha256}-{pkg_sha256}
-        parts = key.split("-")
-        assert len(parts) == 4  # python, v{version}, {img_sha256}, {pkg_sha256}
-        assert len(parts[2]) == 64  # full SHA-256 hex digest
-        assert len(parts[3]) == 64  # full SHA-256 hex digest
-
-        # Test without packages (base)
-        base_key = snapshot_manager._compute_cache_key(
-            language=Language.PYTHON,
-            packages=[],
-        )
-        # Format: python-v{version}-{img_hash}-base
-        assert base_key.startswith(f"python-v{version}-")
-        assert base_key.endswith("-base")
-        base_parts = base_key.split("-")
-        assert len(base_parts) == 4  # python, v{version}, {img_sha256}, base
-        assert len(base_parts[2]) == 64  # full SHA-256 hex digest
 
     @skip_unless_hwaccel
     async def test_create_snapshot(self, make_snapshot_manager, tmp_path: Path) -> None:
@@ -291,110 +321,65 @@ class TestDiskSnapshotManagerIntegration:
         )
 
         # Create snapshot (this boots a VM and installs packages)
-        snapshot_path = await snapshot_manager.get_or_create_snapshot(
-            language=Language.PYTHON,
-            packages=["requests==2.31.0"],
-            tenant_id="test",
-            task_id=f"test-{random_test_id()}",
-            memory_mb=256,
+        snapshot_path = await _built_path(
+            snapshot_manager.get_or_create_snapshot(
+                language=Language.PYTHON,
+                packages=["requests==2.31.0"],
+                tenant_id="test",
+                task_id=f"test-{random_test_id()}",
+                memory_mb=256,
+            )
         )
 
         assert snapshot_path.exists()
         assert snapshot_path.suffix == ".qcow2"
 
         # Second call should hit L2 cache
-        cached_path = await snapshot_manager.get_or_create_snapshot(
-            language=Language.PYTHON,
-            packages=["requests==2.31.0"],
-            tenant_id="test",
-            task_id=f"test-{random_test_id()}",
-            memory_mb=256,
+        cached_path = await _built_path(
+            snapshot_manager.get_or_create_snapshot(
+                language=Language.PYTHON,
+                packages=["requests==2.31.0"],
+                tenant_id="test",
+                task_id=f"test-{random_test_id()}",
+                memory_mb=256,
+            )
         )
 
         assert cached_path == snapshot_path
 
-    async def test_cache_key_changes_on_image_rebuild(self, images_dir: Path, tmp_path: Path) -> None:
-        """Cache key changes when the base image is modified (rebuild detection).
+    def test_base_image_is_the_catalog_version(self, tmp_path: Path) -> None:
+        """An older build in the folder (python-3.13) is not used: the base image is the one the
+        images catalog names (one place for a new runtime version)."""
+        images = tmp_path / "images"
+        images.mkdir()
+        host = GuestImages(images_dir=images, kernel_dir=images, download_dir=None, arch=HostArch.X86_64)
+        (images / "python-3.13-base-x86_64.qcow2").touch()
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND):
+            host.base_image(Language.PYTHON)
+        (images / "python-3.14-base-x86_64.qcow2").touch()
+        assert host.base_image(Language.PYTHON) == images / "python-3.14-base-x86_64.qcow2"
 
-        _compute_cache_key hashes base image stat (mtime_ns + size) via image_hash().
-        Modifying the base image file must produce a different cache key, ensuring
-        stale snapshots are never served after an image rebuild.
-
-        Uses a temp copy of the base image to avoid mutating shared images/dist/.
-        """
-        # Copy base image to temp dir so we can mutate it safely
-        isolated_images = tmp_path / "images"
-        isolated_images.mkdir()
-        arch = "aarch64" if platform.machine() == "arm64" else platform.machine()
-        original_base = None
-        for f in images_dir.iterdir():
-            if f.name.startswith("python-") and f.name.endswith(f"-base-{arch}.qcow2"):
-                shutil.copy2(f, isolated_images / f.name)
-                original_base = isolated_images / f.name
-        assert original_base is not None, "No python base image found in images_dir"
-
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        settings = Settings(
-            base_images_dir=isolated_images,
-            kernel_path=isolated_images,
-            disk_snapshot_cache_dir=cache_dir,
-        )
-        vm_manager = VmManager(settings)
-        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
-
-        # Compute initial cache key
-        key1 = snapshot_manager._compute_cache_key(Language.PYTHON, ["pandas==2.0.0"])
-
-        # Modify the base image (append a byte + explicit mtime change)
-        with original_base.open("ab") as fh:
-            fh.write(b"\x00")
-        # Ensure mtime_ns differs (filesystem resolution may round sub-ms)
-        stat = original_base.stat()
-        os.utime(original_base, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
-
-        # Compute cache key again
-        key2 = snapshot_manager._compute_cache_key(Language.PYTHON, ["pandas==2.0.0"])
-
-        version = _get_major_minor_version()
-        assert key1.startswith(f"python-v{version}-")
-        assert key2.startswith(f"python-v{version}-")
-        assert key1 != key2, "Cache key must change when base image is modified"
-
-    async def test_get_base_image_returns_sorted_first(self, tmp_path: Path) -> None:
-        """get_base_image returns the lexicographically first match via sorted()[0].
-
-        When multiple base images exist for a language, the sorted()[0] determinism
-        guarantee must hold. If sorted() is removed, glob order is non-deterministic.
-        """
-        fresh_images = tmp_path / "images"
-        fresh_images.mkdir()
-        arch = "aarch64" if platform.machine() == "arm64" else platform.machine()
-
-        # Create two base images with different version numbers
-        path_313 = fresh_images / f"python-3.13-base-{arch}.qcow2"
-        path_314 = fresh_images / f"python-3.14-base-{arch}.qcow2"
-        await create_test_qcow2(path_313)
-        await create_test_qcow2(path_314)
-
-        settings = Settings(
-            base_images_dir=fresh_images,
-            kernel_path=fresh_images,
-        )
-        vm_manager = VmManager(settings)
-
-        result = vm_manager.get_base_image("python")
-        # sorted() puts 3.13 before 3.14 lexicographically
-        assert result == path_313, f"Expected {path_313}, got {result}"
-
-    def test_unknown_language_raises_internal_error(self, unit_test_vm_manager) -> None:
-        """get_base_image raises InternalError INTERNAL (not KeyError) for unknown languages.
-
-        The patterns dict uses .get() with an explicit check, so an unknown language
-        must raise InternalError with 'Unknown language', not a raw KeyError.
-        """
-        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.INTERNAL, match="Unknown language"):
-            unit_test_vm_manager.get_base_image("ruby")
+    @pytest.mark.parametrize(
+        ("host_arch", "suffix"), [(HostArch.AARCH64, "aarch64"), (HostArch.X86_64, "x86_64")], ids=["aarch64", "x86_64"]
+    )
+    @pytest.mark.parametrize("language", list(Language), ids=[language.value for language in Language])
+    def test_base_image_skips_the_other_architecture(
+        self, tmp_path: Path, language: Language, host_arch: HostArch, suffix: str
+    ) -> None:
+        """A folder with both architectures (make build IMAGE_ARCH=all) gives the host's image,
+        and the overlay pool fills for the same one; a download in progress (.zst) is no image."""
+        images = tmp_path / "images"
+        images.mkdir()
+        stem = {Language.PYTHON: "python-3.14-base", Language.JAVASCRIPT: "node-1.4-base", Language.RAW: "raw-base"}[
+            language
+        ]
+        for arch in ("aarch64", "x86_64"):
+            (images / f"{stem}-{arch}.qcow2").touch()
+        host = GuestImages(images_dir=images, kernel_dir=images, download_dir=None, arch=host_arch)
+        mine = images / f"{stem}-{suffix}.qcow2"
+        (images / f"{mine.name}.zst").touch()
+        assert host.base_image(language) == mine
+        assert host.present_base_images() == [mine]
 
 
 # ============================================================================
@@ -405,73 +390,45 @@ class TestDiskSnapshotManagerIntegration:
 class TestL2Cache:
     """Tests for L2 (local qcow2) cache operations."""
 
-    async def test_l2_cache_hit_returns_path(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """L2 cache returns path when valid qcow2 snapshot exists."""
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-        )
-
-        # Create a minimal valid qcow2 file
-        cache_key = "python-abc123"
-        snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
-
-        # Create actual qcow2 using qemu-img
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            str(snapshot_path),
-            "1M",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-        assert proc.returncode == 0
-
-        path = await snapshot_manager._check_l2_cache(cache_key)
-        assert path == snapshot_path
-
-    async def test_l2_hit_keeps_mtime_so_digest_is_not_recomputed(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """An L2 hit bumps atime only: image_hash keys its cache on mtime, so a hit must not force a re-read."""
-        snapshot_manager, settings = await make_snapshot_manager(disk_snapshot_cache_dir=tmp_path / "cache")
-        snapshot_path = settings.disk_snapshot_cache_dir / "python-mtime.qcow2"
+    async def test_l2_hit_keeps_mtime_so_digest_is_not_recomputed(self, make_keyed_manager) -> None:
+        """An L2 hit bumps atime only: image_digest keys its cache on mtime, so a hit must not force a re-read."""
+        snapshot_manager, settings = await make_keyed_manager()
+        snapshot_path = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
         await create_test_qcow2(snapshot_path)
         os.utime(snapshot_path, ns=(1, 2))
-        digest = snapshot_manager.image_hash(snapshot_path)
+        digest = image_digest(snapshot_path)
 
-        assert await snapshot_manager._check_l2_cache("python-mtime") == snapshot_path
+        assert await _checked(snapshot_manager, Language.PYTHON, _PACKAGES) == snapshot_path
 
         stat = snapshot_path.stat()
         assert stat.st_mtime_ns == 2
         assert stat.st_atime_ns > 1
-        with patch("exec_sandbox.base_cache_manager.hashlib.file_digest", side_effect=AssertionError("re-read")):
-            assert snapshot_manager.image_hash(snapshot_path) == digest
+        with patch("exec_sandbox.images.hashlib.file_digest", side_effect=AssertionError("re-read")):
+            assert image_digest(snapshot_path) == digest
 
-    async def test_l2_check_runs_once_per_file_version(self, make_snapshot_manager, tmp_path: Path) -> None:
+    async def test_l2_check_runs_once_per_file_version(self, make_keyed_manager) -> None:
         """A passed qemu-img check is kept for the process: the next packages request on the
         same L2 runs no qemu-img. A changed file (new mtime) is checked again."""
-        snapshot_manager, settings = await make_snapshot_manager(disk_snapshot_cache_dir=tmp_path / "cache")
-        snapshot_path = settings.disk_snapshot_cache_dir / "python-memo.qcow2"
+        snapshot_manager, settings = await make_keyed_manager()
+        snapshot_path = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
         await create_test_qcow2(snapshot_path)
 
         with patch(
             "exec_sandbox.disk_snapshot_manager.communicate_managed_process", side_effect=communicate_managed_process
         ) as qemu_img:
-            assert await snapshot_manager._check_l2_cache("python-memo") == snapshot_path
-            assert await snapshot_manager._check_l2_cache("python-memo") == snapshot_path
+            assert await _checked(snapshot_manager, Language.PYTHON, _PACKAGES) == snapshot_path
+            assert await _checked(snapshot_manager, Language.PYTHON, _PACKAGES) == snapshot_path
             assert qemu_img.await_count == 1
 
             os.utime(snapshot_path, ns=(1, 2))  # rewritten in place
-            assert await snapshot_manager._check_l2_cache("python-memo") == snapshot_path
+            assert await _checked(snapshot_manager, Language.PYTHON, _PACKAGES) == snapshot_path
             assert qemu_img.await_count == 2
 
-    async def test_l2_check_that_did_not_run_is_not_kept(self, make_snapshot_manager, tmp_path: Path) -> None:
+    async def test_l2_check_that_did_not_run_is_not_kept(self, make_keyed_manager) -> None:
         """qemu-img could not start now (a process limit): a miss, and the next request runs the
         check. A qemu-img this user cannot run is HOST_DEPENDENCY (test_missing_qemu_img_is_a_config_error)."""
-        snapshot_manager, settings = await make_snapshot_manager(disk_snapshot_cache_dir=tmp_path / "cache")
-        snapshot_path = settings.disk_snapshot_cache_dir / "python-nocheck.qcow2"
+        snapshot_manager, settings = await make_keyed_manager()
+        snapshot_path = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
         await create_test_qcow2(snapshot_path)
         runs: list[str] = []
 
@@ -482,8 +439,10 @@ class TestL2Cache:
             return await communicate_managed_process(*args, **kwargs)
 
         with patch("exec_sandbox.disk_snapshot_manager.communicate_managed_process", side_effect=qemu_img_fails_once):
-            assert await snapshot_manager._check_l2_cache("python-nocheck") is None
-            assert await snapshot_manager._check_l2_cache("python-nocheck") == snapshot_path
+            assert await _checked(snapshot_manager, Language.PYTHON, _PACKAGES) is None
+            assert not leased_here(snapshot_path)  # the miss let its lease go
+            assert evictable(snapshot_path)
+            assert await _checked(snapshot_manager, Language.PYTHON, _PACKAGES) == snapshot_path
 
         assert runs == ["qemu-img", "qemu-img"]
 
@@ -491,11 +450,11 @@ class TestL2Cache:
         snapshot_manager, settings = await make_snapshot_manager(disk_snapshot_cache_dir=tmp_path / "cache")
         snapshot_path = settings.disk_snapshot_cache_dir / "python-evict.qcow2"
         await create_test_qcow2(snapshot_path)
-        snapshot_manager.image_hash(snapshot_path)
+        image_digest(snapshot_path)
         sidecar = snapshot_path.with_name("python-evict.qcow2.sha256")
         assert sidecar.exists()
 
-        await snapshot_manager._evict_oldest_snapshot()
+        await snapshot_manager.evict_oldest()
 
         assert not snapshot_path.exists()
         assert not sidecar.exists()
@@ -506,7 +465,7 @@ class TestL2Cache:
         """.part files of a killed process are removed at start, in a worker thread (a listing
         with no size limit, GBs per part); a live writer's are kept."""
         cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
+        cache_dir.mkdir(mode=0o700)
         dead = cache_dir / "python-x.qcow2.999999999.0123abcd.part"
         live = cache_dir / f"python-y.qcow2.{os.getpid()}.0123abcd.part"
         dead.write_bytes(b"orphan")
@@ -526,7 +485,7 @@ class TestL2Cache:
         """A .part name with no pid field (too few fields, or not a number there) names no writer:
         start() keeps it and goes on to the other parts."""
         cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
+        cache_dir.mkdir(mode=0o700)
         for name in ("stray.part", "python-z.qcow2.notapid.0123abcd.part", "python-x.qcow2.999999999.0123abcd.part"):
             (cache_dir / name).write_bytes(b"x")
 
@@ -535,38 +494,29 @@ class TestL2Cache:
 
         assert sorted(p.name for p in cache_dir.iterdir()) == ["python-z.qcow2.notapid.0123abcd.part", "stray.part"]
 
-    async def test_l2_cache_removes_corrupt_snapshot(self, make_snapshot_manager, tmp_path: Path) -> None:
+    async def test_l2_cache_removes_corrupt_snapshot(self, make_keyed_manager) -> None:
         """L2 cache detects and removes corrupt qcow2 (fails qemu-img check)."""
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-        )
-
-        cache_key = "python-corrupt123"
-        snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
+        snapshot_manager, settings = await make_keyed_manager()
+        snapshot_path = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
         snapshot_path.write_bytes(b"not a valid qcow2 file")
-        sidecar = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2.sha256"
+        sidecar = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2.sha256"
         sidecar.write_text("stamp digest")
 
-        result = await snapshot_manager._check_l2_cache(cache_key)
+        result = await _checked(snapshot_manager, Language.PYTHON, _PACKAGES)
 
         assert result is None, "Should return None for corrupt qcow2"
         assert not snapshot_path.exists(), "Corrupt snapshot should be removed"
         assert not sidecar.exists(), "Its digest sidecar goes with it"
 
-    async def test_l2_cache_nonexistent_returns_none(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """L2 cache returns None for non-existent snapshot."""
+    async def test_l2_cache_empty_is_a_miss(self, make_keyed_manager) -> None:
+        """An empty cache is a miss, with no lease and no lock file."""
+        snapshot_manager, settings = await make_keyed_manager()
 
-        snapshot_manager, _settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-        )
-
-        # Check for non-existent snapshot
-        path = await snapshot_manager._check_l2_cache("nonexistent-key")
-        assert path is None
+        assert await snapshot_manager.check_cache(Language.PYTHON, _PACKAGES) is None
+        assert list(settings.disk_snapshot_cache_dir.iterdir()) == []
 
     async def test_l1_evict_oldest_snapshot(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """_evict_oldest_snapshot removes oldest file by atime."""
+        """evict_oldest removes oldest file by atime."""
 
         snapshot_manager, settings = await make_snapshot_manager(
             disk_snapshot_cache_dir=tmp_path / "cache",
@@ -601,11 +551,16 @@ class TestL2Cache:
         assert newest_path.exists()
 
         # Evict oldest
-        await snapshot_manager._evict_oldest_snapshot()
+        assert await snapshot_manager.evict_oldest() is not None
 
         # Oldest should be removed, newest should remain
         assert not oldest_path.exists()
         assert newest_path.exists()
+
+        # Admission evicts until this says no entry is left
+        assert await snapshot_manager.evict_oldest() is not None
+        assert not newest_path.exists()
+        assert await snapshot_manager.evict_oldest() is None
 
 
 # ============================================================================
@@ -613,94 +568,133 @@ class TestL2Cache:
 # ============================================================================
 
 
+@NO_VM_TIMEOUT
 class TestL3Cache:
-    """Tests for L3 (S3) cache operations using moto server mode."""
+    """The L3 cache (S3, moto server mode), through get_or_create_snapshot with an empty L2: a
+    download on an L3 hit (_lookup), an upload after a build (_build). The build is a stub."""
 
-    async def test_no_bucket_touches_no_s3(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """Without s3_bucket, a download is a miss and an upload a no-op: neither opens an S3 client."""
+    async def test_managers_share_api_models(
+        self, make_keyed_manager, moto_s3_server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A manager makes no botocore loader of its own: a new one lists every service folder
+        and parses the S3 model again (~0.2 s per manager)."""
+        endpoint_url, _ = moto_s3_server
+        loaders = 0
+        new_loader = Loader.__init__
 
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket=None,
-        )
-        snapshot_path = settings.disk_snapshot_cache_dir / "python-nobucket.qcow2"
-        snapshot_path.write_bytes(b"image")
+        def counted(self: Loader, *args: object, **kwargs: object) -> None:
+            nonlocal loaders
+            loaders += 1
+            new_loader(self, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        async def look_up(name: str) -> None:
+            manager, _ = await make_keyed_manager(
+                disk_snapshot_cache_dir=tmp_path / name,
+                s3_bucket=BUCKET,
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+            )
+            assert await _lookup(manager) is None  # an L3 miss: S3 answered
+
+        await look_up("first")  # makes the loader of the process, if no earlier test did
+        search_paths = list(_api_models().search_paths)
+        monkeypatch.setattr(Loader, "__init__", counted)
+        await look_up("second")
+        assert loaders == 0
+        assert _api_models().search_paths == search_paths  # boto3 adds its data folder once, not per manager
+
+    async def test_no_bucket_touches_no_s3(self, make_keyed_manager) -> None:
+        """Without s3_bucket, the lookup skips L3 and the build is not uploaded: no S3 client
+        is made."""
+        snapshot_manager, settings = await make_keyed_manager(s3_bucket=None)
 
         with patch.object(snapshot_manager, "_get_s3_client", new_callable=AsyncMock) as get_client:
-            assert await snapshot_manager._download_from_s3("python-nobucket") is None
-            await snapshot_manager._upload_to_s3("python-nobucket", snapshot_path)
+            built = await _build(snapshot_manager, _PACKAGES, b"image")
 
         get_client.assert_not_awaited()
-        assert sorted(p.name for p in settings.disk_snapshot_cache_dir.iterdir()) == [snapshot_path.name]
+        assert built == settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
+        assert _entries(settings.disk_snapshot_cache_dir) == [built.name]
 
-    async def test_upload_to_s3_success(self, make_snapshot_manager, moto_s3_server, tmp_path: Path) -> None:
-        """Snapshot uploads to S3 with zstd compression using real aioboto3 client."""
-
+    async def test_upload_to_s3_success(self, make_keyed_manager, moto_s3_server) -> None:
+        """A new build goes to S3 zstd-compressed, with the SHA-256 of its uncompressed bytes in
+        the object metadata; no compressed part stays."""
         endpoint_url, s3_sync = moto_s3_server
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
-        # Create a test snapshot file
-        cache_key = "python-test123"
-        snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
-        snapshot_path.write_bytes(b"fake qcow2 content")
+        await _build(snapshot_manager, _PACKAGES, b"fake qcow2 content")
 
-        # Upload using real aioboto3 client
-        await snapshot_manager._upload_to_s3(cache_key, snapshot_path)
+        uploaded = s3_sync.get_object(Bucket=BUCKET, Key=_L3_OBJECT)
+        assert zstd.decompress(uploaded["Body"].read()) == b"fake qcow2 content"
+        assert uploaded["Metadata"]["sha256"] == hashlib.sha256(b"fake qcow2 content").hexdigest()
+        assert _entries(settings.disk_snapshot_cache_dir) == [f"{_KEY}.qcow2"]
 
-        # Verify uploaded (compressed) using sync boto3
-        objects = s3_sync.list_objects_v2(Bucket="test-snapshots")
-        keys = [obj["Key"] for obj in objects.get("Contents", [])]
-        assert f"snapshots/{cache_key}.qcow2.zst" in keys
-
-        # Metadata digest is the sha256 of the uploaded (uncompressed) bytes
-        head = s3_sync.head_object(Bucket="test-snapshots", Key=f"snapshots/{cache_key}.qcow2.zst")
-        assert head["Metadata"]["sha256"] == hashlib.sha256(b"fake qcow2 content").hexdigest()
-
-        # Verify compressed temp files were cleaned up
-        assert sorted(p.name for p in settings.disk_snapshot_cache_dir.iterdir()) == [f"{cache_key}.qcow2"]
-
-    async def test_download_from_s3_success(self, make_snapshot_manager, moto_s3_server, tmp_path: Path) -> None:
-        """Snapshot downloads from S3 and decompresses using real aioboto3 client."""
-
+    async def test_download_from_s3_success(self, make_keyed_manager, moto_s3_server, tmp_path: Path) -> None:
+        """An L3 hit is decompressed into L2 under its key, and no build runs."""
         endpoint_url, s3_sync = moto_s3_server
-
-        # Compress and upload a real (standalone) qcow2
         source = tmp_path / "source.qcow2"
         await create_test_qcow2(source)
         original_content = source.read_bytes()
-        compressed = zstd.compress(original_content)
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key="snapshots/python-download123.qcow2.zst",
-            Body=compressed,
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
+            Body=zstd.compress(original_content),
             Metadata={"sha256": hashlib.sha256(original_content).hexdigest()},
         )
-
-        snapshot_manager, _settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
-        # Download using real aioboto3 client
-        result = await snapshot_manager._download_from_s3("python-download123")
+        result = await _lookup(snapshot_manager)
 
-        # Verify downloaded and decompressed
-        assert result is not None
-        assert result.exists()
+        assert result == settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
         assert result.read_bytes() == original_content
+
+    async def test_l3_files_have_no_group_or_other_write(
+        self, make_keyed_manager, moto_s3_server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under `sg qemu-vm` and umask 002, open() made files 0664 of group qemu-vm. A layer
+        from S3 is 0644 (QEMU as qemu-vm reads it, every later VM boots with it); the
+        compressed parts of a download and of an upload are 0600 (only this process reads them)."""
+        endpoint_url, s3_sync = moto_s3_server
+        source = tmp_path / "source.qcow2"
+        await create_test_qcow2(source)
+        content = source.read_bytes()
+        s3_sync.put_object(
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
+            Body=zstd.compress(content),
+            Metadata={"sha256": hashlib.sha256(content).hexdigest()},
+        )
+        snapshot_manager, _settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
+        )
+        part_modes: list[int] = []
+
+        def compressed_part(path: Path) -> bool:
+            """Notes the mode of a compressed part just before it goes."""
+            if ".qcow2.zst." in path.name and path.exists():
+                part_modes.append(stat.S_IMODE(path.stat().st_mode))
+            return False
+
+        _spy_unlink(monkeypatch, when=compressed_part)
+        old = os.umask(0o002)
+        try:
+            layer = await _lookup(snapshot_manager)
+            assert layer is not None
+            await _build(snapshot_manager, ["other==1.0"], content)
+        finally:
+            os.umask(old)
+
+        assert layer.read_bytes() == content
+        assert stat.S_IMODE(layer.stat().st_mode) == 0o644
+        assert part_modes == [0o600, 0o600, 0o600]  # the hit's download, the miss's download, the upload
 
     @pytest.mark.parametrize("verified", [True, False], ids=["verified", "wrong-digest"])
     async def test_download_removes_its_parts_off_the_loop(
         self,
-        make_snapshot_manager,
+        make_keyed_manager,
         moto_s3_server,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -715,21 +709,18 @@ class TestL3Cache:
         await create_test_qcow2(source)
         content = source.read_bytes()
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key="snapshots/python-parts.qcow2.zst",
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
             Body=zstd.compress(content),
             Metadata={"sha256": hashlib.sha256(content).hexdigest() if verified else "0" * 64},
         )
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
         removers = _spy_unlink(monkeypatch, when=lambda path: path.name.endswith(".part"))
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.disk_snapshot_manager"):
-            result = await snapshot_manager._download_from_s3("python-parts")
+            result = await _lookup(snapshot_manager)
         if verified:
             assert result is not None
             assert result.read_bytes() == content
@@ -740,27 +731,21 @@ class TestL3Cache:
 
         assert removers
         assert threading.get_ident() not in removers
-        assert [p.name for p in settings.disk_snapshot_cache_dir.iterdir()] == (
-            ["python-parts.qcow2"] if verified else []
-        )
+        assert _entries(settings.disk_snapshot_cache_dir) == ([f"{_KEY}.qcow2"] if verified else [])
 
     async def test_download_from_s3_not_found(
-        self, make_snapshot_manager, moto_s3_server, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, make_keyed_manager, moto_s3_server, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A missing key is an L3 miss (None, logged), not an error."""
-
+        """A missing object is an L3 miss (logged): the build runs, no error."""
         endpoint_url, _s3_sync = moto_s3_server
-
-        snapshot_manager, _settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.disk_snapshot_manager"):
-            assert await snapshot_manager._download_from_s3("nonexistent-key") is None
+            assert await _lookup(snapshot_manager) is None
         assert len(_l3_miss_reasons(caplog)) == 1
+        assert _entries(settings.disk_snapshot_cache_dir) == []
 
     @pytest.mark.parametrize(
         ("metadata", "reason"),
@@ -771,66 +756,52 @@ class TestL3Cache:
     )
     async def test_download_from_s3_rejects_unverified(
         self,
-        make_snapshot_manager,
+        make_keyed_manager,
         moto_s3_server,
-        tmp_path: Path,
         *,
         caplog: pytest.LogCaptureFixture,
         metadata: dict[str, str],
         reason: str,
     ) -> None:
         """A missing or wrong sha256 digest is an L3 miss and leaves no file in L2."""
-
         endpoint_url, s3_sync = moto_s3_server
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key="snapshots/python-tampered.qcow2.zst",
-            Body=zstd.compress(b"tampered qcow2 content"),
-            Metadata=metadata,
+            Bucket=BUCKET, Key=_L3_OBJECT, Body=zstd.compress(b"tampered qcow2 content"), Metadata=metadata
         )
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.disk_snapshot_manager"):
-            assert await snapshot_manager._download_from_s3("python-tampered") is None
+            assert await _lookup(snapshot_manager) is None
         assert len(_l3_miss_reasons(caplog)) == 1
         assert reason in _l3_miss_reasons(caplog)[0]
-        assert list(settings.disk_snapshot_cache_dir.iterdir()) == []
+        assert _entries(settings.disk_snapshot_cache_dir) == []
 
     async def test_download_from_s3_rejects_truncated_stream(
-        self, make_snapshot_manager, moto_s3_server, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, make_keyed_manager, moto_s3_server, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A cut zstd stream fails the download, even if its partial output matches the digest."""
-
         endpoint_url, s3_sync = moto_s3_server
         original_content = os.urandom(256 * 1024)
         compressed = zstd.compress(original_content)
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key="snapshots/python-truncated.qcow2.zst",
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
             Body=compressed[: len(compressed) // 2],
             Metadata={"sha256": hashlib.sha256(original_content).hexdigest()},
         )
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.disk_snapshot_manager"):
-            assert await snapshot_manager._download_from_s3("python-truncated") is None
+            assert await _lookup(snapshot_manager) is None
         assert _l3_miss_reasons(caplog) == ["S3 snapshot stream is truncated"]
-        assert list(settings.disk_snapshot_cache_dir.iterdir()) == []
+        assert _entries(settings.disk_snapshot_cache_dir) == []
 
     async def test_download_rejects_qcow2_with_backing_file(
-        self, make_snapshot_manager, moto_s3_server, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, make_keyed_manager, moto_s3_server, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A qcow2 that names a host backing file never reaches L2 (QEMU would serve that file to the guest)."""
         endpoint_url, s3_sync = moto_s3_server
@@ -845,57 +816,49 @@ class TestL3Cache:
         assert proc.returncode == 0
         content = crafted.read_bytes()
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key="snapshots/python-backing.qcow2.zst",
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
             Body=zstd.compress(content),
             Metadata={"sha256": hashlib.sha256(content).hexdigest()},
         )
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.disk_snapshot_manager"):
-            assert await snapshot_manager._download_from_s3("python-backing") is None
+            assert await _lookup(snapshot_manager) is None
         assert _l3_miss_reasons(caplog) == ["S3 snapshot names a backing or data file; L2 images are standalone"]
-        assert list(settings.disk_snapshot_cache_dir.iterdir()) == []
+        assert _entries(settings.disk_snapshot_cache_dir) == []
 
     async def test_download_stops_above_max_size(
         self,
-        make_snapshot_manager,
+        make_keyed_manager,
         moto_s3_server,
-        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Decompressed output above the largest possible L2 image fails (zstd bomb guard)."""
+        """Decompressed output above the largest possible L2 image fails (zstd bomb guard). The
+        bound is set to 1 MiB here: at its real value (576 MiB) the test would write that much."""
         endpoint_url, s3_sync = moto_s3_server
         monkeypatch.setattr("exec_sandbox.disk_snapshot_manager._L2_MAX_FILE_BYTES", 1024 * 1024)
         content = bytes(2 * 1024 * 1024)  # compresses to a few hundred bytes
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key="snapshots/python-bomb.qcow2.zst",
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
             Body=zstd.compress(content),
             Metadata={"sha256": hashlib.sha256(content).hexdigest()},
         )
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.disk_snapshot_manager"):
-            assert await snapshot_manager._download_from_s3("python-bomb") is None
+            assert await _lookup(snapshot_manager) is None
         assert _l3_miss_reasons(caplog) == ["S3 snapshot is larger than any L2 image"]
-        assert list(settings.disk_snapshot_cache_dir.iterdir()) == []
+        assert _entries(settings.disk_snapshot_cache_dir) == []
 
     async def test_download_of_a_chunk_that_gives_several_output_steps(
-        self, make_snapshot_manager, moto_s3_server, tmp_path: Path
+        self, make_keyed_manager, moto_s3_server, tmp_path: Path
     ) -> None:
         """One 64 KiB compressed chunk whose output is larger than one 4 MiB step: every step is kept."""
         endpoint_url, s3_sync = moto_s3_server
@@ -905,97 +868,71 @@ class TestL3Cache:
         compressed = zstd.compress(content)
         assert len(compressed) < 64 * 1024  # the whole object is one read chunk
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key="snapshots/python-steps.qcow2.zst",
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
             Body=compressed,
             Metadata={"sha256": hashlib.sha256(content).hexdigest()},
         )
-        snapshot_manager, _settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, _settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
-        result = await snapshot_manager._download_from_s3("python-steps")
+        result = await _lookup(snapshot_manager)
 
         assert result is not None
         assert result.read_bytes() == content
 
     async def test_download_rejects_an_object_that_is_not_qcow2(
-        self, make_snapshot_manager, moto_s3_server, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, make_keyed_manager, moto_s3_server, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A verified object that is not a qcow2 image never reaches L2."""
         endpoint_url, s3_sync = moto_s3_server
         content = os.urandom(256 * 1024)
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key="snapshots/python-raw.qcow2.zst",
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
             Body=zstd.compress(content),
             Metadata={"sha256": hashlib.sha256(content).hexdigest()},
         )
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.disk_snapshot_manager"):
-            assert await snapshot_manager._download_from_s3("python-raw") is None
+            assert await _lookup(snapshot_manager) is None
         assert _l3_miss_reasons(caplog) == ["S3 snapshot is not qcow2 (format=raw)"]
-        assert list(settings.disk_snapshot_cache_dir.iterdir()) == []
+        assert _entries(settings.disk_snapshot_cache_dir) == []
 
-    async def test_upload_to_s3_silent_failure(self, make_snapshot_manager, moto_s3_server, tmp_path: Path) -> None:
-        """S3 upload failure is silent (L2 cache still works)."""
-
+    async def test_upload_to_s3_silent_failure(
+        self, make_keyed_manager, moto_s3_server, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An upload that fails (here, no such bucket) is logged, never raised: the build stays
+        in L2 and its compressed part goes."""
         endpoint_url, _s3_sync = moto_s3_server
-
-        # Use a bucket that doesn't exist on the moto server
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="nonexistent-bucket",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket="nonexistent-bucket", s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
 
-        cache_key = "python-fail123"
-        snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
-        snapshot_path.write_bytes(b"test content")
+        with caplog.at_level(logging.WARNING, logger="exec_sandbox.disk_snapshot_manager"):
+            built = await _build(snapshot_manager, _PACKAGES, b"test content")
 
-        # Should not raise - silent failure (bucket doesn't exist)
-        await snapshot_manager._upload_to_s3(cache_key, snapshot_path)
-        # No exception = success (silent failure)
+        assert [r.getMessage() for r in caplog.records].count("S3 upload failed silently") == 1
+        assert built.read_bytes() == b"test content"
+        assert _entries(settings.disk_snapshot_cache_dir) == [built.name]
 
-    async def test_upload_semaphore_limits_concurrency(
-        self, make_snapshot_manager, moto_s3_server, tmp_path: Path
-    ) -> None:
-        """Upload semaphore limits concurrent S3 uploads to configured max.
+    async def test_upload_semaphore_limits_concurrency(self, make_keyed_manager, moto_s3_server) -> None:
+        """Five builds at once: their uploads run two at a time (max_concurrent_s3_uploads=2).
 
-        Verifies that max_concurrent_s3_uploads actually bounds parallel uploads.
-        Uses real moto server with instrumented upload tracking.
-        """
-
+        The uploads in flight are counted at the S3 client (_get_s3_client wraps upload_file):
+        the one place where they can be seen."""
         endpoint_url, s3_sync = moto_s3_server
-
-        # Create a separate bucket for this test
         bucket_name = "test-semaphore-snapshots"
         s3_sync.create_bucket(Bucket=bucket_name)
-
-        # Configure semaphore to allow only 2 concurrent uploads
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket=bucket_name,
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
-            max_concurrent_s3_uploads=2,
+        snapshot_manager, _settings = await make_keyed_manager(
+            s3_bucket=bucket_name, s3_region="us-east-1", s3_endpoint_url=endpoint_url, max_concurrent_s3_uploads=2
         )
-
-        # Track concurrent uploads (inside semaphore-protected section)
         concurrent_count = 0
         max_concurrent_observed = 0
-
-        # Wrap _get_s3_client to return instrumented client
         original_get_client = snapshot_manager._get_s3_client
 
         @asynccontextmanager
@@ -1029,39 +966,76 @@ class TestL3Cache:
 
         snapshot_manager._get_s3_client = tracked_get_s3_client  # type: ignore[method-assign]
 
-        # Create test snapshot files
-        for i in range(5):
-            (settings.disk_snapshot_cache_dir / f"test-{i}.qcow2").write_bytes(b"test data")
+        async def build(*_args: object, cache_key: str, **_kwargs: object) -> Path:
+            built = snapshot_manager.cache_dir / f"{cache_key}.qcow2"
+            built.write_bytes(b"test data")
+            return built
 
-        # Start 5 uploads simultaneously
-        tasks = [
-            asyncio.create_task(
-                snapshot_manager._upload_to_s3(f"test-{i}", settings.disk_snapshot_cache_dir / f"test-{i}.qcow2")
+        with patch.object(snapshot_manager, "_create_snapshot", side_effect=build):
+            await asyncio.gather(
+                *(
+                    _built_path(
+                        snapshot_manager.get_or_create_snapshot(
+                            Language.PYTHON, [f"pkg{i}==1.0"], tenant_id="t", task_id=f"t{i}", memory_mb=256
+                        )
+                    )
+                    for i in range(5)
+                )
             )
-            for i in range(5)
-        ]
+        await snapshot_manager.stop()
 
-        # Wait for all uploads to complete
-        await asyncio.gather(*tasks)
-
-        # Verify all files uploaded to S3
         objects = s3_sync.list_objects_v2(Bucket=bucket_name)
-        keys = [obj["Key"] for obj in objects.get("Contents", [])]
-        assert len(keys) == 5, f"Expected 5 uploads, got {len(keys)}"
-
-        # Verify semaphore limited concurrency
-        assert max_concurrent_observed <= 2, (
-            f"Expected max 2 concurrent uploads (semaphore limit), but observed {max_concurrent_observed}"
-        )
-        # Also verify uploads actually ran concurrently (not serialized to 1)
-        assert max_concurrent_observed == 2, (
-            f"Expected exactly 2 concurrent uploads (semaphore should allow 2), but observed {max_concurrent_observed}"
-        )
+        assert len(objects.get("Contents", [])) == 5
+        assert max_concurrent_observed == 2  # bounded by the semaphore, and not one at a time
 
 
 # ============================================================================
-# Cache Hierarchy Tests - Full L2 → L3 → Create Flow
+# Builds (the build VM is a stub)
 # ============================================================================
+
+
+_REFUSED_OUTPUTS = [
+    "ERROR: No matching distribution found for nonexistent-package",
+    "ERROR: Could not find a version that satisfies the requirement foo",
+    "error: 404 Not Found - GET https://registry.npmjs.org/nonexistent",
+    "error: 404 Client Error: Not Found for url: https://pypi.org/simple/nonexistent/",
+    "npm ERR! ERESOLVE could not resolve dependency tree",
+    "npm ERR! could not resolve dependency lodash@^99.0.0",
+    "ERROR: Invalid version specifier: pandas==",
+    "npm ERR! 404 Not Found - not found in registry",
+    "npm ERR! No matching version found for foo@^99.0.0",
+    "pip ERROR: version not found for package foo==99.99.99",
+    "HTTP 404 Client Error for url: https://pypi.org/simple/foo/",
+    "NO MATCHING DISTRIBUTION found",
+    "ERESOLVE could not resolve",
+]
+"""Package manager output of a refusal: the same packages fail again."""
+
+_NETWORK_OUTPUTS = [
+    "error: Failed to download: client error (Connect)",
+    "error: connection refused",
+    "Connection reset by peer",
+    "error: connection timed out",
+    "error: Temporary failure in name resolution",
+    "error: Name resolution failed for files.pythonhosted.org",
+    "error: network unreachable",
+    "error: timed out waiting for response",
+    "error: reset by peer",
+    "error: request failed after 3 retries",
+    "CONNECTION REFUSED",
+    "Client Error (Connect)",
+    "NETWORK UNREACHABLE",
+]
+"""Package manager output of a network failure: a retry can pass."""
+
+_UNCLASSIFIED_OUTPUTS = [
+    "error: package 'foo' has no attribute 'bar'",
+    "SyntaxError: invalid syntax",
+    "some unknown error occurred",
+    "Segmentation fault",
+    "",
+]
+"""Package manager output that names no known cause ("": no output, reported as "Unknown error")."""
 
 
 class TestBuildRetryAfterDiskFull:
@@ -1072,12 +1046,15 @@ class TestBuildRetryAfterDiskFull:
     Through the public get_or_create_snapshot; ENOSPC comes from the package install step (an
     OSError of the qemu-img runner is a spawn failure: test_missing_qemu_img_is_a_config_error)."""
 
+    host_disk_full = False
+    """What the fake build VM answers to raise_if_host_disk_full (QEMU paused it on a full disk)."""
+
     _TIMEOUT = 10.0
     """A retry that waits for its own semaphore hangs: the bound turns that into a failure."""
 
     async def _fake_build(
         self,
-        make_snapshot_manager,
+        make_keyed_manager,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         *,
@@ -1087,7 +1064,7 @@ class TestBuildRetryAfterDiskFull:
         """A manager whose build makes a small image with no VM. With `stub_install`, the package
         install does nothing, except its first `disk_full_times` runs, which fail with ENOSPC.
         Returns (manager, oldest entry, newer entry)."""
-        snapshot_manager, settings = await make_snapshot_manager(
+        snapshot_manager, settings = await make_keyed_manager(
             disk_snapshot_cache_dir=tmp_path / "cache", s3_bucket=None
         )
         cache_dir = settings.disk_snapshot_cache_dir
@@ -1109,10 +1086,28 @@ class TestBuildRetryAfterDiskFull:
             if installs <= disk_full_times:
                 raise OSError(errno.ENOSPC, "No space left on device")
 
+        async def deadline_diagnostics(*, operation: str) -> dict[str, object]:
+            assert operation == "install_packages"
+            return _DEADLINE_DIAGNOSTICS
+
+        async def raise_if_host_disk_full() -> None:
+            if TestBuildRetryAfterDiskFull.host_disk_full:
+                raise TransientError(
+                    "VM fake stopped: the host disk is full",
+                    code=ErrorCode.LOCAL_DISK,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                )
+
         @asynccontextmanager
         async def ephemeral_vm(*_: object, **__: object) -> AsyncIterator[SimpleNamespace]:
             yield SimpleNamespace(  # exited cleanly
-                vm_id="fake", process=SimpleNamespace(returncode=0), channel=SimpleNamespace(connect=AsyncMock())
+                vm_id="fake",
+                process=SimpleNamespace(returncode=0),
+                channel=SimpleNamespace(connect=AsyncMock()),
+                deadline_diagnostics=deadline_diagnostics,
+                raise_if_host_disk_full=raise_if_host_disk_full,
             )
 
         async def never_dies(*_: object) -> None:
@@ -1128,36 +1123,120 @@ class TestBuildRetryAfterDiskFull:
 
     async def _build(self, snapshot_manager: DiskSnapshotManager) -> Path:
         return await asyncio.wait_for(
-            snapshot_manager.get_or_create_snapshot(Language.PYTHON, [], tenant_id="t", task_id="t", memory_mb=512),
+            _built_path(
+                snapshot_manager.get_or_create_snapshot(Language.PYTHON, [], tenant_id="t", task_id="t", memory_mb=512)
+            ),
             self._TIMEOUT,
         )
 
-    @staticmethod
-    def _entries(cache_dir: Path) -> list[str]:
-        """The cache folder listing, without the build locks."""
-        return sorted(p.name for p in cache_dir.iterdir() if not p.name.endswith(".lock"))
-
     async def test_disk_full_once_evicts_once_off_the_loop_and_retries(
-        self, make_snapshot_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The eviction lists a folder with no size limit and removes GBs: worker threads."""
         snapshot_manager, oldest, newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=1, stub_install=True
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=1, stub_install=True
         )
         removers = _spy_unlink(monkeypatch, when=lambda path: path.name.startswith(oldest.name))
 
         built = await self._build(snapshot_manager)
 
         assert built.read_bytes() == b"built"
-        assert self._entries(oldest.parent) == sorted([newer.name, built.name])  # one eviction: the oldest
+        assert _entries(oldest.parent) == sorted([newer.name, built.name])  # one eviction: the oldest
         assert removers
         assert threading.get_ident() not in removers
 
+    @staticmethod
+    def _wrapped_qemu(
+        snapshot_manager: DiskSnapshotManager, monkeypatch: pytest.MonkeyPatch, *, quit_works: bool
+    ) -> AsyncMock:
+        """The build's VM, with QEMU under a wrapper that ignores SIGTERM (an `unshare --fork`
+        parent): its signals end QEMU with SIGKILL (-9); a QMP quit, when it works, ends it
+        with 0. Returns the QMP quit mock. The wrapper's signal handling does not come on
+        demand: the cleanup stub and the QMP client stand in for it."""
+        process = SimpleNamespace(returncode=None)
+        quit_qemu = AsyncMock(side_effect=lambda: setattr(process, "returncode", 0))
+
+        @asynccontextmanager
+        async def ephemeral_vm(*_: object, **__: object) -> AsyncIterator[SimpleNamespace]:
+            yield SimpleNamespace(
+                vm_id="fake",
+                process=process,
+                qmp_socket=Path("/nonexistent/qmp.sock"),
+                use_qemu_vm_user=False,
+                channel=SimpleNamespace(connect=AsyncMock()),
+                deadline_diagnostics=AsyncMock(return_value={}),
+                raise_if_host_disk_full=AsyncMock(),
+            )
+
+        @asynccontextmanager
+        async def qmp(*_: object) -> AsyncIterator[SimpleNamespace]:
+            if not quit_works:
+                raise TransientError(
+                    "QMP connection failed", code=ErrorCode.MIGRATION_FAILED, context={}, hint=None, instance_id=None
+                )
+            yield SimpleNamespace(quit=quit_qemu)
+
+        async def signals(proc: SimpleNamespace, *_args: object, **_kwargs: object) -> bool:
+            if proc.returncode is None:
+                proc.returncode = -9  # SIGTERM ignored, then SIGKILL after term_timeout
+            return True
+
+        monkeypatch.setattr(snapshot_manager.vm_manager, "ephemeral_vm", ephemeral_vm)
+        monkeypatch.setattr("exec_sandbox.disk_snapshot_manager.MigrationClient", qmp)
+        monkeypatch.setattr("exec_sandbox.disk_snapshot_manager.cleanup_process", signals)
+        return quit_qemu
+
+    async def test_a_qemu_under_a_wrapper_that_ignores_sigterm_quits_clean(
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """QMP quit ends the build's QEMU with 0 before any signal: the layer is published
+        (under `unshare --fork`, signals alone end it -9 on every build)."""
+        snapshot_manager, _oldest, _newer = await self._fake_build(
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
+        )
+        quit_qemu = self._wrapped_qemu(snapshot_manager, monkeypatch, quit_works=True)
+
+        built = await self._build(snapshot_manager)
+
+        quit_qemu.assert_awaited_once()
+        assert built.read_bytes() == b"built"
+
+    async def test_a_build_whose_qemu_ends_on_sigkill_publishes_no_layer(
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No QMP quit (its connect fails), and the signals end QEMU with SIGKILL: the layer it
+        did not close is not published, QEMU_CRASHED."""
+        snapshot_manager, oldest, newer = await self._fake_build(
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
+        )
+        self._wrapped_qemu(snapshot_manager, monkeypatch, quit_works=False)
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED):
+            await self._build(snapshot_manager)
+        assert _entries(oldest.parent) == sorted([oldest.name, newer.name])  # no layer published
+
+    async def test_built_layer_has_no_group_or_other_write(
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The build target comes from qemu-img (0644 minus the umask), and QEMU as qemu-vm owned
+        it during the build (it may change its mode). It goes into the cache 0644: QEMU as
+        qemu-vm reads it, none may write it. Here the fake qemu-img makes it 0664 (umask 002)."""
+        snapshot_manager, _oldest, _newer = await self._fake_build(
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
+        )
+        old = os.umask(0o002)
+        try:
+            built = await self._build(snapshot_manager)
+        finally:
+            os.umask(old)
+        assert built.read_bytes() == b"built"
+        assert stat.S_IMODE(built.stat().st_mode) == 0o644
+
     async def test_disk_full_twice_raises(
-        self, make_snapshot_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         snapshot_manager, oldest, newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=2, stub_install=True
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=2, stub_install=True
         )
         with pytest.raises(
             TransientError,
@@ -1165,7 +1244,19 @@ class TestBuildRetryAfterDiskFull:
             match=r"^Local disk error for snapshot .+: No space left on device$",
         ):
             await self._build(snapshot_manager)
-        assert self._entries(oldest.parent) == [newer.name]  # one eviction, then no second one; no image, no .part
+        assert _entries(oldest.parent) == [newer.name]  # one eviction, then no second one; no image, no .part
+
+    async def test_disk_full_and_a_cache_that_cannot_be_listed_is_a_local_disk_error(
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The eviction after ENOSPC fails too (the cache folder cannot be listed): the build
+        fails with its file error, never a raw OSError."""
+        snapshot_manager, _oldest, _newer = await self._fake_build(
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=1, stub_install=True
+        )
+        monkeypatch.setattr(snapshot_manager, "evict_oldest", AsyncMock(side_effect=OSError(errno.EIO, "I/O error")))
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK, match="I/O error"):
+            await self._build(snapshot_manager)
 
     @pytest.mark.parametrize(
         ("failure", "raised", "code", "message"),
@@ -1223,7 +1314,7 @@ class TestBuildRetryAfterDiskFull:
     )
     async def test_failed_build_removes_its_image_file(
         self,
-        make_snapshot_manager,
+        make_keyed_manager,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         *,
@@ -1238,14 +1329,14 @@ class TestBuildRetryAfterDiskFull:
         the same way again: SETTING_INVALID (FIX_CONFIG); a TimeoutError (an OSError) is not a
         disk error: INTERNAL, like any other failure."""
         snapshot_manager, oldest, newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
         )
         monkeypatch.setattr(snapshot_manager, "_install_packages", AsyncMock(side_effect=failure))
 
         with pytest.raises(raised, check=lambda e: getattr(e, "code", None) is code, match=message):
             await self._build(snapshot_manager)
 
-        assert self._entries(oldest.parent) == [newer.name, oldest.name]
+        assert _entries(oldest.parent) == [newer.name, oldest.name]
 
     @pytest.mark.parametrize(
         "spawn_error",
@@ -1257,13 +1348,13 @@ class TestBuildRetryAfterDiskFull:
         ids=["missing", "not-executable", "other-arch"],
     )
     async def test_missing_qemu_img_is_a_config_error(
-        self, make_snapshot_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawn_error: OSError
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawn_error: OSError
     ) -> None:
         """No qemu-img on the host (Debian and Ubuntu ship it in qemu-utils), or one this user
         may not run: ConfigError HOST_DEPENDENCY, which no retry fixes, never a local disk error
         that callers retry, nor a cache folder setting."""
         snapshot_manager, oldest, newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
         )
 
         async def no_qemu_img(cmd: list[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
@@ -1275,15 +1366,15 @@ class TestBuildRetryAfterDiskFull:
             await self._build(snapshot_manager)
         assert (exc.value.context["binary"], exc.value.context["errno"]) == ("qemu-img", spawn_error.errno)
         assert exc.value.hint == "Install QEMU (on Debian and Ubuntu, the qemu-utils package)."
-        assert self._entries(oldest.parent) == [newer.name, oldest.name]
+        assert _entries(oldest.parent) == [newer.name, oldest.name]
 
     async def test_qemu_img_fork_limit_is_overlay_failed(
-        self, make_snapshot_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A qemu-img fork that hits a process limit can pass later: TransientError
         OVERLAY_FAILED, not a local disk error."""
         snapshot_manager, _oldest, _newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
         )
 
         async def fork_limit(cmd: list[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
@@ -1296,12 +1387,12 @@ class TestBuildRetryAfterDiskFull:
         assert exc.value.context["errno"] == errno.EAGAIN
 
     async def test_cache_folder_removed_at_run_time_is_made_again(
-        self, make_snapshot_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A cache folder removed while the worker runs (a tmp cleaner) is made again at the
         next build, which succeeds: never LOCAL_DISK (RETRY) on every build until a restart."""
         snapshot_manager, oldest, _newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
         )
         shutil.rmtree(oldest.parent)
 
@@ -1312,12 +1403,12 @@ class TestBuildRetryAfterDiskFull:
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root writes a 0o500 folder")
     async def test_read_only_cache_folder_is_a_config_error(
-        self, make_snapshot_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A cache folder this user cannot write fails at the build lock, the first file of a
         build: ConfigError SETTING_INVALID that names the setting, never a raw PermissionError."""
         snapshot_manager, oldest, newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=True
         )
         oldest.parent.chmod(0o500)
         try:
@@ -1330,7 +1421,7 @@ class TestBuildRetryAfterDiskFull:
                 await self._build(snapshot_manager)
         finally:
             oldest.parent.chmod(0o700)
-        assert self._entries(oldest.parent) == [newer.name, oldest.name]
+        assert _entries(oldest.parent) == [newer.name, oldest.name]
 
     @pytest.mark.parametrize(
         ("manager", "setting"),
@@ -1355,14 +1446,51 @@ class TestBuildRetryAfterDiskFull:
         ):
             manager(vm_manager.settings, vm_manager)
 
+    @pytest.mark.parametrize(
+        "lost",
+        [
+            pytest.param(
+                OutcomeUnknownError(
+                    "stopped: the host disk is full",
+                    code=ErrorCode.GUEST_OUTCOME_UNKNOWN,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                ),
+                id="in-flight",
+            ),
+            pytest.param(TimeoutError(), id="no-answer"),
+        ],
+    )
+    async def test_install_on_a_full_host_disk_is_local_disk(
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lost: Exception
+    ) -> None:
+        """QEMU paused the build VM on a full host disk: the install fails with LOCAL_DISK
+        (free disk space), not GUEST_UNAVAILABLE or PACKAGE_DOWNLOAD (a guest or network fault)."""
+        snapshot_manager, _oldest, _newer = await self._fake_build(
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
+        )
+        monkeypatch.setattr(TestBuildRetryAfterDiskFull, "host_disk_full", True)
+        monkeypatch.setattr("exec_sandbox.disk_snapshot_manager.consume_stream", AsyncMock(side_effect=lost))
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+            await asyncio.wait_for(
+                _built_path(
+                    snapshot_manager.get_or_create_snapshot(
+                        Language.PYTHON, ["pandas==2.2.3"], tenant_id="t", task_id="t", memory_mb=512
+                    )
+                ),
+                self._TIMEOUT,
+            )
+
     async def test_install_outcome_unknown_is_guest_unavailable(
-        self, make_snapshot_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An install whose transport is lost after dispatch ran no user code: the build
         raises TransientError GUEST_UNAVAILABLE (RETRY), never OutcomeUnknownError (VERIFY),
         which would reach the caller of Scheduler.new. Not retried (only PACKAGE_DOWNLOAD is)."""
         snapshot_manager, oldest, newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
         )
         lost = OutcomeUnknownError(
             "transport lost after dispatch",
@@ -1378,20 +1506,24 @@ class TestBuildRetryAfterDiskFull:
             TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE and e.__cause__ is lost
         ):
             await asyncio.wait_for(
-                snapshot_manager.get_or_create_snapshot(
-                    Language.PYTHON, ["pandas==2.2.3"], tenant_id="t", task_id="t", memory_mb=512
+                _built_path(
+                    snapshot_manager.get_or_create_snapshot(
+                        Language.PYTHON, ["pandas==2.2.3"], tenant_id="t", task_id="t", memory_mb=512
+                    )
                 ),
                 self._TIMEOUT,
             )
 
         consume.assert_awaited_once()
-        assert self._entries(oldest.parent) == [newer.name, oldest.name]
+        assert _entries(oldest.parent) == [newer.name, oldest.name]
 
     async def _install(self, snapshot_manager: DiskSnapshotManager) -> Path:
         """A build with one package: its install goes through consume_stream."""
         return await asyncio.wait_for(
-            snapshot_manager.get_or_create_snapshot(
-                Language.PYTHON, ["pandas==2.2.3"], tenant_id="t", task_id="t", memory_mb=512
+            _built_path(
+                snapshot_manager.get_or_create_snapshot(
+                    Language.PYTHON, ["pandas==2.2.3"], tenant_id="t", task_id="t", memory_mb=512
+                )
             ),
             self._TIMEOUT,
         )
@@ -1403,12 +1535,12 @@ class TestBuildRetryAfterDiskFull:
         monkeypatch.setattr(constants, "PACKAGE_INSTALL_RETRY_MAX_SECONDS", 0)
 
     async def test_guest_timeout_during_install_is_package_download(
-        self, make_snapshot_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The guest reports a timeout of the package manager: TransientError PACKAGE_DOWNLOAD,
         the one code the install retries (3 attempts), then raised; the build file goes."""
         snapshot_manager, oldest, newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
         )
         self._no_backoff(monkeypatch)
 
@@ -1427,41 +1559,49 @@ class TestBuildRetryAfterDiskFull:
             await self._install(snapshot_manager)
 
         assert consume.await_count == 3
-        assert self._entries(oldest.parent) == [newer.name, oldest.name]
+        assert _entries(oldest.parent) == [newer.name, oldest.name]
 
     @pytest.mark.parametrize(
         ("stderr", "raised", "code", "message", "attempts"),
         [
-            pytest.param(
-                "ERROR: No matching distribution found for pandas==2.2.3",
-                InvalidInputError,
-                ErrorCode.PACKAGE_INSTALL_FAILED,
-                r"^Package installation failed permanently \(exit code 1\): "
-                r"ERROR: No matching distribution found for pandas==2\.2\.3$",
-                1,
-                id="permanent",
+            *(
+                pytest.param(
+                    output,
+                    InvalidInputError,
+                    ErrorCode.PACKAGE_INSTALL_FAILED,
+                    rf"^Package installation failed permanently \(exit code 1\): {re.escape(output)}$",
+                    1,
+                    id=f"refused-{index}",
+                )
+                for index, output in enumerate(_REFUSED_OUTPUTS)
             ),
-            pytest.param(
-                "Connection reset by peer",
-                TransientError,
-                ErrorCode.PACKAGE_DOWNLOAD,
-                r"^Package installation failed with transient network error \(exit code 1\): Connection reset by peer$",
-                3,
-                id="network",
+            *(
+                pytest.param(
+                    output,
+                    TransientError,
+                    ErrorCode.PACKAGE_DOWNLOAD,
+                    rf"^Package installation failed with transient network error \(exit code 1\): {re.escape(output)}$",
+                    3,
+                    id=f"network-{index}",
+                )
+                for index, output in enumerate(_NETWORK_OUTPUTS)
             ),
-            pytest.param(
-                "Segmentation fault",
-                InvalidInputError,
-                ErrorCode.PACKAGE_INSTALL_FAILED,
-                r"^Package installation failed with exit code 1: Segmentation fault$",
-                1,
-                id="unclassified",
+            *(
+                pytest.param(
+                    output,
+                    InvalidInputError,
+                    ErrorCode.PACKAGE_INSTALL_FAILED,
+                    rf"^Package installation failed with exit code 1: {re.escape(output or 'Unknown error')}$",
+                    1,
+                    id=f"unclassified-{index}",
+                )
+                for index, output in enumerate(_UNCLASSIFIED_OUTPUTS)
             ),
         ],
     )
     async def test_failed_install_is_classified_by_its_output(
         self,
-        make_snapshot_manager,
+        make_keyed_manager,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         *,
@@ -1471,11 +1611,12 @@ class TestBuildRetryAfterDiskFull:
         message: str,
         attempts: int,
     ) -> None:
-        """The package manager exits 1: its output decides. A network failure is PACKAGE_DOWNLOAD
-        (RETRY, retried); a refusal or an unknown failure is PACKAGE_INSTALL_FAILED (FIX_INPUT,
-        not retried: the same packages fail again)."""
+        """The package manager exits 1: its output decides, case-insensitive. A network failure
+        is PACKAGE_DOWNLOAD (RETRY, retried); a refusal or an unknown failure is
+        PACKAGE_INSTALL_FAILED (FIX_INPUT, not retried: the same packages fail again). A refusal
+        wins over a network word in the same output ("404 Client Error")."""
         snapshot_manager, oldest, newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
         )
         self._no_backoff(monkeypatch)
         consume = AsyncMock(return_value=StreamResult(exit_code=1, stderr=stderr))
@@ -1485,463 +1626,132 @@ class TestBuildRetryAfterDiskFull:
             await self._install(snapshot_manager)
 
         assert consume.await_count == attempts
-        assert self._entries(oldest.parent) == [newer.name, oldest.name]
+        assert _entries(oldest.parent) == [newer.name, oldest.name]
 
     async def test_install_past_its_total_timeout_is_package_download(
-        self, make_snapshot_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An install still running at its total bound (all attempts and backoffs): TransientError
         PACKAGE_DOWNLOAD (RETRY), not the builtin TimeoutError."""
         snapshot_manager, oldest, newer = await self._fake_build(
-            make_snapshot_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
         )
-        # One attempt, bound 1 s: hard_timeout is PACKAGE_INSTALL_TIMEOUT_SECONDS + margin + 8.
+        # One attempt, bound 50 ms: hard_timeout is PACKAGE_INSTALL_TIMEOUT_SECONDS + margin + 8.
         monkeypatch.setattr(constants, "PACKAGE_INSTALL_MAX_RETRIES", 1)
         monkeypatch.setattr(constants, "PACKAGE_INSTALL_TIMEOUT_SECONDS", 0)
-        monkeypatch.setattr(constants, "EXECUTION_TIMEOUT_MARGIN_SECONDS", -7)
+        monkeypatch.setattr(constants, "EXECUTION_TIMEOUT_MARGIN_SECONDS", -7.95)
 
         async def never_ends(*_args: object, **_kwargs: object) -> StreamResult:
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
         monkeypatch.setattr("exec_sandbox.disk_snapshot_manager.consume_stream", never_ends)
+        # The install's clock reads 1000.0 s at its start and 1012.3 s at its deadline: the error
+        # gives the time spent (12.3 s), not the 0.05 s bound, whatever the load on the host.
+        reads = iter((1000.0, 1012.3))
+        monkeypatch.setattr("exec_sandbox.disk_snapshot_manager.time", SimpleNamespace(monotonic=lambda: next(reads)))
 
         with pytest.raises(
             TransientError,
             check=lambda e: e.code is ErrorCode.PACKAGE_DOWNLOAD and isinstance(e.__cause__, TimeoutError),
-            match=r"^Package installation timeout after 1\.0s$",
+            match=r"^Package installation timeout after 12\.3s$",
         ):
             await self._install(snapshot_manager)
 
-        assert self._entries(oldest.parent) == [newer.name, oldest.name]
+        assert _entries(oldest.parent) == [newer.name, oldest.name]
+
+    async def test_install_stream_deadline_reports_elapsed_time_and_guest_state(
+        self, make_keyed_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The stream deadline of the first attempt (a host deadline, not retried) ends the
+        install long before its total bound: the error gives the time spent, not that bound,
+        and the guest console and QEMU state (CI: one 318 s attempt reported as 970 s)."""
+        snapshot_manager, _oldest, _newer = await self._fake_build(
+            make_keyed_manager, tmp_path, monkeypatch, disk_full_times=0, stub_install=False
+        )
+        consume = AsyncMock(side_effect=StreamDeadlineExceededError("total stream deadline"))
+        monkeypatch.setattr("exec_sandbox.disk_snapshot_manager.consume_stream", consume)
+        # The install's clock reads 1000.0 s at its start and 1012.3 s at the deadline: the error
+        # gives the time spent (12.3 s), not the 970 s total bound, whatever the load on the host.
+        reads = iter((1000.0, 1012.3))
+        monkeypatch.setattr("exec_sandbox.disk_snapshot_manager.time", SimpleNamespace(monotonic=lambda: next(reads)))
+
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.PACKAGE_DOWNLOAD,
+            match=r"^Package installation timeout after 12\.3s$",
+        ) as exc_info:
+            await self._install(snapshot_manager)
+
+        consume.assert_awaited_once()
+        assert exc_info.value.context.items() >= _DEADLINE_DIAGNOSTICS.items()
+
+
+# ============================================================================
+# Cache hierarchy: L2, then L3, then a build
+# ============================================================================
 
 
 class TestCacheHierarchy:
-    """Tests for the full cache hierarchy flow in get_or_create_snapshot().
+    """get_or_create_snapshot: an L2 hit, else an L3 hit (S3), else a build. The build is a stub
+    (_create_snapshot: no VM boots); TestL3Cache has the L3 downloads and uploads."""
 
-    These tests verify the real L2 → L3 → Create pattern:
-    - L2 hit: Return immediately from local disk
-    - L2 miss → L3 hit: Download from S3, populate L2
-    - L2 miss → L3 miss: Create snapshot, upload to S3
-
-    Uses moto server for real S3 client and mocks _create_snapshot to avoid QEMU.
-    """
-
-    async def test_l2_hit_returns_immediately_no_s3(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """L2 cache hit returns path immediately without touching S3.
-
-        Flow: L2 HIT → return (no S3 call, no creation)
-        """
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-bucket",  # S3 configured but should NOT be called
-            s3_region="us-east-1",
-        )
-
-        # Pre-populate L2 cache with valid qcow2
-        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["requests==2.31.0"])
-        snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
-
-        # Create actual qcow2 using qemu-img
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            str(snapshot_path),
-            "1M",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-        assert proc.returncode == 0
-
-        # Mock S3 and creation to track if they're called
-        with patch.object(snapshot_manager, "_download_from_s3", new_callable=AsyncMock) as mock_s3:
-            with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-                result_path = await snapshot_manager.get_or_create_snapshot(
-                    language=Language.PYTHON,
-                    packages=["requests==2.31.0"],
-                    tenant_id="test",
-                    task_id=f"test-{random_test_id()}",
-                    memory_mb=256,
-                )
-
-        # Verify L2 hit: returned correct path
-        assert result_path == snapshot_path
-
-        # Verify S3 was NOT called (L2 hit skips S3)
-        mock_s3.assert_not_called()
-
-        # Verify creation was NOT called (L2 hit skips creation)
-        mock_create.assert_not_called()
-
-    async def test_l2_miss_l3_hit_downloads_from_s3(
-        self, make_snapshot_manager, moto_s3_server, tmp_path: Path
-    ) -> None:
-        """L2 miss with L3 hit downloads from S3 and returns path.
-
-        Flow: L2 MISS → L3 HIT → download → return (no creation)
-        """
-
+    async def test_l2_hit_returns_immediately_no_s3(self, make_keyed_manager, moto_s3_server, tmp_path: Path) -> None:
+        """An L2 hit is returned as it is: the S3 object of the same key is not downloaded over
+        it, and no build runs."""
         endpoint_url, s3_sync = moto_s3_server
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
-
-        # Compute cache key for the packages we'll request
-        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["numpy==1.26.0"])
-
-        # Pre-populate S3 (L3) with a compressed real qcow2
-        source = tmp_path / "source.qcow2"
-        await create_test_qcow2(source)
-        original_content = source.read_bytes()
-        compressed = zstd.compress(original_content)
+        entry = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
+        await create_test_qcow2(entry)
+        l2_content = entry.read_bytes()
+        other = tmp_path / "other.qcow2"
+        await create_test_qcow2(other, size="2M")
+        s3_content = other.read_bytes()
+        assert s3_content != l2_content
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key=f"snapshots/{cache_key}.qcow2.zst",
-            Body=compressed,
-            Metadata={"sha256": hashlib.sha256(original_content).hexdigest()},
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
+            Body=zstd.compress(s3_content),
+            Metadata={"sha256": hashlib.sha256(s3_content).hexdigest()},
         )
 
-        # L2 is empty (no file on disk)
-        assert not (settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2").exists()
+        assert await _lookup(snapshot_manager) == entry
+        assert entry.read_bytes() == l2_content
 
-        # Mock creation to verify it's NOT called
-        with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-            result_path = await snapshot_manager.get_or_create_snapshot(
-                language=Language.PYTHON,
-                packages=["numpy==1.26.0"],
-                tenant_id="test",
-                task_id=f"test-{random_test_id()}",
-                memory_mb=256,
-            )
-
-        # Verify returned path exists and has correct content (decompressed from S3)
-        assert result_path.exists()
-        assert result_path.read_bytes() == original_content
-
-        # Verify creation was NOT called (L3 hit skips creation)
-        mock_create.assert_not_called()
-
-    async def test_l2_miss_l3_miss_creates_snapshot(
-        self, make_snapshot_manager, moto_s3_server, tmp_path: Path
-    ) -> None:
-        """L2 miss and L3 miss triggers snapshot creation.
-
-        Flow: L2 MISS → L3 MISS → create → return (and upload to S3)
-        """
-
+    async def test_l2_populated_after_l3_download(self, make_keyed_manager, moto_s3_server, tmp_path: Path) -> None:
+        """An L3 download fills L2: the next request is an L2 hit, also once the S3 object is gone."""
         endpoint_url, s3_sync = moto_s3_server
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
+        snapshot_manager, settings = await make_keyed_manager(
+            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
         )
-
-        # Compute cache key
-        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["pandas==2.1.0"])
-        expected_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
-
-        # Mock _create_snapshot to simulate snapshot creation (avoids real QEMU)
-        async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
-            # Simulate creating a qcow2 file
-            proc = await asyncio.create_subprocess_exec(
-                "qemu-img",
-                "create",
-                "-f",
-                "qcow2",
-                str(expected_path),
-                "1M",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            return expected_path
-
-        with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot) as mock_create:
-            result_path = await snapshot_manager.get_or_create_snapshot(
-                language=Language.PYTHON,
-                packages=["pandas==2.1.0"],
-                tenant_id="test",
-                task_id=f"test-{random_test_id()}",
-                memory_mb=256,
-            )
-
-        # Verify creation WAS called (cache miss)
-        mock_create.assert_called_once()
-
-        # Verify returned path
-        assert result_path == expected_path
-        assert result_path.exists()
-
-        # Wait briefly for background S3 upload task
-        await asyncio.sleep(0.5)
-
-        # Verify S3 upload happened (background task)
-        objects = s3_sync.list_objects_v2(Bucket="test-snapshots")
-        keys = [obj["Key"] for obj in objects.get("Contents", [])]
-        assert f"snapshots/{cache_key}.qcow2.zst" in keys
-
-    async def test_l2_populated_after_l3_download(self, make_snapshot_manager, moto_s3_server, tmp_path: Path) -> None:
-        """After L3 download, L2 cache is populated for next call.
-
-        Flow: L2 MISS → L3 HIT → download → L2 populated
-        Then: L2 HIT → return immediately
-        """
-
-        endpoint_url, s3_sync = moto_s3_server
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-snapshots",
-            s3_region="us-east-1",
-            s3_endpoint_url=endpoint_url,
-        )
-
-        # Compute cache key
-        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["scipy==1.11.0"])
-        l2_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
-
-        # Create a real qcow2 to upload to S3 (must pass qemu-img check on L2 hit)
         real_qcow2 = tmp_path / "real-snapshot.qcow2"
-        await create_test_qcow2(real_qcow2)
+        await create_test_qcow2(real_qcow2)  # an L2 hit runs qemu-img check on it
         original_content = real_qcow2.read_bytes()
-
-        # Pre-populate S3 only
-        compressed = zstd.compress(original_content)
         s3_sync.put_object(
-            Bucket="test-snapshots",
-            Key=f"snapshots/{cache_key}.qcow2.zst",
-            Body=compressed,
+            Bucket=BUCKET,
+            Key=_L3_OBJECT,
+            Body=zstd.compress(original_content),
             Metadata={"sha256": hashlib.sha256(original_content).hexdigest()},
         )
+        l2_path = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
 
-        # Verify L2 is empty before first call
-        assert not l2_path.exists()
-
-        # First call: L2 miss → L3 hit
-        with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-            _result1_path = await snapshot_manager.get_or_create_snapshot(
-                language=Language.PYTHON,
-                packages=["scipy==1.11.0"],
-                tenant_id="test",
-                task_id=f"test-{random_test_id()}",
-                memory_mb=256,
-            )
-            mock_create.assert_not_called()
-
-        # Verify L2 is NOW populated
-        assert l2_path.exists()
+        assert await _lookup(snapshot_manager) == l2_path
         assert l2_path.read_bytes() == original_content
 
-        # Second call: should hit L2 (no S3 download)
-        # We'll spy on _download_from_s3 to verify it's not called
-        original_download = snapshot_manager._download_from_s3
-        download_called = False
+        s3_sync.delete_object(Bucket=BUCKET, Key=_L3_OBJECT)
+        assert await _lookup(snapshot_manager) == l2_path  # a download now would miss and build
 
-        async def spy_download(*args, **kwargs):
-            nonlocal download_called
-            download_called = True
-            return await original_download(*args, **kwargs)
-
-        with patch.object(snapshot_manager, "_download_from_s3", side_effect=spy_download):
-            result2_path = await snapshot_manager.get_or_create_snapshot(
-                language=Language.PYTHON,
-                packages=["scipy==1.11.0"],
-                tenant_id="test",
-                task_id=f"test-{random_test_id()}",
-                memory_mb=256,
-            )
-
-        # Verify L2 hit on second call
-        assert result2_path == l2_path
-        assert not download_called, "S3 download should NOT be called on L2 hit"
-
-    async def test_same_packages_same_cache_key(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """Same packages (regardless of order) produce same cache key and path.
-
-        Verifies deterministic cache key computation.
-        """
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket=None,
-        )
-
-        # Compute cache keys for same packages in different orders
-        key1 = snapshot_manager._compute_cache_key(Language.PYTHON, ["pandas==2.0.0", "numpy==1.25.0"])
-        key2 = snapshot_manager._compute_cache_key(Language.PYTHON, ["numpy==1.25.0", "pandas==2.0.0"])
-
-        # Keys should be identical (packages are sorted internally)
-        assert key1 == key2
-
-        # Pre-populate L2 with snapshot for these packages
-        snapshot_path = settings.disk_snapshot_cache_dir / f"{key1}.qcow2"
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            str(snapshot_path),
-            "1M",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-
-        # Both orderings should return same path
-        with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-            result1_path = await snapshot_manager.get_or_create_snapshot(
-                language=Language.PYTHON,
-                packages=["pandas==2.0.0", "numpy==1.25.0"],
-                tenant_id="test",
-                task_id=f"test-{random_test_id()}",
-                memory_mb=256,
-            )
-            result2_path = await snapshot_manager.get_or_create_snapshot(
-                language=Language.PYTHON,
-                packages=["numpy==1.25.0", "pandas==2.0.0"],
-                tenant_id="test",
-                task_id=f"test-{random_test_id()}",
-                memory_mb=256,
-            )
-
-        assert result1_path == result2_path == snapshot_path
-        mock_create.assert_not_called()  # Both hit L2 cache
-
-    async def test_different_packages_different_cache_key(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """Different packages produce different cache keys.
-
-        Verifies cache isolation between different package sets.
-        """
-
-        snapshot_manager, _settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-        )
-
-        key1 = snapshot_manager._compute_cache_key(Language.PYTHON, ["requests==2.31.0"])
-        key2 = snapshot_manager._compute_cache_key(Language.PYTHON, ["flask==3.0.0"])
-        key3 = snapshot_manager._compute_cache_key(Language.PYTHON, ["requests==2.31.0", "flask==3.0.0"])
-
-        # All keys should be different
-        assert key1 != key2
-        assert key1 != key3
-        assert key2 != key3
-
-    async def test_different_languages_different_cache_key(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """Same packages with different languages produce different cache keys.
-
-        Verifies cache isolation between languages.
-        """
-
-        snapshot_manager, _settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-        )
-
-        # Same "package" name but different languages
-        key_python = snapshot_manager._compute_cache_key(Language.PYTHON, ["test-pkg==1.0.0"])
-        key_node = snapshot_manager._compute_cache_key(Language.JAVASCRIPT, ["test-pkg==1.0.0"])
-
-        assert key_python != key_node
-
-    async def test_l3_disabled_skips_s3_entirely(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """When S3 is not configured, L3 is skipped entirely.
-
-        Flow: L2 MISS → (skip L3) → create
-        """
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket=None,
-        )
-
-        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["aiohttp==3.9.0"])
-        expected_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
-
-        # Mock creation
-        async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
-            proc = await asyncio.create_subprocess_exec(
-                "qemu-img",
-                "create",
-                "-f",
-                "qcow2",
-                str(expected_path),
-                "1M",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            return expected_path
-
-        # S3 disabled: the L3 check is a miss and the build runs
-        with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot):
-            result_path = await snapshot_manager.get_or_create_snapshot(
-                language=Language.PYTHON,
-                packages=["aiohttp==3.9.0"],
-                tenant_id="test",
-                task_id=f"test-{random_test_id()}",
-                memory_mb=256,
-            )
-
-        # Verify snapshot was created
-        assert result_path == expected_path
-        assert result_path.exists()
-
-    async def test_creation_failure_propagates_error(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """When snapshot creation fails, error is propagated.
-
-        Verifies error handling in the cache hierarchy.
-        """
-
-        snapshot_manager, _settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket=None,
-        )
-
-        # Mock creation to fail
-        with patch.object(
-            snapshot_manager,
-            "_create_snapshot",
-            new_callable=AsyncMock,
-            side_effect=TransientError(
-                "VM boot failed", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None
-            ),
-        ):
-            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
-                await snapshot_manager.get_or_create_snapshot(
-                    language=Language.PYTHON,
-                    packages=["broken-pkg==1.0.0"],
-                    tenant_id="test",
-                    task_id=f"test-{random_test_id()}",
-                    memory_mb=256,
-                )
-
-        assert "VM boot failed" in str(exc_info.value)
-
-    async def test_concurrent_snapshot_requests_single_creation(self, make_snapshot_manager, tmp_path: Path) -> None:
+    async def test_concurrent_snapshot_requests_single_creation(self, make_keyed_manager) -> None:
         """10 concurrent get_or_create_snapshot calls create snapshot exactly once.
 
-        Validates the file_lock + creation_semaphore contract: the first caller
+        Validates the CacheEntry.saving + creation_semaphore contract: the first caller
         acquires the lock and creates the snapshot, while the other 9 see
         should_create=False (file already exists) and return the same path.
         """
-
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket=None,
-        )
-
-        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["requests==2.31.0"])
-        expected_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
-
+        snapshot_manager, settings = await make_keyed_manager(s3_bucket=None)
+        expected_path = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
         creation_count = 0
 
         async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
@@ -1950,103 +1760,205 @@ class TestCacheHierarchy:
             # Yield control so all 10 coroutines are queued on the asyncio.Lock
             # before the first one finishes creating the file.
             await asyncio.sleep(0.1)
-            await create_test_qcow2(expected_path)
-            return expected_path
+            built = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
+            await create_test_qcow2(built)
+            return built
 
         with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot):
             results = await asyncio.gather(
                 *(
-                    snapshot_manager.get_or_create_snapshot(
-                        language=Language.PYTHON,
-                        packages=["requests==2.31.0"],
-                        tenant_id="test",
-                        task_id=f"concurrent-{i}",
-                        memory_mb=256,
+                    _built_path(
+                        snapshot_manager.get_or_create_snapshot(
+                            language=Language.PYTHON,
+                            packages=_PACKAGES,
+                            tenant_id="test",
+                            task_id=f"concurrent-{i}",
+                            memory_mb=256,
+                        )
                     )
                     for i in range(10)
                 )
             )
 
         assert creation_count == 1, f"Expected 1 creation, got {creation_count}"
-        for result in results:
-            assert result == expected_path
+        assert results == [expected_path] * 10
 
-    async def test_corrupt_l2_triggers_recreation(self, make_snapshot_manager, tmp_path: Path) -> None:
-        """Corrupt qcow2 in L2 cache is rejected by qemu-img check, triggering _create_snapshot.
+    async def test_l2_hit_is_leased_until_released(self, make_keyed_manager) -> None:
+        """The hit is leased before its check: eviction (admission's, for disk space) skips
+        it until the caller lets it go (each VM on it holds its own share)."""
+        snapshot_manager, settings = await make_keyed_manager()
+        entry = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
+        await create_test_qcow2(entry)
 
-        Verifies that a corrupt L2 file (garbage bytes) does not produce a false
-        cache hit. _check_l2_cache should return None, and the slow path should
-        proceed to _create_snapshot.
-        """
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket=None,
+        lease = await snapshot_manager.get_or_create_snapshot(
+            language=Language.PYTHON, packages=_PACKAGES, tenant_id="t", task_id="t", memory_mb=256
         )
+        assert lease.path == entry
+        assert await snapshot_manager.evict_oldest() is None  # the only entry is in use
+        assert entry.exists()
+        lease.release()
+        size = entry_bytes(entry)
+        assert await snapshot_manager.evict_oldest() == size
+        assert not entry.exists()
 
-        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["pandas==2.0.0"])
-        corrupt_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
+    async def test_broken_l2_entry_leaves_no_lease(self, make_keyed_manager) -> None:
+        """A broken entry (qemu-img check fails) is a miss: it goes, and so does its lease."""
+        snapshot_manager, settings = await make_keyed_manager()
+        broken = settings.disk_snapshot_cache_dir / f"{_BASE_KEY}.qcow2"
+        broken.write_bytes(b"\x00\xff\xde\xad" * 64)
 
-        # Write garbage bytes to simulate corruption
+        assert await snapshot_manager.check_cache(Language.PYTHON, []) is None
+        assert not broken.exists()
+        assert not leased_here(broken)
+
+    async def test_broken_l2_entry_another_process_runs_on_stays(self, make_keyed_manager) -> None:
+        """A check that finds the entry broken removes it as an eviction does: not while a VM
+        of another process runs on it (its lease), and its own lease goes first."""
+        snapshot_manager, settings = await make_keyed_manager()
+        broken = settings.disk_snapshot_cache_dir / f"{_BASE_KEY}.qcow2"
+        broken.write_bytes(b"\x00\xff\xde\xad" * 64)
+
+        with leased_in_child(broken):
+            assert await snapshot_manager.check_cache(Language.PYTHON, []) is None
+            assert broken.exists()
+            assert not leased_here(broken)
+        assert await snapshot_manager.check_cache(Language.PYTHON, []) is None
+        assert not broken.exists()
+
+    async def test_leaked_clusters_only_is_a_valid_image(self, make_keyed_manager) -> None:
+        """qemu-img check exit 3: leaked clusters only (space lost inside the file after an
+        interrupted write), the data is intact. A hit, kept."""
+        snapshot_manager, settings = await make_keyed_manager()
+        entry = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
+        await create_test_qcow2(entry)
+
+        async def leaked(cmd: list[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
+            assert cmd[:2] == ["qemu-img", "check"]
+            return 3, b"", b"Leaked cluster 7 refcount=1 reference=0"
+
+        with patch("exec_sandbox.disk_snapshot_manager.communicate_managed_process", side_effect=leaked):
+            assert await _checked(snapshot_manager, Language.PYTHON, _PACKAGES) == entry
+        assert entry.exists()
+
+    async def test_upload_holds_its_share_until_it_ends(self, make_keyed_manager) -> None:
+        """The S3 upload of a build reads the image after the request is over (it waits for its
+        turn first): its own share keeps eviction off the image until it ends. The
+        upload (_upload_to_s3) is a stub that waits: the window in which only its share holds
+        the image."""
+        snapshot_manager, settings = await make_keyed_manager(s3_bucket=None)
+        entry = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
+        reading = asyncio.Event()
+        done = asyncio.Event()
+        seen: list[Path] = []
+
+        async def build(*_args: object, cache_key: str, **_kwargs: object) -> Path:
+            built = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
+            await create_test_qcow2(built)
+            return built
+
+        async def upload(_cache_key: str, path: Path) -> None:
+            seen.append(path)
+            reading.set()
+            await done.wait()
+
+        with (
+            patch.object(snapshot_manager, "_create_snapshot", side_effect=build),
+            patch.object(snapshot_manager, "_upload_to_s3", side_effect=upload),
+        ):
+            lease = await snapshot_manager.get_or_create_snapshot(
+                Language.PYTHON, _PACKAGES, tenant_id="t", task_id="t", memory_mb=256
+            )
+            lease.release()  # the request is over
+            await reading.wait()
+            assert not evictable(entry)
+            done.set()
+            await snapshot_manager.stop()
+        assert seen == [entry]
+        assert evictable(entry)
+
+    async def test_built_snapshot_is_leased_when_returned(self, make_keyed_manager) -> None:
+        """A new build is leased under its build lock (that eviction needs too): the caller
+        gets it held, with no moment in which an eviction could take it."""
+        snapshot_manager, settings = await make_keyed_manager(s3_bucket=None)
+
+        async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):  # type: ignore[no-untyped-def]
+            built = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
+            await create_test_qcow2(built)
+            return built
+
+        with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot):
+            lease = await snapshot_manager.get_or_create_snapshot(
+                language=Language.PYTHON, packages=["pandas==2.0.0"], tenant_id="t", task_id="t", memory_mb=256
+            )
+        try:
+            assert lease.path.exists()
+            assert not evictable(lease.path)
+        finally:
+            lease.release()
+
+    async def test_corrupt_l2_triggers_recreation(self, make_keyed_manager) -> None:
+        """A corrupt qcow2 in L2 (garbage bytes) fails qemu-img check: no false hit, a new build
+        takes its place."""
+        snapshot_manager, settings = await make_keyed_manager(s3_bucket=None)
+        corrupt_path = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
         corrupt_path.write_bytes(b"\x00\xff\xde\xad" * 64)
+        rebuilt = b""
 
-        # Mock _create_snapshot to write valid qcow2
         async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
+            nonlocal rebuilt
             expected = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
             await create_test_qcow2(expected)
+            rebuilt = expected.read_bytes()
             return expected
 
-        with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot) as mock_create:
-            result_path = await snapshot_manager.get_or_create_snapshot(
-                language=Language.PYTHON,
-                packages=["pandas==2.0.0"],
-                tenant_id="test",
-                task_id=f"test-{random_test_id()}",
-                memory_mb=256,
+        with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot):
+            result_path = await _built_path(
+                snapshot_manager.get_or_create_snapshot(
+                    language=Language.PYTHON,
+                    packages=_PACKAGES,
+                    tenant_id="test",
+                    task_id=f"test-{random_test_id()}",
+                    memory_mb=256,
+                )
             )
 
-        # _create_snapshot must have been called (corrupt L2 rejected)
-        mock_create.assert_called_once()
-        assert result_path.exists()
+        assert result_path == corrupt_path
+        assert rebuilt
+        assert result_path.read_bytes() == rebuilt
 
-    async def test_stale_lock_file_does_not_block(self, make_snapshot_manager, tmp_path: Path) -> None:
+    async def test_stale_lock_file_does_not_block(self, make_keyed_manager) -> None:
         """A stale .lock file left by a crashed process does not cause deadlock.
 
-        file_lock uses flock() which is automatically released when the process dies
+        CacheEntry.saving uses flock(), which is automatically released when the process dies
         (fd close). A leftover .lock file on disk should not prevent new callers from
         acquiring the lock and creating the snapshot.
         """
-        snapshot_manager, settings = await make_snapshot_manager(
-            disk_snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket=None,
-        )
-
-        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["requests==2.31.0"])
-        expected_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
+        snapshot_manager, settings = await make_keyed_manager(s3_bucket=None)
+        expected_path = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
 
         # Simulate stale .lock file left by a crashed process
         lock_path = expected_path.with_suffix(".qcow2.lock")
         lock_path.touch()
 
-        # No .qcow2 file exists (simulates crash before write completed)
-        assert not expected_path.exists()
-        assert lock_path.exists()
-
         async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
-            await create_test_qcow2(expected_path)
-            return expected_path
+            built = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
+            await create_test_qcow2(built)
+            return built
 
         with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot):
             # Must complete within 10s (no deadlock on stale lock file)
             result_path = await asyncio.wait_for(
-                snapshot_manager.get_or_create_snapshot(
-                    language=Language.PYTHON,
-                    packages=["requests==2.31.0"],
-                    tenant_id="test",
-                    task_id=f"test-{random_test_id()}",
-                    memory_mb=256,
+                _built_path(
+                    snapshot_manager.get_or_create_snapshot(
+                        language=Language.PYTHON,
+                        packages=_PACKAGES,
+                        tenant_id="test",
+                        task_id=f"test-{random_test_id()}",
+                        memory_mb=256,
+                    )
                 ),
                 timeout=10,
             )
 
-        assert result_path.exists()
         assert result_path == expected_path
+        assert result_path.exists()

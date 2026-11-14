@@ -12,24 +12,30 @@ Includes:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import fcntl
+import gc
+import hashlib
 import json
 import logging
 import os
 import shutil
+import stat
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Generator
 
 import pytest
 
+from exec_sandbox import memory_snapshot_manager as msm
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
@@ -38,9 +44,25 @@ from exec_sandbox.exceptions import (
     SandboxError,
     TransientError,
 )
-from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager, _vmstate_digest
+from exec_sandbox.files.disk import pwrite_all
+from exec_sandbox.files.locks import CacheEntry, EntryLease
+from exec_sandbox.guest_agent_protocol import WarmReplAckMessage
+from exec_sandbox.images import image_digest
+from exec_sandbox.memory_snapshot_manager import (
+    MemorySnapshotManager,
+    _open_live_ram_dir,
+    _publish_ram,
+    _vmstate_digest,
+    remove_dead_live_ram_dirs,
+)
 from exec_sandbox.models import Language
+from exec_sandbox.platform_utils import get_arch_name
+from exec_sandbox.private_run_dir import PrivateRunDir, new_folder_name
 from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import asyncio_with
+from tests.test_files_locks import evictable, leased_here, leased_in_child
+
+_BLOCK = 64 * 1024
 
 
 @pytest.fixture
@@ -49,20 +71,72 @@ def cache_dir(tmp_path: Path) -> Path:
     return tmp_path / "l1-cache"
 
 
+@pytest.fixture(autouse=True)
+def live_ram_root(tmp_path: Path) -> Generator[Path]:
+    """The folder a save VM's RAM would go to in memory (/dev/shm): a test folder, not made
+    unless the test asks (`in_memory`): with no such folder the RAM stays in the cache
+    folder. No test writes to the host's /dev/shm, and every test sees the same host."""
+    root = tmp_path / "shm"
+    with patch("exec_sandbox.memory_snapshot_manager._LIVE_RAM_ROOT", root):
+        yield root
+
+
+@pytest.fixture
+def in_memory(live_ram_root: Path) -> Generator[Path]:
+    """`live_ram_root` is there (Linux /dev/shm). Its folders stay until closed: the save
+    must remove its folder itself, not leave it to garbage collection."""
+    live_ram_root.mkdir()
+    live_ram_root.chmod(0o1777)  # as /dev/shm: sticky, open to every user
+    kept: list[PrivateRunDir] = []
+    real_open = PrivateRunDir.open
+
+    def open_and_keep(root: Path, *, name: str) -> PrivateRunDir:
+        kept.append(real_open(root, name=name))
+        return kept[-1]
+
+    with patch("exec_sandbox.memory_snapshot_manager.PrivateRunDir.open", open_and_keep):
+        yield live_ram_root
+    for folder in kept:
+        folder.close()
+
+
+def _live_folders(root: Path) -> list[Path]:
+    """The save folders (PrivateRunDir) under the memory root, of every process of this user."""
+    user_root = root / f"exec-sandbox-{os.geteuid()}"
+    return sorted(user_root.iterdir()) if user_root.exists() else []
+
+
 @pytest.fixture
 def images_dir(tmp_path: Path) -> Path:
-    """Dummy image files so real VmManager.get_base_image() glob works."""
+    """Dummy image files so the real VmManager.images (GuestImages) finds them."""
     d = tmp_path / "images"
     d.mkdir()
-    (d / "python-3.14-base-aarch64.qcow2").touch()
-    (d / "node-23-base-aarch64.qcow2").touch()
-    (d / "raw-base-aarch64.qcow2").touch()
+    arch = get_arch_name()
+    (d / f"python-3.14-base-{arch}.qcow2").touch()
+    (d / f"node-1.4-base-{arch}.qcow2").touch()
+    (d / f"raw-base-{arch}.qcow2").touch()
     kernels = d / "kernels"
     kernels.mkdir()
     for arch in ("aarch64", "x86_64"):
         (kernels / f"vmlinuz-{arch}").write_bytes(b"fake-kernel")
         (kernels / f"initramfs-{arch}").write_bytes(b"fake-initramfs")
     return d
+
+
+def test_cache_folder_is_private_whatever_the_umask(tmp_path: Path, images_dir: Path) -> None:
+    """Made 0700 under umask 002 (the Ubuntu default) and any group (sg qemu-vm): the L1 and
+    L2 folders (BaseCacheManager._make_cache_dir)."""
+    from exec_sandbox.settings import Settings
+    from exec_sandbox.vm_manager import VmManager
+
+    cache = tmp_path / "cache" / "memory-snapshots"
+    settings = Settings(memory_snapshot_cache_dir=cache, base_images_dir=images_dir, kernel_path=images_dir / "kernels")
+    old = os.umask(0o002)
+    try:
+        MemorySnapshotManager(settings, VmManager(settings))
+    finally:
+        os.umask(old)
+    assert [stat.S_IMODE(p.stat().st_mode) & 0o777 for p in (cache.parent, cache)] == [0o700, 0o700]
 
 
 @pytest.fixture
@@ -91,6 +165,114 @@ async def _schedule_save(manager: MemorySnapshotManager, spec: VmSpec) -> asynci
     return await manager.schedule_background_save(spec, key=key, snapshot_drive=None)
 
 
+async def _save(manager: MemorySnapshotManager, spec: VmSpec) -> None:
+    """One whole background save of `spec` (schedule_background_save, then its task)."""
+    task = await _schedule_save(manager, spec)
+    assert task is not None
+    await task
+
+
+def _files_of(manager: MemorySnapshotManager, key: str) -> list[str]:
+    """The suffixes of the files of `key` in the cache folder, lock files aside (they stay:
+    files.locks)."""
+    return sorted(
+        path.name.removeprefix(key)
+        for path in manager.cache_dir.iterdir()
+        if path.name.startswith(key) and not path.name.endswith(".lock")
+    )
+
+
+def _save_vm(*, home_disk: Path, qemu_vm: bool) -> MagicMock:
+    """A save VM whose guest answers the REPL warm-up. No QEMU starts."""
+    vm = MagicMock()
+    vm.qmp_socket = Path("/tmp/fake.sock")
+    vm.use_qemu_vm_user = qemu_vm
+    vm.workdir.home_disk = home_disk
+    vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+    return vm
+
+
+@contextlib.contextmanager
+def _template_save(
+    manager: MemorySnapshotManager, *, vm: MagicMock, migrate: Callable[..., Awaitable[None]]
+) -> Generator[list[Path]]:
+    """schedule_background_save runs its whole save: `vm` is the save VM, and `migrate`
+    is the migration that writes the device state to the file it gets. Yields the RAM file
+    of each save VM."""
+    mapped: list[Path] = []
+
+    @contextlib.asynccontextmanager
+    async def ephemeral_vm(*_args: object, **kwargs: object) -> AsyncIterator[MagicMock]:
+        mapped.append(Path(cast("str", kwargs["mem_path"])))
+        yield vm
+
+    client = AsyncMock()
+    client.save_snapshot.side_effect = migrate
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    with (
+        patch(
+            "exec_sandbox.memory_snapshot_manager.probe_qemu_as_qemu_vm",
+            AsyncMock(return_value=vm.use_qemu_vm_user),
+        ),
+        patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm),
+        patch("exec_sandbox.memory_snapshot_manager.MigrationClient", return_value=client),
+    ):
+        yield mapped
+
+
+async def _write_vmstate(path: Path, **_kwargs: object) -> None:
+    """The migration: QEMU writes the device state to the file the host made."""
+    with path.open("r+b") as f:  # QEMU opens the existing file: O_CREAT without O_EXCL
+        f.write(b"device state")
+
+
+class _SaveVms:
+    """Save VMs that never reach a save: each boot records its task_id and RAM file, waits
+    for `gate`, then fails (`fail`) or yields a VM whose REPL warm-up fails. The save then
+    ends without an entry. No QEMU starts."""
+
+    def __init__(self, *, gate: asyncio.Event, fail: bool) -> None:
+        self.task_ids: list[str] = []
+        self.mem_paths: list[Path] = []
+        self._gate = gate
+        self._fail = fail
+        self._booted = asyncio.Condition()
+
+    @contextlib.asynccontextmanager
+    async def ephemeral_vm(
+        self, *_args: object, task_id: str, mem_path: str, **_kwargs: object
+    ) -> AsyncIterator[MagicMock]:
+        async with self._booted:
+            self.task_ids.append(task_id)
+            self.mem_paths.append(Path(mem_path))
+            self._booted.notify_all()
+        await self._gate.wait()
+        if self._fail:
+            raise TransientError("boot failed", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None)
+        vm = MagicMock()
+        vm.channel.send_request = AsyncMock(return_value=MagicMock(status="error"))
+        yield vm
+
+    async def booted(self, count: int) -> None:
+        """Wait until `count` save VMs have booted (a hang guard of 5 s: TimeoutError when
+        the saves do not boot)."""
+        async with asyncio.timeout(5), self._booted:
+            await self._booted.wait_for(lambda: len(self.task_ids) >= count)
+
+    @contextlib.contextmanager
+    def of(self, manager: MemorySnapshotManager) -> Generator[None]:
+        """The save VMs of `manager` are these."""
+        with patch.object(manager.vm_manager, "ephemeral_vm", self.ephemeral_vm):
+            yield
+
+
+def _open_gate() -> asyncio.Event:
+    gate = asyncio.Event()
+    gate.set()
+    return gate
+
+
 @pytest.fixture
 def mock_system_probes() -> Generator[dict[str, Any], None, None]:
     """Patch system probes (arch, QEMU version, accel) with standard defaults.
@@ -104,6 +286,8 @@ def mock_system_probes() -> Generator[dict[str, Any], None, None]:
         patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
         patch("exec_sandbox.memory_snapshot_manager.probe_qemu_version", new_callable=AsyncMock) as mock_qemu,
         patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
+        # QEMU as this user (no sudo probe on a Linux host with the qemu-vm setup)
+        patch("exec_sandbox.memory_snapshot_manager.probe_qemu_as_qemu_vm", new_callable=AsyncMock, return_value=False),
     ):
         mock_arch.return_value = HostArch.AARCH64
         mock_qemu.return_value = (11, 1, 3)  # at or above the migration floor: saves allowed
@@ -172,14 +356,14 @@ class TestComputeCacheKey:
             jobs.append(getattr(func, "__name__", repr(func)))
             return await to_thread(func, *args, **kwargs)
 
-        monkeypatch.setattr(asyncio, "to_thread", counted)
+        monkeypatch.setattr("exec_sandbox.memory_snapshot_manager.asyncio", asyncio_with(to_thread=counted))
         await self._compute_key(manager, packages=["pandas==2.2.3"], l2_path=l2)
         assert len(jobs) == 1, jobs
 
     async def test_same_inputs_same_key(self, manager: MemorySnapshotManager) -> None:
         """Identical inputs produce identical cache keys."""
-        key1 = await self._compute_key(manager)
-        key2 = await self._compute_key(manager)
+        key1 = await self._compute_key(manager, packages=["numpy", "pandas"])
+        key2 = await self._compute_key(manager, packages=["numpy", "pandas"])
         assert key1 == key2
 
     async def test_different_language_different_key(self, manager: MemorySnapshotManager) -> None:
@@ -212,6 +396,36 @@ class TestComputeCacheKey:
         key_tcg = await self._compute_key(manager, accel="TCG")
         assert key_hvf != key_tcg
 
+    async def test_different_cpu_model_different_key(self, manager: MemorySnapshotManager) -> None:
+        """Another -cpu value (same accelerator) gives another key: a restore needs the CPU it
+        was saved on (an ARM TCG entry saved with pointer auth cannot resume without it)."""
+        with patch("exec_sandbox.memory_snapshot_manager.guest_cpu_model", new_callable=AsyncMock) as cpu:
+            cpu.return_value = "max,pauth-impdef=on"
+            key_max = await self._compute_key(manager, accel="TCG")
+            cpu.return_value = "neoverse-v1,pauth=off"
+            key_v1 = await self._compute_key(manager, accel="TCG")
+        assert key_max != key_v1
+
+    async def test_x86_tsc_deadline_changes_the_key(self, manager: MemorySnapshotManager) -> None:
+        """On x86 the guest CPU model holds +tsc-deadline when the host has it (KVM/HVF): a
+        host with it and one without make different keys, through the real guest_cpu_model."""
+        from exec_sandbox.platform_utils import HostArch
+        from exec_sandbox.system_probes import AccelType
+
+        keys = []
+        for tsc_deadline in (True, False):
+            with (
+                patch("exec_sandbox.memory_snapshot_manager.detect_host_arch", return_value=HostArch.X86_64),
+                patch("exec_sandbox.memory_snapshot_manager.probe_qemu_version", new_callable=AsyncMock) as qemu,
+                patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as accel,
+                patch("exec_sandbox.qemu_cmd.check_tsc_deadline", new_callable=AsyncMock, return_value=tsc_deadline),
+                patch("exec_sandbox.qemu_cmd.detect_host_x86_vendor", return_value="GenuineIntel"),
+            ):
+                qemu.return_value = (11, 1, 3)
+                accel.return_value = AccelType.KVM
+                keys.append(await manager.compute_cache_key(VmSpec(language=Language.PYTHON), l2_path=None))
+        assert keys[0] != keys[1]
+
     async def test_different_network_different_key(self, manager: MemorySnapshotManager) -> None:
         """Different allow_network values produce different keys (topology differs)."""
         key_nonet = await self._compute_key(manager, allow_network=False)
@@ -234,13 +448,17 @@ class TestComputeCacheKey:
         assert key_ab == key_ba
 
     async def test_none_qemu_version(self, manager: MemorySnapshotManager) -> None:
-        """None QEMU version should produce stable key with 'unknown'."""
+        """An unknown QEMU version gives a stable key of its own."""
         key = await self._compute_key(manager, qemu_version=None)
         assert key.startswith("l1-python-v")
+        assert key == await self._compute_key(manager, qemu_version=None)
+        assert key != await self._compute_key(manager, qemu_version=(9, 2, 0))
 
 
 class TestVmstateDigest:
-    """The L1 integrity digest: every non-zero byte, its offset and the size count; holes are not read."""
+    """The L1 integrity digest: every non-zero byte, its offset and the size count; holes are
+    not read. Private level: check_cache only compares two digests, so these properties of
+    the digest are not visible through it."""
 
     _SIZE = 1024 * 1024 * 1024  # APFS reports the holes of a large sparse file only
     _LAYOUT_SIZE = 64 * 1024 * 1024  # APFS reports its holes; cheap to read whole
@@ -351,20 +569,6 @@ class TestCheckCache:
         meta.write_text(json.dumps(meta_obj))
         return vmstate
 
-    async def test_cache_miss_no_files(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Cache miss when no files exist."""
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is None
-
-    async def test_cache_hit(self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]) -> None:
-        """Cache hit returns vmstate path."""
-        vmstate = await self._populate_cache(manager)
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is not None
-        assert result == vmstate
-
     async def test_zero_size_cleaned_up(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
@@ -391,7 +595,7 @@ class TestCheckCache:
     async def test_missing_metadata_returns_miss(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Missing metadata file returns miss."""
+        """A vmstate without its metadata is a miss, and the check does not remove it."""
         vmstate = await self._populate_cache(manager)
         # Delete metadata only
         meta = vmstate.parent / f"{vmstate.name[: -len('.vmstate')]}.vmstate.meta"
@@ -399,23 +603,12 @@ class TestCheckCache:
 
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is None
-
-    async def test_sha256_mismatch_cleaned_up(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """vmstate with wrong SHA-256 is cleaned up and returns miss."""
-        vmstate = await self._populate_cache(manager)
-        # Corrupt vmstate content (metadata still has old SHA-256)
-        vmstate.write_bytes(b"corrupted data")
-
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is None
-        assert not vmstate.exists()
+        assert vmstate.exists()
 
     async def test_no_sha256_in_metadata_still_hits(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Legacy metadata without SHA-256 still returns hit (graceful upgrade)."""
+        """Metadata without vmstate_sha256: no digest check, and the entry is a hit."""
         key = await manager.compute_cache_key(
             VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
         )
@@ -428,6 +621,42 @@ class TestCheckCache:
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is not None
         assert result == vmstate
+
+
+@pytest.mark.usefixtures("mock_system_probes")
+class TestCheckCacheAtime:
+    async def test_atime_update_refused_is_still_a_hit(self, manager: MemorySnapshotManager) -> None:
+        """The atime update of an entry this process may not write (another user's file)
+        raises PermissionError: the hit stands (the atime only orders eviction)."""
+        key, files = await TestRestore._entry(manager)
+        with patch(
+            "exec_sandbox.memory_snapshot_manager.os.utime", side_effect=PermissionError(13, "Permission denied")
+        ):
+            assert await manager.check_cache(key) == files[0]
+
+    async def test_atime_update_sets_the_access_time_and_keeps_the_stamp(self, manager: MemorySnapshotManager) -> None:
+        """A hit moves the access time (eviction removes the oldest first); the mtime stays,
+        so the version a restore checked (its stamp) is still the file a refusal removes."""
+        key, files = await TestRestore._entry(manager)
+        os.utime(files[0], (1_000_000, 2_000_000))
+        assert await manager.check_cache(key) == files[0]
+        stat = files[0].stat()
+        assert stat.st_atime > 1_000_000
+        assert stat.st_mtime == 2_000_000
+
+    async def test_entry_evicted_after_its_check_is_not_made_again(self, manager: MemorySnapshotManager) -> None:
+        """An eviction between the check and the atime update: no empty vmstate appears in
+        its place (Path.touch would make one: a zero-size entry until the next check). The
+        window has no public hook: the test replaces the private check step to evict there."""
+        key, files = await TestRestore._entry(manager)
+
+        async def checked_then_evicted(vmstate: Path, *_args: object, **_kwargs: object) -> None:
+            for path in files:
+                path.unlink()
+
+        with patch.object(manager, "_entry_problem", new=checked_then_evicted):
+            await manager.check_cache(key)
+        assert not files[0].exists()
 
 
 class TestHomeDiskEntry:
@@ -490,7 +719,9 @@ class TestHomeDiskEntry:
         )
 
         assert await manager.check_cache(key) is None
-        assert sorted(p.name for p in manager.cache_dir.iterdir() if p.name.startswith(key)) == []
+        # Only the lock files of the removal stay (lock files are never deleted: files.locks)
+        left = sorted(p.name for p in manager.cache_dir.iterdir() if p.name.startswith(key))
+        assert left == [f"{key}.vmstate.lock", f"{key}.vmstate.use.lock"]
 
     async def test_disk_size_in_key(self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]) -> None:
         """A template formats its home disk: another disk size is another template."""
@@ -517,18 +748,36 @@ class TestRestore:
         return key, files
 
     @staticmethod
-    async def _restore(manager: MemorySnapshotManager, key: str, reservation: object) -> object:
-        return await manager.restore(
-            TestRestore._SPEC,
-            key=key,
-            tenant_id="tenant",
-            task_id="task",
-            snapshot_drive=Path("/l2.qcow2"),
-            expose_ports=None,
-            reservation=reservation,  # type: ignore[arg-type]
-        )
+    def _layer(manager: MemorySnapshotManager) -> Path:
+        """The L2 layer the restored VM runs on (an entry of another cache)."""
+        return manager.cache_dir.parent / "l2.qcow2"
 
-    async def test_hit_restores_the_entry(self, manager: MemorySnapshotManager) -> None:
+    @staticmethod
+    async def _restore(manager: MemorySnapshotManager, key: str, reservation: object) -> object:
+        """restore() as the scheduler calls it: with its lease on the L2 layer, and the L1
+        entry leased before (None: a miss, no restore)."""
+        layer = TestRestore._layer(manager)
+        layer.write_bytes(b"l2")
+        lease = await CacheEntry(layer).lease()
+        assert lease is not None
+        entry = await manager.lease(key)
+        if entry is None:
+            lease.release()
+            return None
+        try:
+            return await manager.restore(
+                TestRestore._SPEC,
+                entry=entry,
+                tenant_id="tenant",
+                task_id="task",
+                snapshot_drive=lease,
+                expose_ports=None,
+                reservation=reservation,  # type: ignore[arg-type]
+            )
+        finally:
+            lease.release()
+
+    async def test_hit_restores_the_entry(self, manager: MemorySnapshotManager, images_dir: Path) -> None:
         key, files = await self._entry(manager)
         vm, reservation = MagicMock(), MagicMock()
         with patch.object(manager.vm_manager, "restore_vm", new=AsyncMock(return_value=vm)) as restore_vm:
@@ -538,17 +787,42 @@ class TestRestore:
             tenant_id="tenant",
             task_id="task",
             vmstate_path=files[0],
-            base_image=manager.vm_manager.get_base_image("python"),
-            snapshot_drive=Path("/l2.qcow2"),
+            base_image=images_dir / f"python-3.14-base-{get_arch_name()}.qcow2",
+            snapshot_drive=self._layer(manager),
+            cache_leases=ANY,
             expose_ports=None,
             reservation=reservation,
         )
+        leases = restore_vm.await_args.kwargs["cache_leases"]
+        assert [lease.path for lease in leases] == [files[0], self._layer(manager)]
 
-    async def test_miss_starts_nothing(self, manager: MemorySnapshotManager) -> None:
-        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
-        with patch.object(manager.vm_manager, "restore_vm", new=AsyncMock()) as restore_vm:
-            assert await self._restore(manager, key, MagicMock()) is None
-        restore_vm.assert_not_awaited()
+    async def test_entry_is_leased_until_the_vm_has_its_own_share(self, manager: MemorySnapshotManager) -> None:
+        """No eviction removes the entry from its check to the VM launch (the VM takes its
+        own share of the lease there); restore() releases its own lease after."""
+        key, files = await self._entry(manager)
+        evictable_at_launch: list[bool] = []
+
+        async def restore_vm(*_args: object, **_kwargs: object) -> MagicMock:
+            evictable_at_launch.append(evictable(files[0]))
+            return MagicMock()
+
+        with patch.object(manager.vm_manager, "restore_vm", new=restore_vm):
+            await self._restore(manager, key, MagicMock())
+        assert evictable_at_launch == [False]
+        assert evictable(files[0])
+        assert not leased_here(files[0])  # released, not only closed by the garbage collector
+
+    async def test_no_lease_without_an_entry(self, manager: MemorySnapshotManager) -> None:
+        """No entry, or one evicted between the lookup and the lease: no lease (the caller
+        cold boots), and no lock file is made for a key that was never saved."""
+        never_saved = await manager.compute_cache_key(VmSpec(language=Language.JAVASCRIPT, memory_mb=512), l2_path=None)
+        assert await manager.lease(never_saved) is None
+        assert list(manager.cache_dir.iterdir()) == []
+
+        key, files = await self._entry(manager)
+        assert await manager.check_cache(key) == files[0]
+        assert await manager.evict_oldest() is not None
+        assert await manager.lease(key) is None
 
     @pytest.mark.parametrize(
         ("cause", "evicted"),
@@ -597,6 +871,31 @@ class TestRestore:
             assert await self._restore(manager, key, MagicMock()) is None
         assert all(not f.exists() for f in files) if evicted else all(f.exists() for f in files)
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(PermissionError(13, "Permission denied"), id="raw-eacces"),
+            pytest.param(
+                ConfigError(
+                    "no qemu-vm access", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None
+                ),
+                id="host-dependency",
+            ),
+            pytest.param(
+                InternalError("bug", code=ErrorCode.INTERNAL, context=None, hint=None, instance_id=None), id="internal"
+            ),
+        ],
+    )
+    async def test_any_failure_cold_boots_and_keeps_the_entry(
+        self, manager: MemorySnapshotManager, error: Exception
+    ) -> None:
+        """Not only a TransientError: every failed restore gives None (the caller cold
+        boots) and keeps a good entry (a host problem is no refusal of the saved state)."""
+        key, files = await self._entry(manager)
+        with patch.object(manager.vm_manager, "restore_vm", new=AsyncMock(side_effect=error)):
+            assert await self._restore(manager, key, MagicMock()) is None
+        assert all(f.exists() for f in files)
+
     async def test_silent_guest_removes_the_entry(self, manager: MemorySnapshotManager) -> None:
         """A guest that never answers after its state loaded: the request cold boots and
         the entry goes (else every later hit waits for the same silence)."""
@@ -632,6 +931,32 @@ class TestRestore:
             assert await self._restore(manager, key, MagicMock()) is None
         assert not any(f.exists() for f in files)
 
+    async def test_refused_entry_another_process_runs_on_stays(self, manager: MemorySnapshotManager) -> None:
+        """QEMU refused the entry here, but a VM of another process runs on it (its lease):
+        the removal waits for a later check, as an eviction would."""
+        key, files = await self._entry(manager)
+        error = TransientError(
+            "guest did not answer", code=ErrorCode.GUEST_SILENT_AFTER_RESTORE, context=None, hint=None, instance_id=None
+        )
+        with (
+            leased_in_child(files[0]),
+            patch.object(manager.vm_manager, "restore_vm", new=AsyncMock(side_effect=error)),
+        ):
+            assert await self._restore(manager, key, MagicMock()) is None
+            assert all(f.exists() for f in files)
+            assert not leased_here(files[0])
+
+    async def test_broken_entry_another_process_runs_on_stays(self, manager: MemorySnapshotManager) -> None:
+        """check_cache finds the entry broken while a VM of another process runs on it: a
+        miss, and the entry stays until no lease holds it."""
+        key, files = await self._entry(manager)
+        files[1].write_text(json.dumps({"vmstate_sha256": "0" * 64}))  # fails the check
+        with leased_in_child(files[0]):
+            assert await manager.check_cache(key) is None
+            assert all(f.exists() for f in files)
+        assert await manager.check_cache(key) is None
+        assert not files[0].exists()
+
     async def test_unconfirmed_cleanup_raises_cleanup_unconfirmed_and_keeps_the_entry(
         self, manager: MemorySnapshotManager
     ) -> None:
@@ -654,60 +979,814 @@ class TestRestore:
         assert all(f.exists() for f in files)
 
 
+@pytest.mark.usefixtures("mock_system_probes")
+class TestHostOwnsEntryFiles:
+    """The host makes every L1 file QEMU writes (the RAM template before the save VM boots,
+    the tmp vmstate before the migration) and gives qemu-vm access by ACL: "rw" while the
+    save VM writes, "r" once published. QEMU never makes a file in the cache folder, so a
+    qemu-vm save works and any QEMU identity of the host can restore the entry."""
+
+    _SPEC = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1)
+
+    @pytest.mark.parametrize("memory", [False, True], ids=["cache", "memory"])
+    async def test_ram_template_made_and_granted_before_the_save_vm_boots(
+        self, manager: MemorySnapshotManager, live_ram_root: Path, request: pytest.FixtureRequest, memory: bool
+    ) -> None:
+        """The RAM file exists (0600, the host's, the RAM size) and qemu-vm has rw before
+        the VM starts: in a new folder in memory when the host has a memory file system,
+        else at {key}.ram. A save that publishes nothing removes it (and its folder)."""
+        if memory:
+            request.getfixturevalue("in_memory")
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        ram_path = manager.cache_dir / f"{key}.ram"
+        stale = b"stale template of a crashed save"
+        ram_path.write_bytes(stale)
+        seen: dict[str, object] = {}
+        grants: list[tuple[list[Path], str]] = []
+
+        async def grant(paths: list[Path], *, perms: str) -> bool:
+            grants.append((list(paths), perms))
+            return True
+
+        @contextlib.asynccontextmanager
+        async def ephemeral_vm(*_args: object, **kwargs: object) -> AsyncIterator[MagicMock]:
+            live_ram = Path(cast("str", kwargs["mem_path"]))
+            st = live_ram.stat()
+            with live_ram.open("rb") as ram:
+                head = ram.read(len(stale))
+            seen.update(
+                live_ram=live_ram,
+                mode=stat.S_IMODE(st.st_mode),
+                uid=st.st_uid,
+                size=st.st_size,
+                fresh=head == bytes(len(stale)),  # a new sparse file (ext4 can reuse the old inode number)
+                grants=list(grants),
+            )
+            vm = MagicMock()
+            vm.channel.send_request = AsyncMock(return_value=MagicMock(status="error"))  # REPL warm fails
+            yield vm
+
+        with (
+            patch("exec_sandbox.memory_snapshot_manager.probe_qemu_as_qemu_vm", AsyncMock(return_value=True)),
+            patch("exec_sandbox.memory_snapshot_manager.grant_qemu_vm_acl", grant),
+            patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm),
+        ):
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+            assert task is not None
+            await task
+
+        live_ram = cast("Path", seen.pop("live_ram"))
+        assert seen == {
+            "mode": 0o600,
+            "uid": os.getuid(),
+            "size": 512 * 1024 * 1024,
+            "fresh": True,
+            "grants": [([live_ram], "rw")],
+        }
+        if memory:  # a folder of its own, under the memory root
+            assert (live_ram.name, live_ram.parent.parent) == (
+                ram_path.name,
+                live_ram_root / f"exec-sandbox-{os.geteuid()}",
+            )
+        else:
+            assert live_ram == ram_path
+        assert not ram_path.exists()
+        assert not live_ram.exists()
+        assert _live_folders(live_ram_root) == []
+
+    async def test_save_keeps_the_l2_layer_leased_after_the_caller_lets_go(
+        self, manager: MemorySnapshotManager, tmp_path: Path
+    ) -> None:
+        """The scheduler releases its lease on the L2 layer when its request ends; the
+        save task boots its VM on the layer later. The task holds its own share until it
+        ends (the VM gets it in cache_leases), so no eviction removes the layer first."""
+        layer = tmp_path / "l2.qcow2"
+        layer.write_bytes(b"l2")
+        key = await manager.compute_cache_key(self._SPEC, l2_path=layer)
+        boot = asyncio.Event()
+        seen: dict[str, object] = {}
+
+        @contextlib.asynccontextmanager
+        async def ephemeral_vm(*_args: object, **kwargs: object) -> AsyncIterator[MagicMock]:
+            leases = cast("tuple[EntryLease, ...]", kwargs["cache_leases"])
+            seen.update(drive=kwargs["snapshot_drive"], leases=[lease.path for lease in leases])
+            vm = MagicMock()
+            vm.channel.send_request = AsyncMock(return_value=MagicMock(status="error"))  # REPL warm fails
+            yield vm
+
+        async def boot_later() -> bool:
+            await boot.wait()
+            return False
+
+        lease = await CacheEntry(layer).lease()
+        assert lease is not None
+        with (
+            patch("exec_sandbox.memory_snapshot_manager.probe_qemu_as_qemu_vm", boot_later),
+            patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm),
+        ):
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=lease)
+            assert task is not None
+            lease.release()  # the request is over
+            assert not evictable(layer)  # the task's share
+            boot.set()
+            await task
+        assert seen == {"drive": layer, "leases": [layer]}
+        assert evictable(layer)
+
+    async def test_grant_failure_boots_no_vm_and_leaves_no_file(self, manager: MemorySnapshotManager) -> None:
+        """qemu-vm cannot get the RAM file (no setfacl, a folder it cannot traverse): the save
+        fails before any VM starts (no QEMU exit 1 at boot), and the file goes."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        ram_path = manager.cache_dir / f"{key}.ram"
+        ephemeral_vm = MagicMock()
+        with (
+            patch("exec_sandbox.memory_snapshot_manager.probe_qemu_as_qemu_vm", AsyncMock(return_value=True)),
+            patch("exec_sandbox.memory_snapshot_manager.grant_qemu_vm_acl", AsyncMock(return_value=False)),
+            patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm),
+        ):
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+            assert task is not None
+            await task
+
+        ephemeral_vm.assert_not_called()
+        assert not ram_path.exists()
+
+    async def test_qemu_vm_save_writes_host_files_and_publishes_read_only(
+        self, manager: MemorySnapshotManager, tmp_path: Path
+    ) -> None:
+        """As qemu-vm: the migration target exists before `migrate` (0600, the host's) with
+        rw for qemu-vm; at publish qemu-vm keeps r on the vmstate and the RAM template."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        ram_path = manager.cache_dir / f"{key}.ram"
+        tmp_vmstate = manager.cache_dir / f"{key}.vmstate.tmp"
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+        grants: list[tuple[list[Path], str]] = []
+        at_migrate: dict[str, object] = {}
+
+        async def grant(paths: list[Path], *, perms: str) -> bool:
+            grants.append((list(paths), perms))
+            return True
+
+        async def write_vmstate(path: Path, **kwargs: object) -> None:
+            st = path.stat()
+            at_migrate.update(path=path, mode=stat.S_IMODE(st.st_mode), uid=st.st_uid, grants=list(grants))
+            await _write_vmstate(path, **kwargs)
+
+        with (
+            patch("exec_sandbox.memory_snapshot_manager.grant_qemu_vm_acl", grant),
+            _template_save(manager, vm=_save_vm(home_disk=home_disk, qemu_vm=True), migrate=write_vmstate),
+        ):
+            await _save(manager, self._SPEC)
+
+        assert at_migrate == {
+            "path": tmp_vmstate,
+            "mode": 0o600,
+            "uid": os.getuid(),
+            "grants": [([ram_path], "rw"), ([tmp_vmstate], "rw")],
+        }
+        assert grants == [([ram_path], "rw"), ([tmp_vmstate], "rw"), ([tmp_vmstate, ram_path], "r")]
+        assert await manager.check_cache(key) == manager.cache_dir / f"{key}.vmstate"
+
+    async def test_publish_grant_failure_publishes_nothing(
+        self, manager: MemorySnapshotManager, tmp_path: Path
+    ) -> None:
+        """qemu-vm keeps write access when "r" cannot be set: the entry is not published
+        (any QEMU could change a shared template), and no file of it stays."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+
+        async def grant(_paths: list[Path], *, perms: str) -> bool:
+            return perms == "rw"
+
+        with (
+            patch("exec_sandbox.memory_snapshot_manager.grant_qemu_vm_acl", grant),
+            _template_save(manager, vm=_save_vm(home_disk=home_disk, qemu_vm=True), migrate=_write_vmstate),
+        ):
+            await _save(manager, self._SPEC)
+
+        assert _files_of(manager, key) == []
+
+    async def test_metadata_has_no_group_or_other_access(self, manager: MemorySnapshotManager, tmp_path: Path) -> None:
+        """Under `sg qemu-vm` and umask 002, open() made the metadata 0664 of group qemu-vm: a
+        QEMU as qemu-vm could change the digest each restore checks the vmstate against. It is
+        0600, also where a failed save left one (here 0666)."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        vmstate_path = manager.cache_dir / f"{key}.vmstate"
+        meta_path = manager.cache_dir / f"{key}.vmstate.meta"
+        meta_path.write_text("left by a failed save")
+        meta_path.chmod(0o666)
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+
+        old = os.umask(0o002)
+        try:
+            with _template_save(manager, vm=_save_vm(home_disk=home_disk, qemu_vm=False), migrate=_write_vmstate):
+                await _save(manager, self._SPEC)
+        finally:
+            os.umask(old)
+
+        assert await manager.check_cache(key) == vmstate_path  # the new metadata, with the vmstate's digest
+        assert {p.name: stat.S_IMODE(p.stat().st_mode) for p in (vmstate_path, meta_path)} == {
+            vmstate_path.name: 0o600,
+            meta_path.name: 0o600,
+        }
+
+
+@pytest.mark.usefixtures("mock_system_probes")
+class TestTemplateRamInMemory:
+    """With a memory file system (Linux /dev/shm), the save VM's RAM is a file there, not
+    in the cache folder: on a disk, writeback of the RAM the guest keeps writing stalls the
+    VM. The save writes the RAM to the cache once, then frees it."""
+
+    _SPEC = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1)
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_ram_in_memory_is_published_to_the_cache_and_freed(
+        self, manager: MemorySnapshotManager, live_ram_root: Path, tmp_path: Path
+    ) -> None:
+        """The VM maps a file under the memory root; the published entry has the same RAM
+        in {key}.ram (a host file, "r" for qemu-vm); the folder in memory is gone at the end."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        vmstate_path = manager.cache_dir / f"{key}.vmstate"
+        ram_path = manager.cache_dir / f"{key}.ram"
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+        grants: list[tuple[list[Path], str]] = []
+        seen: dict[str, Path] = {}
+
+        async def grant(paths: list[Path], *, perms: str) -> bool:
+            grants.append((list(paths), perms))
+            return True
+
+        @contextlib.asynccontextmanager
+        async def ephemeral_vm(*_args: object, **kwargs: object) -> AsyncIterator[MagicMock]:
+            seen["live_ram"] = live_ram = Path(cast("str", kwargs["mem_path"]))
+            with live_ram.open("r+b") as ram:  # the guest writes its RAM
+                ram.write(b"\x01" * _BLOCK)
+                ram.seek(5 * _BLOCK + 7)
+                ram.write(b"guest page")
+            vm = MagicMock()
+            vm.qmp_socket = Path("/tmp/fake.sock")
+            vm.use_qemu_vm_user = True
+            vm.workdir.home_disk = home_disk
+            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+            yield vm
+
+        async def write_vmstate(path: Path, **_kwargs: object) -> None:
+            path.write_bytes(b"device state")
+
+        with (
+            patch("exec_sandbox.memory_snapshot_manager.probe_qemu_as_qemu_vm", AsyncMock(return_value=True)),
+            patch("exec_sandbox.memory_snapshot_manager.grant_qemu_vm_acl", grant),
+            patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm),
+            patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client,
+        ):
+            client = AsyncMock()
+            client.save_snapshot.side_effect = write_vmstate
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = client
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+            assert task is not None
+            await task
+
+        live_ram = seen["live_ram"]
+        assert live_ram.is_relative_to(live_ram_root)
+        assert await manager.check_cache(key) == vmstate_path
+        st = ram_path.stat()
+        assert (st.st_size, stat.S_IMODE(st.st_mode)) == (512 * 1024 * 1024, 0o600)
+        with ram_path.open("rb") as ram:  # zeros elsewhere (test_publish_writes_the_non_zero_blocks_only)
+            assert ram.read(_BLOCK) == b"\x01" * _BLOCK
+            ram.seek(5 * _BLOCK)
+            assert ram.read(_BLOCK) == bytes(7) + b"guest page" + bytes(_BLOCK - 17)
+        tmp_vmstate = vmstate_path.parent / f"{vmstate_path.name}.tmp"
+        assert grants == [([live_ram], "rw"), ([tmp_vmstate], "rw"), ([tmp_vmstate, ram_path], "r")]
+        assert _live_folders(live_ram_root) == []
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_ram_removed_from_memory_during_the_save_is_still_published(
+        self, manager: MemorySnapshotManager, live_ram_root: Path, tmp_path: Path
+    ) -> None:
+        """systemd-logind (RemoveIPC=yes, its default) removes every /dev/shm file of a user
+        that is not a system user when its last login session ends, here during the save (as
+        on EC2 at 04:21:12, user@1000 stopped). The fd the save holds keeps the RAM pages: the
+        entry is still published, with the guest's RAM."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        vmstate_path = manager.cache_dir / f"{key}.vmstate"
+        ram_path = manager.cache_dir / f"{key}.ram"
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+        user_root = live_ram_root / f"exec-sandbox-{os.geteuid()}"
+
+        @contextlib.asynccontextmanager
+        async def ephemeral_vm(*_args: object, **kwargs: object) -> AsyncIterator[MagicMock]:
+            with Path(cast("str", kwargs["mem_path"])).open("r+b") as ram:  # the guest writes its RAM
+                ram.seek(3 * _BLOCK)
+                ram.write(b"guest page")
+            vm = MagicMock()
+            vm.qmp_socket = Path("/tmp/fake.sock")
+            vm.use_qemu_vm_user = False
+            vm.workdir.home_disk = home_disk
+            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+            yield vm
+
+        async def write_vmstate_then_logout(path: Path, **_kwargs: object) -> None:
+            path.write_bytes(b"device state")
+            shutil.rmtree(user_root)  # logind's RemoveIPC at the user's last logout
+
+        with (
+            patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm),
+            patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client,
+        ):
+            client = AsyncMock()
+            client.save_snapshot.side_effect = write_vmstate_then_logout
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = client
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+            assert task is not None
+            await task
+
+        assert not user_root.exists()
+        assert await manager.check_cache(key) == vmstate_path
+        with ram_path.open("rb") as ram:
+            ram.seek(3 * _BLOCK)
+            assert ram.read(len(b"guest page")) == b"guest page"
+
+    @pytest.mark.usefixtures("in_memory")
+    @pytest.mark.parametrize("where", ["making-it", "removing-the-entry"])
+    async def test_ram_in_memory_goes_when_the_save_is_cancelled(
+        self, manager: MemorySnapshotManager, live_ram_root: Path, where: str
+    ) -> None:
+        """A cancel while the RAM file is made, or while a failed save's entry is removed:
+        the fd on the RAM file and its folder in memory are gone once the task has ended (an
+        open fd keeps up to the guest RAM in tmpfs until the process ends). The cancel must
+        come while a worker-thread job runs: the test holds the private step of that job."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        loop = asyncio.get_running_loop()
+        in_job = asyncio.Event()
+        made: list[int] = []
+        real_new_live_ram = msm._new_live_ram
+        real_open_live_ram_dir = msm._open_live_ram_dir
+        real_remove_entry = manager._remove_entry
+
+        def open_live_ram_dir(*, size: int) -> Any:
+            live_dir = real_open_live_ram_dir(size=size)
+            if where == "making-it":  # the cancel comes before the RAM file and its fd are made
+                loop.call_soon_threadsafe(in_job.set)
+                time.sleep(0.1)
+            return live_dir
+
+        def new_live_ram(*args: Any, **kwargs: Any) -> Any:
+            live_ram = real_new_live_ram(*args, **kwargs)
+            made.append(cast("int", live_ram.fd))
+            return live_ram
+
+        def remove_entry(path: Path) -> None:
+            if where == "removing-the-entry":
+                loop.call_soon_threadsafe(in_job.set)
+                time.sleep(0.1)
+            real_remove_entry(path)
+
+        @contextlib.asynccontextmanager
+        async def boot_fails(*_args: object, **_kwargs: object) -> AsyncIterator[MagicMock]:
+            raise TransientError("boot", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None)
+            yield MagicMock()  # pragma: no cover
+
+        with (
+            patch.object(msm, "_open_live_ram_dir", open_live_ram_dir),
+            patch.object(msm, "_new_live_ram", new_live_ram),
+            patch.object(manager, "_remove_entry", remove_entry),
+            patch.object(manager.vm_manager, "ephemeral_vm", boot_fails),
+        ):
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+            assert task is not None
+            await in_job.wait()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(made[0])
+        assert _live_folders(live_ram_root) == []
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_cancel_while_publishing_waits_for_the_copy(
+        self, manager: MemorySnapshotManager, live_ram_root: Path, tmp_path: Path
+    ) -> None:
+        """A cancel while the RAM is copied to the cache (a stop, the end of asyncio.run): the
+        copy ends before the fd is closed. Else the job read on through a closed fd, whose
+        number the next open takes: another file's data in the template. The test holds the
+        private copy step to put the cancel in it."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+        loop = asyncio.get_running_loop()
+        in_job = asyncio.Event()
+        same_file: list[bool] = []
+        real_publish_ram = msm._publish_ram
+
+        def publish_ram(stop: threading.Event, *, src_fd: int, dst: Path) -> None:
+            inode = os.fstat(src_fd).st_ino
+            loop.call_soon_threadsafe(in_job.set)
+            time.sleep(0.1)  # the cancel comes while the copy runs
+            try:
+                same_file.append(os.fstat(src_fd).st_ino == inode)
+            except OSError:
+                same_file.append(False)
+            real_publish_ram(stop, src_fd=src_fd, dst=dst)
+
+        @contextlib.asynccontextmanager
+        async def ephemeral_vm(*_args: object, **_kwargs: object) -> AsyncIterator[MagicMock]:
+            vm = MagicMock()
+            vm.qmp_socket = Path("/tmp/fake.sock")
+            vm.use_qemu_vm_user = False
+            vm.workdir.home_disk = home_disk
+            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+            yield vm
+
+        async def write_vmstate(path: Path, **_kwargs: object) -> None:
+            path.write_bytes(b"device state")
+
+        with (
+            patch.object(msm, "_publish_ram", publish_ram),
+            patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm),
+            patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client,
+        ):
+            client = AsyncMock()
+            client.save_snapshot.side_effect = write_vmstate
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = client
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+            assert task is not None
+            await in_job.wait()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        assert same_file == [True]
+        assert task.cancelled()
+        assert _live_folders(live_ram_root) == []
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_cancel_stops_a_long_copy_at_its_next_block(
+        self, manager: MemorySnapshotManager, live_ram_root: Path, tmp_path: Path
+    ) -> None:
+        """A cancel during the copy of a large RAM (GBs: seconds) ends it at its next 64 KiB
+        block, not at its end; the fd closes only after the copy has stopped. Here 200
+        blocks at 10 ms each: 2 s for the whole copy. The test slows the block writes and
+        wraps the private copy step to see the fd at its end."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+        loop = asyncio.get_running_loop()
+        copying = asyncio.Event()
+        written: list[int] = []
+        fd_open_at_end: list[bool] = []
+        real_publish_ram = msm._publish_ram
+
+        def slow_pwrite_all(fd: int, data: bytes, offset: int) -> None:
+            written.append(offset)
+            loop.call_soon_threadsafe(copying.set)
+            time.sleep(0.01)
+            pwrite_all(fd, data, offset)
+
+        def publish_ram(stop: threading.Event, *, src_fd: int, dst: Path) -> None:
+            real_publish_ram(stop, src_fd=src_fd, dst=dst)
+            fd_open_at_end.append(os.fstat(src_fd).st_size > 0)
+
+        @contextlib.asynccontextmanager
+        async def ephemeral_vm(*_args: object, **kwargs: object) -> AsyncIterator[MagicMock]:
+            with Path(cast("str", kwargs["mem_path"])).open("r+b") as ram:  # 200 non-zero blocks
+                for index in range(200):
+                    ram.seek(index * _BLOCK)
+                    ram.write(b"\x01")
+            vm = MagicMock()
+            vm.qmp_socket = Path("/tmp/fake.sock")
+            vm.use_qemu_vm_user = False
+            vm.workdir.home_disk = home_disk
+            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+            yield vm
+
+        async def write_vmstate(path: Path, **_kwargs: object) -> None:
+            path.write_bytes(b"device state")
+
+        with (
+            patch.object(msm, "pwrite_all", slow_pwrite_all),
+            patch.object(msm, "_publish_ram", publish_ram),
+            patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm),
+            patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client,
+        ):
+            client = AsyncMock()
+            client.save_snapshot.side_effect = write_vmstate
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = client
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+            assert task is not None
+            await copying.wait()
+            cancelled_at = time.monotonic()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            ended_s = time.monotonic() - cancelled_at
+        assert task.cancelled()
+        assert len(written) < 20, len(written)  # stopped within a block or two, not after 200
+        assert ended_s < 0.5, ended_s
+        assert fd_open_at_end == [True]  # the copy's end came before the fd's close
+        assert _live_folders(live_ram_root) == []
+        assert await manager.check_cache(key) is None  # the partial copy is gone
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_cancel_stays_a_cancel_when_the_files_cannot_be_removed(
+        self, manager: MemorySnapshotManager, live_ram_root: Path
+    ) -> None:
+        """A cancelled save whose removal fails (EIO): the error is logged, the cancel goes on
+        (the task ends cancelled, as a stop expects), and the RAM in memory goes. The disk
+        fault is made by the private removal step."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        booting = asyncio.Event()
+
+        @contextlib.asynccontextmanager
+        async def boot_hangs(*_args: object, **_kwargs: object) -> AsyncIterator[MagicMock]:
+            booting.set()
+            await asyncio.Event().wait()
+            yield MagicMock()  # pragma: no cover
+
+        with (
+            patch.object(manager, "_remove_entry", side_effect=OSError(errno.EIO, "Input/output error")),
+            patch.object(manager.vm_manager, "ephemeral_vm", boot_hangs),
+        ):
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+            assert task is not None
+            await booting.wait()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        assert task.cancelled()
+        assert _live_folders(live_ram_root) == []
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_ram_in_memory_goes_when_the_entry_cannot_be_removed(
+        self, manager: MemorySnapshotManager, live_ram_root: Path
+    ) -> None:
+        """A failed save whose entry cannot be removed (EIO, a read-only disk): the RAM in
+        memory goes all the same. The disk fault is made by the private removal step, and the
+        test gets the RAM fd from the private step that opens it."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        made: list[int] = []
+        real_new_live_ram = msm._new_live_ram
+
+        def new_live_ram(*args: Any, **kwargs: Any) -> Any:
+            live_ram = real_new_live_ram(*args, **kwargs)
+            made.append(cast("int", live_ram.fd))
+            return live_ram
+
+        @contextlib.asynccontextmanager
+        async def boot_fails(*_args: object, **_kwargs: object) -> AsyncIterator[MagicMock]:
+            raise TransientError("boot", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None)
+            yield MagicMock()  # pragma: no cover
+
+        with (
+            patch.object(msm, "_new_live_ram", new_live_ram),
+            patch.object(manager, "_remove_entry", side_effect=OSError(errno.EIO, "Input/output error")),
+            patch.object(manager.vm_manager, "ephemeral_vm", boot_fails),
+        ):
+            task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+            assert task is not None
+            await task  # the save logs its error
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(made[0])
+        assert _live_folders(live_ram_root) == []
+
+    async def test_publish_writes_the_non_zero_blocks_only(self, tmp_path: Path) -> None:
+        """The guest's zero pages stay holes in the cache (a Python template: 68 of 192 MiB
+        are not zero). A stale {key}.ram is replaced, never written in place: a restored VM
+        may still map it. Private level: whether a file system reports a hole depends on it,
+        so the test records the blocks the copy writes."""
+        src = tmp_path / "live.ram"
+        size = 6 * _BLOCK + 100
+        with src.open("wb") as f:
+            f.write(b"\x02" * _BLOCK)  # block 0: data
+            f.write(bytes(2 * _BLOCK))  # blocks 1-2: written zeros (the guest freed them)
+            f.seek(4 * _BLOCK + 3)
+            f.write(b"x")  # block 4: one byte; block 3: a hole
+            f.truncate(size)  # block 5 and the 100-byte tail: a hole
+        dst = tmp_path / "entry.ram"
+        dst.write_bytes(b"stale")
+        written: list[tuple[int, int]] = []
+
+        def recording_pwrite_all(fd: int, data: bytes, offset: int) -> None:
+            written.append((offset, len(data)))
+            pwrite_all(fd, data, offset)
+
+        with (
+            dst.open("rb") as mapped,  # a restored VM's view of the old template
+            patch("exec_sandbox.memory_snapshot_manager.pwrite_all", recording_pwrite_all),
+        ):
+            with src.open("rb") as live:
+                _publish_ram(threading.Event(), src_fd=live.fileno(), dst=dst)
+            assert mapped.read() == b"stale"
+
+        assert written == [(0, _BLOCK), (4 * _BLOCK, _BLOCK)]
+        assert dst.read_bytes() == src.read_bytes()
+        assert stat.S_IMODE(dst.stat().st_mode) == 0o600
+
+    async def test_publish_writes_through_as_it_goes(self, tmp_path: Path) -> None:
+        """The copy flushes each 32 MiB (here: each block), so the page cache it dirties
+        stays small whatever the RAM size. Private level: dirty page cache is not visible to
+        a test, so the test records the flushes."""
+        src = tmp_path / "live.ram"
+        with src.open("wb") as f:
+            for value in (1, 2, 3):
+                f.write(bytes([value]) * _BLOCK)
+        flushed: list[int] = []
+        with (
+            patch("exec_sandbox.memory_snapshot_manager._PUBLISH_FLUSH_BYTES", _BLOCK),
+            patch(
+                "exec_sandbox.memory_snapshot_manager.flush_to_disk", lambda fd: flushed.append(os.fstat(fd).st_size)
+            ),
+        ):
+            with src.open("rb") as live:
+                _publish_ram(threading.Event(), src_fd=live.fileno(), dst=tmp_path / "entry.ram")
+        assert len(flushed) == 3
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_save_removes_the_folder_of_a_dead_process_and_keeps_a_live_one(
+        self, manager: MemorySnapshotManager, live_ram_root: Path
+    ) -> None:
+        """A process that died during a save leaves its RAM file in memory: the next save
+        removes its folder (lock not held). Another live save's folder stays."""
+        user_root = live_ram_root / f"exec-sandbox-{os.geteuid()}"
+        user_root.mkdir(mode=0o700)
+        dead = user_root / "vmm-dead"
+        dead.mkdir()
+        (dead / ".lock").touch()
+        (dead / "l1-python.ram").write_bytes(b"guest RAM")
+        live = PrivateRunDir.open(user_root, name=new_folder_name())
+        vms = _SaveVms(gate=_open_gate(), fail=False)
+        try:
+            with vms.of(manager):
+                await _save(manager, self._SPEC)
+            assert vms.mem_paths[0].parent.parent == user_root  # the save VM's RAM was in memory
+            assert _live_folders(live_ram_root) == [live.path]
+        finally:
+            live.close()
+
+    @pytest.mark.usefixtures("in_memory")
+    def test_start_sweep_removes_dead_folders_without_a_save(self, live_ram_root: Path) -> None:
+        """VmManager.start runs remove_dead_live_ram_dirs: the RAM file of a killed save goes
+        at the next start, not only at the next save (it holds memory until then)."""
+        user_root = live_ram_root / f"exec-sandbox-{os.geteuid()}"
+        user_root.mkdir(mode=0o700)
+        dead = user_root / "vmm-dead"
+        dead.mkdir()
+        (dead / ".lock").touch()
+        (dead / "l1-python.ram").write_bytes(b"guest RAM")
+        live = PrivateRunDir.open(user_root, name=new_folder_name())
+        try:
+            remove_dead_live_ram_dirs()
+            assert _live_folders(live_ram_root) == [live.path]
+        finally:
+            live.close()
+
+    @pytest.mark.parametrize("memory", [False, True], ids=["no-shm-folder", "no-folder-yet"])
+    def test_start_sweep_makes_nothing(
+        self, live_ram_root: Path, request: pytest.FixtureRequest, caplog: pytest.LogCaptureFixture, memory: bool
+    ) -> None:
+        """No /dev/shm folder (macOS), or no save ever ran: nothing to remove, nothing made,
+        and nothing to warn about."""
+        if memory:
+            request.getfixturevalue("in_memory")
+        with caplog.at_level("WARNING", logger="exec_sandbox"):
+            remove_dead_live_ram_dirs()
+        assert not live_ram_root.exists() or list(live_ram_root.iterdir()) == []
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.usefixtures("in_memory")
+    def test_start_sweep_leaves_a_root_others_can_write(
+        self, live_ram_root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """/dev/shm is open to every user: anyone can make exec-sandbox-<uid> first and put
+        folders in it. Nothing in it is removed; a warning says why."""
+        user_root = live_ram_root / f"exec-sandbox-{os.geteuid()}"
+        user_root.mkdir()
+        user_root.chmod(0o777)
+        dead = user_root / "vmm-dead"
+        dead.mkdir()
+        (dead / ".lock").touch()
+        with caplog.at_level("WARNING", logger="exec_sandbox.memory_snapshot_manager"):
+            remove_dead_live_ram_dirs()
+        assert dead.exists()
+        assert [r.getMessage() for r in caplog.records] == ["RAM folders of stopped L1 saves stay in /dev/shm"]
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_folder_goes_when_the_ram_file_cannot_be_made(
+        self, manager: MemorySnapshotManager, live_ram_root: Path
+    ) -> None:
+        """No RAM file (here ENOSPC in memory), no folder: the save boots no VM and leaves
+        nothing in memory or in the cache."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        vms = _SaveVms(gate=_open_gate(), fail=False)
+        with (
+            patch(
+                "exec_sandbox.memory_snapshot_manager.create_sparse",
+                side_effect=OSError(errno.ENOSPC, "No space left on device"),
+            ),
+            vms.of(manager),
+        ):
+            await _save(manager, self._SPEC)
+        assert vms.task_ids == []
+        assert _live_folders(live_ram_root) == []
+        assert _files_of(manager, key) == []
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_ram_stays_in_the_cache_without_room_in_memory(
+        self, live_ram_root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Less free space in memory than the RAM (a container's 64 MB /dev/shm): None, and
+        nothing is made in memory. Private level: a VmSpec cannot ask for more RAM than the
+        free space of the test folder."""
+        assert _open_live_ram_dir(size=1 << 62) is None  # more than any free space
+        assert _live_folders(live_ram_root) == []
+        assert "/dev/shm is too small" in caplog.text
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_ram_stays_in_the_cache_when_another_user_can_change_the_root(
+        self, manager: MemorySnapshotManager, live_ram_root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Anyone can make /dev/shm/exec-sandbox-<uid> first: a root open to others (or of
+        another user) is neither used nor swept; the save goes on in the cache folder."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        user_root = live_ram_root / f"exec-sandbox-{os.geteuid()}"
+        user_root.mkdir()
+        user_root.chmod(0o777)
+        planted = user_root / "vmm-planted"
+        planted.mkdir()
+        (planted / ".lock").touch()
+        vms = _SaveVms(gate=_open_gate(), fail=False)
+        with vms.of(manager):
+            await _save(manager, self._SPEC)
+        assert vms.mem_paths == [manager.cache_dir / f"{key}.ram"]
+        assert list(user_root.iterdir()) == [planted]
+        assert any("has mode 0o777" in getattr(record, "error", "") for record in caplog.records)
+
+
+@pytest.mark.usefixtures("mock_system_probes")
 class TestSaveLock:
-    """Tests for _save_lock (file-based flock deduplication)."""
+    """The save lock of a key ({key}.vmstate.lock): one save of a key at a time, in every
+    process. TestScheduleBackgroundSaveEdgeCases has the saves that skip the key."""
 
-    async def test_lock_yields_true_when_no_file(self, manager: MemorySnapshotManager) -> None:
-        """Lock yields True when vmstate file does not exist."""
-        async with manager._save_lock("test-key") as should_save:
-            assert should_save is True
+    _SPEC = VmSpec(language=Language.PYTHON, memory_mb=512)
 
-    async def test_lock_yields_false_when_file_exists(self, manager: MemorySnapshotManager) -> None:
-        """Lock yields False when vmstate file already exists."""
-        vmstate = manager.cache_dir / "test-key.vmstate"
-        vmstate.write_bytes(b"data")
-        async with manager._save_lock("test-key") as should_save:
-            assert should_save is False
+    async def test_empty_vmstate_is_saved_again(self, manager: MemorySnapshotManager) -> None:
+        """An empty {key}.vmstate (a miss: it has no metadata) is no entry: the save boots its VM."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        (manager.cache_dir / f"{key}.vmstate").write_bytes(b"")
+        vms = _SaveVms(gate=_open_gate(), fail=False)
+        with vms.of(manager):
+            await _save(manager, self._SPEC)
+        assert vms.task_ids == ["l1-save-python"]
 
-    async def test_lock_yields_true_when_file_empty(self, manager: MemorySnapshotManager) -> None:
-        """Lock yields True when vmstate file exists but is empty (partial write)."""
-        vmstate = manager.cache_dir / "test-key.vmstate"
-        vmstate.write_bytes(b"")
-        async with manager._save_lock("test-key") as should_save:
-            assert should_save is True
-
-    async def test_concurrent_lock_raises_blocking(self, manager: MemorySnapshotManager) -> None:
-        """Second concurrent lock on same key raises BlockingIOError."""
-        async with manager._save_lock("test-key"):
-            with pytest.raises(BlockingIOError):
-                async with manager._save_lock("test-key"):
-                    pass  # Should not reach here
-
-    async def test_lock_makes_a_removed_cache_folder_again(self, manager: MemorySnapshotManager) -> None:
+    async def test_removed_cache_folder_is_made_again(self, manager: MemorySnapshotManager) -> None:
         """A cache folder removed while the worker runs (a tmp cleaner) is made again: the
         save goes on, instead of a FileNotFoundError on every save until a restart."""
         shutil.rmtree(manager.cache_dir)
-        async with manager._save_lock("test-key") as should_save:
-            assert should_save is True
+        vms = _SaveVms(gate=_open_gate(), fail=False)
+        with vms.of(manager):
+            await _save(manager, self._SPEC)
+        assert vms.task_ids == ["l1-save-python"]
         assert manager.cache_dir.is_dir()
 
-    async def test_lock_released_after_context(self, manager: MemorySnapshotManager) -> None:
-        """Lock is released when context manager exits — re-acquire succeeds."""
-        async with manager._save_lock("test-key"):
-            pass
-        # Should succeed (lock released)
-        async with manager._save_lock("test-key") as should_save:
-            assert should_save is True
+    async def test_stale_lock_file_does_not_stop_a_save_and_stays(self, manager: MemorySnapshotManager) -> None:
+        """A lock file of an earlier process (no lock held on it) does not stop a save, and
+        the lock file stays after the save (files.locks never deletes one)."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        lock = manager.cache_dir / f"{key}.vmstate.lock"
+        lock.write_text("stale")
+        vms = _SaveVms(gate=_open_gate(), fail=False)
+        with vms.of(manager):
+            await _save(manager, self._SPEC)
+        assert vms.task_ids == ["l1-save-python"]
+        assert lock.exists()
+
+    @pytest.mark.parametrize("fail", [True, False], ids=["boot-fails", "warm-up-fails"])
+    async def test_ended_save_frees_its_key(self, manager: MemorySnapshotManager, fail: bool) -> None:
+        """A save that ended without an entry leaves its key free (no lock held, no save in
+        flight): the next save of the key boots its VM again."""
+        vms = _SaveVms(gate=_open_gate(), fail=fail)
+        with vms.of(manager):
+            await _save(manager, self._SPEC)
+            await _save(manager, self._SPEC)
+        assert vms.task_ids == ["l1-save-python", "l1-save-python"]
 
 
 class TestEvictOldestSnapshot:
-    """Tests for _evict_oldest_snapshot (LRU eviction)."""
+    """Tests for evict_oldest (LRU eviction)."""
 
     async def test_evict_removes_oldest(self, manager: MemorySnapshotManager) -> None:
-        """Eviction removes the oldest snapshot by atime."""
-        import os
-        import time
-
+        """Eviction removes the oldest snapshot by atime, and only it."""
         # Create 3 snapshots with different atimes
         for i, name in enumerate(["old", "mid", "new"]):
             vmstate = manager.cache_dir / f"{name}.vmstate"
@@ -718,7 +1797,7 @@ class TestEvictOldestSnapshot:
             atime = time.time() - (100 - i * 10)
             os.utime(vmstate, (atime,) * 2)  # mtime too: relatime resets an atime older than mtime
 
-        await manager._evict_oldest_snapshot()
+        await manager.evict_oldest()
 
         assert not (manager.cache_dir / "old.vmstate").exists()
         assert not (manager.cache_dir / "old.vmstate.meta").exists()
@@ -726,15 +1805,11 @@ class TestEvictOldestSnapshot:
         assert (manager.cache_dir / "new.vmstate").exists()
 
     async def test_evict_no_files(self, manager: MemorySnapshotManager) -> None:
-        """Eviction with no files is a no-op."""
-        await manager._evict_oldest_snapshot()  # Should not raise
+        """Eviction with no entry removes nothing and returns None."""
+        assert await manager.evict_oldest() is None
 
     async def test_evict_skips_locked_entry(self, manager: MemorySnapshotManager) -> None:
         """Eviction skips entries with an active flock and evicts the next oldest."""
-        import fcntl
-        import os
-        import time
-
         # Create 2 snapshots: "locked" (oldest) and "unlocked" (newer)
         for i, name in enumerate(["locked", "unlocked"]):
             vmstate = manager.cache_dir / f"{name}.vmstate"
@@ -749,7 +1824,7 @@ class TestEvictOldestSnapshot:
         fd = lock_path.open("w")
         fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            await manager._evict_oldest_snapshot()
+            await manager.evict_oldest()
 
             # "locked" should be skipped, "unlocked" evicted instead
             assert (manager.cache_dir / "locked.vmstate").exists()
@@ -758,97 +1833,97 @@ class TestEvictOldestSnapshot:
             fd.close()
 
 
+@pytest.mark.usefixtures("mock_system_probes")
 class TestStop:
-    """Tests for stop (background task cleanup)."""
+    """stop() waits for the saves in flight."""
 
-    async def test_stop_waits_for_tasks(self, manager: MemorySnapshotManager) -> None:
-        """Stop should wait for all background tasks."""
-        completed = []
+    _SPEC = VmSpec(language=Language.PYTHON, memory_mb=512)
 
-        async def slow_task() -> None:
-            await asyncio.sleep(0.01)
-            completed.append(True)
+    async def test_stop_waits_for_every_save_in_flight(self, manager: MemorySnapshotManager) -> None:
+        gate = asyncio.Event()
+        vms = _SaveVms(gate=gate, fail=False)
+        with vms.of(manager):
+            tasks = [
+                await _schedule_save(manager, VmSpec(language=language, memory_mb=512))
+                for language in (Language.PYTHON, Language.JAVASCRIPT)
+            ]
+            await vms.booted(2)
+            stop = asyncio.create_task(manager.stop())
+            await asyncio.sleep(0)
+            assert not stop.done()  # the saves wait for the gate
+            gate.set()
+            await stop
+        assert [task is not None and task.done() for task in tasks] == [True, True]
+        await manager.stop()  # nothing in flight
 
-        task = asyncio.create_task(slow_task())
-        manager._track_task(task, name="test-slow-task")
+    async def test_stop_returns_after_a_cancelled_save(self, manager: MemorySnapshotManager) -> None:
+        """A save task cancelled in flight: stop() returns, and does not raise its CancelledError."""
+        vms = _SaveVms(gate=asyncio.Event(), fail=False)
+        with vms.of(manager):
+            task = await _schedule_save(manager, self._SPEC)
+            assert task is not None
+            await vms.booted(1)
+            task.cancel()
+            await manager.stop()
+        assert task.cancelled()
 
-        await manager.stop()
-        assert len(completed) == 1
+    @pytest.mark.parametrize("end", ["no-entry", "boot-failed", "cancelled"])
+    async def test_ended_save_is_not_kept(self, manager: MemorySnapshotManager, end: str) -> None:
+        """The manager keeps no reference to a save task once it has ended, whatever its end:
+        the ended tasks of a long-running process do not pile up."""
+        gate = asyncio.Event()
+        if end != "cancelled":
+            gate.set()
+        vms = _SaveVms(gate=gate, fail=end == "boot-failed")
+        with vms.of(manager):
+            task = await _schedule_save(manager, self._SPEC)
+            assert task is not None
+            if end == "cancelled":
+                await vms.booted(1)
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await asyncio.sleep(0)  # the loop's handle that woke this test holds the task until it returns
+        ended = weakref.ref(task)
+        del task
+        gc.collect()
+        assert ended() is None
 
-    async def test_stop_no_tasks(self, manager: MemorySnapshotManager) -> None:
-        """Stop with no tasks is a no-op."""
-        await manager.stop()  # Should not raise
 
-    async def test_context_manager(self, manager: MemorySnapshotManager) -> None:
-        """Async context manager calls stop on exit."""
-        async with manager:
-            pass  # Should not raise
-
-
+@pytest.mark.usefixtures("mock_system_probes")
 class TestScheduleBackgroundSave:
     """Tests for schedule_background_save (fire-and-forget L1 creation)."""
 
-    async def test_skips_if_cache_exists(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Should be no-op if L1 cache already exists."""
-        # Populate cache
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
+    _SPEC = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)
+
+    async def test_skips_if_cache_exists(self, manager: MemorySnapshotManager) -> None:
+        """A valid entry of the key: no save task, no VM."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
         vmstate = manager.cache_dir / f"{key}.vmstate"
         meta = manager.cache_dir / f"{key}.vmstate.meta"
-        data = b"fake " * 100
-        vmstate.write_bytes(data)
+        vmstate.write_bytes(b"fake " * 100)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
         meta.write_text(json.dumps({"test": True, "vmstate_sha256": _vmstate_digest(vmstate)}))
+        vms = _SaveVms(gate=_open_gate(), fail=False)
 
-        # Should not schedule anything
-        await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
+        with vms.of(manager):
+            assert await _schedule_save(manager, self._SPEC) is None
 
-        assert len(manager._background_tasks) == 0
+        assert vms.task_ids == []
 
-    @pytest.mark.skipif(
-        __import__("sys").platform == "darwin",
-        reason="macOS flock is per-process (not per-fd) — concurrent tasks in same process don't block each other",
-    )
-    async def test_flock_deduplicates_concurrent_saves(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Concurrent background saves for same key — flock ensures only 1 VM boots."""
-        # Mock create_vm to block until we release it
+    async def test_concurrent_saves_of_one_key_boot_one_vm(self, manager: MemorySnapshotManager) -> None:
+        """Five concurrent saves of one key in one process: one task and one VM boot (the
+        other calls find the save of the key in flight)."""
         gate = asyncio.Event()
-        call_count = 0
-
-        async def slow_create_vm(*_args: object, **_kwargs: object) -> MagicMock:
-            nonlocal call_count
-            call_count += 1
-            await gate.wait()
-            return MagicMock()
-
-        with patch.object(manager.vm_manager, "create_vm", new=AsyncMock(side_effect=slow_create_vm)):
-            # Schedule 5 concurrent saves for same key
-            await asyncio.gather(
-                _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)),
-                _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)),
-                _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)),
-                _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)),
-                _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)),
-            )
-
-            # Give background tasks a tick to hit the flock
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-
-            # Only 1 create_vm should be called (others blocked by flock → skip)
-            assert call_count == 1
-
-            # Clean up
+        vms = _SaveVms(gate=gate, fail=False)
+        with vms.of(manager):
+            tasks = await asyncio.gather(*(_schedule_save(manager, self._SPEC) for _ in range(5)))
+            started = [task for task in tasks if task is not None]
+            assert len(started) == 1
+            await vms.booted(1)
             gate.set()
-            for task in list(manager._background_tasks):
-                task.cancel()
-            await asyncio.gather(*manager._background_tasks, return_exceptions=True)
-            manager._background_tasks.clear()
+            await started[0]
+        assert vms.task_ids == ["l1-save-python"]
 
     @pytest.mark.parametrize(
         ("qemu_version", "scheduled"),
@@ -867,30 +1942,13 @@ class TestScheduleBackgroundSave:
     ) -> None:
         """Below QEMU 11.0 every save fails: no sacrificial VM is booted for it."""
         mock_system_probes["qemu_version"].return_value = qemu_version
-        create_vm = AsyncMock(side_effect=RuntimeError("boot failed"))
-        with patch.object(manager.vm_manager, "create_vm", new=create_vm):
-            task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
+        vms = _SaveVms(gate=_open_gate(), fail=True)
+        with vms.of(manager):
+            task = await _schedule_save(manager, self._SPEC)
             if task is not None:
-                await asyncio.gather(task, return_exceptions=True)
+                await task
 
-        assert (task is not None, create_vm.await_count) == (scheduled, int(scheduled))
-
-    async def test_lock_released_after_failure(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """After background save fails, flock is released — retry can proceed."""
-        # First attempt: create_vm fails
-        with patch.object(manager.vm_manager, "create_vm", new=AsyncMock(side_effect=RuntimeError("boot failed"))):
-            await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-            await asyncio.gather(*manager._background_tasks, return_exceptions=True)
-            manager._background_tasks.clear()
-
-        # Lock should be released — second attempt can acquire it
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
-        async with manager._save_lock(key) as should_save:
-            assert should_save is True  # Lock free, no vmstate file
+        assert (task is not None, len(vms.task_ids)) == (scheduled, int(scheduled))
 
 
 # ============================================================================
@@ -948,12 +2006,6 @@ class TestComputeCacheKeyEdgeCases:
         key_without = await self._compute_key(manager, packages=[])
         assert key_with != key_without
 
-    async def test_duplicate_packages_produce_same_key(self, manager: MemorySnapshotManager) -> None:
-        """Duplicate packages: sorted dedup happens at input level (both produce same sorted result)."""
-        key_dup = await self._compute_key(manager, packages=["a", "a", "b"])
-        key_nodup = await self._compute_key(manager, packages=["a", "a", "b"])
-        assert key_dup == key_nodup
-
     async def test_huge_package_list(self, manager: MemorySnapshotManager) -> None:
         """Large package list (1000 packages) still produces a fixed-length fingerprint."""
         packages = [f"pkg-{i}" for i in range(1000)]
@@ -973,14 +2025,9 @@ class TestComputeCacheKeyEdgeCases:
 
     async def test_different_cpu_cores_different_key(self, manager: MemorySnapshotManager) -> None:
         """Different cpu_cores produce different keys."""
-        from exec_sandbox import constants
-
         key_1 = await self._compute_key(manager, cpu_cores=1)
         key_4 = await self._compute_key(manager, cpu_cores=4)
-        if constants.DEFAULT_VM_CPU_CORES == 1:
-            assert key_1 != key_4
-        else:
-            assert key_1 != key_4
+        assert key_1 != key_4
 
     async def test_all_languages(self, manager: MemorySnapshotManager) -> None:
         """Every Language enum member produces a unique key."""
@@ -996,13 +2043,6 @@ class TestComputeCacheKeyEdgeCases:
         # Should only contain alphanumeric, hyphens, dots
         for c in key:
             assert c.isalnum() or c in "-.", f"Unsafe character in key: {c!r}"
-
-    async def test_key_deterministic_across_calls(self, manager: MemorySnapshotManager) -> None:
-        """Key is deterministic — same inputs always produce same output (100 iterations)."""
-        keys = set()
-        for _ in range(100):
-            keys.add(await self._compute_key(manager, packages=["numpy", "pandas"]))
-        assert len(keys) == 1
 
 
 # ============================================================================
@@ -1038,15 +2078,6 @@ class TestCheckCacheEdgeCases:
                 meta_dict["vmstate_sha256"] = sha
         meta.write_text(json.dumps(meta_dict))
         return vmstate, meta
-
-    async def test_vmstate_exists_meta_missing(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """vmstate present but metadata missing → miss, vmstate NOT cleaned (no evidence of corruption)."""
-        _vmstate, meta = await self._populate(manager)
-        meta.unlink()
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is None
 
     async def test_meta_exists_vmstate_missing(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
@@ -1120,20 +2151,6 @@ class TestCheckCacheEdgeCases:
         assert len(paths) == 1  # All return same path
         assert all(r is not None for r in results)
 
-    async def test_check_cache_updates_atime(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """check_cache updates atime for LRU tracking."""
-        vmstate, _meta = await self._populate(manager)
-        # Set old atime
-        old_atime = time.time() - 3600
-        os.utime(vmstate, (old_atime,) * 2)  # mtime too: relatime resets an atime older than mtime
-
-        await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-
-        new_atime = vmstate.stat().st_atime
-        assert new_atime > old_atime
-
     async def test_sha256_partial_corruption(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
@@ -1150,311 +2167,138 @@ class TestCheckCacheEdgeCases:
         assert not vmstate.exists()
         assert not meta.exists()
 
-    async def test_metadata_truncated_json(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Truncated JSON in metadata (e.g., disk full during write)."""
-        vmstate, meta = await self._populate(manager)
-        meta.write_text('{"vmstate_sha256": "abc')  # Truncated
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is None  # JSONDecodeError → cleanup
-        assert not vmstate.exists()
-
 
 # ============================================================================
-# Torture Tests — _save_lock Edge Cases
+# Torture Tests — Save Results
 # ============================================================================
 
 
-class TestSaveLockEdgeCases:
-    """Edge cases for file-based flock deduplication."""
+@pytest.mark.usefixtures("mock_system_probes")
+class TestSaveResults:
+    """A save publishes an entry that check_cache accepts. A save that fails at any step
+    publishes nothing, and no file of it stays (also not its {key}.vmstate.tmp)."""
 
-    async def test_lock_released_on_exception_in_body(self, manager: MemorySnapshotManager) -> None:
-        """Lock is released even if body raises an exception."""
-        with pytest.raises(ValueError, match="intentional"):
-            async with manager._save_lock("test-key"):
-                raise ValueError("intentional")
+    _SPEC = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1)
 
-        # Lock should be released — re-acquire succeeds
-        async with manager._save_lock("test-key") as should_save:
-            assert should_save is True
-
-    async def test_lock_file_persists_after_use(self, manager: MemorySnapshotManager) -> None:
-        """Lock file is NOT deleted after use (persistent, intentional)."""
-        async with manager._save_lock("test-key"):
-            pass
-        lock_path = manager.cache_dir / "test-key.vmstate.lock"
-        assert lock_path.exists()
-
-    async def test_lock_file_already_exists_before_acquire(self, manager: MemorySnapshotManager) -> None:
-        """Pre-existing lock file (from previous run) doesn't break acquire."""
-        lock_path = manager.cache_dir / "test-key.vmstate.lock"
-        lock_path.write_text("stale")  # Simulate leftover from crash
-
-        async with manager._save_lock("test-key") as should_save:
-            assert should_save is True
-
-    async def test_file_created_during_lock(self, manager: MemorySnapshotManager) -> None:
-        """File created inside lock body — next lock yields False."""
-        async with manager._save_lock("test-key") as should_save:
-            assert should_save is True
-            vmstate = manager.cache_dir / "test-key.vmstate"
-            vmstate.write_bytes(b"saved data")
-
-        async with manager._save_lock("test-key") as should_save:
-            assert should_save is False
-
-    async def test_many_different_keys_no_interference(self, manager: MemorySnapshotManager) -> None:
-        """Multiple different keys can be locked simultaneously."""
-        results = {}
-        for key in ["key-a", "key-b", "key-c", "key-d", "key-e"]:
-            async with manager._save_lock(key) as should_save:
-                results[key] = should_save
-        assert all(results.values())
-
-    async def test_lock_key_with_special_chars(self, manager: MemorySnapshotManager) -> None:
-        """Lock key with dots, numbers, hyphens (typical cache key format)."""
-        key = "l1-python-v0.1-abcdef0123456789"
-        async with manager._save_lock(key) as should_save:
-            assert should_save is True
-
-
-# ============================================================================
-# Torture Tests — _do_save Edge Cases
-# ============================================================================
-
-
-class TestDoSaveEdgeCases:
-    """Edge cases for _do_save (ENOSPC, partial writes, errors)."""
-
-    async def test_do_save_enospc_cleanup(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """_do_save: ENOSPC during migration → evict, clean partial files, return None."""
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
-        vmstate_path, meta_path = manager._cache_paths(key)
-        tmp_path = vmstate_path.parent / f"{vmstate_path.name}.tmp"
-
-        # Create some dummy eviction targets
-        old_vmstate = manager.cache_dir / "old.vmstate"
-        old_meta = manager.cache_dir / "old.vmstate.meta"
-        old_vmstate.write_bytes(b"old data")
-        old_meta.write_text("{}")
-        os.utime(old_vmstate, (time.time() - 1000,) * 2)  # mtime too: relatime resets an atime older than mtime
-
-        vm = MagicMock()
-        vm.qmp_socket = Path("/tmp/fake.sock")
-        vm.use_qemu_vm_user = False
-
-        enospc = OSError(errno.ENOSPC, "No space left on device")
-        with patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client:
-            mock_instance = AsyncMock()
-            mock_instance.save_snapshot.side_effect = enospc
-            mock_instance.__aenter__ = AsyncMock(return_value=mock_instance)
-            mock_instance.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value = mock_instance
-
-            result = await manager._do_save(
-                vm,
-                key,
-                vmstate_path,
-                meta_path,
-                VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1),
-            )
-
-        assert result is None
-        assert not tmp_path.exists()
-        assert not vmstate_path.exists()
-        # Eviction should have removed old entry
-        assert not old_vmstate.exists()
-
-    async def test_ram_and_home_flushed_before_the_entry_is_published(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any], tmp_path: Path
-    ) -> None:
-        """The digest covers the vmstate only: the RAM template and the home disk go
-        through to the disk before the metadata and the rename publish the entry."""
-        spec = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1)
-        key = await manager.compute_cache_key(spec, l2_path=None)
-        vmstate_path, meta_path = manager._cache_paths(key)
-        ram_path = manager.ram_path_from_vmstate(vmstate_path)
-        ram_path.write_bytes(b"ram template")  # the template save maps it before QEMU starts
+    @pytest.fixture
+    def save_vm(self, tmp_path: Path) -> MagicMock:
+        """The save VM (as this user), with its home disk."""
         home_disk = tmp_path / "home.img"
         home_disk.write_bytes(b"home")
-        vm = MagicMock()
-        vm.qmp_socket = Path("/tmp/fake.sock")
-        vm.use_qemu_vm_user = False
-        vm.workdir.home_disk = home_disk
+        return _save_vm(home_disk=home_disk, qemu_vm=False)
 
-        async def write_vmstate(path: Path, **_kwargs: object) -> None:
-            path.write_bytes(b"vmstate")
+    async def test_saved_entry_is_a_hit(self, manager: MemorySnapshotManager, save_vm: MagicMock) -> None:
+        """The entry the save publishes passes check_cache: the save writes the digest the
+        check computes. (The other tests build their entries with _vmstate_digest, so
+        they cannot see a save that writes another digest.) The entry has its home disk."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        with _template_save(manager, vm=save_vm, migrate=_write_vmstate):
+            await _save(manager, self._SPEC)
 
+        assert _files_of(manager, key) == [".home", ".ram", ".vmstate", ".vmstate.meta"]
+        assert await manager.check_cache(key) == manager.cache_dir / f"{key}.vmstate"
+        assert (manager.cache_dir / f"{key}.home").read_bytes() == b"home"
+
+    async def test_ram_and_home_flushed_before_the_entry_is_published(
+        self, manager: MemorySnapshotManager, save_vm: MagicMock
+    ) -> None:
+        """The digest covers the vmstate only: the RAM template and the home disk go
+        through to the disk before the metadata and the rename publish the entry. A test
+        cannot cut the power: it records the flushes."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        meta_path = manager.cache_dir / f"{key}.vmstate.meta"
         flushed: list[tuple[Path, bool]] = []
 
         def recording_flush(fd: int) -> None:
             flushed.append((_fd_path(fd), meta_path.exists()))
 
         with (
-            patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client,
             patch("exec_sandbox.memory_snapshot_manager.flush_to_disk", recording_flush),
+            _template_save(manager, vm=save_vm, migrate=_write_vmstate),
         ):
-            client = AsyncMock()
-            client.save_snapshot.side_effect = write_vmstate
-            client.__aenter__ = AsyncMock(return_value=client)
-            client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value = client
-            await manager._do_save(vm, key, vmstate_path, meta_path, spec)
+            await _save(manager, self._SPEC)
 
-        assert vmstate_path.exists()
-        home_path = manager.home_path_from_vmstate(vmstate_path)
-        assert sorted(flushed) == sorted([(ram_path.resolve(), False), (home_path.resolve(), False)])
+        assert (manager.cache_dir / f"{key}.vmstate").exists()
+        assert sorted(flushed) == sorted(
+            [
+                ((manager.cache_dir / f"{key}.ram").resolve(), False),
+                ((manager.cache_dir / f"{key}.home").resolve(), False),
+            ]
+        )
 
-    async def test_saved_entry_is_a_hit(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any], tmp_path: Path
+    async def test_enospc_evicts_the_oldest_entry_and_leaves_no_file(
+        self, manager: MemorySnapshotManager, save_vm: MagicMock
     ) -> None:
-        """An entry _do_save publishes passes check_cache: the save writes the digest the
-        check computes. (The other tests build their entries with _vmstate_digest, so
-        they cannot see a save that writes another digest.)"""
-        spec = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1)
-        key = await manager.compute_cache_key(spec, l2_path=None)
-        vmstate_path, meta_path = manager._cache_paths(key)
-        manager.ram_path_from_vmstate(vmstate_path).write_bytes(b"ram template")  # a template entry
-        home_disk = tmp_path / "home.img"
-        home_disk.write_bytes(b"home")
-        vm = MagicMock()
-        vm.qmp_socket = Path("/tmp/fake.sock")
-        vm.use_qemu_vm_user = False
-        vm.workdir.home_disk = home_disk
+        """ENOSPC during the migration: the oldest entry is evicted (the next request saves
+        again), and no file of the failed save stays."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        old_vmstate = manager.cache_dir / "old.vmstate"
+        old_meta = manager.cache_dir / "old.vmstate.meta"
+        old_vmstate.write_bytes(b"old data")
+        old_meta.write_text("{}")
+        os.utime(old_vmstate, (time.time() - 1000,) * 2)  # mtime too: relatime resets an atime older than mtime
 
-        async def write_vmstate(path: Path, **_kwargs: object) -> None:
-            path.write_bytes(b"vmstate")
+        async def disk_full(_path: Path, **_kwargs: object) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
 
-        with patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client:
-            client = AsyncMock()
-            client.save_snapshot.side_effect = write_vmstate
-            client.__aenter__ = AsyncMock(return_value=client)
-            client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value = client
-            assert await manager._do_save(vm, key, vmstate_path, meta_path, spec) == vmstate_path
+        with _template_save(manager, vm=save_vm, migrate=disk_full):
+            await _save(manager, self._SPEC)
 
-        assert await manager.check_cache(key) == vmstate_path
+        assert not old_vmstate.exists()
+        assert not old_meta.exists()
+        assert _files_of(manager, key) == []
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root opens a file of mode 0")
-    async def test_entry_file_this_process_cannot_open_is_published_unflushed(
-        self,
-        manager: MemorySnapshotManager,
-        mock_system_probes: dict[str, Any],
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
+    async def test_entry_file_this_process_cannot_open_fails_the_save(
+        self, manager: MemorySnapshotManager, save_vm: MagicMock
     ) -> None:
-        """A RAM template QEMU made as another user (qemu-vm) that this process may not open:
-        the save still publishes the entry; that file is logged and not flushed."""
-        spec = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1)
-        key = await manager.compute_cache_key(spec, l2_path=None)
-        vmstate_path, meta_path = manager._cache_paths(key)
-        ram_path = manager.ram_path_from_vmstate(vmstate_path)
-        ram_path.write_bytes(b"ram template")
-        ram_path.chmod(0)
-        home_disk = tmp_path / "home.img"
-        home_disk.write_bytes(b"home")
-        vm = MagicMock()
-        vm.qmp_socket = Path("/tmp/fake.sock")
-        vm.use_qemu_vm_user = False
-        vm.workdir.home_disk = home_disk
+        """The host makes every file of an entry, so it can always flush them: a file it
+        cannot open (here the RAM template, mode 0 after the migration) is a fault, and the
+        save publishes nothing (no unflushed template)."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
 
-        async def write_vmstate(path: Path, **_kwargs: object) -> None:
-            path.write_bytes(b"vmstate")
+        async def migrate_then_lock_the_ram(path: Path, **kwargs: object) -> None:
+            await _write_vmstate(path, **kwargs)
+            (manager.cache_dir / f"{key}.ram").chmod(0)
 
-        flushed: list[Path] = []
-        with (
-            patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client,
-            patch("exec_sandbox.memory_snapshot_manager.flush_to_disk", lambda fd: flushed.append(_fd_path(fd))),
-            caplog.at_level(logging.WARNING, logger="exec_sandbox.memory_snapshot_manager"),
-        ):
-            client = AsyncMock()
-            client.save_snapshot.side_effect = write_vmstate
-            client.__aenter__ = AsyncMock(return_value=client)
-            client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value = client
-            result = await manager._do_save(vm, key, vmstate_path, meta_path, spec)
+        with _template_save(manager, vm=save_vm, migrate=migrate_then_lock_the_ram):
+            await _save(manager, self._SPEC)
 
-        assert result == vmstate_path
-        assert meta_path.exists()
-        assert flushed == [manager.home_path_from_vmstate(vmstate_path).resolve()]
-        assert [r.path for r in caplog.records if r.getMessage() == "L1 entry file not flushed (no access)"] == [  # type: ignore[attr-defined]
-            str(ram_path)
-        ]
+        assert _files_of(manager, key) == []
 
-    async def test_do_save_cancelled_error_cleanup(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """_do_save: CancelledError during migration → clean up partial files, re-raise."""
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
-        vmstate_path, meta_path = manager._cache_paths(key)
-        tmp_path = vmstate_path.parent / f"{vmstate_path.name}.tmp"
+    async def test_cancelled_save_leaves_no_file(self, manager: MemorySnapshotManager, save_vm: MagicMock) -> None:
+        """A cancel during the migration (a stop): the task ends cancelled, and no file of
+        the save stays."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        migrating = asyncio.Event()
 
-        # Pre-create a tmp file to verify cleanup
-        tmp_path.write_bytes(b"partial")
+        async def migrate_until_cancelled(_path: Path, **_kwargs: object) -> None:
+            migrating.set()
+            await asyncio.Event().wait()
 
-        vm = MagicMock()
-        vm.qmp_socket = Path("/tmp/fake.sock")
-        vm.use_qemu_vm_user = False
+        with _template_save(manager, vm=save_vm, migrate=migrate_until_cancelled):
+            task = await _schedule_save(manager, self._SPEC)
+            assert task is not None
+            await migrating.wait()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
-        with patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client:
-            mock_instance = AsyncMock()
-            mock_instance.save_snapshot.side_effect = asyncio.CancelledError()
-            mock_instance.__aenter__ = AsyncMock(return_value=mock_instance)
-            mock_instance.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value = mock_instance
+        assert task.cancelled()
+        assert _files_of(manager, key) == []
 
-            with pytest.raises(asyncio.CancelledError):
-                await manager._do_save(
-                    vm,
-                    key,
-                    vmstate_path,
-                    meta_path,
-                    VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1),
-                )
+    async def test_failed_migration_leaves_no_file(self, manager: MemorySnapshotManager, save_vm: MagicMock) -> None:
+        """The migration fails (QEMU crashed): no entry, and no file of the save stays."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
 
-        # Partial files cleaned up
-        assert not tmp_path.exists()
-        assert not vmstate_path.exists()
-        assert not meta_path.exists()
+        async def crashed(_path: Path, **_kwargs: object) -> None:
+            raise ConnectionError("QEMU crashed")
 
-    async def test_do_save_generic_exception_cleanup(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """_do_save: Generic exception during migration → clean up, return None."""
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
-        vmstate_path, meta_path = manager._cache_paths(key)
+        with _template_save(manager, vm=save_vm, migrate=crashed):
+            await _save(manager, self._SPEC)
 
-        vm = MagicMock()
-        vm.qmp_socket = Path("/tmp/fake.sock")
-        vm.use_qemu_vm_user = False
-
-        with patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client:
-            mock_instance = AsyncMock()
-            mock_instance.save_snapshot.side_effect = ConnectionError("QEMU crashed")
-            mock_instance.__aenter__ = AsyncMock(return_value=mock_instance)
-            mock_instance.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value = mock_instance
-
-            result = await manager._do_save(
-                vm,
-                key,
-                vmstate_path,
-                meta_path,
-                VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1),
-            )
-
-        assert result is None
-        assert not vmstate_path.exists()
-        assert not meta_path.exists()
+        assert _files_of(manager, key) == []
+        assert await manager.check_cache(key) is None
 
 
 # ============================================================================
@@ -1462,99 +2306,43 @@ class TestDoSaveEdgeCases:
 # ============================================================================
 
 
+@pytest.mark.usefixtures("mock_system_probes")
 class TestScheduleBackgroundSaveEdgeCases:
     """Edge cases for background save scheduling."""
 
-    async def test_in_flight_dedup_same_key(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Second schedule for same key returns None if task already in-flight."""
+    _SPEC = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)
+
+    async def test_different_keys_run_in_parallel(self, manager: MemorySnapshotManager) -> None:
+        """Saves of two keys do not wait for each other: both save VMs boot at once."""
         gate = asyncio.Event()
-
-        async def slow_create_vm(*_args: object, **_kwargs: object) -> MagicMock:
-            await gate.wait()
-            return MagicMock()
-
-        with patch.object(manager.vm_manager, "create_vm", new=AsyncMock(side_effect=slow_create_vm)):
-            # First schedule creates a task
-            task1 = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-            assert task1 is not None
-
-            # Second schedule for same key → skipped (in-flight dedup)
-            task2 = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-            assert task2 is None
-
-            # Cleanup
+        vms = _SaveVms(gate=gate, fail=False)
+        with vms.of(manager):
+            tasks = [
+                await _schedule_save(manager, VmSpec(language=language, memory_mb=512))
+                for language in (Language.PYTHON, Language.JAVASCRIPT)
+            ]
+            await vms.booted(2)  # both boot before either ends
             gate.set()
-            task1.cancel()
-            await asyncio.gather(task1, return_exceptions=True)
+            await asyncio.gather(*(task for task in tasks if task is not None))
+        assert sorted(vms.task_ids) == ["l1-save-javascript", "l1-save-python"]
 
-    async def test_in_flight_key_removed_on_task_done(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """In-flight key is removed when background task completes."""
-        with patch.object(manager.vm_manager, "create_vm", new=AsyncMock(side_effect=RuntimeError("boot fail"))):
-            task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-            assert task is not None
-
-            # Wait for task to finish (it will fail)
-            await asyncio.gather(task, return_exceptions=True)
-            await asyncio.sleep(0)  # Let done callback fire
-
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
-        assert key not in manager._in_flight_saves
-
-    async def test_different_keys_run_in_parallel(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Different keys can have concurrent background saves."""
-        gate = asyncio.Event()
-
-        async def slow_create_vm(*_args: object, **_kwargs: object) -> MagicMock:
-            await gate.wait()
-            return MagicMock()
-
-        with patch.object(manager.vm_manager, "create_vm", new=AsyncMock(side_effect=slow_create_vm)):
-            task_py = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-            task_js = await _schedule_save(manager, VmSpec(language=Language.JAVASCRIPT, packages=(), memory_mb=512))
-
-            assert task_py is not None
-            assert task_js is not None
-            assert len(manager._in_flight_saves) == 2
-
-            gate.set()
-            for t in [task_py, task_js]:
-                t.cancel()
-            await asyncio.gather(task_py, task_js, return_exceptions=True)
-
-    async def test_vm_destroyed_on_success(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """VM is destroyed in finally block even on success path."""
+    async def test_vm_destroyed_when_the_warm_up_fails(self, manager: MemorySnapshotManager) -> None:
+        """The REPL warm-up answers with an error: no save, and the save VM is destroyed."""
         mock_vm = MagicMock()
-        mock_vm.qmp_socket = Path("/tmp/fake.sock")
-        mock_vm.use_qemu_vm_user = False
-
-        # Mock channel.send_request to return error (REPL warm fails)
         mock_vm.channel.send_request = AsyncMock(return_value=MagicMock(status="error"))
 
         with (
             patch.object(manager.vm_manager, "create_vm", new=AsyncMock(return_value=mock_vm)),
             patch.object(manager.vm_manager, "destroy_vm", new=AsyncMock()) as mock_destroy,
         ):
-            task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
+            task = await _schedule_save(manager, self._SPEC)
             assert task is not None
-            await asyncio.gather(task, return_exceptions=True)
-            await asyncio.sleep(0)  # Let callbacks fire
+            await task
 
-            mock_destroy.assert_called_once_with(mock_vm)
+        mock_destroy.assert_awaited_once_with(mock_vm)
 
-    async def test_vm_destroyed_on_exception(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """VM is destroyed even when create_vm succeeds but REPL warm raises."""
+    async def test_vm_destroyed_on_exception(self, manager: MemorySnapshotManager) -> None:
+        """The REPL warm-up raises: the save VM is destroyed all the same."""
         mock_vm = MagicMock()
         mock_vm.channel.send_request = AsyncMock(side_effect=TimeoutError("REPL timeout"))
 
@@ -1562,56 +2350,37 @@ class TestScheduleBackgroundSaveEdgeCases:
             patch.object(manager.vm_manager, "create_vm", new=AsyncMock(return_value=mock_vm)),
             patch.object(manager.vm_manager, "destroy_vm", new=AsyncMock()) as mock_destroy,
         ):
-            task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-            assert task is not None
-            await asyncio.gather(task, return_exceptions=True)
-            await asyncio.sleep(0)
-
-            mock_destroy.assert_called_once_with(mock_vm)
-
-    async def test_entry_saved_before_lock_boots_no_vm(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """The entry appears between check_cache and the save lock: the save stops, no VM boots."""
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
-        (manager.cache_dir / f"{key}.vmstate").write_bytes(b"already saved")  # no meta yet: check_cache misses
-
-        with patch.object(manager.vm_manager, "create_vm", new=AsyncMock()) as create:
-            task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
+            task = await _schedule_save(manager, self._SPEC)
             assert task is not None
             await task
 
-        create.assert_not_awaited()
+        mock_destroy.assert_awaited_once_with(mock_vm)
 
-    async def test_save_lock_held_by_other_process_boots_no_vm(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
+    async def test_entry_saved_before_lock_boots_no_vm(self, manager: MemorySnapshotManager) -> None:
+        """The entry appears between check_cache and the save lock: the save stops, no VM boots."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        (manager.cache_dir / f"{key}.vmstate").write_bytes(b"already saved")  # no meta yet: check_cache misses
+        vms = _SaveVms(gate=_open_gate(), fail=False)
+
+        with vms.of(manager):
+            await _save(manager, self._SPEC)
+
+        assert vms.task_ids == []
+        assert (manager.cache_dir / f"{key}.vmstate").read_bytes() == b"already saved"
+
+    async def test_save_lock_held_by_other_process_boots_no_vm(self, manager: MemorySnapshotManager) -> None:
         """Another process saves this key (holds its flock): the save skips, no VM boots."""
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        vms = _SaveVms(gate=_open_gate(), fail=False)
         fd = (manager.cache_dir / f"{key}.vmstate.lock").open("w")
         fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            with patch.object(manager.vm_manager, "create_vm", new=AsyncMock()) as create:
-                task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-                assert task is not None
-                await task
+            with vms.of(manager):
+                await _save(manager, self._SPEC)
         finally:
             fd.close()
 
-        create.assert_not_awaited()
-
-    async def test_returns_task_handle(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """schedule_background_save returns task handle for monitoring."""
-        with patch.object(manager.vm_manager, "create_vm", new=AsyncMock(side_effect=RuntimeError("fail"))):
-            task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-            assert isinstance(task, asyncio.Task)
-            await asyncio.gather(task, return_exceptions=True)
+        assert vms.task_ids == []
 
 
 # ============================================================================
@@ -1621,17 +2390,6 @@ class TestScheduleBackgroundSaveEdgeCases:
 
 class TestEvictOldestSnapshotEdgeCases:
     """Edge cases for LRU eviction."""
-
-    async def test_evict_single_entry(self, manager: MemorySnapshotManager) -> None:
-        """Eviction with exactly one entry removes it."""
-        vmstate = manager.cache_dir / "only.vmstate"
-        meta = manager.cache_dir / "only.vmstate.meta"
-        vmstate.write_bytes(b"data")
-        meta.write_text("{}")
-
-        await manager._evict_oldest_snapshot()
-        assert not vmstate.exists()
-        assert not meta.exists()
 
     async def test_evict_all_entries_locked(self, manager: MemorySnapshotManager) -> None:
         """All entries locked → eviction is a no-op (nothing evicted)."""
@@ -1647,7 +2405,7 @@ class TestEvictOldestSnapshotEdgeCases:
         fcntl.flock(fd_a.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(fd_b.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            await manager._evict_oldest_snapshot()
+            assert await manager.evict_oldest() is None
             # Both still exist
             assert (manager.cache_dir / "a.vmstate").exists()
             assert (manager.cache_dir / "b.vmstate").exists()
@@ -1656,50 +2414,14 @@ class TestEvictOldestSnapshotEdgeCases:
             fd_b.close()
 
     async def test_evict_removes_sidecar_files(self, manager: MemorySnapshotManager) -> None:
-        """Eviction removes sidecar files (.vmstate.meta)."""
-        vmstate = manager.cache_dir / "victim.vmstate"
-        meta = manager.cache_dir / "victim.vmstate.meta"
-        vmstate.write_bytes(b"data")
-        meta.write_text('{"test": true}')
+        """Eviction of an entry (no lock file yet) removes its sidecars too: the metadata,
+        the RAM template and the home disk (eviction lists only *.vmstate)."""
+        files = [manager.cache_dir / f"victim{ext}" for ext in (".vmstate", ".vmstate.meta", ".ram", ".home")]
+        for path in files:
+            path.write_bytes(b"data")
 
-        await manager._evict_oldest_snapshot()
-        assert not vmstate.exists()
-        assert not meta.exists()
-
-    async def test_evict_with_no_lock_file(self, manager: MemorySnapshotManager) -> None:
-        """Entry without lock file can be evicted (no lock file = no lock check)."""
-        vmstate = manager.cache_dir / "nolockfile.vmstate"
-        vmstate.write_bytes(b"data")
-
-        await manager._evict_oldest_snapshot()
-        assert not vmstate.exists()
-
-    async def test_evict_selects_oldest_by_atime(self, manager: MemorySnapshotManager) -> None:
-        """With 5 entries, eviction removes the one with oldest atime."""
-        entries = ["e1", "e2", "e3", "e4", "e5"]
-        for i, name in enumerate(entries):
-            vmstate = manager.cache_dir / f"{name}.vmstate"
-            vmstate.write_bytes(b"data")
-            atime = time.time() - (500 - i * 100)  # e1 oldest, e5 newest
-            os.utime(vmstate, (atime,) * 2)  # mtime too: relatime resets an atime older than mtime
-
-        await manager._evict_oldest_snapshot()
-        assert not (manager.cache_dir / "e1.vmstate").exists()
-        for name in entries[1:]:
-            assert (manager.cache_dir / f"{name}.vmstate").exists()
-
-    async def test_evict_only_removes_one(self, manager: MemorySnapshotManager) -> None:
-        """Eviction removes exactly one entry (the oldest), not more."""
-        for name in ["a", "b", "c"]:
-            vmstate = manager.cache_dir / f"{name}.vmstate"
-            vmstate.write_bytes(b"data")
-            atime = time.time() - (300 - ord(name) * 10)
-            os.utime(vmstate, (atime,) * 2)  # mtime too: relatime resets an atime older than mtime
-
-        await manager._evict_oldest_snapshot()
-
-        remaining = list(manager.cache_dir.glob("*.vmstate"))
-        assert len(remaining) == 2
+        assert await manager.evict_oldest() is not None
+        assert [path.name for path in files if path.exists()] == []
 
     async def test_evict_ignores_non_vmstate_files(self, manager: MemorySnapshotManager) -> None:
         """Eviction only considers .vmstate files, ignores .lock and .meta."""
@@ -1708,7 +2430,7 @@ class TestEvictOldestSnapshotEdgeCases:
         (manager.cache_dir / "orphan.vmstate.meta").write_text("{}")
         (manager.cache_dir / "random.txt").write_text("hello")
 
-        await manager._evict_oldest_snapshot()  # No-op, no .vmstate files
+        assert await manager.evict_oldest() is None  # no .vmstate file
 
         assert (manager.cache_dir / "orphan.vmstate.lock").exists()
         assert (manager.cache_dir / "orphan.vmstate.meta").exists()
@@ -1716,191 +2438,75 @@ class TestEvictOldestSnapshotEdgeCases:
 
 
 # ============================================================================
-# Torture Tests — Background Task Lifecycle
-# ============================================================================
-
-
-class TestBackgroundTaskLifecycle:
-    """Tests for _track_task and background task tracking."""
-
-    async def test_task_count_tracks_in_flight(self, manager: MemorySnapshotManager) -> None:
-        """The tracked set holds the running tasks, and only them."""
-        assert len(manager._background_tasks) == 0
-
-        gate = asyncio.Event()
-
-        async def wait_task() -> None:
-            await gate.wait()
-
-        tasks = []
-        for _ in range(5):
-            task = asyncio.create_task(wait_task())
-            manager._track_task(task, name="test")
-            tasks.append(task)
-
-        assert len(manager._background_tasks) == 5
-
-        gate.set()
-        await asyncio.gather(*tasks)
-        await asyncio.sleep(0)  # Let done callbacks fire
-
-        assert len(manager._background_tasks) == 0
-
-    async def test_failed_task_removed_from_tracking(self, manager: MemorySnapshotManager) -> None:
-        """Failed background tasks are removed from tracking dict."""
-
-        async def fail_task() -> None:
-            raise RuntimeError("boom")
-
-        task = asyncio.create_task(fail_task())
-        manager._track_task(task, name="failing-task")
-
-        await asyncio.gather(task, return_exceptions=True)
-        await asyncio.sleep(0)
-
-        assert len(manager._background_tasks) == 0
-
-    async def test_cancelled_task_removed_from_tracking(self, manager: MemorySnapshotManager) -> None:
-        """Cancelled background tasks are removed from tracking dict."""
-        gate = asyncio.Event()
-
-        async def wait_task() -> None:
-            await gate.wait()
-
-        task = asyncio.create_task(wait_task())
-        manager._track_task(task, name="cancel-me")
-
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await asyncio.sleep(0)
-
-        assert len(manager._background_tasks) == 0
-
-    async def test_stop_waits_for_multiple_tasks(self, manager: MemorySnapshotManager) -> None:
-        """stop() waits for all background tasks to complete."""
-        results: list[int] = []
-
-        async def numbered_task(n: int) -> None:
-            await asyncio.sleep(0.01)
-            results.append(n)
-
-        for i in range(10):
-            task = asyncio.create_task(numbered_task(i))
-            manager._track_task(task, name=f"task-{i}")
-
-        await manager.stop()
-        assert sorted(results) == list(range(10))
-
-    async def test_stop_handles_task_exceptions(self, manager: MemorySnapshotManager) -> None:
-        """stop() doesn't raise even if tasks fail."""
-
-        async def fail_task() -> None:
-            raise RuntimeError("task failure")
-
-        for _ in range(3):
-            task = asyncio.create_task(fail_task())
-            manager._track_task(task, name="will-fail")
-
-        await manager.stop()  # Should not raise
-
-    async def test_context_manager_calls_stop(self, manager: MemorySnapshotManager) -> None:
-        """Async context manager __aexit__ calls stop()."""
-        completed = []
-
-        async def slow_task() -> None:
-            await asyncio.sleep(0.01)
-            completed.append(True)
-
-        async with manager:
-            task = asyncio.create_task(slow_task())
-            manager._track_task(task, name="ctx-task")
-
-        assert len(completed) == 1
-
-
-# ============================================================================
-# Torture Tests — image_hash Edge Cases
+# Torture Tests — image_digest Edge Cases
 # ============================================================================
 
 
 class TestImageHashEdgeCases:
     """Edge cases for content-digest image identity."""
 
-    def test_missing_file(self, tmp_path: Path) -> None:
-        """Missing file returns 'missing0'."""
-        from exec_sandbox.base_cache_manager import BaseCacheManager
-
-        result = BaseCacheManager.image_hash(tmp_path / "nonexistent")
-        assert result == "missing0"
-
     def test_empty_file(self, tmp_path: Path) -> None:
-        """Empty file produces valid hash (not 'missing0')."""
-        from exec_sandbox.base_cache_manager import BaseCacheManager
+        """An empty file has a digest (it exists)."""
 
         f = tmp_path / "empty"
         f.write_bytes(b"")
-        result = BaseCacheManager.image_hash(f)
-        assert result != "missing0"
-        assert len(result) == 64  # full SHA-256 hex digest
-
-    def test_same_file_same_hash(self, tmp_path: Path) -> None:
-        """Same file produces same hash across calls."""
-        from exec_sandbox.base_cache_manager import BaseCacheManager
-
-        f = tmp_path / "test"
-        f.write_bytes(b"data")
-        h1 = BaseCacheManager.image_hash(f)
-        h2 = BaseCacheManager.image_hash(f)
-        assert h1 == h2
-
-    def test_hash_is_content_digest(self, tmp_path: Path) -> None:
-        """The digest is the SHA-256 of the bytes, identical on every host."""
-        import hashlib
-
-        from exec_sandbox.base_cache_manager import BaseCacheManager
-
-        f = tmp_path / "test"
-        f.write_bytes(b"data")
-        assert BaseCacheManager.image_hash(f) == hashlib.sha256(b"data").hexdigest()
+        assert image_digest(f) == hashlib.sha256(b"").hexdigest()
 
     def test_same_content_different_mtime_same_hash(self, tmp_path: Path) -> None:
         """A rewrite with identical bytes keeps the identity (mtime is not identity)."""
-        from exec_sandbox.base_cache_manager import BaseCacheManager
 
         f = tmp_path / "test"
         f.write_bytes(b"data")
-        h1 = BaseCacheManager.image_hash(f)
-        time.sleep(0.01)
+        h1 = image_digest(f)
         f.write_bytes(b"data")
-        assert BaseCacheManager.image_hash(f) == h1
+        st = f.stat()
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # a new stamp
+        assert image_digest(f) == h1
 
     def test_different_content_same_stat_different_hash(self, tmp_path: Path) -> None:
         """New bytes with the old mtime and size are re-hashed (stamp includes inode)."""
-        from exec_sandbox.base_cache_manager import BaseCacheManager
 
         f = tmp_path / "test"
         f.write_bytes(b"aaaa")
         stat1 = f.stat()
-        h1 = BaseCacheManager.image_hash(f)
+        h1 = image_digest(f)
 
         # Replace the file (new inode) with different bytes but the same mtime and size
         replacement = tmp_path / "replacement"
         replacement.write_bytes(b"bbbb")
         os.utime(replacement, ns=(stat1.st_atime_ns, stat1.st_mtime_ns))
         replacement.replace(f)
-        assert BaseCacheManager.image_hash(f) != h1
+        assert h1 == hashlib.sha256(b"aaaa").hexdigest()
+        assert image_digest(f) == hashlib.sha256(b"bbbb").hexdigest()
 
-    def test_sidecar_written_and_reused(self, tmp_path: Path) -> None:
+    def test_sidecar_written(self, tmp_path: Path) -> None:
         """The digest is cached in a <file>.sha256 sidecar keyed by inode, mtime and size."""
-        import hashlib
+        f = tmp_path / "image.qcow2"
+        f.write_bytes(b"image-bytes")
+        digest = image_digest(f)
+        sidecar = tmp_path / "image.qcow2.sha256"
+        assert sidecar.read_text().split()[1] == digest == hashlib.sha256(b"image-bytes").hexdigest()
 
-        from exec_sandbox.base_cache_manager import BaseCacheManager
+    def test_sidecar_has_no_group_or_other_access(self, tmp_path: Path) -> None:
+        """Under `sg qemu-vm` and umask 002, open() made the sidecar 0664 of group qemu-vm: a
+        QEMU as qemu-vm could give a base image or an L2 layer a wrong digest, and so the
+        cache keys built on it. It is 0600, also where a killed process with this pid left
+        its temp file (here 0666)."""
 
         f = tmp_path / "image.qcow2"
         f.write_bytes(b"image-bytes")
-        digest = BaseCacheManager.image_hash(f)
+        stale = tmp_path / f"image.qcow2.sha256.{os.getpid()}.tmp"
+        stale.write_text("old")
+        stale.chmod(0o666)
+        old = os.umask(0o002)
+        try:
+            digest = image_digest(f)
+        finally:
+            os.umask(old)
         sidecar = tmp_path / "image.qcow2.sha256"
-        assert sidecar.read_text().split()[1] == digest == hashlib.sha256(b"image-bytes").hexdigest()
+        assert sidecar.read_text().split()[1] == digest
+        assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+        assert not stale.exists()
 
 
 # ============================================================================
@@ -1948,7 +2554,7 @@ class TestIntegrationCycles:
         vmstate, _meta = await self._populate(manager)
         assert await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)) == vmstate
 
-        await manager._evict_oldest_snapshot()
+        await manager.evict_oldest()
         assert await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)) is None
 
     async def test_multiple_entries_independent(
@@ -1965,7 +2571,7 @@ class TestIntegrationCycles:
 
         # Evict one (should be oldest)
         os.utime(py_vmstate, (time.time() - 1000,) * 2)  # mtime too: relatime resets an atime older than mtime
-        await manager._evict_oldest_snapshot()
+        await manager.evict_oldest()
 
         assert await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)) is None
         assert (
@@ -1987,39 +2593,6 @@ class TestIntegrationCycles:
         # Repopulate
         vmstate2, _meta2 = await self._populate(manager)
         assert await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)) == vmstate2
-
-    async def test_concurrent_populate_and_check(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Concurrent check_cache while entry is being written."""
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
-        vmstate = manager.cache_dir / f"{key}.vmstate"
-        meta = manager.cache_dir / f"{key}.vmstate.meta"
-
-        # Start checking in parallel with a delayed populate
-        async def delayed_populate() -> None:
-            await asyncio.sleep(0.01)
-            data = b"vmstate " * 100
-            vmstate.write_bytes(data)
-            vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
-            meta.write_text(json.dumps({"vmstate_sha256": _vmstate_digest(vmstate)}))
-
-        results = []
-
-        async def check_loop() -> None:
-            for _ in range(50):
-                result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-                results.append(result)
-                await asyncio.sleep(0.001)
-
-        await asyncio.gather(delayed_populate(), check_loop())
-
-        # Some checks should be None (before populate), some should hit
-        assert None in results  # Early checks miss
-        non_none = [r for r in results if r is not None]
-        assert len(non_none) > 0  # Later checks hit
 
     async def test_cache_survives_manager_recreate(
         self, cache_dir: Path, images_dir: Path, mock_system_probes: dict[str, Any]
