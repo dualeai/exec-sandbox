@@ -64,7 +64,9 @@ async def test_wait_for_guest_fails_at_once_on_socket_access_denied(
         base_image=Path("/test/base.qcow2"),
         packages_image=None,
         accel_type=AccelType.KVM,
-        release_callback=AsyncMock(side_effect=AssertionError("this test does not destroy the VM")),
+        gvproxy_proc=None,
+        qemu_log_task=None,
+        gvproxy_log_task=None,
     )
     try:
         with pytest.raises(ConfigError) as caught:

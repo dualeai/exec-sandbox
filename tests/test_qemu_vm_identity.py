@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from exec_sandbox import cgroup
+from exec_sandbox import cgroup, constants
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import _probe_cache as permission_probe_cache  # pyright: ignore[reportPrivateUsage]
@@ -62,13 +62,26 @@ def _vm_processes(vm_id: str) -> dict[int, int]:
 
 
 async def _run(vm: QemuVM, code: str) -> str:
-    result = await vm.execute(code, timeout_seconds=60)
+    result = await vm.execute(code, timeout_seconds=60, env_vars=None, on_stdout=None, on_stderr=None)
     assert result.exit_code == 0, result.stderr
     return result.stdout.strip()
 
 
 async def test_vm_runs_as_qemu_vm_with_group_sockets(vm_manager: VmManager) -> None:
-    vm = await vm_manager.create_vm(_SPEC, tenant_id="identity", task_id="uid", cache_leases=())
+    vm = await vm_manager.create_vm(
+        _SPEC,
+        tenant_id="identity",
+        task_id="uid",
+        cache_leases=(),
+        direct_write_target=None,
+        expose_ports=None,
+        on_boot_log=None,
+        snapshot_drive=None,
+        reservation=None,
+        retry_profile=constants.RETRY_USER_FACING,
+        mem_path=None,
+        mem_path_share=False,
+    )
     try:
         uids = set(_vm_processes(vm.vm_id).values())
         assert uids == {get_qemu_vm_uid()}
@@ -83,7 +96,20 @@ async def test_vm_runs_as_qemu_vm_with_group_sockets(vm_manager: VmManager) -> N
 async def test_destroy_leaves_no_cgroup_and_no_process(vm_manager: VmManager) -> None:
     """QEMU's async-teardown process outlives QEMU; destroy kills and waits for the whole
     cgroup, so the cgroup can go and destroy_vm confirms everything."""
-    vm = await vm_manager.create_vm(_SPEC, tenant_id="identity", task_id="cgroup", cache_leases=())
+    vm = await vm_manager.create_vm(
+        _SPEC,
+        tenant_id="identity",
+        task_id="cgroup",
+        cache_leases=(),
+        direct_write_target=None,
+        expose_ports=None,
+        on_boot_log=None,
+        snapshot_drive=None,
+        reservation=None,
+        retry_profile=constants.RETRY_USER_FACING,
+        mem_path=None,
+        mem_path_share=False,
+    )
     if vm.cgroup is None:
         await vm_manager.destroy_vm(vm)
         pytest.skip("no delegated cgroup v2 for this process")
@@ -99,7 +125,7 @@ async def test_destroy_leaves_no_cgroup_and_no_process(vm_manager: VmManager) ->
 
     assert not cgroup_path.exists()
     assert _vm_processes(vm.vm_id) == {}
-    assert vm.holds_admission_slot is False
+    assert vm.resource_reservation is None
 
 
 async def _save(memory: MemorySnapshotManager, key: str) -> Path:
@@ -136,7 +162,8 @@ async def test_l1_save_then_restore_as_qemu_vm(
 ) -> None:
     """The cache folder is in pytest's tmp folder (0700): the grants make it traversable.
     Every entry file belongs to this user; qemu-vm reads the published state by ACL ("r",
-    no write: no QEMU may change a shared template)."""
+    no write: no QEMU may change a shared template). One probe per process picks the QEMU
+    identity and no setting changes it: the saved-as-this-user case sets the probe's cache."""
     memory = MemorySnapshotManager(
         vm_settings.model_copy(update={"memory_snapshot_cache_dir": tmp_path / "l1"}), vm_manager
     )

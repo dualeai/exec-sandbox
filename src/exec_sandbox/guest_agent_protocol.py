@@ -71,9 +71,11 @@ class PingRequest(GuestAgentRequest):
 
 
 class WarmReplRequest(GuestAgentRequest):
-    """Pre-warm REPL for faster first execution.
+    """Warm the REPL of a language: the guest takes its live REPL, or starts one and waits
+    for its ready line, then runs a no-op on it, so the first exec of a user is not the
+    REPL's first.
 
-    Response: WarmReplAckMessage.
+    Response: WarmReplAckMessage (status "ok" or "error").
     """
 
     action: Literal["warm_repl"] = Field(default="warm_repl")  # type: ignore[assignment]
@@ -145,7 +147,7 @@ class InstallPackagesRequest(GuestAgentRequest):
 
     Guest agent enforces:
     - Package count limit: 50
-    - Package name length: 214 chars (npm's limit)
+    - Package spec length: 214 bytes, name and version (npm's name limit)
     - Version specifier required: pandas==2.0.0, lodash@4.17.21
     - Path traversal protection: no /, .., \\
     - Timeout: at most 300 s (0 = the default, 300 s)
@@ -155,7 +157,7 @@ class InstallPackagesRequest(GuestAgentRequest):
 
     action: Literal["install_packages"] = Field(default="install_packages")  # type: ignore[assignment]
     language: Language = Field(
-        description="Programming language (python: uv pip, javascript: bun add; raw has no package manager and is refused)"
+        description="Programming language (python: uv pip, javascript: bun add; raw has no package manager: refused)"
     )
     packages: list[str] = Field(
         min_length=1,
@@ -214,7 +216,7 @@ class ReadFileRequest(GuestAgentRequest):
     """
 
     action: Literal["read_file"] = Field(default="read_file")  # type: ignore[assignment]
-    op_id: str = Field(description="Operation ID (UUID4 hex) for correlating response chunks")  # type: ignore[assignment]
+    op_id: str = Field(description="Operation ID (UUID4 hex) to match response chunks")  # type: ignore[assignment]
     path: str = Field(
         min_length=1,
         max_length=MAX_FILE_PATH_LENGTH,
@@ -279,7 +281,10 @@ class ExecutionCompleteMessage(GuestAgentResponse):
     execution_time_ms: int = Field(description="Total execution time in milliseconds")
     spawn_ms: int | None = Field(
         default=None,
-        description="Time to acquire REPL process in milliseconds (guest-reported). Includes fork/exec on cold start, ~0ms on cache hit.",
+        description=(
+            "Time to get the REPL process in milliseconds (guest-reported): a new REPL's start up "
+            "to its ready line, ~0 ms when one runs."
+        ),
     )
     process_ms: int | None = Field(
         default=None,
@@ -293,7 +298,6 @@ class StreamingErrorMessage(GuestAgentResponse):
     type: Literal["error"] = "error"
     message: str = Field(description="Error message")
     error_type: str = Field(description="Error classification")
-    version: str | None = Field(default=None, description="Guest agent version")
 
 
 class PongMessage(GuestAgentResponse):
@@ -365,7 +369,6 @@ class FileListMessage(GuestAgentResponse):
     """Directory listing response from the sandbox."""
 
     type: Literal["file_list"] = "file_list"
-    path: str = Field(description="Directory path listed (relative to sandbox root)")
     entries: list[FileEntryInfo] = Field(description="Directory entries")
 
 

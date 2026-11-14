@@ -50,7 +50,7 @@ def _block_io_error(**data: Any) -> bytes:
     return json.dumps({"event": "BLOCK_IO_ERROR", "data": event, "timestamp": {"seconds": 0, "microseconds": 0}})
 
 
-_EMPTY_LISTING: dict[str, Any] = {"type": "file_list", "path": "", "entries": []}
+_EMPTY_LISTING: dict[str, Any] = {"type": "file_list", "entries": []}
 """The guest agent's answer to list_files of an empty folder."""
 
 
@@ -165,7 +165,9 @@ async def _fake_vm(
         base_image=Path("/test/base.qcow2"),
         packages_image=None,
         accel_type=AccelType.KVM,
-        release_callback=AsyncMock(side_effect=AssertionError("this test does not destroy the VM")),
+        gvproxy_proc=None,
+        qemu_log_task=None,
+        gvproxy_log_task=None,
     )
     vm.start_event_watch()
     try:
@@ -181,6 +183,9 @@ async def _fake_vm(
 async def test_full_host_disk_fails_the_call_in_flight_then_every_call(
     short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The event comes after the guest got list_files: that call fails at once, the next one
+    raises LOCAL_DISK at its start with the home disk and a hint, and the VM is not reused.
+    QEMU sends one event per failed request: the repeats change nothing."""
     monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 2)  # a missed event fails in 2 s, not 120 s
     nospace = _block_io_error(nospace=True, action="stop", reason="No space left on device")
     stop = json.dumps({"event": "STOP", "timestamp": {"seconds": 0, "microseconds": 0}})
@@ -201,10 +206,11 @@ async def test_full_host_disk_fails_the_call_in_flight_then_every_call(
 
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK) as caught:
             await vm.list_files("")
-        assert "host disk is full" in str(caught.value)
+        assert str(caught.value) == (
+            "VM disk-full-vm stopped: the host disk is full (a write to its home disk found no space)"
+        )
         assert caught.value.context["home_disk"] == "/disks/vm.img"
-        assert caught.value.hint is not None
-        assert "home_disk_dir" in caught.value.hint
+        assert caught.value.hint == "Free space on the filesystem of home_disk_dir, then open a new session."
         assert vm.state is VmState.DESTROYING  # non-reusable: a session closes on it
 
 
@@ -229,10 +235,12 @@ async def test_full_host_disk_fails_the_exec_in_flight_then_every_exec(
         await vm.transition_state(VmState.READY)
         # A missed event ends the exec at its 2 s host deadline, without this text.
         with pytest.raises(OutcomeUnknownError, match="host disk is full"):
-            await vm.execute("sleep 60", timeout_seconds=1)  # the paused guest never answers
+            await vm.execute(
+                "sleep 60", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None
+            )  # the paused guest never answers
 
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
-            await vm.execute("echo", timeout_seconds=1)
+            await vm.execute("echo", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None)
         assert vm.state is VmState.DESTROYING
 
 
@@ -284,7 +292,7 @@ async def test_full_host_disk_during_boot_ends_the_boot_wait(short_tmp_dir: Path
 async def test_io_error_without_nospace_is_not_a_full_disk(short_tmp_dir: Path) -> None:
     """werror=report drives (overlay, packages) send no nospace: the guest got the error, the VM runs."""
     report = _block_io_error(action="report", reason="Input/output error")
-    listing = {"type": "file_list", "path": "", "entries": []}
+    listing = {"type": "file_list", "entries": []}
     async with _fake_vm(
         short_tmp_dir,
         events_on_connect=[],
@@ -394,7 +402,9 @@ class TestEventWatch:
             start = asyncio.get_running_loop().time()
             # A missed event ends the exec at its 2 s host deadline, without this text.
             with pytest.raises(OutcomeUnknownError, match="closed its port guest-cmd"):
-                await vm.execute("sleep 60", timeout_seconds=1)  # the guest dropped the request
+                await vm.execute(
+                    "sleep 60", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None
+                )  # the guest dropped the request
             assert asyncio.get_running_loop().time() - start < 0.5
 
 
@@ -414,23 +424,6 @@ def _paused_vm_monitor(status: str) -> Callable[[asyncio.StreamReader, asyncio.S
 
 class TestStopNotSeenByTheWatch:
     """Paths that meet a VM QEMU paused on a full host disk before (or without) its event."""
-
-    @staticmethod
-    def _vm(socket_dir: Path, channel: Any) -> QemuVM:
-        workdir = MagicMock(qmp_socket=socket_dir / "qmp.sock", home_disk=Path("/disks/vm.img"), use_qemu_vm_user=False)
-        return QemuVM(
-            "paused-vm",
-            process=MagicMock(returncode=None),
-            cgroup=None,
-            workdir=workdir,
-            channel=channel,
-            spec=VmSpec(language=Language.RAW),
-            console_lines=deque(maxlen=10),
-            base_image=Path("/test/base.qcow2"),
-            packages_image=None,
-            accel_type=AccelType.KVM,
-            release_callback=AsyncMock(side_effect=AssertionError("this test does not destroy the VM")),
-        )
 
     @pytest.mark.parametrize(("status", "full"), [("io-error", True), ("running", False), ("paused", False)])
     async def test_run_state_io_error_is_a_full_host_disk(
@@ -475,19 +468,56 @@ class TestStopNotSeenByTheWatch:
     async def test_call_not_sent_when_the_stop_lands_is_local_disk(self, short_tmp_dir: Path) -> None:
         """The call passed its start check; the stop fails it before it was sent: LOCAL_DISK
         (the session closes), not GUEST_UNAVAILABLE (a retry on a VM that never runs again).
-        A race window: a fake channel makes the stop land inside its connect, between the
-        start check and the send."""
-        channel = MagicMock(abort_operations=AsyncMock())
-        vm = self._vm(short_tmp_dir, channel)
+        A race window: a fake channel's connect lets the fake QEMU send BLOCK_IO_ERROR and
+        waits until the watch stopped the VM, between the start check and the send."""
+        send_event = asyncio.Event()
+        nospace = _block_io_error(nospace=True, action="stop", reason="No space left on device")
+
+        async def monitor(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            writer.write(_GREETING)
+            for _ in range(2):  # qmp_capabilities, then query-block: QEMU echoes each id
+                request = json.loads(await reader.readline())
+                result = [_HOME_DRIVE] if request["execute"] == "query-block" else {}
+                writer.write(json.dumps({"return": result, "id": request["id"]}).encode() + b"\n")
+            await send_event.wait()
+            writer.write(nospace.encode() + b"\n")
+            writer.write_eof()
+            await reader.read()
+
+        channel = MagicMock()
+        events_socket = short_tmp_dir / "qmp-events.sock"
+        workdir = MagicMock(qmp_events_socket=events_socket, home_disk=Path("/disks/vm.img"), use_qemu_vm_user=False)
+        vm = QemuVM(
+            "paused-vm",
+            process=MagicMock(returncode=None),
+            cgroup=None,
+            workdir=workdir,
+            channel=channel,
+            spec=VmSpec(language=Language.RAW),
+            console_lines=deque(maxlen=10),
+            base_image=Path("/test/base.qcow2"),
+            packages_image=None,
+            accel_type=AccelType.KVM,
+            gvproxy_proc=None,
+            qemu_log_task=None,
+            gvproxy_log_task=None,
+        )
 
         async def stop_then_fail(*_args: object, **_kwargs: object) -> None:
-            await vm._stop_for_full_host_disk({"device": "hd2", "operation": "write"})  # pyright: ignore[reportPrivateUsage]
+            send_event.set()
+            await _until_stopped(vm)
             raise CommunicationError("operations aborted: the host disk is full", context=None)
 
         channel.connect = AsyncMock(side_effect=stop_then_fail)
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
-            await vm.list_files("")
-        assert vm.state is VmState.DESTROYING
+        server = await asyncio.start_unix_server(monitor, path=str(events_socket))
+        vm.start_event_watch()
+        try:
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+                await vm.list_files("")
+            assert vm.state is VmState.DESTROYING
+        finally:
+            await vm.confirm_destroyed()  # ends the watch
+            server.close()
 
 
 class TestGuestPortClosed:
@@ -523,7 +553,9 @@ class TestGuestPortClosed:
                 caplog.at_level(logging.DEBUG, logger="exec_sandbox"),
                 pytest.raises(OutcomeUnknownError, match="closed its port guest-cmd"),
             ):
-                await vm.execute("sleep 60", timeout_seconds=1)  # the guest dropped the request
+                await vm.execute(
+                    "sleep 60", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None
+                )  # the guest dropped the request
             assert asyncio.get_running_loop().time() - start < 0.5
             assert [r.levelno for r in caplog.records if "closed its port" in r.getMessage()] == [logging.ERROR]
 
@@ -551,7 +583,7 @@ class TestGuestPortClosed:
             await self._ready(vm)
             start = asyncio.get_running_loop().time()
             with pytest.raises(OutcomeUnknownError, match="closed its port guest-cmd and opened it again"):
-                await vm.execute("sleep 60", timeout_seconds=1)
+                await vm.execute("sleep 60", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None)
             assert asyncio.get_running_loop().time() - start < 0.5
             assert await vm.list_files("") == []
 
@@ -576,7 +608,9 @@ class TestGuestPortClosed:
         )
         async with fake as (vm, _):
             await self._ready(vm)
-            assert (await vm.execute("echo", timeout_seconds=1)).exit_code == 0
+            assert (
+                await vm.execute("echo", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None)
+            ).exit_code == 0
 
     async def test_change_before_the_call_was_sent_does_not_fail_it(self, short_tmp_dir: Path) -> None:
         """A close and an open that QEMU made before the exec was sent (their events can
@@ -597,7 +631,9 @@ class TestGuestPortClosed:
         )
         async with fake as (vm, _):
             await self._ready(vm)
-            assert (await vm.execute("echo", timeout_seconds=1)).exit_code == 0
+            assert (
+                await vm.execute("echo", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None)
+            ).exit_code == 0
 
     @pytest.mark.parametrize("step", [3600.0, -5.0, -3600.0], ids=["back-1h", "forward-5s", "forward-1h"])
     async def test_close_after_a_wall_clock_step_fails_the_exec_in_flight(
@@ -636,7 +672,7 @@ class TestGuestPortClosed:
             await self._ready(vm)
             start = asyncio.get_running_loop().time()
             with pytest.raises(OutcomeUnknownError, match="closed its port guest-cmd"):
-                await vm.execute("sleep 60", timeout_seconds=1)
+                await vm.execute("sleep 60", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None)
             assert asyncio.get_running_loop().time() - start < 0.5
 
     @pytest.mark.parametrize("end", ["destroy", "qemu-shutdown"])

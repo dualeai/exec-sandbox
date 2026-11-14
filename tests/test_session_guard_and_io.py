@@ -4,7 +4,8 @@ sources), of the QemuVM file calls on a fake guest channel (frames on the wire, 
 mapping), of FileOpDispatcher routing, and of the DualPortChannel reconnection probe.
 
 No VM: the Session tests use a mocked QemuVM; the QemuVM tests use a real QemuVM on a
-mocked channel. Covers:
+mocked channel; the DualPortChannel tests use a real channel on a fake guest agent that
+serves the two port sockets (_FakeGuest). Covers:
 - Session calls: closed checks, lock serialization, idle deadline suspended during a
   call, fail-fast retirement of dead VMs, close paths
 - write_file sources (bytes, Path, stream): checks, size limits, local errors
@@ -15,6 +16,7 @@ mocked channel. Covers:
 
 import asyncio
 import base64
+import contextlib
 import errno
 import gc
 import io
@@ -27,9 +29,10 @@ import threading
 import time
 import weakref
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Self
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -49,13 +52,13 @@ from exec_sandbox.exceptions import (
     TransientError,
 )
 from exec_sandbox.guest_agent_protocol import (
+    ExecuteCodeRequest,
     ExecutionCompleteMessage,
     FileChunkResponseMessage,
     FileListMessage,
     FileReadCompleteMessage,
     FileWriteAckMessage,
     OutputChunkMessage,
-    PingRequest,
     PongMessage,
     StreamingErrorMessage,
     StreamingMessage,
@@ -65,14 +68,14 @@ from exec_sandbox.guest_channel import (
     DualPortChannel,
     FileOpDispatcher,
     OperationInbox,
-    UnixSocketChannel,
+    StreamDeadlineExceededError,
 )
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, StartupTiming, TimingBreakdown
 from exec_sandbox.qemu_vm import QemuVM, local_path_error, zstd
 from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType, VmState
-from tests.conftest import NonSeekableIO, make_destroy_mock
+from tests.conftest import NonSeekableIO, asyncio_with, make_destroy_mock
 
 # ============================================================================
 # Helpers — build a Session with mocked VM + VmManager
@@ -213,6 +216,57 @@ def _assert_freed(session_ref: "weakref.ref[Session]") -> None:
     assert session_ref() is None, "an idle deadline holds the closed session"
 
 
+class _Timer:
+    """A call_later handle on _LoopClock's clock: the session only cancels it."""
+
+    def __init__(self, when: float, callback: Callable[..., object], args: tuple[object, ...]) -> None:
+        self.when, self._callback, self._args = when, callback, args
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def run(self) -> None:
+        if not self.cancelled:
+            self._callback(*self._args)
+
+
+class _LoopClock:
+    """The session's loop timers on a test clock, with no real wait: session.py's own
+    `asyncio` name gives a loop whose call_later (the idle deadline) runs on this clock, and
+    every other call goes to the real loop. The loop itself is not patched: its clock and
+    timers stay those of every other task (tests/test_patch_targets.py). Create it before
+    the session: the session arms its deadline at creation."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        real = asyncio.get_running_loop()
+        self._now = 0.0
+        self._timers: list[_Timer] = []
+        clock = self
+
+        class _SessionLoop:
+            def call_later(self, delay: float, callback: Callable[..., object], *args: object) -> _Timer:
+                timer = _Timer(clock._now + delay, callback, args)
+                clock._timers.append(timer)
+                return timer
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(real, name)
+
+        loop = _SessionLoop()
+        monkeypatch.setattr("exec_sandbox.session.asyncio", asyncio_with(get_running_loop=lambda: loop))
+
+    async def advance(self, seconds: float) -> None:
+        """Move the clock `seconds` forward and run the timers that fell due, then give the
+        loop the turns to run the first steps of the task that a timer starts."""
+        self._now += seconds
+        for timer in [t for t in self._timers if t.when <= self._now]:
+            self._timers.remove(timer)
+            timer.run()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+
 # ============================================================================
 # exec() — timeout_seconds validation
 # ============================================================================
@@ -342,6 +396,51 @@ class TestSaveCloseRule:
         assert mock_vm_manager.destroy_vm.await_count == (1 if closes else 0)
         await session.close()
 
+    async def test_close_during_a_failing_save_releases_the_instance_files_once(self) -> None:
+        """close() during a save: the save owns the loaded instance's local files, and releases
+        them once it ends (here it fails, as close() destroys its VM); close() leaves them to it."""
+        _, mock_vm, mock_vm_manager = _make_session()
+        save_entered, fail_save = asyncio.Event(), asyncio.Event()
+        destroy_entered, end_destroy = asyncio.Event(), asyncio.Event()
+        confirmed = make_destroy_mock("confirmed")
+
+        async def save_until_failed(*_args: object, **_kwargs: object) -> None:
+            save_entered.set()
+            await fail_save.wait()
+            raise TransientError("VM gone", code=ErrorCode.MIGRATION_FAILED, context=None, hint=None, instance_id=None)
+
+        async def destroy_when_released(vm: object) -> bool:
+            destroy_entered.set()
+            await end_destroy.wait()
+            return await confirmed(vm)
+
+        mock_vm_manager.destroy_vm = AsyncMock(side_effect=destroy_when_released)
+        loaded = MagicMock(instance_id="loaded", header=MagicMock(generation=3))
+        instances = AsyncMock(save=AsyncMock(side_effect=save_until_failed), release=AsyncMock())
+        session = Session(
+            vm=mock_vm,
+            vm_manager=mock_vm_manager,
+            spec=VmSpec(language=Language.PYTHON),
+            startup_timing=_STARTUP,
+            instances=instances,
+            instance=loaded,
+            new_instance_id=None,
+            idle_timeout_seconds=300,
+            default_timeout_seconds=30,
+        )
+
+        save = asyncio.create_task(session.save())
+        await save_entered.wait()
+        close = asyncio.create_task(session.close())
+        await destroy_entered.wait()
+        fail_save.set()
+        with pytest.raises(SessionClosedError, match="Session closed during save"):
+            await save
+        end_destroy.set()
+        await close
+
+        assert [c.args for c in instances.release.await_args_list] == [(loaded,)]
+
 
 # ============================================================================
 # _guard() — Normal cases
@@ -419,11 +518,11 @@ class TestGuardNormal:
         assert not session.closed
 
     async def test_list_files_calls_vm(self) -> None:
-        """list_files() delegates to VM under _guard."""
+        """list_files() delegates to VM under _guard and returns the VM's entries."""
         session, mock_vm, _ = _make_session()
         result = await session.list_files("subdir")
         mock_vm.list_files.assert_awaited_once_with("subdir")
-        assert len(result) == 1
+        assert result == [FileInfo(name="a.txt", is_dir=False, size=10)]
 
     @pytest.mark.parametrize("content", [b"data", b""], ids=["bytes", "empty"])
     async def test_write_file_bytes_calls_vm(self, content: bytes) -> None:
@@ -589,46 +688,32 @@ class TestGuardClosedDuringLockWait:
 
 
 class TestGuardIdleTimerReset:
-    """Verify that file I/O operations reset the idle timer via _guard()."""
+    """Each call re-arms the idle deadline when it ends: the session closes
+    idle_timeout_seconds after the end of its last call, not after its creation. A fake
+    loop clock moves the time."""
 
-    async def test_write_file_resets_idle_timer(self) -> None:
-        """write_file() resets idle timer (prevents auto-close)."""
-        session, _, _ = _make_session(idle_timeout_seconds=1)
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(lambda s, _p: s.exec("x = 1"), id="exec"),
+            pytest.param(lambda s, _p: s.write_file("reset.txt", b"x"), id="write_file"),
+            pytest.param(lambda s, p: s.read_file("any.txt", destination=p / "any.bin"), id="read_file"),
+            pytest.param(lambda s, _p: s.list_files(), id="list_files"),
+        ],
+    )
+    async def test_call_rearms_the_deadline(self, call: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _LoopClock(monkeypatch)
+        session, _, manager = _make_session(idle_timeout_seconds=10)
 
-        # Wait most of the timeout, then call write_file to reset
-        await asyncio.sleep(0.7)
-        await session.write_file("reset.txt", b"x")
-
-        # Wait again — if timer was NOT reset, session would be closed by now
-        await asyncio.sleep(0.7)
+        await clock.advance(7)
+        await call(session, tmp_path)
+        await clock.advance(7)  # 14 s after the creation, 7 s after the call
         assert not session.closed
+        await clock.advance(3.5)  # 10.5 s after the call
+        assert session.closed
 
-        # Cleanup
-        await session.close()
-
-    async def test_read_file_resets_idle_timer(self, tmp_path: Path) -> None:
-        """read_file() resets idle timer."""
-        session, _, _ = _make_session(idle_timeout_seconds=1)
-
-        await asyncio.sleep(0.7)
-        await session.read_file("any.txt", destination=tmp_path / "any.bin")
-
-        await asyncio.sleep(0.7)
-        assert not session.closed
-
-        await session.close()
-
-    async def test_list_files_resets_idle_timer(self) -> None:
-        """list_files() resets idle timer."""
-        session, _, _ = _make_session(idle_timeout_seconds=1)
-
-        await asyncio.sleep(0.7)
-        await session.list_files()
-
-        await asyncio.sleep(0.7)
-        assert not session.closed
-
-        await session.close()
+        await session.close()  # waits for the cleanup that the deadline started
+        manager.destroy_vm.assert_awaited_once()
 
 
 # ============================================================================
@@ -639,44 +724,20 @@ class TestGuardIdleTimerReset:
 class TestGuardConcurrentFileIO:
     """Verify file I/O operations are serialized by the exec lock."""
 
-    async def test_concurrent_writes_serialized(self) -> None:
-        """Two concurrent write_file() calls are serialized, not interleaved."""
-        session, mock_vm, _ = _make_session()
-        call_order: list[str] = []
-
-        async def tracked_write(path: str, content: bytes, *, make_executable: bool = False) -> None:
-            call_order.append(f"start:{path}")
-            await asyncio.sleep(0.05)
-            call_order.append(f"end:{path}")
-
-        mock_vm.write_file = AsyncMock(side_effect=tracked_write)
-
-        await asyncio.gather(
-            session.write_file("a.txt", b"a"),
-            session.write_file("b.txt", b"b"),
-        )
-
-        # Serialized means one fully completes before the other starts
-        assert call_order[0].startswith("start:")
-        assert call_order[1].startswith("end:")
-        assert call_order[2].startswith("start:")
-        assert call_order[3].startswith("end:")
-
-        await session.close()
-
     async def test_read_and_write_serialized(self, tmp_path: Path) -> None:
-        """Concurrent read_file and write_file are serialized."""
+        """A read_file and a write_file started at once run one after the other, in call
+        order: the second starts once the first has ended."""
         session, mock_vm, _ = _make_session()
         order: list[str] = []
 
         async def tracked_read(path: str, *, destination: Path) -> None:
             order.append("read_start")
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0)  # a turn for the write, were it not serialized
             order.append("read_end")
 
         async def tracked_write(path: str, content: bytes, *, make_executable: bool = False) -> None:
             order.append("write_start")
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0)
             order.append("write_end")
 
         mock_vm.read_file = AsyncMock(side_effect=tracked_read)
@@ -687,11 +748,7 @@ class TestGuardConcurrentFileIO:
             session.write_file("b.txt", b"b"),
         )
 
-        # Verify no interleaving (one start/end pair completes before the next starts)
-        for i in range(0, len(order), 2):
-            assert "start" in order[i]
-            assert "end" in order[i + 1]
-
+        assert order == ["read_start", "read_end", "write_start", "write_end"]
         await session.close()
 
 
@@ -1139,7 +1196,9 @@ async def _file_io_vm(vm_id: str, *answers: StreamingMessage) -> tuple[QemuVM, A
         base_image=Path("/test/base.qcow2"),
         packages_image=None,
         accel_type=AccelType.KVM,
-        release_callback=AsyncMock(side_effect=AssertionError("this test does not destroy the VM")),
+        gvproxy_proc=None,
+        qemu_log_task=None,
+        gvproxy_log_task=None,
     )
     vm.deadline_diagnostics = AsyncMock(return_value=_DEADLINE_DIAGNOSTICS)  # type: ignore[method-assign]
     return vm, channel, inbox
@@ -1217,7 +1276,7 @@ class TestWriteFilePathValidation:
         with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL, match="No active write"):
             await vm.write_file("target.bin", io.BytesIO(b"data"))
 
-        channel.register_op.assert_awaited_once()
+        channel.register_op.assert_called_once()
         assert [f["action"] for f in _frames(channel)].count("write_file") == 1
         channel.close.assert_not_awaited()
 
@@ -1276,7 +1335,7 @@ class TestWriteFileWire:
         assert actions == ["write_file", *["file_chunk"] * (len(actions) - 2), "file_end"]
         assert {f["op_id"] for f in frames} == {frames[-1]["op_id"]}
         assert _sent_content(frames) == content
-        channel.unregister_op.assert_awaited_once_with(frames[-1]["op_id"])
+        channel.unregister_op.assert_called_once_with(frames[-1]["op_id"])
 
     async def test_compressible_content_is_compressed(self) -> None:
         """1 MiB of zeros goes on the wire in far fewer bytes than the file."""
@@ -1327,7 +1386,7 @@ class TestWriteFileCommitProtocol:
         assert isinstance(exc_info.value.__cause__, OSError)
         assert [f["action"] for f in _frames(channel)] == ["write_file", "file_chunk"]  # never a file_end
         channel.close.assert_awaited_once()  # the guest drops the partial write
-        channel.unregister_op.assert_awaited_once()
+        channel.unregister_op.assert_called_once()
         assert source.tell() == (4 if seekable else 4 + FILE_TRANSFER_CHUNK_SIZE)
 
     async def test_failed_chunk_enqueue_never_starts_the_next_source_read(self) -> None:
@@ -1422,7 +1481,7 @@ class TestReadFileTerminalIntegrity:
         (request,) = _frames(channel)
         assert isinstance(request.pop("host_time_ns"), int)
         assert request == {"action": "read_file", "op_id": request["op_id"], "path": "file.bin"}
-        channel.unregister_op.assert_awaited_once_with(request["op_id"])
+        channel.unregister_op.assert_called_once_with(request["op_id"])
 
     @pytest.mark.parametrize("parts", [1, 3], ids=["one-chunk", "three-chunks"])
     async def test_stream_destination_gets_every_byte(self, parts: int) -> None:
@@ -1453,7 +1512,7 @@ class TestReadFileTerminalIntegrity:
         await vm.read_file("file.bin", destination=destination)
         assert destination.read_bytes() == payload
         assert sorted(p.name for p in destination.parent.iterdir()) == ["file.bin"]  # no temp file left
-        channel.unregister_op.assert_awaited_once()
+        channel.unregister_op.assert_called_once()
 
     @pytest.mark.parametrize("case", ["file-in-path", "no-write-access", "folder-at-destination"])
     async def test_destination_the_caller_can_fix_is_argument_invalid(self, tmp_path: Path, case: str) -> None:
@@ -1486,7 +1545,7 @@ class TestReadFileTerminalIntegrity:
                 (tmp_path / "locked").chmod(0o700)
         assert isinstance(exc_info.value.__cause__, OSError)
         assert exc_info.value.context["path"] == "file.bin"
-        channel.unregister_op.assert_awaited_once()
+        channel.unregister_op.assert_called_once()
         assert list(tmp_path.rglob("*.tmp")) == []  # no temp file left
 
     @pytest.mark.parametrize(
@@ -1510,8 +1569,8 @@ class TestReadFileTerminalIntegrity:
         ) as exc_info:
             await vm.read_file("file.bin", destination=make_destination(tmp_path))
         assert isinstance(exc_info.value.__cause__, ValueError)
-        channel.register_op.assert_not_awaited()
-        channel.unregister_op.assert_awaited_once()
+        channel.register_op.assert_not_called()
+        channel.unregister_op.assert_called_once()
         assert list(tmp_path.iterdir()) == []
 
     async def test_host_disk_error_is_local_disk(self) -> None:
@@ -1561,7 +1620,7 @@ class TestReadFileTerminalIntegrity:
         ) as exc_info:
             await vm.read_file("file.bin", destination=destination)
         assert exc_info.value.__cause__ is error
-        channel.unregister_op.assert_awaited_once()
+        channel.unregister_op.assert_called_once()
         assert list(tmp_path.iterdir()) == []
         # Only a deadline carries the guest console and the QEMU state.
         has_diagnostics = exc_info.value.context.items() >= _DEADLINE_DIAGNOSTICS.items()
@@ -1710,7 +1769,6 @@ _WIRE_TYPES = {
     "stdout": ("OutputChunkMessage", "chunk", {}),
     "file_read_complete": ("FileReadCompleteMessage", "path", {"size": 1}),
     "file_write_ack": ("FileWriteAckMessage", "path", {"bytes_written": 1}),
-    "file_list": ("FileListMessage", "path", {"entries": []}),
 }
 """Event types with a free text field: the message class the host parses each into, the
 field that carries the test's marker, and the other required fields."""
@@ -1725,6 +1783,111 @@ def _marker(message: StreamingMessage) -> str:
     field = next(field for name, field, _ in _WIRE_TYPES.values() if name == type(message).__name__)
     value = getattr(message, field)
     return value.decode() if isinstance(value, bytes) else value
+
+
+class _FakeGuest:
+    """The guest agent behind QEMU's two port sockets, served by this process: a real
+    DualPortChannel connects to it (the peer check sees this user). Each ping on the command
+    port gets the next answer of `answers`, then "pong": "pong"; "silent" (no answer yet: a
+    slow guest); "error" (an error event, not a pong); "drop" (the guest side closes both
+    ports). `pings` holds, for each ping, the number of the command-port connection it came
+    on (1 is the first); `connections` counts those connections; `eofs` counts the ports
+    that the host closed."""
+
+    def __init__(self, folder: Path, answers: list[str]) -> None:
+        self.cmd_socket = str(folder / "cmd.sock")
+        self.event_socket = str(folder / "event.sock")
+        self.answers = answers
+        self.pings: list[int] = []
+        self.connections = 0
+        self.eofs = 0
+        self._event_writers: list[asyncio.StreamWriter] = []  # one for each event-port connection, in order
+        self._writers: list[asyncio.StreamWriter] = []
+        self._servers: list[asyncio.Server] = []
+        self._changed = asyncio.Condition()
+
+    async def __aenter__(self) -> Self:
+        self._servers = [
+            await asyncio.start_unix_server(self._serve_cmd, path=self.cmd_socket),
+            await asyncio.start_unix_server(self._serve_event, path=self.event_socket),
+        ]
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        for server in self._servers:
+            server.close()
+        for _ in range(3):  # a connection that the server has not handed to its handler yet
+            self.drop()
+            await asyncio.sleep(0)
+        for server in self._servers:
+            await asyncio.wait_for(server.wait_closed(), timeout=5)
+
+    def channel(self) -> DualPortChannel:
+        return DualPortChannel(cmd_socket=self.cmd_socket, event_socket=self.event_socket, expected_uid=os.getuid())
+
+    async def send(self, frame: dict[str, object], *, connection: int | None = None) -> None:
+        """Send one event frame to the host on the event port of `connection` (1 is the
+        first; default: the latest). Waits until the server has that connection."""
+        count = connection or 1
+        async with self._changed:
+            await asyncio.wait_for(self._changed.wait_for(lambda: len(self._event_writers) >= count), timeout=5)
+        writer = self._event_writers[-1 if connection is None else connection - 1]
+        writer.write(json.dumps(frame).encode() + b"\n")
+        await writer.drain()
+
+    def drop(self) -> None:
+        """The guest side closes every port connection (QEMU exits)."""
+        for writer in self._writers:
+            writer.close()
+
+    async def host_closed(self, ports: int) -> None:
+        """Wait until the host has closed `ports` port connections in all."""
+        async with self._changed:
+            await asyncio.wait_for(self._changed.wait_for(lambda: self.eofs >= ports), timeout=5)
+
+    async def _eof(self) -> None:
+        async with self._changed:
+            self.eofs += 1
+            self._changed.notify_all()
+
+    async def _serve_event(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._writers.append(writer)
+        async with self._changed:
+            self._event_writers.append(writer)
+            self._changed.notify_all()
+        with contextlib.suppress(ConnectionError):
+            if await reader.read() == b"":
+                await self._eof()
+        writer.close()
+
+    async def _serve_cmd(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._writers.append(writer)
+        self.connections += 1
+        connection = self.connections
+        with contextlib.suppress(ConnectionError):
+            while line := await reader.readline():
+                request = json.loads(line)
+                if request["action"] != "ping":
+                    continue
+                self.pings.append(connection)
+                answer = self.answers.pop(0) if self.answers else "pong"
+                if answer == "pong":
+                    pong = {"type": "pong", "version": "1.0", "op_id": request["op_id"]}
+                    await self.send(pong, connection=connection)
+                elif answer == "error":
+                    error = {
+                        "type": "error",
+                        "error_type": "unknown",
+                        "message": "not a pong",
+                        "op_id": request["op_id"],
+                    }
+                    await self.send(error, connection=connection)
+                elif answer == "drop":
+                    self.drop()
+                    return
+            if not writer.is_closing():
+                await self._eof()
+        writer.close()
 
 
 class TestFileOpDispatcherRouting:
@@ -1744,7 +1907,7 @@ class TestFileOpDispatcherRouting:
                 {"type": "complete", "exit_code": 0, "execution_time_ms": 100}, ExecutionCompleteMessage, id="complete"
             ),
             pytest.param({"type": "stdout", "chunk": "hello"}, OutputChunkMessage, id="stdout"),
-            pytest.param({"type": "file_list", "path": "", "entries": []}, FileListMessage, id="file_list"),
+            pytest.param({"type": "file_list", "entries": []}, FileListMessage, id="file_list"),
             pytest.param(
                 {"type": "file_read_complete", "path": "a", "size": 1}, FileReadCompleteMessage, id="file_read_complete"
             ),
@@ -1761,7 +1924,7 @@ class TestFileOpDispatcherRouting:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        inbox = await dispatcher.register_op(op_id)
+        inbox = dispatcher.register_op(op_id)
         _feed(reader, {**frame, "op_id": op_id})
         reader.feed_eof()
 
@@ -1786,12 +1949,12 @@ class TestFileOpDispatcherRouting:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        inbox = await dispatcher.register_op("op-A")
+        inbox = dispatcher.register_op("op-A")
         _feed(reader, stray)
-        _feed(reader, {"type": "file_list", "path": "next", "entries": [], "op_id": "op-A"})
+        _feed(reader, {"type": "stdout", "chunk": "next", "op_id": "op-A"})
         reader.feed_eof()
 
-        assert [(type(m), _marker(m)) for m in await _received(inbox)] == [(FileListMessage, "next")]
+        assert [(type(m), _marker(m)) for m in await _received(inbox)] == [(OutputChunkMessage, "next")]
         await dispatcher.stop()
 
     async def test_message_after_unregister_is_discarded(self) -> None:
@@ -1800,14 +1963,14 @@ class TestFileOpDispatcherRouting:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        old = await dispatcher.register_op("op-A")
+        old = dispatcher.register_op("op-A")
         _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": _wire("data", "first")})
         first = await asyncio.wait_for(old.get(), timeout=1.0)
         assert isinstance(first, FileChunkResponseMessage)
         assert first.data == b"first"
 
-        await dispatcher.unregister_op("op-A")
-        other = await dispatcher.register_op("op-B")
+        dispatcher.unregister_op("op-A")
+        other = dispatcher.register_op("op-B")
         _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": _wire("data", "late")})
         _feed(reader, {"type": "file_chunk", "op_id": "op-B", "data": _wire("data", "other")})
         reader.feed_eof()
@@ -1825,7 +1988,7 @@ class TestFileOpDispatcherRouting:
         dispatcher.start()
         rng = random.Random(42)
         ops = [f"op-{i}" for i in range(100)]
-        inboxes = {op: await dispatcher.register_op(op) for op in ops}
+        inboxes = {op: dispatcher.register_op(op) for op in ops}
         slots = [op for op in ops for _ in range(rng.randint(1, 5))]
         rng.shuffle(slots)
         expected: dict[str, list[tuple[str, str]]] = {op: [] for op in ops}
@@ -1848,7 +2011,7 @@ class TestFileOpDispatcherRouting:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        inbox = await dispatcher.register_op("op-A")
+        inbox = dispatcher.register_op("op-A")
         waiting = asyncio.create_task(inbox.get())
         await asyncio.sleep(0)  # get() waits on its empty inbox
         assert await inbox.route(OutputChunkMessage(type="stdout", chunk="kept", op_id="op-A"))
@@ -1897,7 +2060,7 @@ class TestDispatchLoopConnectionReset:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        inbox = await dispatcher.register_op("op-A")
+        inbox = dispatcher.register_op("op-A")
         await asyncio.sleep(0)  # the loop waits in readuntil()
 
         end(reader)
@@ -1914,7 +2077,7 @@ class TestDispatchLoopConnectionReset:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        op_queue = await dispatcher.register_op("op-A")
+        op_queue = dispatcher.register_op("op-A")
         _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": _wire("data", "before-reset")})
         await asyncio.sleep(0)  # the loop routes the message, then waits in readuntil()
 
@@ -1933,7 +2096,7 @@ class TestDispatchLoopConnectionReset:
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
 
-        op_queue = await dispatcher.register_op("op-full")
+        op_queue = dispatcher.register_op("op-full")
         for index in range(OP_QUEUE_DEPTH):
             assert await op_queue.route(OutputChunkMessage(type="stdout", chunk=str(index), op_id="op-full"))
 
@@ -1953,12 +2116,12 @@ class TestDispatchLoopConnectionReset:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        first = await dispatcher.register_op("first-op")
+        first = dispatcher.register_op("first-op")
         reader.feed_eof()
         with pytest.raises(CommunicationError, match="EOF"):  # the loop ended
             await asyncio.wait_for(first.get(), timeout=1.0)
 
-        op_queue = await dispatcher.register_op("late-op")
+        op_queue = dispatcher.register_op("late-op")
         with pytest.raises(CommunicationError, match="EOF"):
             op_queue.ensure_open()
 
@@ -1970,7 +2133,7 @@ class TestDispatchLoopConnectionReset:
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
 
-        op_queue = await dispatcher.register_op("op-complete")
+        op_queue = dispatcher.register_op("op-complete")
         for index in range(OP_QUEUE_DEPTH - 1):
             assert await op_queue.route(OutputChunkMessage(type="stdout", chunk=str(index), op_id="op-complete"))
         assert await op_queue.route(ExecutionCompleteMessage(exit_code=0, execution_time_ms=1, op_id="op-complete"))
@@ -1992,7 +2155,7 @@ class TestDispatchLoopConnectionReset:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        op_queue = await dispatcher.register_op("overflow")
+        op_queue = dispatcher.register_op("overflow")
 
         for index in range(OP_QUEUE_DEPTH + 1):
             _feed(reader, {"type": "stdout", "chunk": str(index), "op_id": "overflow"})
@@ -2014,15 +2177,15 @@ class TestDispatchLoopConnectionReset:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        abandoned = await dispatcher.register_op("abandoned")
+        abandoned = dispatcher.register_op("abandoned")
 
         for index in range(OP_QUEUE_DEPTH + 1):
             _feed(reader, {"type": "stdout", "chunk": str(index), "op_id": "abandoned"})
         await asyncio.sleep(0)  # dispatcher fills 64 slots, then blocks routing the 65th
         assert abandoned._queue.full()
-        await dispatcher.unregister_op("abandoned")
+        dispatcher.unregister_op("abandoned")
 
-        later = await dispatcher.register_op("later")
+        later = dispatcher.register_op("later")
         _feed(reader, {"type": "complete", "exit_code": 0, "execution_time_ms": 1, "op_id": "later"})
         message = await asyncio.wait_for(later.get(), timeout=1.0)
         assert isinstance(message, ExecutionCompleteMessage)
@@ -2032,94 +2195,65 @@ class TestDispatchLoopConnectionReset:
             await asyncio.wait_for(later.get(), timeout=1.0)
         await dispatcher.stop()
 
-    async def test_qemu_exit_drains_reader_buffered_terminal_before_failure(self) -> None:
-        """Process death cannot overtake a terminal frame accepted by the reader."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-        inbox = await dispatcher.register_op("terminal")
-        inbox.mark_command_sent()
-        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-        channel._dispatcher = dispatcher
+    async def test_qemu_exit_drains_reader_buffered_terminal_before_failure(self, short_tmp_dir: Path) -> None:
+        """Process death cannot overtake a terminal frame accepted by the reader: the guest
+        sends the frame, then QEMU's sockets close."""
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            channel = guest.channel()
+            await channel.connect(timeout_seconds=5.0)
+            inbox = channel.register_op("terminal")
+            inbox.mark_command_sent()
 
-        _feed(reader, {"type": "complete", "exit_code": 137, "execution_time_ms": 321, "op_id": "terminal"})
-        reader.feed_eof()
-        await channel.fail_pending_operations("QEMU exited with code 0")
+            await guest.send({"type": "complete", "exit_code": 137, "execution_time_ms": 321, "op_id": "terminal"})
+            guest.drop()
+            await channel.fail_pending_operations("QEMU exited with code 0")
 
-        message = await asyncio.wait_for(inbox.get(), timeout=1.0)
-        assert isinstance(message, ExecutionCompleteMessage)
-        assert message.exit_code == 137
-        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="EOF"):
-            await inbox.get()
-        await dispatcher.stop()
+            message = await asyncio.wait_for(inbox.get(), timeout=1.0)
+            assert isinstance(message, ExecutionCompleteMessage)
+            assert message.exit_code == 137
+            with pytest.raises(
+                OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="EOF"
+            ):
+                await inbox.get()
+            await channel.close()
 
-    async def test_qemu_exit_with_full_queue_preserves_late_terminal(self) -> None:
-        """Backpressure plus peer exit cannot overtake a buffered terminal."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-        inbox = await dispatcher.register_op("terminal-after-overflow")
-        inbox.mark_command_sent()
-        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-        channel._dispatcher = dispatcher
+    async def test_qemu_exit_with_full_queue_preserves_late_terminal(self, short_tmp_dir: Path) -> None:
+        """Backpressure plus peer exit cannot overtake a buffered terminal: the guest sends
+        more messages than the inbox holds, then the terminal, then QEMU's sockets close."""
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            channel = guest.channel()
+            await channel.connect(timeout_seconds=5.0)
+            inbox = channel.register_op("terminal-after-overflow")
+            inbox.mark_command_sent()
 
-        for index in range(OP_QUEUE_DEPTH + 1):
-            _feed(
-                reader,
-                {
-                    "type": "stdout",
-                    "chunk": str(index),
-                    "op_id": "terminal-after-overflow",
-                },
+            for index in range(OP_QUEUE_DEPTH + 1):
+                await guest.send({"type": "stdout", "chunk": str(index), "op_id": "terminal-after-overflow"})
+            await guest.send(
+                {"type": "complete", "exit_code": 137, "execution_time_ms": 321, "op_id": "terminal-after-overflow"}
             )
-        _feed(
-            reader,
-            {
-                "type": "complete",
-                "exit_code": 137,
-                "execution_time_ms": 321,
-                "op_id": "terminal-after-overflow",
-            },
-        )
-        reader.feed_eof()
+            guest.drop()
 
-        failure = asyncio.create_task(channel.fail_pending_operations("QEMU exited with code 0"))
-        messages = [await asyncio.wait_for(inbox.get(), timeout=1.0) for _ in range(OP_QUEUE_DEPTH + 2)]
-        await asyncio.wait_for(failure, timeout=1.0)
+            failure = asyncio.create_task(channel.fail_pending_operations("QEMU exited with code 0"))
+            messages = [await asyncio.wait_for(inbox.get(), timeout=1.0) for _ in range(OP_QUEUE_DEPTH + 2)]
+            await asyncio.wait_for(failure, timeout=1.0)
 
-        assert [message.chunk for message in messages[:-1] if isinstance(message, OutputChunkMessage)] == [
-            str(index) for index in range(OP_QUEUE_DEPTH + 1)
-        ]
-        assert isinstance(messages[-1], ExecutionCompleteMessage)
-        assert messages[-1].exit_code == 137
-        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="EOF"):
-            await inbox.get()
-        await dispatcher.stop()
-
-    async def test_total_deadline_during_registration_is_predispatch(self) -> None:
-        """The total timer includes registration without inventing dispatch."""
-        from exec_sandbox.guest_agent_protocol import PingRequest
-        from exec_sandbox.guest_channel import StreamDeadlineExceededError
-
-        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-        channel._dispatcher = MagicMock()
-
-        async def blocked_registration(_op_id: str) -> OperationInbox:
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
-        channel.register_op = blocked_registration  # type: ignore[method-assign]
-        stream = channel.stream_messages(PingRequest(), timeout=0)
-        with pytest.raises(StreamDeadlineExceededError) as exc_info:
-            await anext(stream)
-        assert exc_info.value.command_dispatched is False
+            assert [message.chunk for message in messages[:-1] if isinstance(message, OutputChunkMessage)] == [
+                str(index) for index in range(OP_QUEUE_DEPTH + 1)
+            ]
+            assert isinstance(messages[-1], ExecutionCompleteMessage)
+            assert messages[-1].exit_code == 137
+            with pytest.raises(
+                OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="EOF"
+            ):
+                await inbox.get()
+            await channel.close()
 
     async def test_transport_loss_after_dispatch_is_outcome_unknown(self) -> None:
         """Host transport loss is never fabricated as a retryable guest error."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        op_queue = await dispatcher.register_op("sent")
+        op_queue = dispatcher.register_op("sent")
         op_queue.mark_command_sent()
         reader.feed_eof()
 
@@ -2132,7 +2266,7 @@ class TestDispatchLoopConnectionReset:
         never hides it, and only after the loop has ended and the ops are failed. The
         loop is cancelled before its first step, so it fails no op itself."""
         dispatcher = FileOpDispatcher(asyncio.StreamReader())
-        inbox = await dispatcher.register_op("op-A")
+        inbox = dispatcher.register_op("op-A")
 
         async def start_then_stop() -> None:
             dispatcher.start()
@@ -2148,21 +2282,20 @@ class TestDispatchLoopConnectionReset:
         with pytest.raises(CommunicationError, match=r"^event dispatcher stopped$"):
             await asyncio.wait_for(inbox.get(), timeout=1.0)
 
-    @pytest.mark.parametrize("close_channel", [False, True], ids=["dispatcher-stop", "channel-close"])
-    async def test_stop_in_a_cancel_handler_does_not_cancel_again(self, close_channel: bool) -> None:
+    async def test_stop_in_a_cancel_handler_does_not_cancel_again(self) -> None:
         """A cleanup in a cancel handler (destroy_vm in a pool's handler, ephemeral_vm's
-        finally) stops the dispatcher, or closes the channel, while its task's cancel count
-        is already 1: it ends, with no new cancel, and the cleanup goes on."""
+        finally) stops the dispatcher while its task's cancel count is already 1: it ends,
+        with no new cancel, and the cleanup goes on (TestDualPortChannelCloseResiliency:
+        the same for close() of a channel)."""
         dispatcher = FileOpDispatcher(asyncio.StreamReader())
         dispatcher.start()
-        channel = _make_close_channel(dispatcher)
         steps: list[str] = []
 
         async def cancelled_then_clean_up() -> None:
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                await (channel.close() if close_channel else dispatcher.stop())
+                await dispatcher.stop()
                 steps.append("after the stop")  # destroy_vm: kill QEMU
                 raise
 
@@ -2180,7 +2313,7 @@ class TestDispatchLoopConnectionReset:
         reader = asyncio.StreamReader(limit=16)
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        op_queue = await dispatcher.register_op("oversized")
+        op_queue = dispatcher.register_op("oversized")
         reader.feed_data(b"x" * 64 + b"\n")
 
         with pytest.raises(CommunicationError, match="reader limit"):
@@ -2194,76 +2327,113 @@ class TestDispatchLoopConnectionReset:
 # ============================================================================
 
 
-def _make_close_channel(dispatcher: FileOpDispatcher | AsyncMock | None) -> DualPortChannel:
-    """A DualPortChannel with mocked ports (no sockets) and the given dispatcher."""
-    ch = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-    ch._dispatcher = dispatcher  # type: ignore[assignment]
-    ch._cmd_channel = AsyncMock(spec=UnixSocketChannel)
-    ch._event_channel = AsyncMock(spec=UnixSocketChannel)
-    return ch
-
-
 class TestDualPortChannelCloseResiliency:
     """close() stops the dispatcher, closes both ports, and always drops the dispatcher,
     also when its stop raises: a later call must not use a dispatcher that failed (a
-    poisoned dispatcher would block each health check retry)."""
+    poisoned dispatcher would block each health check retry). A real channel on a fake
+    guest (_FakeGuest): the guest sees each port that the host closes."""
 
-    async def test_close_fails_ops_in_flight_and_closes_both_ports(self) -> None:
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-        ch = _make_close_channel(dispatcher)
-        inbox = await ch.register_op("op-A")
+    async def test_close_fails_ops_in_flight_and_closes_both_ports(self, short_tmp_dir: Path) -> None:
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            ch = guest.channel()
+            await ch.connect(timeout_seconds=5.0)
+            inbox = ch.register_op("op-A")
+
+            await ch.close()
+
+            with pytest.raises(CommunicationError, match=r"^event dispatcher stopped$"):
+                await asyncio.wait_for(inbox.get(), timeout=1.0)
+            await guest.host_closed(2)
+            with pytest.raises(RuntimeError, match="channel not connected"):
+                ch.register_op("op-B")
+        assert guest.eofs == 2
+
+    async def test_close_before_connect_is_a_no_op(self) -> None:
+        """close() of a channel that never connected raises nothing; the channel has no
+        dispatcher after it."""
+        ch = DualPortChannel(cmd_socket="/nonexistent/cmd.sock", event_socket="/nonexistent/event.sock", expected_uid=0)
 
         await ch.close()
 
-        with pytest.raises(CommunicationError, match=r"^event dispatcher stopped$"):
-            await asyncio.wait_for(inbox.get(), timeout=1.0)
-        assert not dispatcher.is_alive()
-        ch._cmd_channel.close.assert_awaited_once()
-        ch._event_channel.close.assert_awaited_once()
         with pytest.raises(RuntimeError, match="channel not connected"):
-            await ch.register_op("op-B")
-
-    async def test_close_with_no_dispatcher_still_closes_channels(self) -> None:
-        ch = _make_close_channel(None)
-
-        await ch.close()
-
-        ch._cmd_channel.close.assert_awaited_once()
-        ch._event_channel.close.assert_awaited_once()
+            ch.register_op("op-A")
 
     @pytest.mark.parametrize(
         "error",
         [RuntimeError("dispatch task exploded"), KeyboardInterrupt(), asyncio.CancelledError()],
         ids=["RuntimeError", "KeyboardInterrupt", "caller-cancel"],
     )
-    async def test_close_drops_dispatcher_when_stop_raises(self, error: BaseException) -> None:
-        """The stop error propagates; both ports are closed all the same, and the
-        channel has no dispatcher after it."""
-        dispatcher = AsyncMock(spec=FileOpDispatcher)
-        dispatcher.stop.side_effect = error
-        ch = _make_close_channel(dispatcher)
+    async def test_close_drops_dispatcher_when_stop_raises(
+        self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch, error: BaseException
+    ) -> None:
+        """The dispatcher's stop raises after it stopped (a stand-in): the error propagates,
+        both ports are closed all the same, and the channel has no dispatcher after it."""
+        real_stop = FileOpDispatcher.stop
 
-        with pytest.raises(type(error)):
+        async def failing_stop(dispatcher: FileOpDispatcher) -> None:
+            await real_stop(dispatcher)
+            raise error
+
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            ch = guest.channel()
+            await ch.connect(timeout_seconds=5.0)
+            monkeypatch.setattr(FileOpDispatcher, "stop", failing_stop)
+
+            with pytest.raises(type(error)):
+                await ch.close()
+
+            await guest.host_closed(2)
+            with pytest.raises(RuntimeError, match="channel not connected"):
+                ch.register_op("op-A")
+        assert guest.eofs == 2
+
+    async def test_close_idempotent(self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A second close() stops nothing more and closes nothing more, without error."""
+        stops: list[FileOpDispatcher] = []
+        real_stop = FileOpDispatcher.stop
+
+        async def counted_stop(dispatcher: FileOpDispatcher) -> None:
+            stops.append(dispatcher)
+            await real_stop(dispatcher)
+
+        monkeypatch.setattr(FileOpDispatcher, "stop", counted_stop)
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            ch = guest.channel()
+            await ch.connect(timeout_seconds=5.0)
+
+            await ch.close()
             await ch.close()
 
-        ch._cmd_channel.close.assert_awaited_once()
-        ch._event_channel.close.assert_awaited_once()
-        with pytest.raises(RuntimeError, match="channel not connected"):
-            await ch.register_op("op-A")
+            await guest.host_closed(2)
+            with pytest.raises(RuntimeError, match="channel not connected"):
+                ch.register_op("op-A")
+        assert (len(stops), guest.eofs) == (1, 2)
 
-    async def test_close_idempotent(self) -> None:
-        """A second close() stops nothing more and closes the ports again without error."""
-        dispatcher = AsyncMock(spec=FileOpDispatcher)
-        ch = _make_close_channel(dispatcher)
+    async def test_close_in_a_cancel_handler_does_not_cancel_again(self, short_tmp_dir: Path) -> None:
+        """A cleanup in a cancel handler (destroy_vm in a pool's handler, ephemeral_vm's
+        finally) closes the channel while its task's cancel count is already 1: the close
+        ends, with no new cancel, the ports are closed, and the cleanup goes on."""
+        steps: list[str] = []
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            channel = guest.channel()
+            await channel.connect(timeout_seconds=5.0)
 
-        await ch.close()
-        await ch.close()
+            async def cancelled_then_clean_up() -> None:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await channel.close()
+                    steps.append("after the close")  # destroy_vm: kill QEMU
+                    raise
 
-        dispatcher.stop.assert_awaited_once()
-        with pytest.raises(RuntimeError, match="channel not connected"):
-            await ch.register_op("op-A")
+            task = asyncio.create_task(cancelled_then_clean_up())
+            await asyncio.sleep(0)
+            task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await guest.host_closed(2)
+        assert steps == ["after the close"]
 
 
 # ============================================================================
@@ -2293,207 +2463,182 @@ class TestExposedPorts:
 # ============================================================================
 #
 # connect() on a channel that was connected before pings the guest until a pong
-# comes. No sockets: _raw_connect (open both sockets) and close are mocks, and
-# send_request plays the guest. The tests check what connect() returns or raises,
-# the pings sent, and each socket reset (close, then _raw_connect).
+# comes. A real channel on a fake guest (_FakeGuest): the tests check what
+# connect() returns or raises, the pings the guest gets, and on which connection.
 # ============================================================================
 
 
-def _new_channel() -> DualPortChannel:
-    """A DualPortChannel that opens no socket (_raw_connect and close are mocks)."""
-    channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-    channel._raw_connect = AsyncMock()  # type: ignore[method-assign]
-    channel.close = AsyncMock()  # type: ignore[method-assign]
-    channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))  # type: ignore[method-assign]
-    return channel
+def _probe_budget(monkeypatch: pytest.MonkeyPatch, answers: list[str]) -> None:
+    """Six probe attempts, as in production: 50 ms for a ping that the guest leaves with
+    no answer, 5 s for the others (an answer then never misses its wait on a loaded host)."""
+    slots = (answers + ["pong"] * 6)[:6]
+    timeouts = tuple(0.05 if answer == "silent" else 5.0 for answer in slots)
+    monkeypatch.setattr(constants, "GUEST_RECONNECT_PROBE_TIMEOUTS", timeouts)
 
 
-async def _make_probe_channel(guest: object) -> DualPortChannel:
-    """A channel past its first connect, so the next connect() probes the guest. `guest`
-    is the send_request side effect: a list with one answer (a message, or an exception for
-    a transport failure) per ping, or a function. The mocks count from zero."""
-    channel = _new_channel()
+async def _reconnect(guest: _FakeGuest) -> DualPortChannel:
+    """A channel of `guest`, connected once and closed: its next connect() probes the guest."""
+    channel = guest.channel()
     await channel.connect(timeout_seconds=5.0)
-    channel._raw_connect.reset_mock()  # type: ignore[attr-defined]
-    channel.send_request = AsyncMock(side_effect=guest)  # type: ignore[method-assign]
+    await channel.close()
     return channel
 
 
-def _pings(channel: DualPortChannel) -> int:
-    """The pings the probe sent: every request is a PingRequest."""
-    requests = [call.args[0] for call in channel.send_request.await_args_list]  # type: ignore[attr-defined]
-    assert all(isinstance(request, PingRequest) for request in requests), requests
-    return len(requests)
+class TestDualPortStreamDeadline:
+    """The total deadline of stream_messages, on a real channel."""
+
+    async def test_an_exec_the_guest_never_answers_ends_at_the_deadline(self, short_tmp_dir: Path) -> None:
+        """The guest reads the exec and never answers: stream_messages raises
+        StreamDeadlineExceededError at its total deadline. The command was handed to the
+        transport before any await, so QemuVM reports an unknown outcome, never a retry."""
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            channel = guest.channel()
+            await channel.connect(timeout_seconds=5.0)
+            started = time.monotonic()
+            with pytest.raises(StreamDeadlineExceededError, match=r"^stream exceeded 1s total deadline$"):
+                async for _message in channel.stream_messages(
+                    ExecuteCodeRequest(language=Language.PYTHON, code="x"), timeout=1
+                ):
+                    pass
+            elapsed = time.monotonic() - started
+            await channel.close()
+        assert 1.0 <= elapsed < 3.0
 
 
 class TestDualPortConnectLifecycle:
     """When connect() probes the guest (a reconnection), and when it does not."""
 
-    async def test_first_connect_does_not_probe(self) -> None:
+    async def test_first_connect_does_not_probe(self, short_tmp_dir: Path) -> None:
         """Boot-time connect sends no ping."""
-        channel = _new_channel()
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            channel = guest.channel()
+            await channel.connect(timeout_seconds=5.0)
+            await channel.close()
+        assert (guest.connections, guest.pings) == (1, [])
 
-        await channel.connect(timeout_seconds=5.0)
+    async def test_idempotent_when_already_connected(self, short_tmp_dir: Path) -> None:
+        """connect() on a connected channel opens nothing and sends no ping."""
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            channel = guest.channel()
+            await channel.connect(timeout_seconds=5.0)
+            await channel.connect(timeout_seconds=5.0)
+            await channel.close()
+        assert (guest.connections, guest.pings) == (1, [])
 
-        channel._raw_connect.assert_awaited_once_with(5.0)  # type: ignore[attr-defined]
-        assert _pings(channel) == 0
+    async def test_first_connect_after_a_restore_probes(self, short_tmp_dir: Path) -> None:
+        """A channel of a guest restored from an L1 save (mark_restored, as restore_vm does):
+        its first connect sends one ping, as a reconnection does, and gets the pong."""
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            channel = guest.channel()
+            channel.mark_restored()
+            await channel.connect(timeout_seconds=5.0)
+            await channel.close()
+        assert (guest.connections, guest.pings) == (1, [1])
 
-    async def test_reconnect_does_probe(self) -> None:
-        """After a successful connect, the next connect sends one ping and gets the pong."""
-        channel = _new_channel()
-
-        await channel.connect(timeout_seconds=5.0)
-        await channel.connect(timeout_seconds=5.0)
-
-        assert _pings(channel) == 1
-
-    async def test_idempotent_when_already_connected(self) -> None:
-        """connect() on an already-connected channel opens nothing and sends no ping."""
-        channel = _new_channel()
-        channel._cmd_channel.is_connected = MagicMock(return_value=True)  # type: ignore[method-assign]
-        channel._event_channel.is_connected = MagicMock(return_value=True)  # type: ignore[method-assign]
-
-        await channel.connect(timeout_seconds=5.0)
-
-        channel._raw_connect.assert_not_awaited()  # type: ignore[attr-defined]
-        assert _pings(channel) == 0
-
-    async def test_connect_after_close_probes(self) -> None:
-        """close() does not make the channel new: the connect after it probes the guest."""
-        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-        channel._raw_connect = AsyncMock()  # type: ignore[method-assign]
-        channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))  # type: ignore[method-assign]
-
-        await channel.connect(timeout_seconds=5.0)
-        await channel.close()  # the real close: no socket is open
-        await channel.connect(timeout_seconds=5.0)
-
-        assert _pings(channel) == 1
+    async def test_connect_after_close_probes(self, short_tmp_dir: Path) -> None:
+        """close() does not make the channel new: the connect after it sends one ping on the
+        new connection and gets the pong."""
+        async with _FakeGuest(short_tmp_dir, []) as guest:
+            channel = await _reconnect(guest)
+            await channel.connect(timeout_seconds=5.0)
+            await channel.close()
+        assert (guest.connections, guest.pings) == (2, [2])
 
 
 class TestDualPortProbeSuccess:
     """connect() returns when the guest answers a ping in its budget."""
 
-    async def test_guest_ready_immediately(self) -> None:
-        """Guest responds with PongMessage on first attempt."""
-        channel = await _make_probe_channel([PongMessage(version="1.0")])
-        await channel.connect(timeout_seconds=5.0)
-        assert _pings(channel) == 1
+    @pytest.mark.parametrize(
+        ("answers", "pings", "connections"),
+        [
+            pytest.param([], [2], 2, id="ready-at-once"),
+            pytest.param(["silent", "drop", "error"], [2, 2, 3, 3], 3, id="mixed-failures"),
+            pytest.param(["silent"] * 5, [2] * 6, 2, id="last-possible-attempt"),
+        ],
+    )
+    async def test_guest_ready_after_failed_attempts(
+        self,
+        short_tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        answers: list[str],
+        pings: list[int],
+        connections: int,
+    ) -> None:
+        """The guest answers after pings with no answer, a dropped connection or a wrong
+        answer: connect() returns at the first pong, also on the sixth and last attempt."""
+        _probe_budget(monkeypatch, answers)
+        async with _FakeGuest(short_tmp_dir, answers) as guest:
+            channel = await _reconnect(guest)
+            await channel.connect(timeout_seconds=5.0)
+            await channel.close()
+        assert (guest.pings, guest.connections) == (pings, connections)
 
-    async def test_guest_ready_after_transient_timeouts(self) -> None:
-        """Guest unresponsive twice then ready."""
-        channel = await _make_probe_channel([TimeoutError(), TimeoutError(), PongMessage(version="1.0")])
-        await channel.connect(timeout_seconds=5.0)
-        assert _pings(channel) == 3
-
-    async def test_guest_ready_after_mixed_transport_errors(self) -> None:
-        """Different transport failures then success — probe is resilient."""
-        channel = await _make_probe_channel(
-            [
-                TimeoutError(),
-                OSError("reset"),
-                ConnectionError("refused"),
-                asyncio.IncompleteReadError(b"", 100),
-                PongMessage(version="1.0"),
-            ]
-        )
-        await channel.connect(timeout_seconds=5.0)
-        assert _pings(channel) == 5
-
-    async def test_guest_ready_on_last_possible_attempt(self) -> None:
-        """Guest responds on the very last retry — boundary case."""
-        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
-        channel = await _make_probe_channel([TimeoutError()] * (max_retries - 1) + [PongMessage(version="1.0")])
-        await channel.connect(timeout_seconds=5.0)
-        assert _pings(channel) == max_retries
-
-    async def test_unanswered_first_ping_costs_a_short_wait(self) -> None:
+    async def test_unanswered_first_ping_costs_a_short_wait(self, short_tmp_dir: Path) -> None:
         """The first ping gets no answer in time: the next ping on the same connection
-        ends the probe in ~0.1 s (the first wait is 50 ms)."""
-        answered: list[bool] = []
+        ends the probe in ~0.1 s (the production first wait is 50 ms)."""
+        async with _FakeGuest(short_tmp_dir, ["silent"]) as guest:
+            channel = await _reconnect(guest)
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            await channel.connect(timeout_seconds=5.0)
+            elapsed = loop.time() - start
+            await channel.close()
 
-        async def guest(*_args: object, **_kwargs: object) -> PongMessage:
-            if not answered:
-                answered.append(False)
-                await asyncio.Event().wait()  # no answer in time
-            return PongMessage(version="1.0")
+        assert elapsed < 0.3
+        assert guest.pings == [2, 2]
 
-        channel = await _make_probe_channel(guest)
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        await channel.connect(timeout_seconds=5.0)
-
-        assert loop.time() - start < 0.3
-
-    async def test_slow_pong_never_resets_the_connection(self) -> None:
+    async def test_slow_pong_never_resets_the_connection(
+        self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A ping with no answer yet is slow, not lost: the probe sends the next ping on
         the same connection. Closing it would show the guest a host disconnect for each
         slow pong."""
-        channel = await _make_probe_channel(
-            [TimeoutError(), TimeoutError(), TimeoutError(), PongMessage(version="1.0")]
-        )
+        answers = ["silent"] * 3
+        _probe_budget(monkeypatch, answers)
+        async with _FakeGuest(short_tmp_dir, answers) as guest:
+            channel = await _reconnect(guest)
+            await channel.connect(timeout_seconds=5.0)
+            await channel.close()
+        assert (guest.pings, guest.connections) == ([2] * 4, 2)
 
-        await channel.connect(timeout_seconds=5.0)
-
-        assert _pings(channel) == 4
-        channel.close.assert_not_awaited()  # type: ignore[attr-defined]
-        channel._raw_connect.assert_awaited_once_with(5.0)  # type: ignore[attr-defined]  # the reconnection only
-
-    async def test_failed_connection_is_opened_again(self) -> None:
+    async def test_failed_connection_is_opened_again(self, short_tmp_dir: Path) -> None:
         """Only a connection that failed is closed and opened again before the next ping."""
-        channel = await _make_probe_channel([ConnectionError("reset"), PongMessage(version="1.0")])
-
-        await channel.connect(timeout_seconds=5.0)
-
-        assert _pings(channel) == 2
-        channel.close.assert_awaited_once()  # type: ignore[attr-defined]
-        assert channel._raw_connect.await_args_list == [((5.0,),), ((5.0,),)]  # type: ignore[attr-defined]
+        async with _FakeGuest(short_tmp_dir, ["drop"]) as guest:
+            channel = await _reconnect(guest)
+            await channel.connect(timeout_seconds=5.0)
+            await channel.close()
+        assert (guest.pings, guest.connections) == ([2, 3], 3)
 
 
 class TestDualPortProbeFailure:
     """connect() raises TimeoutError when the guest never answers in the probe budget."""
 
-    async def test_all_attempts_timeout(self) -> None:
-        """Guest never responds — TimeoutError with descriptive message."""
-        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
-        channel = await _make_probe_channel([TimeoutError()] * max_retries)
-
-        with pytest.raises(TimeoutError, match=f"^Guest agent did not respond to ping after {max_retries} attempts$"):
-            await channel.connect(timeout_seconds=5.0)
-        # Every ping goes on the same connection.
-        assert _pings(channel) == max_retries
-        channel._raw_connect.assert_awaited_once()  # type: ignore[attr-defined]  # the reconnection only
-        channel.close.assert_not_awaited()  # type: ignore[attr-defined]
-
-    async def test_all_attempts_connection_error(self) -> None:
-        """Guest socket broken every time — same TimeoutError."""
-        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
-        channel = await _make_probe_channel([ConnectionError()] * max_retries)
-
-        with pytest.raises(TimeoutError, match="attempts"):
-            await channel.connect(timeout_seconds=5.0)
-        # One reconnect between attempts, none after the last: it would only delay the error.
-        assert channel.close.await_count == max_retries - 1  # type: ignore[attr-defined]
-        assert channel._raw_connect.await_count == 1 + (max_retries - 1)  # type: ignore[attr-defined]
-
-    async def test_guest_returns_wrong_message_type(self) -> None:
-        """Guest returns StreamingErrorMessage instead of PongMessage — treated as failure."""
-        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
-        wrong_msg = StreamingErrorMessage(error_type="unknown", message="not a pong")
-        channel = await _make_probe_channel([wrong_msg] * max_retries)
-
-        with pytest.raises(TimeoutError, match="attempts"):
-            await channel.connect(timeout_seconds=5.0)
-        assert _pings(channel) == max_retries
-
-    async def test_one_more_failure_than_budget_still_raises(self) -> None:
-        """MAX_RETRIES-1 failures + wrong message type = still raises."""
-        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
-        wrong_msg = StreamingErrorMessage(error_type="unknown", message="bad")
-        channel = await _make_probe_channel([TimeoutError()] * (max_retries - 1) + [wrong_msg])
-
-        with pytest.raises(TimeoutError):
-            await channel.connect(timeout_seconds=5.0)
+    @pytest.mark.parametrize(
+        ("answers", "pings", "connections"),
+        [
+            # Every ping goes on the same connection.
+            pytest.param(["silent"] * 6, [2] * 6, 2, id="no-answer"),
+            # One reconnect between attempts, none after the last: it would only delay the error.
+            pytest.param(["drop"] * 6, [2, 3, 4, 5, 6, 7], 7, id="connection-drops"),
+            pytest.param(["error"] * 6, [2] * 6, 2, id="wrong-message-type"),
+            pytest.param(["silent"] * 5 + ["error"], [2] * 6, 2, id="wrong-message-on-the-last-attempt"),
+        ],
+    )
+    async def test_no_pong_in_six_attempts(
+        self,
+        short_tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        answers: list[str],
+        pings: list[int],
+        connections: int,
+    ) -> None:
+        _probe_budget(monkeypatch, answers)
+        async with _FakeGuest(short_tmp_dir, answers) as guest:
+            channel = await _reconnect(guest)
+            with pytest.raises(TimeoutError, match=r"^Guest agent did not respond to ping after 6 attempts$"):
+                await channel.connect(timeout_seconds=5.0)
+            await channel.close()
+        assert (guest.pings, guest.connections) == (pings, connections)
 
 
 # ============================================================================
@@ -2524,10 +2669,14 @@ class TestIdleTimerLifecycleNormal:
         _assert_freed(session_ref)
 
     async def test_context_manager_disarms(self) -> None:
-        """async with Session disarms via __aexit__."""
-        session, _, _ = _make_session()
+        """async with Session closes it at the block's end (__aexit__): its VM is destroyed and
+        no deadline stays armed."""
+        session, _, manager = _make_session()
         async with session:
             await session.exec("x = 1")
+            assert not session.closed
+        assert session.closed
+        manager.destroy_vm.assert_awaited_once()
         session_ref = weakref.ref(session)
         del session
         _assert_freed(session_ref)
@@ -2688,39 +2837,31 @@ class TestIdleTimerLifecycleStress:
         manager.destroy_vm.assert_awaited_once()
         assert session.closed
 
-    async def test_idle_timer_suspended_during_operation(self) -> None:
+    async def test_idle_timer_suspended_during_operation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An operation running longer than the idle timeout is not destroyed.
 
-        Idle means "no operation in flight": the timer is cancelled while an
-        operation runs and re-armed afterwards.
+        Idle means "no operation in flight": the timer is cancelled while an operation
+        runs and re-armed when it ends (TestGuardIdleTimerReset: it then fires). A fake
+        loop clock moves the time.
         """
-        session, vm, manager = _make_session(idle_timeout_seconds=1)
+        clock = _LoopClock(monkeypatch)
+        session, vm, manager = _make_session(idle_timeout_seconds=10)
+        closed_during: list[bool] = []
 
-        async def slow_execute(**_kwargs: object) -> ExecutionResult:
-            await asyncio.sleep(1.3)
+        async def long_execute(**_kwargs: object) -> ExecutionResult:
+            await clock.advance(15)  # the call runs past the idle deadline
+            closed_during.append(session.closed)
             return _make_exec_result()
 
-        vm.execute.side_effect = slow_execute
+        vm.execute.side_effect = long_execute
         result = await session.exec("print(1)")
+        await clock.advance(9)  # the deadline counts from the end of the call
 
         assert result.exit_code == 0
+        assert closed_during == [False]
         assert not session.closed
         manager.destroy_vm.assert_not_awaited()
         await session.close()
-
-    async def test_idle_timer_rearmed_after_operation(self) -> None:
-        """After an operation completes, the idle timer must fire again.
-
-        Kills the mutation "suspend forever": deleting the finally re-arm in
-        _guard would leak sessions that never idle-close after their first op.
-        """
-        session, _vm, manager = _make_session(idle_timeout_seconds=1)
-        await session.exec("print(1)")
-        assert not session.closed
-
-        await asyncio.sleep(1.3)
-        assert session.closed
-        manager.destroy_vm.assert_awaited_once()
 
     @pytest.mark.parametrize(
         "state, returncode",

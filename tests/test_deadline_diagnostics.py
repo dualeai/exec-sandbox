@@ -20,7 +20,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 from unittest.mock import AsyncMock, MagicMock
 
 import psutil
@@ -32,7 +32,7 @@ from exec_sandbox.guest_channel import StreamDeadlineExceededError
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import get_expected_socket_uid
 from exec_sandbox.qemu_vm import QemuVM
-from exec_sandbox.qmp_client import QmpClient
+from exec_sandbox.qmp_client import QMP_BUFFER_LIMIT, QmpClient
 from exec_sandbox.socket_auth import connect_and_verify
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType, VmState
@@ -72,9 +72,6 @@ def qmp_path(short_tmp_dir: Path) -> Path:
 class _DeadlineChannel:
     """Connected channel whose answers never come in time."""
 
-    def __init__(self, *, command_dispatched: bool) -> None:
-        self.command_dispatched = command_dispatched
-
     async def connect(self, timeout_seconds: float) -> None:
         pass
 
@@ -82,49 +79,70 @@ class _DeadlineChannel:
         raise TimeoutError
 
     async def stream_messages(self, request: object, timeout: int) -> AsyncGenerator[object]:
-        raise StreamDeadlineExceededError("total stream deadline", command_dispatched=self.command_dispatched)
+        raise StreamDeadlineExceededError("total stream deadline")
         yield  # an async generator
 
 
-async def _wait_forever() -> int:
-    await asyncio.Event().wait()
-    return 0
+class _MakeVm(Protocol):
+    def __call__(self, *, qemu: psutil.Process | None, console: list[str], channel: object = None) -> QemuVM: ...
 
 
-def _vm(*, qmp_socket: Path, qemu: psutil.Process | None, console: list[str], channel: object = None) -> QemuVM:
-    """A real QemuVM in state READY whose QEMU still runs: its QMP control socket at
-    `qmp_socket`, `qemu` as the process psutil sees (None: psutil never saw it), `console` in
-    its console ring buffer."""
-    process = AsyncMock()
-    process.returncode = None
-    process.psutil_proc = qemu
-    process.wait = AsyncMock(side_effect=_wait_forever)
-    vm = QemuVM(
-        vm_id="deadline-vm",
-        process=process,
-        cgroup=None,
-        workdir=MagicMock(qmp_socket=qmp_socket, use_qemu_vm_user=False),
-        channel=channel or MagicMock(),  # type: ignore[arg-type]
-        spec=VmSpec(language=Language.PYTHON),
-        console_lines=deque(console, maxlen=10),
-        base_image=Path("/test/base.qcow2"),
-        packages_image=None,
-        accel_type=AccelType.KVM,
-        release_callback=AsyncMock(side_effect=AssertionError("this test does not destroy the VM")),
-    )
-    vm._state = VmState.READY  # pyright: ignore[reportPrivateUsage]
-    return vm
+@pytest.fixture
+async def make_vm(qmp_path: Path) -> AsyncGenerator[_MakeVm]:
+    """Makes real QemuVMs in state READY whose QEMU still runs: the QMP control socket at
+    `qmp_path`, `qemu` as the process psutil sees (None: psutil never saw it), `console` in the
+    console ring buffer. The state is set directly: only a boot makes a VM READY.
+
+    At teardown QEMU exits and each VM is confirmed destroyed: the QEMU exit task that a VM
+    starts at its first execute() ends with the test, as destroy_vm ends it."""
+    exited = asyncio.Event()
+    vms: list[QemuVM] = []
+
+    async def wait() -> int:
+        await exited.wait()
+        return 0
+
+    def make(*, qemu: psutil.Process | None, console: list[str], channel: object = None) -> QemuVM:
+        process = AsyncMock()
+        process.returncode = None
+        process.psutil_proc = qemu
+        process.wait = AsyncMock(side_effect=wait)
+        vm = QemuVM(
+            vm_id="deadline-vm",
+            process=process,
+            cgroup=None,
+            workdir=MagicMock(qmp_socket=qmp_path, use_qemu_vm_user=False),
+            channel=channel or MagicMock(),  # type: ignore[arg-type]
+            spec=VmSpec(language=Language.PYTHON),
+            console_lines=deque(console, maxlen=10),
+            base_image=Path("/test/base.qcow2"),
+            packages_image=None,
+            accel_type=AccelType.KVM,
+            gvproxy_proc=None,
+            qemu_log_task=None,
+            gvproxy_log_task=None,
+        )
+        vm._state = VmState.READY  # pyright: ignore[reportPrivateUsage]
+        vms.append(vm)
+        return vm
+
+    yield make
+    exited.set()
+    for vm in vms:
+        await vm.confirm_destroyed()
 
 
 class TestDeadlineDiagnostics:
     """QemuVM.deadline_diagnostics: the values for the error context, and one ERROR log."""
 
-    async def test_reads_the_qemu_state_and_logs_it(self, qmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    async def test_reads_the_qemu_state_and_logs_it(
+        self, make_vm: _MakeVm, qmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """This test process stands in for QEMU: its CPU time and threads are known here."""
         own = psutil.Process()
         cpu_before = round(sum(own.cpu_times()[:2]), 3)  # user + system
         console = ["boot", "[WARN] Read timeout after 18000ms, reconnecting..."]
-        vm = _vm(qmp_socket=qmp_path, qemu=own, console=console)
+        vm = make_vm(qemu=own, console=console)
 
         async with await _fake_qmp(qmp_path, status="paused"):
             with caplog.at_level(logging.ERROR, logger="exec_sandbox.qemu_vm"):
@@ -143,19 +161,21 @@ class TestDeadlineDiagnostics:
         assert f"operation=write_file qemu_status=paused qemu_cpu_seconds={cpu} qemu_threads={threads}" in caplog.text
         assert "[WARN] Read timeout" in caplog.text
 
-    async def test_no_qemu_is_unavailable(self, qmp_path: Path) -> None:
+    async def test_no_qemu_is_unavailable(self, make_vm: _MakeVm) -> None:
         """No QMP socket, and no process that psutil saw: each value says so, nothing raises."""
-        vm = _vm(qmp_socket=qmp_path, qemu=None, console=[])
+        vm = make_vm(qemu=None, console=[])
 
         values = await vm.deadline_diagnostics(operation="read_file")
 
         assert values["qemu_status"].startswith("unavailable (FileNotFoundError")
         assert (values["qemu_cpu_seconds"], values["qemu_threads"], values["console_log"]) == (None, None, "(empty)")
 
-    async def test_silent_qemu_is_bounded(self, qmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_silent_qemu_is_bounded(
+        self, make_vm: _MakeVm, qmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A QMP monitor that never answers (busy, or held by another client) costs the bound."""
         monkeypatch.setattr(constants, "DEADLINE_DIAGNOSTICS_TIMEOUT_SECONDS", 0.05)
-        vm = _vm(qmp_socket=qmp_path, qemu=None, console=[])
+        vm = make_vm(qemu=None, console=[])
 
         async with await _fake_qmp(qmp_path, status=None), asyncio.timeout(1):
             values = await vm.deadline_diagnostics(operation="execute")
@@ -163,34 +183,23 @@ class TestDeadlineDiagnostics:
         assert values["qemu_status"].startswith("unavailable (TimeoutError")
 
 
-@pytest.mark.parametrize(
-    ("dispatched", "error_class"), [(True, OutcomeUnknownError), (False, TransientError)], ids=["after", "before"]
-)
-async def test_execute_deadline_carries_diagnostics(
-    dispatched: bool, error_class: type[Exception], qmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    vm = _vm(
-        qmp_socket=qmp_path,
-        qemu=None,
-        console=["[repl-timeout] last line"],
-        channel=_DeadlineChannel(command_dispatched=dispatched),
-    )
-    with caplog.at_level(logging.ERROR, logger="exec_sandbox.qemu_vm"), pytest.raises(error_class) as exc_info:
-        await vm.execute(code="x", timeout_seconds=5)
+async def test_execute_deadline_carries_diagnostics(make_vm: _MakeVm, caplog: pytest.LogCaptureFixture) -> None:
+    vm = make_vm(qemu=None, console=["[repl-timeout] last line"], channel=_DeadlineChannel())
+    with caplog.at_level(logging.ERROR, logger="exec_sandbox.qemu_vm"), pytest.raises(OutcomeUnknownError) as exc_info:
+        await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
 
     context = exc_info.value.context  # type: ignore[attr-defined]
     assert context["console_log"] == "[repl-timeout] last line"
-    assert context["qemu_status"].startswith("unavailable (")
+    assert context["qemu_status"].startswith("unavailable (FileNotFoundError")  # no QMP socket
     assert (context["qemu_cpu_seconds"], context["qemu_threads"]) == (None, None)
     assert "operation=execute qemu_status=unavailable" in caplog.text
 
 
-async def test_list_files_deadline_carries_diagnostics(qmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    vm = _vm(
-        qmp_socket=qmp_path,
+async def test_list_files_deadline_carries_diagnostics(make_vm: _MakeVm, caplog: pytest.LogCaptureFixture) -> None:
+    vm = make_vm(
         qemu=None,
         console=["[WARN] last line"],
-        channel=_DeadlineChannel(command_dispatched=True),
+        channel=_DeadlineChannel(),
     )
     with (
         caplog.at_level(logging.ERROR, logger="exec_sandbox.qemu_vm"),
@@ -200,7 +209,7 @@ async def test_list_files_deadline_carries_diagnostics(qmp_path: Path, caplog: p
 
     context = exc_info.value.context
     assert context["console_log"] == "[WARN] last line"
-    assert context["qemu_status"].startswith("unavailable (")
+    assert context["qemu_status"].startswith("unavailable (FileNotFoundError")  # no QMP socket
     assert "operation=list_files qemu_status=unavailable" in caplog.text
 
 
@@ -265,7 +274,10 @@ async def _qmp(vm: QemuVM, command: str) -> dict[str, Any]:
     read yet, and where QEMU's threads wait (once, QEMU answered neither `stop` in
     5 s nor SIGTERM in 3 s)."""
     reader, writer = await connect_and_verify(
-        path=str(vm.qmp_socket), expected_uid=get_expected_socket_uid(vm.use_qemu_vm_user), timeout=5
+        path=str(vm.qmp_socket),
+        expected_uid=get_expected_socket_uid(vm.use_qemu_vm_user),
+        timeout=5,
+        buffer_limit=QMP_BUFFER_LIMIT,
     )
     qmp = QmpClient(reader, writer, error_factory=OSError, id_prefix="test")
     step, started = "start (greeting, qmp_capabilities)", time.monotonic()
@@ -306,7 +318,18 @@ async def test_deadline_on_a_paused_guest_carries_the_qemu_state(
     """A guest that does not run cannot ack a write: the host deadline error says why
     (QMP run state "paused"), with the console and the QEMU CPU time."""
     vm = await vm_manager.create_vm(
-        VmSpec(language=Language.RAW), tenant_id="test", task_id="deadline-diag", cache_leases=()
+        VmSpec(language=Language.RAW),
+        tenant_id="test",
+        task_id="deadline-diag",
+        cache_leases=(),
+        direct_write_target=None,
+        expose_ports=None,
+        on_boot_log=None,
+        snapshot_drive=None,
+        reservation=None,
+        retry_profile=constants.RETRY_USER_FACING,
+        mem_path=None,
+        mem_path_share=False,
     )
     try:
         await vm.write_file("warm.txt", io.BytesIO(b"x"))  # connected and answering
@@ -317,9 +340,11 @@ async def test_deadline_on_a_paused_guest_carries_the_qemu_state(
             await vm.write_file("stalled.txt", io.BytesIO(b"y"))
 
         context = exc_info.value.context
+        assert (context["vm_id"], context["path"]) == (vm.vm_id, "stalled.txt")
         assert context["qemu_status"] == "paused"
         assert isinstance(context["qemu_cpu_seconds"], float)
-        assert context["qemu_threads"] >= 1
+        assert context["qemu_cpu_seconds"] > 0  # the boot and the first write ran on QEMU's CPU time
+        assert context["qemu_threads"] >= 2  # QEMU's main loop and a vCPU at least
         assert context["console_log"] != "(empty)"
         assert context["exit_code"] is None  # QEMU still runs
         await _qmp(vm, "cont")

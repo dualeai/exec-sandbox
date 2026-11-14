@@ -28,7 +28,18 @@ _IDLE_SECONDS = 19
 @pytest.mark.slow
 async def test_request_after_a_long_idle_is_answered(vm_manager: VmManager, monkeypatch: pytest.MonkeyPatch) -> None:
     vm = await vm_manager.create_vm(
-        VmSpec(language=Language.RAW), tenant_id="test", task_id="idle-lossless", cache_leases=()
+        VmSpec(language=Language.RAW),
+        tenant_id="test",
+        task_id="idle-lossless",
+        cache_leases=(),
+        direct_write_target=None,
+        expose_ports=None,
+        on_boot_log=None,
+        snapshot_drive=None,
+        reservation=None,
+        retry_profile=constants.RETRY_USER_FACING,
+        mem_path=None,
+        mem_path_share=False,
     )
     try:
         await vm.write_file("before.txt", io.BytesIO(b"x"))

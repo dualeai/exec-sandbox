@@ -1,6 +1,6 @@
 """Tests for consume_stream() in guest_channel.py.
 
-Unit tests using a mock GuestChannel that yields predefined message sequences.
+Unit tests using a mock channel that yields predefined message sequences.
 """
 
 import asyncio
@@ -26,7 +26,7 @@ from exec_sandbox.guest_channel import StreamResult, consume_stream
 
 
 class _MockChannel:
-    """Minimal mock implementing GuestChannel.stream_messages for testing."""
+    """Minimal mock implementing DualPortChannel.stream_messages for testing."""
 
     def __init__(self, messages: list[StreamingMessage]) -> None:
         self._messages = messages
@@ -89,14 +89,15 @@ def _complete(
     )
 
 
-async def _consume(messages: list[StreamingMessage], **kwargs: Any) -> StreamResult:
-    """Shorthand: build _MockChannel, call consume_stream with test defaults."""
+async def _consume(messages: list[StreamingMessage], **callbacks: Any) -> StreamResult:
+    """Shorthand: build _MockChannel, call consume_stream with test defaults (no callback
+    but those in `callbacks`)."""
     return await consume_stream(
         _MockChannel(messages),  # type: ignore[arg-type]
         PingRequest(),
         timeout=10,
         vm_id="test-vm",
-        **kwargs,
+        **({"on_stdout": None, "on_stderr": None, "on_error": None} | callbacks),
     )
 
 
@@ -114,6 +115,9 @@ async def _consume_error(
         PingRequest(),
         timeout=10,
         vm_id="test-vm",
+        on_stdout=None,
+        on_stderr=None,
+        on_error=None,
     )
 
 
