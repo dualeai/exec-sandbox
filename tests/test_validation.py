@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox.images import GuestImages
 from exec_sandbox.platform_utils import HostArch
 from exec_sandbox.validation import clear_kernel_validation_cache, validate_kernel_initramfs
 
@@ -25,9 +26,11 @@ async def test_kernel_without_initramfs_names_the_missing_file(tmp_path: Path, a
     (tmp_path / f"vmlinuz-{suffix}").touch()
 
     with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND) as exc:
-        await validate_kernel_initramfs(tmp_path, arch)
+        await validate_kernel_initramfs(
+            GuestImages(images_dir=tmp_path, kernel_dir=tmp_path, download_dir=None, arch=arch)
+        )
     assert exc.value.message == f"Initramfs not found: {initramfs}"
     assert exc.value.context == {"initramfs_path": str(initramfs), "arch": suffix}
 
     initramfs.touch()
-    await validate_kernel_initramfs(tmp_path, arch)
+    await validate_kernel_initramfs(GuestImages(images_dir=tmp_path, kernel_dir=tmp_path, download_dir=None, arch=arch))

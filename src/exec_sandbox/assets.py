@@ -8,7 +8,9 @@ Path Resolution Priority:
     1. override (explicit from SchedulerConfig.images_dir)
     2. EXEC_SANDBOX_IMAGES_DIR env var
     3. ./images/dist/ (local build directory)
-    4. ~/.cache/exec-sandbox/v{version}/ (download cache)
+    4. Download cache (images_download_dir): v{version}/ in the user cache folder
+       (~/.cache/exec-sandbox on Linux, ~/Library/Caches/exec-sandbox on macOS), or
+       EXEC_SANDBOX_CACHE_DIR itself when it is set
 """
 
 from __future__ import annotations
@@ -23,14 +25,14 @@ from exec_sandbox import __version__
 from exec_sandbox._logging import get_logger
 from exec_sandbox.asset_downloader import (
     AsyncPooch,
-    decompress_zstd,
     get_current_arch,
     get_gvproxy_suffix,
 )
-from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
+from exec_sandbox.images import BASE_IMAGES, RELEASE_SUFFIX, initramfs_name, kernel_dir_of, kernel_names
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import chmod_executable
-from exec_sandbox.platform_utils import UserDir, get_user_dir
+from exec_sandbox.platform_utils import UserDir, arch_of, get_user_dir
 
 logger = get_logger(__name__)
 
@@ -40,10 +42,7 @@ __all__ = [
     "ensure_assets",
     "ensure_assets_available",
     "ensure_registry_loaded",
-    "fetch_base_image",
     "fetch_gvproxy",
-    "fetch_initramfs",
-    "fetch_kernel",
     "get_assets",
     "get_gvproxy_path",
     "is_offline_mode",
@@ -66,9 +65,10 @@ class PrefetchResult:
     cache_dir: Path | None = None
 
 
-def _versioned_cache_dir() -> Path:
-    """Get version-specific cache directory for downloaded assets."""
-    base = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
+def images_download_dir() -> Path:
+    """The folder where downloaded guest files (kernel, initramfs, base images) land: this
+    version's folder in the user cache (no version folder under EXEC_SANDBOX_CACHE_DIR)."""
+    base = get_user_dir(kind=UserDir.CACHE)
     # Don't add version suffix when user explicitly overrides cache dir
     if os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
         return base
@@ -96,10 +96,9 @@ def _create_assets_registry() -> AsyncPooch:
     """Create the assets registry singleton."""
     pooch_version, _ = _get_asset_version()
     return AsyncPooch(
-        path=_versioned_cache_dir(),
+        path=images_download_dir(),
         base_url=f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/v{{version}}",
         version=pooch_version,
-        env="EXEC_SANDBOX_CACHE_DIR",
         registry={},  # Loaded dynamically from GitHub API
     )
 
@@ -151,128 +150,56 @@ async def ensure_registry_loaded() -> None:
     await assets.load_registry_from_github(GITHUB_OWNER, GITHUB_REPO, version)
 
 
-def _kernel_candidates(arch: str) -> list[str]:
-    """
-    Kernel filenames in preference order for the given architecture.
-
-    For x86_64: vmlinux (PVH direct boot, ~50ms faster) is preferred over vmlinuz.
-    For aarch64: only vmlinuz is used. These are the unpacked names; the release
-    serves each as `<name>.zst`.
-    """
-    candidates: list[str] = []
-    if arch == "x86_64":
-        candidates.append(f"vmlinux-{arch}")
-    candidates.append(f"vmlinuz-{arch}")
-    return candidates
-
-
-async def fetch_kernel(arch: str | None = None, override: Path | None = None) -> Path:
-    """
-    Fetch kernel for the given architecture.
-
-    Prefers vmlinux (PVH direct boot, x86_64 only, ~50ms faster) over vmlinuz.
-    Falls back to vmlinuz if vmlinux is not available.
-
-    Search respects directory priority order: override > env var > images/dist/ > cache.
-    Within each directory, vmlinux is preferred over vmlinuz.
-
-    Args:
-        arch: Architecture ("x86_64" or "aarch64"). Defaults to current machine.
-        override: Explicit path to search first (from SchedulerConfig.images_dir).
-
-    Returns:
-        Path to the decompressed kernel file.
-    """
-    arch = arch or get_current_arch()
-    candidates = _kernel_candidates(arch)
-
-    # Check each search path in priority order.
-    # Within each directory, prefer vmlinux (PVH direct boot, x86_64 only).
-    local = await asyncio.to_thread(
-        _first_existing, [directory / name for directory in _get_search_paths(override) for name in candidates]
-    )
-    if local is not None:
-        logger.debug("Using cached kernel", extra={"arch": arch, "path": str(local)})
-        return local
-
-    # Not found locally, download from GitHub
+async def _download_kernel(arch: str) -> Path:
+    """The kernel of `arch` from the release, unpacked into images_download_dir(): the first
+    of kernel_names that the release has (vmlinux for x86_64, then vmlinuz); the last one when
+    none is listed (its fetch reports it missing)."""
     await ensure_registry_loaded()
     assets = get_assets()
-
-    # Try preferred kernel from registry (vmlinux for x86_64, then vmlinuz)
-    download_candidates = [f"{name}.zst" for name in candidates]
-    for name in download_candidates:
-        if name in assets.registry:
-            logger.debug("Fetching kernel", extra={"arch": arch, "file": name})
-            return await assets.fetch(name, processor=decompress_zstd)
-
-    # Fallback to vmlinuz (will fail at fetch time if truly missing)
-    fallback = download_candidates[-1]
-    logger.debug("Fetching kernel", extra={"arch": arch, "file": fallback})
-    return await assets.fetch(fallback, processor=decompress_zstd)
+    download_candidates = [f"{name}{RELEASE_SUFFIX}" for name in kernel_names(arch_of(arch))]
+    name = next((name for name in download_candidates if name in assets.registry), download_candidates[-1])
+    logger.debug("Fetching kernel", extra={"arch": arch, "file": name})
+    return await assets.fetch(name, decompress=True)
 
 
-async def fetch_initramfs(arch: str | None = None, override: Path | None = None) -> Path:
-    """
-    Fetch initramfs for the given architecture.
-
-    Args:
-        arch: Architecture ("x86_64" or "aarch64"). Defaults to current machine.
-        override: Explicit path to search first (from SchedulerConfig.images_dir).
-
-    Returns:
-        Path to the decompressed initramfs file.
-    """
-    arch = arch or get_current_arch()
-    fname = f"initramfs-{arch}.zst"
-
-    # Check local cache first
-    if local_path := await _find_asset(fname, override):
-        logger.debug("Using cached initramfs", extra={"arch": arch, "path": str(local_path)})
-        return local_path
-
-    # Not found locally, download from GitHub
+async def _download(fname: str) -> Path:
+    """`fname` (a release name, .zst) from the release, unpacked into images_download_dir()."""
     await ensure_registry_loaded()
-    assets = get_assets()
-
-    logger.debug("Fetching initramfs", extra={"arch": arch, "file": fname})
-    return await assets.fetch(fname, processor=decompress_zstd)
+    return await get_assets().fetch(fname, decompress=True)
 
 
-async def fetch_base_image(language: str, arch: str | None = None, override: Path | None = None) -> Path:
+async def _cached(names: tuple[str, ...]) -> Path | None:
+    """The first of `names` (unpacked release names) in images_download_dir(), or None. One
+    worker-thread job."""
+    cache = images_download_dir()
+    return await asyncio.to_thread(_first_existing, [cache / name for name in names])
+
+
+async def _kernel_in_cache(arch: str) -> Path:
+    """The kernel of `arch` in images_download_dir(), downloaded there when missing."""
+    return await _cached(kernel_names(arch_of(arch))) or await _download_kernel(arch)
+
+
+async def _in_cache(name: str) -> Path:
+    """`name` (an unpacked release name) in images_download_dir(), downloaded there when missing."""
+    return await _cached((name,)) or await _download(name + RELEASE_SUFFIX)
+
+
+async def ensure_base_image(language: Language, *, images_dir: Path) -> None:
+    """Have the base image of `language` where GuestImages looks for it: in `images_dir`, else
+    in images_download_dir(), downloaded there when neither holds it. Never from another
+    search folder, which GuestImages does not read.
+
+    Raises:
+        ConfigError: ASSET_NOT_FOUND: not in the release, or offline mode
+        TransientError: ASSET_DOWNLOAD: the download or its hash check failed after retries
     """
-    Fetch base qcow2 image for the given language.
-
-    Args:
-        language: Programming language ("python" or "javascript").
-        arch: Architecture ("x86_64" or "aarch64"). Defaults to current machine.
-        override: Explicit path to search first (from SchedulerConfig.images_dir).
-
-    Returns:
-        Path to the decompressed qcow2 image file.
-    """
-    arch = arch or get_current_arch()
-
-    # Map language to image filename: the names scripts/build-qcow2.sh gives (python-<Python
-    # minor>, node-<Bun minor>); tests/test_assets.py checks them against its default versions.
-    if language == "python":
-        fname = f"python-3.14-base-{arch}.qcow2.zst"
-    elif language == "javascript":
-        fname = f"node-1.4-base-{arch}.qcow2.zst"
-    else:
-        fname = f"raw-base-{arch}.qcow2.zst"
-
-    # Check local cache first
-    if local_path := await _find_asset(fname, override):
-        logger.debug("Using cached base image", extra={"language": language, "arch": arch, "path": str(local_path)})
-        return local_path
-
-    # Not found locally, download from GitHub
-    await ensure_registry_loaded()
-    assets = get_assets()
-
-    logger.debug("Fetching base image", extra={"language": language, "arch": arch, "file": fname})
-    return await assets.fetch(fname, processor=decompress_zstd)
+    arch = get_current_arch()
+    name = BASE_IMAGES[language].file_name(arch_of(arch))
+    if await asyncio.to_thread(_first_existing, [images_dir / name, images_download_dir() / name]):
+        return
+    logger.debug("Fetching base image", extra={"language": language.value, "arch": arch, "file": name})
+    await _download(name + RELEASE_SUFFIX)
 
 
 async def get_gvproxy_path(override: Path | None = None) -> Path | None:
@@ -284,7 +211,7 @@ async def get_gvproxy_path(override: Path | None = None) -> Path | None:
     1. Repo-relative path (gvproxy-wrapper/bin/ - for local development builds)
     2. EXEC_SANDBOX_IMAGES_DIR env var
     3. Local build directory (./images/dist/)
-    4. Download cache directory (~/.cache/exec-sandbox/v{version}/)
+    4. Download cache directory (images_download_dir)
 
     Args:
         override: Explicit path to search first (from SchedulerConfig.images_dir).
@@ -307,7 +234,8 @@ async def _find_gvproxy(override: Path | None, *, arch: str) -> Path | None:
     candidates.append(repo_root / "gvproxy-wrapper" / "bin" / fname)
 
     # 2-4. Fall back to standard asset cache lookup
-    return await asyncio.to_thread(_first_existing, [*candidates, *_asset_candidates(fname, override)])
+    candidates.extend(directory / fname for directory in _get_search_paths(override))
+    return await asyncio.to_thread(_first_existing, candidates)
 
 
 async def fetch_gvproxy(*, override: Path | None, arch: str) -> Path:
@@ -335,7 +263,7 @@ async def fetch_gvproxy(*, override: Path | None, arch: str) -> Path:
     fname = f"gvproxy-wrapper-{get_gvproxy_suffix(arch)}"
 
     logger.debug("Fetching gvproxy-wrapper", extra={"file": fname})
-    path = await assets.fetch(fname)
+    path = await assets.fetch(fname, decompress=False)
 
     # Make executable
     await chmod_executable(path)
@@ -343,36 +271,32 @@ async def fetch_gvproxy(*, override: Path | None, arch: str) -> Path:
     return path
 
 
-async def ensure_assets_available(*, override: Path | None) -> tuple[Path, Path]:
+async def ensure_assets_available() -> tuple[Path, Path]:
     """
-    Ensure the kernel, initramfs and gvproxy are available (base images are fetched
-    per language, on first use: fetch_base_image).
+    Make the download cache hold the boot files (the kernel and the initramfs), and find or
+    download gvproxy (base images are fetched per language, on first use: ensure_base_image).
 
-    Downloads assets from GitHub Releases if not already cached.
-    In offline mode, missing assets raise ConfigError ASSET_NOT_FOUND (no download).
-
-    Args:
-        override: Explicit path to search first (from SchedulerConfig.images_dir).
+    The kernel and the initramfs are taken from images_download_dir(), or downloaded into it,
+    never from another search folder: the images folder must hold both. gvproxy-wrapper
+    is searched with no override (SchedulerConfig.images_dir is not the images folder here, and
+    a VM start searches the images folder first, then the same folders). In offline mode,
+    missing assets raise ConfigError ASSET_NOT_FOUND (no download).
 
     Returns:
-        Tuple of (images_dir, gvproxy_path)
+        Tuple of (images_dir: the download cache, gvproxy_path)
 
     Raises:
         ConfigError: ASSET_NOT_FOUND: release not found on GitHub, or offline mode
             and assets missing.
-        TransientError: ASSET_DOWNLOAD: download or hash verification failed after retries.
+        TransientError: ASSET_DOWNLOAD: the release metadata could not be read, or a
+            download or hash verification failed after retries.
     """
-    # Fetch required assets in parallel
-    fetch_tasks: list[asyncio.Task[Path]] = [
-        asyncio.create_task(fetch_kernel(override=override)),
-        asyncio.create_task(fetch_initramfs(override=override)),
-        asyncio.create_task(fetch_gvproxy(override=override, arch=get_current_arch())),
-    ]
-
-    results = await asyncio.gather(*fetch_tasks)
-    kernel_path, _, gvproxy_path = results[0], results[1], results[2]
-
-    # Images directory is the parent of the kernel
+    arch = get_current_arch()
+    kernel_path, _, gvproxy_path = await asyncio.gather(
+        _kernel_in_cache(arch),
+        _in_cache(initramfs_name(arch_of(arch))),
+        fetch_gvproxy(override=None, arch=arch),
+    )
     images_dir = kernel_path.parent
 
     logger.info(
@@ -387,6 +311,9 @@ async def ensure_assets(*, override: Path | None, download: bool) -> Path:
     """
     Find or download assets. Single entry point for asset resolution.
 
+    With `download`, a found images folder also gets gvproxy-wrapper where a VM start looks
+    for it (best effort: a failure is logged).
+
     Args:
         override: Explicit path from SchedulerConfig.images_dir.
         download: If True, download missing assets. If False, raise on missing.
@@ -398,18 +325,20 @@ async def ensure_assets(*, override: Path | None, download: bool) -> Path:
         ConfigError: ASSET_NOT_FOUND: assets not found and download=False, or release not found on GitHub.
         TransientError: ASSET_DOWNLOAD: download or hash verification failed after retries.
     """
-    # Try to find existing assets first
+    # The first folder, in search order, that holds the boot files: a folder that exists
+    # with none or one of them (an empty images/dist) must not hide one that has both
     if images_dir := await _find_images_dir(override):
-        # Validate that essential files exist (not just the directory)
-        arch = get_current_arch()
-        if await asyncio.to_thread(_first_existing, [images_dir / name for name in _kernel_candidates(arch)]):
-            logger.debug("Found existing assets", extra={"images_dir": str(images_dir)})
-            return images_dir
-        # Directory exists but kernel is missing - fall through to download
-        logger.debug(
-            "Directory exists but kernel missing",
-            extra={"images_dir": str(images_dir)},
-        )
+        logger.debug("Found existing assets", extra={"images_dir": str(images_dir)})
+        if download:
+            # gvproxy-wrapper where a VM start looks for it: the images folder first.
+            # Best effort: a VM with no network needs none; one with network then fails with
+            # HOST_DEPENDENCY at its start. OSError: a read-only folder or a file of another
+            # user refuses the chmod
+            try:
+                await fetch_gvproxy(override=images_dir, arch=get_current_arch())
+            except (ConfigError, TransientError, OSError) as e:
+                logger.warning("gvproxy-wrapper not available: VMs with network cannot start", extra={"error": str(e)})
+        return images_dir
 
     # Not found - either download or error
     if not download:
@@ -425,11 +354,11 @@ async def ensure_assets(*, override: Path | None, download: bool) -> Path:
         )
 
     # Download assets and return images directory
-    images_dir, _ = await ensure_assets_available(override=override)
+    images_dir, _ = await ensure_assets_available()
     return images_dir
 
 
-def _get_search_paths(override: Path | None = None) -> list[Path]:
+def _get_search_paths(override: Path | None) -> list[Path]:
     """
     Get list of directories to search for assets.
 
@@ -437,7 +366,7 @@ def _get_search_paths(override: Path | None = None) -> list[Path]:
     1. override (explicit from SchedulerConfig.images_dir)
     2. EXEC_SANDBOX_IMAGES_DIR env var
     3. Local build directory (./images/dist/ relative to package root)
-    4. Download cache directory (~/.cache/exec-sandbox/v{version}/)
+    4. Download cache directory (images_download_dir)
 
     Args:
         override: Explicit path from config (highest priority).
@@ -460,58 +389,31 @@ def _get_search_paths(override: Path | None = None) -> list[Path]:
     paths.append(local_images)
 
     # Priority 4: Download cache directory
-    paths.append(_versioned_cache_dir())
+    paths.append(images_download_dir())
 
     return paths
 
 
-async def _find_images_dir(override: Path | None = None) -> Path | None:
+async def _find_images_dir(override: Path | None) -> Path | None:
+    """The first images folder, in search order (_get_search_paths: override,
+    EXEC_SANDBOX_IMAGES_DIR, the local build, the download cache), that holds the boot files of
+    this host's architecture: a kernel and the initramfs, in the folder or in its kernels/
+    subfolder (kernel_dir_of, as the settings read them). A folder with only one of them is
+    passed over: VMs read both from the images folder. None when no folder does.
+    One worker-thread job (a few stat calls).
     """
-    Find first existing images directory.
+    host = arch_of(get_current_arch())
+    kernels = kernel_names(host)
+    initramfs = initramfs_name(host)
 
-    Checks multiple locations in priority order:
-    1. override (explicit from SchedulerConfig.images_dir)
-    2. EXEC_SANDBOX_IMAGES_DIR env var
-    3. Local build directory (./images/dist/ relative to package root)
-    4. Download cache directory (~/.cache/exec-sandbox/v{version}/)
+    def first_with_boot_files() -> Path | None:
+        for folder in _get_search_paths(override):
+            boot = kernel_dir_of(folder, arch=host)
+            if _first_existing([boot / name for name in kernels]) and _first_existing([boot / initramfs]):
+                return folder
+        return None
 
-    Args:
-        override: Explicit path from config (highest priority).
-
-    Returns:
-        Path to images directory if found, None otherwise.
-    """
-    return await asyncio.to_thread(_first_existing, _get_search_paths(override))
-
-
-async def _find_asset(fname: str, override: Path | None = None) -> Path | None:
-    """
-    Find specific asset file without downloading.
-
-    Checks multiple locations in priority order:
-    1. override (explicit from SchedulerConfig.images_dir)
-    2. EXEC_SANDBOX_IMAGES_DIR env var
-    3. Local build directory (./images/dist/ relative to package root)
-    4. Download cache directory (~/.cache/exec-sandbox/v{version}/)
-
-    A `.zst` name is looked up unpacked only: decompress_zstd removes the `.zst`
-    once it is unpacked, so one that stays is an unpack that did not end (the
-    process died). It is never a ready asset: the caller unpacks it again (retrieve
-    reuses it when its digest is right) or downloads it.
-
-    Args:
-        fname: Asset filename.
-        override: Explicit path from config (highest priority).
-
-    Returns:
-        Path to the asset file if found, None otherwise.
-    """
-    return await asyncio.to_thread(_first_existing, _asset_candidates(fname, override))
-
-
-def _asset_candidates(fname: str, override: Path | None) -> list[Path]:
-    """Where _find_asset looks, in order: the ready file (`.zst` removed) in each search folder."""
-    return [directory / fname.removesuffix(".zst") for directory in _get_search_paths(override)]
+    return await asyncio.to_thread(first_with_boot_files)
 
 
 def _first_existing(paths: list[Path]) -> Path | None:
@@ -529,9 +431,11 @@ async def prefetch_all_assets(
     """
     Pre-download all VM assets for offline use.
 
-    Downloads kernel, initramfs, gvproxy-wrapper (of this OS), and all base images
-    for the specified architecture. Useful for pre-populating cache in container
-    builds before running with EXEC_SANDBOX_OFFLINE=1.
+    Puts the kernel, the initramfs and all base images of the architecture in the download
+    cache (images_download_dir(): what an offline start reads when no other folder holds the
+    boot files), downloading each that the cache lacks; a copy in another search folder does
+    not count. Also finds or downloads gvproxy-wrapper (of this OS). Useful for
+    pre-populating cache in container builds before running with EXEC_SANDBOX_OFFLINE=1.
 
     Args:
         arch: Target architecture ("x86_64" or "aarch64"). Defaults to current machine.
@@ -555,13 +459,14 @@ async def prefetch_all_assets(
 
     # Define all assets to fetch - core assets plus base images for all languages
     asset_tasks: list[tuple[str, asyncio.Task[Path]]] = [
-        ("kernel", asyncio.create_task(fetch_kernel(arch=arch))),
-        ("initramfs", asyncio.create_task(fetch_initramfs(arch=arch))),
+        ("kernel", asyncio.create_task(_kernel_in_cache(arch))),
+        ("initramfs", asyncio.create_task(_in_cache(initramfs_name(arch_of(arch))))),
         ("gvproxy", asyncio.create_task(fetch_gvproxy(override=None, arch=arch))),
     ]
     # Add base images for all supported languages
     asset_tasks.extend(
-        (f"{lang.value} base", asyncio.create_task(fetch_base_image(lang.value, arch=arch))) for lang in Language
+        (f"{lang.value} base", asyncio.create_task(_in_cache(BASE_IMAGES[lang].file_name(arch_of(arch)))))
+        for lang in Language
     )
 
     # Gather results with exception handling
@@ -589,5 +494,5 @@ async def prefetch_all_assets(
         arch=arch,
         downloaded=downloaded,
         errors=errors,
-        cache_dir=_versioned_cache_dir() if len(errors) == 0 else None,
+        cache_dir=images_download_dir() if len(errors) == 0 else None,
     )

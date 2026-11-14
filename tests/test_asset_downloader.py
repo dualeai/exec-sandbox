@@ -6,19 +6,24 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import stat
 import subprocess
 import sys
 import threading
 import tracemalloc
 from pathlib import Path
 from types import SimpleNamespace
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING
 from unittest.mock import patch
 
 import aiohttp
 import aioresponses.core as aioresponses_core
 import pytest
 from aioresponses import aioresponses
+from yarl import URL
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 if sys.version_info >= (3, 14):
     from compression import zstd
@@ -27,19 +32,19 @@ else:
     from backports import zstd
     from backports.zstd import ZstdError
 
+from exec_sandbox import asset_downloader
 from exec_sandbox.asset_downloader import (
     AsyncPooch,
-    UserDir,
     decompress_zstd,
     get_current_arch,
     get_gvproxy_suffix,
-    get_user_dir,
     retrieve,
 )
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
-from exec_sandbox.hash_utils import IncrementalHasher, file_hash
-from exec_sandbox.lock_utils import file_lock, try_file_lock
-from exec_sandbox.platform_utils import HostOS
+from exec_sandbox.files.disk import create_file
+from exec_sandbox.files.locks import CacheEntry
+from exec_sandbox.hash_utils import file_hash
+from tests.conftest import asyncio_with, skip_unless_aarch64, skip_unless_x86_64
 
 
 class _CompatClientResponse(aiohttp.ClientResponse):
@@ -56,70 +61,91 @@ class _CompatClientResponse(aiohttp.ClientResponse):
 aioresponses_core.ClientResponse = _CompatClientResponse  # type: ignore[misc]  # default response_class
 
 
-class TestUserDirCache:
-    """Tests for get_user_dir(kind=UserDir.CACHE)."""
+@pytest.fixture
+def retry_waits() -> Iterator[list[float]]:
+    """The waits between download attempts, recorded and not slept (1 s, then 2 s): a
+    download that fails each time ends in milliseconds."""
+    waits: list[float] = []
 
-    def test_returns_path(self):
-        """Should return a Path object."""
-        result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-        assert isinstance(result, Path)
+    async def sleep(delay: float) -> None:
+        waits.append(delay)
+        await asyncio.sleep(0)
 
-    def test_project_app_name(self):
-        """Should use the app name exec-sandbox."""
-        result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-        assert "exec-sandbox" in str(result)
-
-    def test_custom_app_name(self):
-        """Should use custom app name when provided."""
-        result = get_user_dir(kind=UserDir.CACHE, app_name="custom-app")
-        assert "custom-app" in str(result)
-
-    def test_env_override(self):
-        """Should respect EXEC_SANDBOX_CACHE_DIR environment variable."""
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/custom/path"}):
-            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-            assert result == Path("/custom/path")
-
-    @pytest.mark.parametrize(
-        ("host_os", "expected_substr"),
-        [
-            (HostOS.MACOS, "Library/Caches"),
-            (HostOS.LINUX, ".cache"),
-            (HostOS.UNKNOWN, ".cache"),
-        ],
-    )
-    def test_platform_cache_path(self, host_os: HostOS, expected_substr: str):
-        """Should use platform-appropriate cache directory."""
-        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=host_os):
-            with patch.dict("os.environ", {}, clear=True):
-                assert expected_substr in str(get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox"))
-
-    def test_linux_xdg_cache_home(self):
-        """Should respect XDG_CACHE_HOME on Linux."""
-        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
-            with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg/cache"}):
-                result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-                assert result == Path("/xdg/cache/exec-sandbox")
+    with patch("exec_sandbox.asset_downloader.asyncio", asyncio_with(sleep=sleep)):
+        yield waits
 
 
-class TestGetUserDirReExport:
-    """Tests for get_user_dir re-export from platform_utils."""
+def attempts(m: aioresponses, url: str) -> int:
+    """How many GET requests went to `url`."""
+    return len(m.requests.get(("GET", URL(url)), []))
 
-    def test_reexport_identity(self):
-        """get_user_dir in asset_downloader is the same object as in platform_utils."""
-        from exec_sandbox.platform_utils import get_user_dir as platform_get_user_dir
 
-        assert get_user_dir is platform_get_user_dir
+@contextlib.asynccontextmanager
+async def _stalled_server(*, first_bytes: bytes):
+    """A local HTTP server that reads each request, sends `first_bytes`, then stalls (it
+    never closes the connection). Yields its base URL."""
+    stall = asyncio.Event()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(first_bytes)
+        await writer.drain()
+        await stall.wait()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        stall.set()  # each handler then closes its connection
+        server.close()
+        await server.wait_closed()
+
+
+class TestStalledServer:
+    """A server that stalls ends a request at its timeout, not after aiohttp's defaults
+    (30 s to connect, 300 s in all)."""
+
+    async def test_a_stalled_download_ends_at_the_read_timeout(self, tmp_path: Path) -> None:
+        """Headers and 10 of 1000 bytes, then nothing: each attempt ends after the read
+        timeout, and the download fails with ASSET_DOWNLOAD."""
+        head = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n" + b"x" * 10
+        with (
+            patch.object(asset_downloader, "_DOWNLOAD_READ_TIMEOUT_SECONDS", 0.2),
+            patch.object(asset_downloader, "RETRY_DELAY", 0.01),
+        ):
+            async with _stalled_server(first_bytes=head) as base:
+                with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD):
+                    await asyncio.wait_for(
+                        retrieve(f"{base}/asset.bin", f"sha256:{'0' * 64}", path=tmp_path, decompress=False),
+                        timeout=5,
+                    )
+
+    async def test_a_metadata_request_with_no_answer_ends_at_its_timeout(self, tmp_path: Path) -> None:
+        """The release metadata request gets no answer: it fails with ASSET_DOWNLOAD at its
+        total timeout."""
+        pooch = AsyncPooch(path=tmp_path, base_url="http://127.0.0.1/unused/v{version}", version="1.0.0")
+        with patch.object(asset_downloader, "_METADATA_TIMEOUT_SECONDS", 0.2):
+            async with _stalled_server(first_bytes=b"") as base:
+                with (
+                    patch.object(asset_downloader, "_GITHUB_API", base),
+                    pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD),
+                ):
+                    await asyncio.wait_for(pooch.load_registry_from_github("owner", "repo", "v1.0.0"), timeout=5)
 
 
 class TestGetCurrentArch:
-    """Tests for get_current_arch function."""
+    """get_current_arch: this host's architecture in the kernel's names."""
 
-    @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
-    def test_returns_correct_arch(self, arch: str):
-        """Should return the correct architecture string."""
-        with patch("exec_sandbox.asset_downloader.get_arch_name", return_value=arch):
-            assert get_current_arch() == arch
+    @skip_unless_x86_64
+    def test_x86_64_host(self):
+        assert get_current_arch() == "x86_64"
+
+    @skip_unless_aarch64
+    def test_aarch64_host(self):
+        """ARM64 hosts are "aarch64", also on macOS (where the machine name is "arm64")."""
+        assert get_current_arch() == "aarch64"
 
 
 class TestGetGvproxySuffix:
@@ -165,10 +191,94 @@ class TestRetrieve:
                 url="https://example.com/test.txt",
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
+                decompress=False,
             )
 
             assert path.exists()
             assert path.read_bytes() == content
+
+    async def test_cache_folder_is_private_whatever_the_umask(self, tmp_path: Path):
+        """Made 0700 under umask 002 (the Ubuntu default) and any group (sg qemu-vm): the user
+        cache folder also holds the home disk folder, so only this user may write it."""
+        content = b"hello world"
+        cache = tmp_path / "cache" / "exec-sandbox"
+        old = os.umask(0o002)
+        try:
+            with aioresponses() as m:
+                m.get("https://example.com/test.txt", body=content)
+                await retrieve(
+                    url="https://example.com/test.txt",
+                    known_hash=f"sha256:{hashlib.sha256(content).hexdigest()}",
+                    path=cache,
+                    decompress=False,
+                )
+        finally:
+            os.umask(old)
+        assert [stat.S_IMODE(p.stat().st_mode) & 0o777 for p in (cache.parent, cache)] == [0o700, 0o700]
+
+    async def test_assets_have_no_group_write_whatever_the_umask(self, tmp_path: Path):
+        """Under `sg qemu-vm` and umask 002, open() makes files 0664 of group qemu-vm: a QEMU
+        that runs as qemu-vm could change a kernel or a base image that every later VM boots.
+        A downloaded asset is 0644 (QEMU as qemu-vm reads it), a decompressed one too, and
+        their lock files are 0600."""
+        raw, compressed = b"gvproxy bytes", zstd.compress(b"kernel bytes")
+        old = os.umask(0o002)
+        try:
+            with aioresponses() as m:
+                m.get("https://example.com/gvproxy", body=raw)
+                m.get("https://example.com/vmlinuz.zst", body=compressed)
+                await retrieve(
+                    url="https://example.com/gvproxy",
+                    known_hash=f"sha256:{hashlib.sha256(raw).hexdigest()}",
+                    path=tmp_path,
+                    decompress=False,
+                )
+                await retrieve(
+                    url="https://example.com/vmlinuz.zst",
+                    known_hash=f"sha256:{hashlib.sha256(compressed).hexdigest()}",
+                    path=tmp_path,
+                    decompress=True,
+                )
+        finally:
+            os.umask(old)
+        assert {p.name: stat.S_IMODE(p.stat().st_mode) for p in tmp_path.iterdir()} == {
+            "gvproxy": 0o644,
+            "gvproxy.lock": 0o600,
+            "vmlinuz": 0o644,
+            "vmlinuz.lock": 0o600,
+        }
+        assert (tmp_path / "vmlinuz").read_bytes() == b"kernel bytes"
+
+    async def test_stale_temp_files_are_replaced(self, tmp_path: Path):
+        """A killed process leaves its temp files (here 0666): the next download (gvproxy.tmp)
+        and unpack (vmlinuz.tmp) make new ones, never write into the old ones. The assets get
+        mode 0644, not the 0666 of the old files, and no temp file stays."""
+        raw, compressed = b"gvproxy bytes", zstd.compress(b"kernel bytes")
+        for stale in ("gvproxy.tmp", "vmlinuz.tmp"):
+            (tmp_path / stale).write_bytes(b"old")
+            (tmp_path / stale).chmod(0o666)
+        with aioresponses() as m:
+            m.get("https://example.com/gvproxy", body=raw)
+            m.get("https://example.com/vmlinuz.zst", body=compressed)
+            gvproxy = await retrieve(
+                url="https://example.com/gvproxy",
+                known_hash=f"sha256:{hashlib.sha256(raw).hexdigest()}",
+                path=tmp_path,
+                decompress=False,
+            )
+            kernel = await retrieve(
+                url="https://example.com/vmlinuz.zst",
+                known_hash=f"sha256:{hashlib.sha256(compressed).hexdigest()}",
+                path=tmp_path,
+                decompress=True,
+            )
+        assert (gvproxy.read_bytes(), kernel.read_bytes()) == (raw, b"kernel bytes")
+        assert {p.name: stat.S_IMODE(p.stat().st_mode) for p in tmp_path.iterdir()} == {
+            "gvproxy": 0o644,
+            "gvproxy.lock": 0o600,
+            "vmlinuz": 0o644,
+            "vmlinuz.lock": 0o600,
+        }
 
     async def test_download_hashes_writes_and_closes_off_the_event_loop(self, tmp_path: Path):
         """Each downloaded chunk is hashed and written in a worker thread (one job per
@@ -178,38 +288,41 @@ class TestRetrieve:
         content = os.urandom(64 * 1024 + 4096)  # more than one 64 KiB block
         known_hash = f"sha256:{hashlib.sha256(content).hexdigest()}"
         loop_thread = threading.get_ident()
-        threads: dict[str, list[int]] = {"update": [], "write": [], "close": []}
-        real_update = IncrementalHasher.update
-        real_open = Path.open
+        threads: dict[str, list[int]] = {"hash": [], "write": [], "close": []}
+        real_hash_and_write = asset_downloader._hash_and_write
 
-        def update(hasher: IncrementalHasher, data: bytes) -> None:
-            threads["update"].append(threading.get_ident())
-            real_update(hasher, data)
+        def hash_and_write(chunk: bytes, *, update: Callable[[bytes], object], sink: IO[bytes]) -> None:
+            def spied_update(data: bytes) -> object:
+                threads["hash"].append(threading.get_ident())
+                return update(data)
 
-        def spied_open(self: Path, *args: Any, **kwargs: Any) -> IO[Any]:
-            stream = real_open(self, *args, **kwargs)
-            if self.name.endswith(".tmp"):
-                real_write, real_close = stream.write, stream.close
+            real_hash_and_write(chunk, update=spied_update, sink=sink)
 
-                def write(data: bytes) -> int:
-                    threads["write"].append(threading.get_ident())
-                    return real_write(data)
+        def spied_create(path: Path, *, mode: int, dir_fd: int | None) -> IO[bytes]:
+            stream = create_file(path, mode=mode, dir_fd=dir_fd)
+            real_write, real_close = stream.write, stream.close
 
-                def close() -> None:
-                    threads["close"].append(threading.get_ident())
-                    real_close()
+            def write(data: bytes) -> int:
+                threads["write"].append(threading.get_ident())
+                return real_write(data)
 
-                stream.write = write  # type: ignore[method-assign]
-                stream.close = close  # type: ignore[method-assign]
+            def close() -> None:
+                threads["close"].append(threading.get_ident())
+                real_close()
+
+            stream.write = write  # type: ignore[method-assign]
+            stream.close = close  # type: ignore[method-assign]
             return stream
 
         with (
             aioresponses() as m,
-            patch.object(IncrementalHasher, "update", autospec=True, side_effect=update),
-            patch.object(Path, "open", spied_open),
+            patch.object(asset_downloader, "_hash_and_write", hash_and_write),
+            patch("exec_sandbox.asset_downloader.create_file", spied_create),
         ):
             m.get("https://example.com/big.bin", body=content)
-            path = await retrieve(url="https://example.com/big.bin", known_hash=known_hash, path=tmp_path)
+            path = await retrieve(
+                url="https://example.com/big.bin", known_hash=known_hash, path=tmp_path, decompress=False
+            )
 
         assert path.read_bytes() == content
         for step, step_threads in threads.items():
@@ -229,6 +342,7 @@ class TestRetrieve:
                 url="https://example.com/cached.txt",
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
+                decompress=False,
             )
 
             # Second call - should use cache (no mock needed)
@@ -236,65 +350,68 @@ class TestRetrieve:
                 url="https://example.com/cached.txt",
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
+                decompress=False,
             )
 
             assert path1 == path2
             # aioresponses should only have been called once
             m.assert_called_once()
 
-    async def test_checksum_verification_fails(self, tmp_path: Path):
-        """Should raise TransientError ASSET_DOWNLOAD on hash mismatch after retries."""
+    async def test_checksum_verification_fails(self, tmp_path: Path, retry_waits: list[float]):
+        """A digest that never matches: three attempts, then TransientError ASSET_DOWNLOAD,
+        and no file stays."""
+        url = "https://example.com/bad.txt"
         with aioresponses() as m:
-            # Mock all retry attempts with wrong content
             for _ in range(3):
-                m.get("https://example.com/bad.txt", body=b"actual content")
+                m.get(url, body=b"actual content")
 
-            with pytest.raises(
-                TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD
-            ):  # the hash mismatch, after the retries
-                await retrieve(
-                    url="https://example.com/bad.txt",
-                    known_hash="sha256:wronghash",
-                    path=tmp_path,
-                )
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD):
+                await retrieve(url=url, known_hash="sha256:wronghash", path=tmp_path, decompress=False)
+            assert attempts(m, url) == 3
+        assert retry_waits == [1.0, 2.0]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["bad.txt.lock"]
 
-    @pytest.mark.skip(reason="aioresponses doesn't properly support sequential error-then-success mocking")
-    async def test_retries_on_failure(self, tmp_path: Path):
-        """Should retry on network failure."""
-        # Note: This test is skipped because aioresponses has limitations with
-        # mocking sequential responses where the first fails and subsequent succeed.
-        # The retry logic is tested implicitly by test_checksum_verification_fails.
+    async def test_retries_on_failure(self, tmp_path: Path, retry_waits: list[float]):
+        """A failed attempt (no connection, then a server error) is tried again after a wait
+        that doubles (1 s, 2 s): the third attempt gets the file."""
+        content = b"third time"
+        url = "https://example.com/flaky.txt"
+        with aioresponses() as m:
+            m.get(url, exception=aiohttp.ClientConnectionError("Connection refused"))
+            m.get(url, status=503)
+            m.get(url, body=content)
+
+            path = await retrieve(
+                url=url, known_hash=f"sha256:{hashlib.sha256(content).hexdigest()}", path=tmp_path, decompress=False
+            )
+            assert attempts(m, url) == 3
+        assert path.read_bytes() == content
+        assert retry_waits == [1.0, 2.0]
 
     @pytest.mark.parametrize("status_code", [404, 500])
-    async def test_http_error(self, tmp_path: Path, status_code: int):
-        """Should raise TransientError ASSET_DOWNLOAD on HTTP error status."""
+    async def test_http_error(self, tmp_path: Path, status_code: int, retry_waits: list[float]):
+        """An HTTP error status at each of the three attempts: TransientError ASSET_DOWNLOAD."""
+        url = f"https://example.com/error-{status_code}.txt"
         with aioresponses() as m:
-            url = f"https://example.com/error-{status_code}.txt"
-            for _ in range(3):  # All retry attempts return error
+            for _ in range(3):
                 m.get(url, status=status_code)
 
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD):
-                await retrieve(
-                    url=url,
-                    known_hash="sha256:abc123",
-                    path=tmp_path,
-                )
+                await retrieve(url=url, known_hash="sha256:abc123", path=tmp_path, decompress=False)
+            assert attempts(m, url) == 3
+        assert retry_waits == [1.0, 2.0]
 
-    async def test_connection_error(self, tmp_path: Path):
-        """Should raise TransientError ASSET_DOWNLOAD on connection failure."""
+    async def test_connection_error(self, tmp_path: Path, retry_waits: list[float]):
+        """No connection at each of the three attempts: TransientError ASSET_DOWNLOAD."""
+        url = "https://example.com/timeout.txt"
         with aioresponses() as m:
-            for _ in range(3):  # All retry attempts fail
-                m.get(
-                    "https://example.com/timeout.txt",
-                    exception=aiohttp.ClientConnectionError("Connection refused"),
-                )
+            for _ in range(3):
+                m.get(url, exception=aiohttp.ClientConnectionError("Connection refused"))
 
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD):
-                await retrieve(
-                    url="https://example.com/timeout.txt",
-                    known_hash="sha256:abc123",
-                    path=tmp_path,
-                )
+                await retrieve(url=url, known_hash="sha256:abc123", path=tmp_path, decompress=False)
+            assert attempts(m, url) == 3
+        assert retry_waits == [1.0, 2.0]
 
     async def test_empty_hash_skips_verification(self, tmp_path: Path):
         """Should skip hash verification when hash is empty."""
@@ -308,42 +425,11 @@ class TestRetrieve:
                 url="https://example.com/nohash.txt",
                 known_hash="",
                 path=tmp_path,
+                decompress=False,
             )
 
             assert path.exists()
             assert path.read_bytes() == content
-
-    async def test_processor_is_called(self, tmp_path: Path):
-        """Should call processor function after download."""
-        content = b"original content"
-        content_hash = hashlib.sha256(content).hexdigest()
-
-        # Track if processor was called
-        processor_called = False
-        processor_input = None
-
-        async def mock_processor(path: Path) -> Path:
-            nonlocal processor_called, processor_input
-            processor_called = True
-            processor_input = path
-            # Create processed file
-            processed_path = path.with_suffix(".processed")
-            processed_path.write_bytes(b"processed")
-            return processed_path
-
-        with aioresponses() as m:
-            m.get("https://example.com/process.txt", body=content)
-
-            result_path = await retrieve(
-                url="https://example.com/process.txt",
-                known_hash=f"sha256:{content_hash}",
-                path=tmp_path,
-                processor=mock_processor,
-            )
-
-            assert processor_called
-            assert processor_input == tmp_path / "process.txt"
-            assert result_path == tmp_path / "process.processed"
 
     async def test_redownloads_on_hash_mismatch(self, tmp_path: Path):
         """Should re-download when cached file has wrong hash."""
@@ -361,19 +447,16 @@ class TestRetrieve:
                 url="https://example.com/cached.txt",
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
+                decompress=False,
             )
 
             # Should have re-downloaded and now have correct content
+            assert path == cached_file
             assert path.read_bytes() == content
 
     async def test_streaming_memory_usage(self, tmp_path: Path):
-        """Should use bounded memory (~64KB chunks) regardless of file size.
-
-        Tests _verify_hash directly with a large file to ensure streaming
-        hash computation uses bounded memory.
-        """
-        from exec_sandbox.asset_downloader import _verify_hash
-
+        """The digest check of a cached file reads it in blocks: the peak memory of a
+        retrieve that finds a 32 MiB file in the cache stays far below the file size."""
         # Use a 32MB file so the streaming-vs-full-read gap is large enough
         # to tolerate GC-delay overhead on free-threaded Python (3.14t).
         file_size = 32 * 1024 * 1024  # 32MB
@@ -381,27 +464,30 @@ class TestRetrieve:
 
         # Write file in chunks to avoid memory spike during setup
         chunk = b"x" * (64 * 1024)  # 64KB chunks
-        hasher = IncrementalHasher()
+        digest = hashlib.sha256()
         with large_file.open("wb") as f:
             for _ in range(file_size // len(chunk)):
                 f.write(chunk)
-                hasher.update(chunk)
-        expected_hash = hasher.hexdigest()
+                digest.update(chunk)
+        known_hash = f"sha256:{digest.hexdigest()}"
+        url = "https://example.com/large.bin"
 
-        # Warmup: absorb one-time allocations from tracemalloc internals,
-        # worker thread startup (asyncio.to_thread), and hashlib module init
-        # so they don't inflate the peak measurement.
-        tracemalloc.start()
-        await _verify_hash(large_file, f"sha256:{expected_hash}")
-        tracemalloc.stop()
+        with aioresponses() as m:  # no route: a download would fail
+            # Warmup: absorb one-time allocations from tracemalloc internals,
+            # worker thread startup (asyncio.to_thread), and hashlib module init
+            # so they don't inflate the peak measurement.
+            tracemalloc.start()
+            await retrieve(url=url, known_hash=known_hash, path=tmp_path, decompress=False)
+            tracemalloc.stop()
 
-        # Measure peak memory during hash verification
-        tracemalloc.start()
-        result = await _verify_hash(large_file, f"sha256:{expected_hash}")
-        _, peak_memory = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+            # Measure peak memory during hash verification
+            tracemalloc.start()
+            result = await retrieve(url=url, known_hash=known_hash, path=tmp_path, decompress=False)
+            _, peak_memory = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            assert not m.requests  # the digest matched: the cached file, no download
 
-        assert result is True
+        assert result == large_file
 
         # Broken streaming (entire file read at once): peak = file_size
         # (hashlib.update processes in-place, no copy).
@@ -418,32 +504,8 @@ class TestRetrieve:
 class TestAsyncPooch:
     """Tests for AsyncPooch class."""
 
-    def test_init(self, tmp_path: Path):
-        """Should initialize with provided configuration."""
-        pooch = AsyncPooch(
-            path=tmp_path,
-            base_url="https://example.com/v{version}",
-            version="1.0.0",
-            registry={"file.txt": "sha256:abc123"},
-        )
-
-        assert pooch.path == tmp_path
-        assert pooch.version == "1.0.0"
-        assert "file.txt" in pooch.registry
-
-    def test_env_override_path(self, tmp_path: Path):
-        """Should respect environment variable for path override."""
-        with patch.dict("os.environ", {"CUSTOM_ENV": "/custom/path"}):
-            pooch = AsyncPooch(
-                path=tmp_path,
-                base_url="https://example.com",
-                version="1.0.0",
-                env="CUSTOM_ENV",
-            )
-            assert pooch.path == Path("/custom/path")
-
     async def test_fetch_downloads_file(self, tmp_path: Path):
-        """Should download file from registry."""
+        """A registry file downloads from base_url with the configured version, into path."""
         content = b"registry content"
         content_hash = hashlib.sha256(content).hexdigest()
 
@@ -457,9 +519,9 @@ class TestAsyncPooch:
         with aioresponses() as m:
             m.get("https://example.com/v1.0.0/file.txt", body=content)
 
-            path = await pooch.fetch("file.txt")
+            path = await pooch.fetch("file.txt", decompress=False)
 
-            assert path.exists()
+            assert path == tmp_path / "file.txt"
             assert path.read_bytes() == content
 
     async def test_fetch_not_in_registry(self, tmp_path: Path):
@@ -472,7 +534,7 @@ class TestAsyncPooch:
         )
 
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND):
-            await pooch.fetch("unknown.txt")
+            await pooch.fetch("unknown.txt", decompress=False)
 
     async def test_load_registry_from_github(self, tmp_path: Path):
         """Should load registry from GitHub release API."""
@@ -622,27 +684,6 @@ class TestAsyncPooch:
 
             assert pooch.registry["file.txt"] == "sha256:hash"
 
-    async def test_fetch_fallback_to_configured_version(self, tmp_path: Path):
-        """Should use configured version when _resolved_version is not set."""
-        content = b"fallback content"
-        content_hash = hashlib.sha256(content).hexdigest()
-
-        pooch = AsyncPooch(
-            path=tmp_path,
-            base_url="https://example.com/v{version}",
-            version="1.0.0",
-            registry={"file.txt": f"sha256:{content_hash}"},
-        )
-
-        with aioresponses() as m:
-            # Should use configured version directly
-            m.get("https://example.com/v1.0.0/file.txt", body=content)
-
-            path = await pooch.fetch("file.txt")
-
-            assert path.exists()
-            assert path.read_bytes() == content
-
     async def test_fetch_uses_resolved_version_from_github(self, tmp_path: Path):
         """Should use actual tag from GitHub API instead of configured version."""
         content = b"resolved version content"
@@ -651,7 +692,7 @@ class TestAsyncPooch:
         pooch = AsyncPooch(
             path=tmp_path,
             base_url="https://github.com/owner/repo/releases/download/v{version}",
-            version="1.0.0.dev0",  # This would be used if _resolved_version wasn't set
+            version="1.0.0.dev0",  # the URL had v1.0.0.dev0 without the GitHub tag
             registry={},
         )
 
@@ -674,11 +715,9 @@ class TestAsyncPooch:
             )
 
             await pooch.load_registry_from_github("owner", "repo", "latest")
-            path = await pooch.fetch("file.txt")
+            path = await pooch.fetch("file.txt", decompress=False)
 
-            assert path.exists()
             assert path.read_bytes() == content
-            assert pooch._resolved_version == "v2.0.0"
 
 
 class TestDecompressZstd:
@@ -703,13 +742,20 @@ class TestDecompressZstd:
         assert not compressed_file.exists()  # Original should be deleted
 
     async def test_corrupted_zstd_file(self, tmp_path: Path):
-        """Should raise error on corrupted zstd file."""
+        """Data that is not zstd: ZstdError, the temp file is removed and the source stays."""
         # Create corrupted file (not valid zstd data)
         corrupted_file = tmp_path / "corrupted.txt.zst"
         corrupted_file.write_bytes(b"this is not valid zstd data")
 
         with pytest.raises(ZstdError):
             await decompress_zstd(corrupted_file)
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["corrupted.txt.zst"]
+
+    async def test_missing_source_raises_file_not_found(self, tmp_path: Path):
+        """No source file: FileNotFoundError, and no temp file stays."""
+        with pytest.raises(FileNotFoundError):
+            await decompress_zstd(tmp_path / "nonexistent.zst")
+        assert list(tmp_path.iterdir()) == []
 
     async def test_empty_zstd_file(self, tmp_path: Path):
         """Should handle empty compressed file."""
@@ -728,34 +774,34 @@ class TestDecompressZstd:
 
 
 # ============================================================================
-# file_lock unit tests
+# CacheEntry.saving unit tests
 # ============================================================================
 
 
 class TestFileLock:
-    """Tests for file_lock utility."""
+    """Tests for CacheEntry.saving and try_saving."""
 
     async def test_yields_true_when_target_missing(self, tmp_path: Path):
         """Should yield True when target file does not exist."""
         target = tmp_path / "missing.txt"
-        async with file_lock(target) as should_proceed:
+        async with CacheEntry(target).saving() as should_proceed:
             assert should_proceed is True
 
     async def test_yields_false_when_target_exists(self, tmp_path: Path):
         """Should yield False when target file already exists with content."""
         target = tmp_path / "existing.txt"
         target.write_text("content")
-        async with file_lock(target) as should_proceed:
+        async with CacheEntry(target).saving() as should_proceed:
             assert should_proceed is False
 
     async def test_try_lock_raises_when_held(self, tmp_path: Path):
-        """try_file_lock raises BlockingIOError at once while file_lock holds the lock."""
+        """try_saving raises BlockingIOError at once while saving holds the lock."""
         target = tmp_path / "locked.txt"
-        async with file_lock(target):
-            with pytest.raises(BlockingIOError), try_file_lock(target):
+        async with CacheEntry(target).saving():
+            with pytest.raises(BlockingIOError), CacheEntry(target).try_saving():
                 pass  # Should not reach here
 
-    @pytest.mark.parametrize("wait", [True, False], ids=["file_lock", "try_file_lock"])
+    @pytest.mark.parametrize("wait", [True, False], ids=["saving", "try_saving"])
     async def test_lock_file_is_not_truncated(self, tmp_path: Path, wait: bool):
         """Taking the lock opens the existing lock file without O_TRUNC (open("w") costs
         about 0.4 ms on APFS): bytes already in it stay, the lock is the same."""
@@ -765,12 +811,15 @@ class TestFileLock:
 
         async with contextlib.AsyncExitStack() as stack:
             if wait:
-                should_proceed = await stack.enter_async_context(file_lock(target))
+                should_proceed = await stack.enter_async_context(CacheEntry(target).saving())
             else:
-                should_proceed = stack.enter_context(try_file_lock(target))
+                should_proceed = stack.enter_context(CacheEntry(target).try_saving())
             assert should_proceed is True
             assert lock_file.read_bytes() == b"kept"
-            with pytest.raises(BlockingIOError), try_file_lock(target):  # still an exclusive lock on the same file
+            with (
+                pytest.raises(BlockingIOError),
+                CacheEntry(target).try_saving(),
+            ):  # still an exclusive lock on the same file
                 pass
 
         assert lock_file.read_bytes() == b"kept"
@@ -782,7 +831,7 @@ class TestFileLock:
         order: list[str] = []
 
         async def holder() -> None:
-            async with file_lock(target) as should_proceed:
+            async with CacheEntry(target).saving() as should_proceed:
                 assert should_proceed is True
                 order.append("holder-acquired")
                 await asyncio.sleep(0.1)  # Simulate work
@@ -792,7 +841,7 @@ class TestFileLock:
         async def waiter(idx: int) -> None:
             # Small delay so holder acquires first
             await asyncio.sleep(0.02)
-            async with file_lock(target) as should_proceed:
+            async with CacheEntry(target).saving() as should_proceed:
                 order.append(f"waiter-{idx}-acquired")
                 # File was produced by holder, so should_proceed is False
                 assert should_proceed is False
@@ -854,7 +903,7 @@ class TestConcurrentRetrieve:
     """Tests for concurrent retrieve() calls.
 
     These tests reproduce the race condition found on EC2 where two concurrent
-    fetch_base_image calls would race: one's retry cleanup (dest.unlink) deleted
+    base image downloads would race: one's retry cleanup (dest.unlink) deleted
     the .zst file while the other coroutine was decompressing it.
     """
 
@@ -862,7 +911,7 @@ class TestConcurrentRetrieve:
     async def test_concurrent_same_url_with_decompress(self, tmp_path: Path, concurrency: int):
         """Concurrent retrieve() with decompress_zstd should not race.
 
-        Regression: on EC2, two fetch_base_image calls raced — one's retry
+        Regression: on EC2, two base image downloads raced — one's retry
         cleanup deleted .zst while the other was decompressing it.
         The file lock on the final output serializes the full pipeline.
         """
@@ -881,8 +930,7 @@ class TestConcurrentRetrieve:
                         url=url,
                         known_hash=f"sha256:{compressed_hash}",
                         path=tmp_path,
-                        processor=decompress_zstd,
-                        progressbar=False,
+                        decompress=True,
                     )
                     for _ in range(concurrency)
                 ]
@@ -894,9 +942,9 @@ class TestConcurrentRetrieve:
             assert results[0].read_bytes() == original
 
     @pytest.mark.parametrize("concurrency", [1, 10, 100])
-    async def test_concurrent_same_url_no_processor(self, tmp_path: Path, concurrency: int):
-        """Concurrent retrieve() without processor should not corrupt the file."""
-        content = b"concurrent download no processor"
+    async def test_concurrent_same_url_no_decompress(self, tmp_path: Path, concurrency: int):
+        """Concurrent retrieve() without decompress should not corrupt the file."""
+        content = b"concurrent download no decompress"
         content_hash = hashlib.sha256(content).hexdigest()
         url = "https://example.com/concurrent-plain.txt"
 
@@ -910,7 +958,7 @@ class TestConcurrentRetrieve:
                         url=url,
                         known_hash=f"sha256:{content_hash}",
                         path=tmp_path,
-                        progressbar=False,
+                        decompress=False,
                     )
                     for _ in range(concurrency)
                 ]
@@ -935,7 +983,7 @@ class TestConcurrentRetrieve:
                         url=url,
                         known_hash=f"sha256:{hashes[url]}",
                         path=tmp_path,
-                        progressbar=False,
+                        decompress=False,
                     )
                     for url, _ in pairs
                 ]
@@ -946,7 +994,9 @@ class TestConcurrentRetrieve:
                 assert results[i].read_bytes() == body
 
     @pytest.mark.parametrize("concurrency", [1, 10, 100])
-    async def test_concurrent_first_fails_rest_succeed(self, tmp_path: Path, concurrency: int):
+    async def test_concurrent_first_fails_rest_succeed(
+        self, tmp_path: Path, concurrency: int, retry_waits: list[float]
+    ):
         """When one concurrent retrieve fails, the others should still succeed."""
         content = b"success content"
         content_hash = hashlib.sha256(content).hexdigest()
@@ -961,9 +1011,9 @@ class TestConcurrentRetrieve:
                 m.get(url, body=content)
 
             results = await asyncio.gather(
-                retrieve(url=url_fail, known_hash="sha256:abc123", path=tmp_path, progressbar=False),
+                retrieve(url=url_fail, known_hash="sha256:abc123", path=tmp_path, decompress=False),
                 *[
-                    retrieve(url=url, known_hash=f"sha256:{content_hash}", path=tmp_path, progressbar=False)
+                    retrieve(url=url, known_hash=f"sha256:{content_hash}", path=tmp_path, decompress=False)
                     for url in ok_urls
                 ],
                 return_exceptions=True,
@@ -977,44 +1027,17 @@ class TestConcurrentRetrieve:
                 assert isinstance(r, Path)
                 assert r.read_bytes() == content
 
-    async def test_concurrent_corrupted_cache_redownloads(self, tmp_path: Path):
-        """Corrupted cached file (wrong hash) should be re-downloaded.
-
-        Exercises the fallthrough path at retrieve() lines 96-101 where
-        should_download is False but hash verification fails.
-        """
-        content = b"correct content"
-        content_hash = hashlib.sha256(content).hexdigest()
-        url = "https://example.com/corrupted.txt"
-
-        # Pre-write a corrupted file so file_lock yields False
-        corrupted_file = tmp_path / "corrupted.txt"
-        corrupted_file.write_bytes(b"wrong content")
-
-        with aioresponses() as m:
-            m.get(url, body=content)
-
-            result = await retrieve(
-                url=url,
-                known_hash=f"sha256:{content_hash}",
-                path=tmp_path,
-                progressbar=False,
-            )
-
-            assert result == corrupted_file
-            assert result.read_bytes() == content
-
     async def test_concurrent_empty_target_proceeds(self, tmp_path: Path):
         """Empty target file should trigger a fresh download.
 
-        Exercises file_lock line 54 where st_size == 0 causes
+        Exercises CacheEntry.saving where st_size == 0 causes
         should_proceed=True even though the file exists.
         """
         content = b"fresh download content"
         content_hash = hashlib.sha256(content).hexdigest()
         url = "https://example.com/empty-target.txt"
 
-        # Pre-create an empty file — file_lock should yield True
+        # Pre-create an empty file — saving should yield True
         empty_file = tmp_path / "empty-target.txt"
         empty_file.write_bytes(b"")
 
@@ -1025,7 +1048,7 @@ class TestConcurrentRetrieve:
                 url=url,
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
-                progressbar=False,
+                decompress=False,
             )
 
             assert result == empty_file
