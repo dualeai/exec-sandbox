@@ -295,6 +295,17 @@ _WRITE_PEAK_SIZES_MB = [1, 10, 32]
 # each chunk to disk: 64 * 131,072 * 4 / 3 B = 10.67 MiB. 25% headroom: the
 # chunk in hand, the decoder and tracemalloc jitter: 13.33 MiB.
 _FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = 13.4
+
+# The read messages that the operation queue holds for one read_file() (MB), by file size: the
+# base64 of each 128 KiB chunk (4/3 of it), at most 64 queued. 1 MiB: 8 chunks, 1.33 MiB;
+# 10 MiB: 64 of its 80 chunks, 10.67 MiB.
+_READ_MESSAGES_QUEUED_MB = {1: 1.4, 10: 10.7}
+
+# RSS of one write then one read beyond their bounded buffers: interpreter objects, allocator
+# bookkeeping, the free-threaded build's per-object locks. Measured on x86_64 KVM (20 runs each on
+# 3.12 and 3.14t): at most 1.6 MB for a 1 MiB file, 2.7 MB for a 10 MiB file.
+_FILE_IO_RSS_FIXED_MB = 5
+
 # Pipeline overhead for psutil RSS tests (includes C allocators, page cache,
 # write queue fill during sustained transfers, and free-threaded Python overhead).
 # 3.14t adds ~2-4MB residual overhead from per-object locks even after warmup.
@@ -452,8 +463,13 @@ async def test_peak_ram_file_io(file_io_size_mb: int, scheduler_config: Schedule
     """Measure peak RSS during a single write+read cycle.
 
     os.urandom(size_bytes) is called AFTER baseline, so content allocation is
-    counted in RSS growth (~1x file_size).  Chunk pipeline is O(chunk_size)
-    with bounded queues.  Threshold: file_size + flat pipeline overhead.
+    counted in RSS growth (~1x file_size). Threshold: the content, the write
+    frames in flight (_WRITE_FRAMES_IN_FLIGHT_MB), the read messages queued
+    (_READ_MESSAGES_QUEUED_MB) and _FILE_IO_RSS_FIXED_MB. Both pipeline peaks
+    count: the allocator keeps the pages that the write freed, so the read
+    buffers can add on top in RSS. A flat 24 MB beyond the content sat at the
+    median for 10 MiB: p50 33.6 and 33.8 MB, max 37.2 and 37.8 MB (3.12 and
+    3.14t, x86_64 KVM).
 
     Warmup run absorbs one-time init costs — see test_no_memory_leak_without_network
     docstring for rationale.
@@ -474,11 +490,13 @@ async def test_peak_ram_file_io(file_io_size_mb: int, scheduler_config: Schedule
 
     peak_growth_mb = (tracker.peak_rss - baseline_rss) / 1024 / 1024
 
-    threshold_mb = file_io_size_mb + _FILE_IO_RSS_OVERHEAD_MB
+    write_mb = _WRITE_FRAMES_IN_FLIGHT_MB[file_io_size_mb]
+    read_mb = _READ_MESSAGES_QUEUED_MB[file_io_size_mb]
+    threshold_mb = file_io_size_mb + write_mb + read_mb + _FILE_IO_RSS_FIXED_MB
     assert peak_growth_mb < threshold_mb, (
         f"Peak RAM too high: {peak_growth_mb:.1f}MB for {file_io_size_mb}MB file I/O "
-        f"(threshold: {threshold_mb}MB = {file_io_size_mb}MB content + "
-        f"{_FILE_IO_RSS_OVERHEAD_MB}MB pipeline overhead)"
+        f"(threshold: {threshold_mb:.1f}MB = {file_io_size_mb}MB content + {write_mb}MB write frames + "
+        f"{read_mb}MB read messages + {_FILE_IO_RSS_FIXED_MB}MB fixed)"
     )
 
 
