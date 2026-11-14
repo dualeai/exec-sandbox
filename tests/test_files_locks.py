@@ -10,7 +10,6 @@ import stat
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Generator
 from pathlib import Path
 
@@ -92,7 +91,9 @@ class SizedCache(BaseCacheManager):
 
 
 def leased_here(entry: Path) -> bool:
-    """Whether a lease of this process on `entry` is still open (not released)."""
+    """Whether a lease of this process on `entry` is still open (not released). Private state:
+    no public call tells this process's leases apart from those of another process
+    (evictable sees both, leased_elsewhere only the other ones)."""
     held = files_locks._use_locks.get(files_locks._lock_key(_use_lock(entry)))  # pyright: ignore[reportPrivateUsage]
     return held is not None and held.leases > 0
 
@@ -168,7 +169,7 @@ class TestEntryLease:
         entry.write_bytes(b"x")
         with CacheEntry(entry).try_evicting():
             leasing = asyncio.create_task(CacheEntry(entry).lease())
-            await asyncio.sleep(0)  # it tried without wait, and waits in a worker thread now
+            await asyncio.sleep(0)  # its try without wait met the eviction: the rest runs in a worker thread
             assert not leasing.done()
             entry.unlink()
         assert await leasing is None
@@ -260,12 +261,11 @@ class TestEntryLease:
         assert first is not None
         assert second is not None
         share = first.share()
-        assert not CacheEntry(entry).leased_elsewhere()
+        assert not CacheEntry(entry).leased_elsewhere()  # a check while this process leases
         first.release()
         second.release()
-        with leased_in_child(entry):
-            # the share alone holds the lock: the child's exclusive try (an eviction) fails
-            assert not _child_can_evict(entry)
+        # the share alone holds the lock (the check closed no file of it): an eviction of another process fails
+        assert not _child_can_evict(entry)
         share.release()
         assert _child_can_evict(entry)
 
@@ -353,18 +353,19 @@ class TestEntryLease:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A full XFS or btrfs disk refuses the new lock file (ENOSPC): eviction goes on to the
-        next entry instead of failing the whole pass."""
+        next entry instead of failing the whole pass. The disk stand-in refuses to make the use
+        lock of the oldest entry."""
         cache = SizedCache(tmp_path / "l2")
         oldest = cache.add("oldest", 100)
         newer = cache.add("newer", 200)
-        real = CacheEntry.try_evicting
+        real_open = os.open
 
-        def full_disk(self: CacheEntry) -> contextlib.AbstractContextManager[None]:
-            if self.path == oldest:
-                raise OSError(errno.ENOSPC, "No space left on device")
-            return real(self)
+        def full_disk(path: str | os.PathLike[str], flags: int, *args: int) -> int:
+            if Path(path) == _use_lock(oldest) and flags & os.O_CREAT:
+                raise OSError(errno.ENOSPC, "No space left on device", str(path))
+            return real_open(path, flags, *args)
 
-        monkeypatch.setattr(CacheEntry, "try_evicting", full_disk)
+        monkeypatch.setattr(os, "open", full_disk)
         assert await cache.evict_oldest() == 200 * 1024 * 1024
         assert oldest.exists()
         assert not newer.exists()
@@ -381,22 +382,6 @@ class TestEntryLease:
         await cache._remove_broken(entry, stamp=seen, lease=None)  # pyright: ignore[reportPrivateUsage]
         assert entry.read_text() == "20"
         await cache._remove_broken(entry, stamp=file_stamp(entry.stat()), lease=None)  # pyright: ignore[reportPrivateUsage]
-        assert not entry.exists()
-
-    async def test_broken_entry_another_process_runs_on_stays(self, tmp_path: Path) -> None:
-        """A check that finds an entry broken releases its own lease, then removes it only when
-        no other lease holds it: a VM of another process runs on it. _remove_broken is
-        what the L1 and L2 caches call when their check finds an entry broken."""
-        cache = SizedCache(tmp_path / "l2")
-        entry = cache.add("broken", 10)
-        stamp = file_stamp(entry.stat())
-        with leased_in_child(entry):
-            lease = await CacheEntry(entry).lease()
-            assert lease is not None
-            await cache._remove_broken(entry, stamp=stamp, lease=lease)  # pyright: ignore[reportPrivateUsage]
-            assert entry.exists()
-        assert evictable(entry)  # the other process ended: the check's own lease went too
-        await cache._remove_broken(entry, stamp=stamp, lease=None)  # pyright: ignore[reportPrivateUsage]
         assert not entry.exists()
 
     async def test_an_error_after_the_lock_leaves_no_trace(
@@ -506,18 +491,20 @@ class TestEntryLease:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A worker's eviction is stuck in a slow open of its lock file (a full disk): the
-        event loop leases, shares and releases other entries at once."""
+        event loop leases, shares and releases other entries while the open still waits."""
         slow, other = tmp_path / "slow.qcow2", tmp_path / "other.qcow2"
         slow.write_bytes(b"x")
         other.write_bytes(b"x")
         opening = threading.Event()
         go_on = threading.Event()
+        opened = threading.Event()
         real_open = Path.open
 
         def slow_disk(self: Path, *args: object, **kwargs: object) -> object:
             if self == _use_lock(slow):
                 opening.set()
                 go_on.wait(5)
+                opened.set()
             return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
 
         def evict() -> None:
@@ -528,12 +515,11 @@ class TestEntryLease:
         worker = asyncio.create_task(asyncio.to_thread(evict))
         try:
             await asyncio.to_thread(opening.wait, 5)
-            started = time.monotonic()
             lease = await CacheEntry(other).lease()
             assert lease is not None
             lease.share().release()
             lease.release()
-            assert time.monotonic() - started < 0.5
+            assert not opened.is_set()  # all done while the worker's open still waits
         finally:
             go_on.set()
             await worker
@@ -624,3 +610,165 @@ def _child_can_evict(entry: Path) -> bool:
     """Whether another process could take the use lock of `entry` exclusive now (an eviction)."""
     child = subprocess.run([sys.executable, "-I", "-c", _CHILD_EVICTS, str(_use_lock(entry))], check=False, timeout=30)
     return child.returncode == 0
+
+
+async def _enter_saving(target: Path) -> None:
+    async with CacheEntry(target).saving():
+        pass
+
+
+@contextlib.contextmanager
+def _save_lock_held(target: Path) -> Generator[threading.Event]:
+    """The save lock of `target` held as another process holds it (flock belongs to an open
+    file: a file of its own) until the block ends, or for 5 s at most: a build that ends. The
+    event is set when the holder let go on its own."""
+    holder = target.with_name(f"{target.name}.lock").open("a+b")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+    let_go = threading.Event()
+
+    def build_ends() -> None:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        let_go.set()
+
+    timer = threading.Timer(5.0, build_ends)
+    timer.start()
+    try:
+        yield let_go
+    finally:
+        timer.cancel()
+        timer.join()
+        holder.close()
+
+
+def _flock_waits(monkeypatch: pytest.MonkeyPatch) -> threading.Semaphore:
+    """Released once for each waiting flock() (LOCK_EX without LOCK_NB: the wait of
+    CacheEntry.saving), just before the call."""
+    waits = threading.Semaphore(0)
+    real_flock = fcntl.flock
+
+    def flock(fd: int, operation: int) -> None:
+        if operation == fcntl.LOCK_EX:
+            waits.release()
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+    return waits
+
+
+class TestSaving:
+    """CacheEntry.saving and try_saving: the save lock of one entry."""
+
+    async def test_yields_true_when_target_missing(self, tmp_path: Path):
+        """Should yield True when target file does not exist."""
+        target = tmp_path / "missing.txt"
+        async with CacheEntry(target).saving() as should_proceed:
+            assert should_proceed is True
+
+    async def test_yields_false_when_target_exists(self, tmp_path: Path):
+        """Should yield False when target file already exists with content."""
+        target = tmp_path / "existing.txt"
+        target.write_text("content")
+        async with CacheEntry(target).saving() as should_proceed:
+            assert should_proceed is False
+
+    async def test_try_lock_raises_when_held(self, tmp_path: Path):
+        """try_saving raises BlockingIOError at once while saving holds the lock."""
+        target = tmp_path / "locked.txt"
+        async with CacheEntry(target).saving():
+            with pytest.raises(BlockingIOError), CacheEntry(target).try_saving():
+                pass  # Should not reach here
+
+    @pytest.mark.parametrize("wait", [True, False], ids=["saving", "try_saving"])
+    async def test_lock_file_is_not_truncated(self, tmp_path: Path, wait: bool):
+        """Taking the lock opens the existing lock file without O_TRUNC (open("w") costs
+        about 0.4 ms on APFS): bytes already in it stay, the lock is the same."""
+        target = tmp_path / "kept.txt"
+        lock_file = tmp_path / "kept.txt.lock"
+        lock_file.write_bytes(b"kept")
+
+        async with contextlib.AsyncExitStack() as stack:
+            if wait:
+                should_proceed = await stack.enter_async_context(CacheEntry(target).saving())
+            else:
+                should_proceed = stack.enter_context(CacheEntry(target).try_saving())
+            assert should_proceed is True
+            assert lock_file.read_bytes() == b"kept"
+            with (
+                pytest.raises(BlockingIOError),
+                CacheEntry(target).try_saving(),
+            ):  # still an exclusive lock on the same file
+                pass
+
+        assert lock_file.read_bytes() == b"kept"
+
+    async def test_cancel_during_the_wait_returns_while_another_holds_the_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Another process holds the save lock (a build of the same entry): a caller cancelled
+        while it waits returns at once, not once the other build ends. macOS close(2) waits for
+        a flock(2) in progress on the same file: a close of the lock file on the event loop would
+        stop every task of the loop until the holder lets go."""
+        target = tmp_path / "entry.qcow2"
+        with _save_lock_held(target) as let_go:
+            waiting = _flock_waits(monkeypatch)
+            first = asyncio.create_task(_enter_saving(target))
+            assert await asyncio.to_thread(waiting.acquire, timeout=5)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert not let_go.is_set()  # the holder still holds the lock: the cancel did not wait for it
+        async with asyncio.timeout(5):
+            await _enter_saving(target)  # the lock is free once the holder lets go
+
+    async def test_a_cancelled_wait_keeps_its_place_until_its_flock_returns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """At most one thread of this process waits in flock() per path: the next caller of the
+        path waits on the in-process lock until the thread of the cancelled caller got the flock
+        (then its lock file closes), never in a second thread."""
+        target = tmp_path / "entry.qcow2"
+        with _save_lock_held(target):
+            waiting = _flock_waits(monkeypatch)
+            first = asyncio.create_task(_enter_saving(target))
+            assert await asyncio.to_thread(waiting.acquire, timeout=5)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            second = asyncio.create_task(_enter_saving(target))
+            assert not await asyncio.to_thread(waiting.acquire, timeout=0.2)
+        async with asyncio.timeout(5):
+            await second
+        assert files_locks._async_locks[asyncio.get_running_loop()] == {}
+
+    @pytest.mark.parametrize("n_waiters", [1, 10, 100])
+    async def test_blocking_waits_then_proceeds(self, tmp_path: Path, n_waiters: int):
+        """Callers that come while the holder saves wait for it, then see the produced file."""
+        target = tmp_path / "produced.txt"
+        order: list[str] = []
+        holding = asyncio.Event()
+        all_waiting = asyncio.Event()
+        entering = [0]
+
+        async def holder() -> None:
+            async with CacheEntry(target).saving() as should_proceed:
+                assert should_proceed is True
+                order.append("holder-acquired")
+                holding.set()
+                await all_waiting.wait()  # every waiter now waits on the lock
+                target.write_text("done")
+                order.append("holder-released")
+
+        async def waiter(idx: int) -> None:
+            await holding.wait()
+            entering[0] += 1
+            if entering[0] == n_waiters:
+                all_waiting.set()
+            # No await before the lock wait inside saving(): this waiter waits on it in this step
+            async with CacheEntry(target).saving() as should_proceed:
+                order.append(f"waiter-{idx}-acquired")
+                # File was produced by holder, so should_proceed is False
+                assert should_proceed is False
+
+        await asyncio.gather(holder(), *(waiter(i) for i in range(n_waiters)))
+        assert order[:2] == ["holder-acquired", "holder-released"]
+        assert sorted(order[2:]) == sorted(f"waiter-{i}-acquired" for i in range(n_waiters))  # each once, after

@@ -1,10 +1,14 @@
 """files.disk: sparse home disk files created and cloned without allocating their holes, new
 files of an exact mode, allocated sizes, memory filesystems, and private folders."""
 
+import contextlib
+import ctypes
 import errno
+import fcntl
 import os
 import stat
 import sys
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -20,7 +24,7 @@ from exec_sandbox.files.disk import (
     create_sparse,
     make_private_dir,
     memory_filesystem,
-    statfs,
+    statfs_type,
 )
 from tests.conftest import skip_unless_linux
 
@@ -29,6 +33,33 @@ _MIB = 1024 * 1024
 
 def _allocated(path: Path) -> int:
     return path.stat().st_blocks * 512
+
+
+@contextlib.contextmanager
+def _copy_on_write(*, reflink: bool) -> Iterator[None]:
+    """The OS calls of a copy-on-write clone give the answers of a filesystem that the test
+    cannot choose: macOS fclonefileat (libc, through ctypes) fails with ENOTSUP, as off APFS;
+    Linux ioctl FICLONE fails with EOPNOTSUPP (ext4), or succeeds when `reflink` (btrfs, XFS)."""
+    real_ioctl = fcntl.ioctl
+
+    class Libc:
+        @staticmethod
+        def fclonefileat(*_args: object) -> int:
+            return -1  # errno (get_errno) ENOTSUP
+
+    def ioctl(fd: int, request: int, arg: Any = 0, *rest: Any) -> Any:
+        if request != 0x40049409:  # FICLONE
+            return real_ioctl(fd, request, arg, *rest)
+        if not reflink:
+            raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+        return 0
+
+    with (
+        patch.object(files_disk, "_libc", Libc()),
+        patch.object(ctypes, "get_errno", lambda: errno.ENOTSUP),
+        patch.object(fcntl, "ioctl", ioctl),
+    ):
+        yield
 
 
 class TestCreateSparse:
@@ -121,41 +152,55 @@ class TestCloneSparse:
 
         Compared with the source, not with an absolute size: APFS allocates the
         range in front of a write in a sparse file (measured), ext4/XFS do not.
-        The data-ranges case is a filesystem without copy-on-write (ext4 and others):
-        _clonefile and _ficlone answer no, as they do there.
+        copy-on-write: the filesystem of this host. data-ranges: a filesystem without
+        copy-on-write (ext4 and others), as the clone calls answer there.
         """
         src, dst = tmp_path / "src.img", tmp_path / "dst.img"
         content = self._written_disk(src)
         if cow:
-            clone_sparse(src, dst)
+            clone_sparse(src, dst, stop=None)
         else:
-            with (
-                patch.object(files_disk, "_clonefile", return_value=False),
-                patch.object(files_disk, "_ficlone", return_value=False),
-            ):
-                assert clone_sparse(src, dst) is False  # a copy: its blocks are not shared
+            with _copy_on_write(reflink=False):
+                assert clone_sparse(src, dst, stop=None) is False  # a copy: its blocks are not shared
         assert dst.read_bytes() == content
         assert _allocated(dst) <= _allocated(src) + _MIB
         assert _allocated(dst) < 64 * _MIB  # holes were not written as zeros
         assert stat.S_IMODE(dst.stat().st_mode) == 0o600
 
-    @pytest.mark.parametrize("way", ["_clonefile", "_ficlone"])
-    def test_clone_says_when_blocks_are_shared(self, tmp_path: Path, way: str) -> None:
-        """A copy-on-write clone (APFS or FICLONE) says so: its blocks take no free space yet.
-        No host has both ways: each one answers yes in turn (_clonefile, _ficlone)."""
-        src = tmp_path / "src.img"
+    @pytest.mark.skipif(sys.platform != "darwin", reason="fclonefileat is macOS only (APFS)")
+    def test_apfs_clone_says_blocks_are_shared(self, tmp_path: Path) -> None:
+        """A real APFS clone (tmp_path is on APFS on macOS) says so: its blocks take no free
+        space until written."""
+        src, dst = tmp_path / "src.img", tmp_path / "dst.img"
+        content = self._written_disk(src)
+        assert clone_sparse(src, dst, stop=None) is True
+        assert dst.read_bytes() == content
+
+    def test_reflink_clone_says_blocks_are_shared(self, tmp_path: Path) -> None:
+        """FICLONE succeeds (btrfs, XFS): the clone says its blocks are shared, and no data is
+        copied (the faked ioctl copies nothing, so the clone stays empty)."""
+        src, dst = tmp_path / "src.img", tmp_path / "dst.img"
         self._written_disk(src)
-        with (
-            patch.object(files_disk, "_clonefile", return_value=way == "_clonefile"),
-            patch.object(files_disk, "_ficlone", return_value=way == "_ficlone"),
-        ):
-            assert clone_sparse(src, tmp_path / "dst.img") is True
+        with _copy_on_write(reflink=True):
+            assert clone_sparse(src, dst, stop=None) is True
+        assert dst.stat().st_size == 0
+
+    def test_a_stopped_copy_raises_and_leaves_no_file(self, tmp_path: Path) -> None:
+        """A copy of the data (no copy-on-write) whose stop is set stops before its next chunk:
+        InterruptedError, and the partial copy is removed (aio_utils.run_stoppable)."""
+        src, dst = tmp_path / "src.img", tmp_path / "dst.img"
+        self._written_disk(src)
+        stop = threading.Event()
+        stop.set()
+        with _copy_on_write(reflink=False), pytest.raises(InterruptedError, match=r"The copy was stopped"):
+            clone_sparse(src, dst, stop=stop)
+        assert not dst.exists()
 
     def test_clone_is_independent(self, tmp_path: Path) -> None:
         """Writes to the clone never reach the source (each VM owns its disk)."""
         src, dst = tmp_path / "src.img", tmp_path / "dst.img"
         content = self._written_disk(src)
-        clone_sparse(src, dst)
+        clone_sparse(src, dst, stop=None)
         with dst.open("r+b") as f:
             f.seek(10 * _MIB)
             f.write(b"C" * 4096)
@@ -163,7 +208,7 @@ class TestCloneSparse:
 
     def test_copy_without_seek_data_fails(self, tmp_path: Path) -> None:
         """No clone and no SEEK_DATA (EINVAL): the copy fails, never writes every hole as zeros.
-        The patches make that filesystem: no copy-on-write, and lseek(SEEK_DATA) refused."""
+        The faked OS calls make that filesystem: no copy-on-write, and lseek(SEEK_DATA) refused."""
         src = tmp_path / "src.img"
         self._written_disk(src)
         real_lseek = os.lseek
@@ -174,12 +219,11 @@ class TestCloneSparse:
             return real_lseek(fd, pos, how)
 
         with (
-            patch.object(files_disk, "_clonefile", return_value=False),
-            patch.object(files_disk, "_ficlone", return_value=False),
+            _copy_on_write(reflink=False),
             patch.object(os, "lseek", no_seek_data),
             pytest.raises(OSError, match="Invalid argument"),
         ):
-            clone_sparse(src, tmp_path / "dst.img")
+            clone_sparse(src, tmp_path / "dst.img", stop=None)
 
 
 class TestDataRanges:
@@ -228,19 +272,18 @@ class TestDataRanges:
                 f.seek(start)
                 f.write(b"D" * (end - start))
         written: list[tuple[int, int]] = []
-        pwrite_all = files_disk.pwrite_all
+        pwrite = os.pwrite
 
-        def recorded(fd: int, data: bytes, offset: int) -> None:
+        def recorded(fd: int, data: bytes, offset: int) -> int:
             written.append((offset, offset + len(data)))
-            pwrite_all(fd, data, offset)
+            return pwrite(fd, data, offset)
 
         with (
-            patch.object(files_disk, "_clonefile", return_value=False),
-            patch.object(files_disk, "_ficlone", return_value=False),
-            patch.object(files_disk, "pwrite_all", recorded),
+            _copy_on_write(reflink=False),
+            patch.object(os, "pwrite", recorded),
             patch.object(os, "lseek", self._lseek([])),
         ):
-            clone_sparse(src, tmp_path / "dst.img")
+            clone_sparse(src, tmp_path / "dst.img", stop=None)
         assert written == self._EXTENTS
         assert (tmp_path / "dst.img").read_bytes() == src.read_bytes()
 
@@ -282,10 +325,9 @@ class TestMemoryFilesystem:
         path says: the mount table (its first match, its escapes) is never read."""
         asked: list[Path] = []
 
-        def fake_statfs(path: Path) -> bytes:
+        def fake_statfs_type(path: Path) -> int:
             asked.append(path)
-            magic = 0x01021994 if path == tmp_path else 0xEF53  # tmpfs here, ext4 elsewhere
-            return magic.to_bytes(8, sys.byteorder) + bytes(4088)
+            return 0x01021994 if path == tmp_path else 0xEF53  # tmpfs here, ext4 elsewhere
 
         real_open = Path.open
 
@@ -293,7 +335,7 @@ class TestMemoryFilesystem:
             assert str(self) != "/proc/self/mounts", "memory_filesystem read the mount table"
             return real_open(self, *args, **kwargs)
 
-        monkeypatch.setattr("exec_sandbox.files.disk.statfs", fake_statfs)
+        monkeypatch.setattr("exec_sandbox.files.disk.statfs_type", fake_statfs_type)
         monkeypatch.setattr(Path, "open", no_mount_table)
 
         assert memory_filesystem(tmp_path / "not" / "made") == "tmpfs"
@@ -302,10 +344,8 @@ class TestMemoryFilesystem:
 
     def test_statfs_sees_the_mount_a_path_is_on(self, tmp_path: Path) -> None:
         """f_type of the real mount, not a parse of /proc/self/mounts (stacked or bind mounts)."""
-        raw = statfs(Path("/dev/shm"))
-        assert raw is not None
-        assert int.from_bytes(raw[:8], sys.byteorder) & 0xFFFFFFFF == 0x01021994  # TMPFS_MAGIC
-        assert statfs(tmp_path / "missing" / "file") is None
+        assert statfs_type(Path("/dev/shm")) == 0x01021994  # TMPFS_MAGIC
+        assert statfs_type(tmp_path / "missing" / "file") is None
 
 
 @pytest.fixture

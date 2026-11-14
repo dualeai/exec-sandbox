@@ -3,7 +3,7 @@
 Lock files are intentionally never deleted.  Deleting after close creates a
 POSIX race: process A acquires flock on inode X, process B unlinks the path and
 creates inode Y, process C flocks inode Y — both A and C now hold "exclusive"
-locks.  Persistent lock files (a few bytes each) eliminate this entirely.
+locks.  Lock files that stay (empty files) remove this race.
 
 Two-level locking prevents thread-pool starvation:
   1. asyncio.Lock (per-path) serializes in-process coroutines — zero threads.
@@ -306,30 +306,50 @@ class CacheEntry:
     async def saving(self) -> AsyncGenerator[bool]:
         """The save lock exclusive, waiting for it (in one worker thread per path, see the
         module docstring). Yields True while the entry is still to make (missing or empty),
-        False when another caller made it. The lock goes when the block ends (fd close)."""
+        False when another caller made it. The lock goes when the block ends (fd close). A
+        cancel during the wait returns at once; the lock file closes when the wait ends."""
         # Level 1: serialize in-process coroutines on an asyncio.Lock so only
         # one coroutine per path ever blocks a thread-pool worker on flock().
         lock_path = _lock_path(self.path)
         key = str(lock_path)
-        locks = _async_locks.setdefault(asyncio.get_running_loop(), {})
+        loop = asyncio.get_running_loop()
+        locks = _async_locks.setdefault(loop, {})
         entry = locks.setdefault(key, _PathLock())
         entry.users += 1
+        acquired = False
+        file: IO[bytes] | None = None
+        flocking: asyncio.Future[None] | None = None
+
+        def leave(_job: object) -> None:
+            """Close the file (frees the flock), then let the next coroutine of the path in."""
+            try:
+                if file is not None:
+                    file.close()
+            finally:
+                if acquired:
+                    entry.lock.release()
+                entry.users -= 1
+                if not entry.users:
+                    del locks[key]
+
         try:
             await entry.lock.acquire()
-            try:
-                fd = _open_lock_file(lock_path)
-                try:
-                    # Level 2: cross-process guard (at most 1 thread per path).
-                    await asyncio.to_thread(fcntl.flock, fd.fileno(), fcntl.LOCK_EX)
-                    yield not (self.path.exists() and self.path.stat().st_size > 0)
-                finally:
-                    fd.close()  # Closing fd releases the flock
-            finally:
-                entry.lock.release()
+            acquired = True
+            file = _open_lock_file(lock_path)
+            # Level 2: cross-process guard (at most 1 thread per path). Shielded: a cancel
+            # leaves the job's future pending until its flock() returns.
+            flocking = loop.run_in_executor(None, fcntl.flock, file.fileno(), fcntl.LOCK_EX)
+            await asyncio.shield(flocking)
+            yield not (self.path.exists() and self.path.stat().st_size > 0)
         finally:
-            entry.users -= 1
-            if not entry.users:
-                del locks[key]
+            if flocking is None or flocking.done():
+                leave(None)
+            else:
+                # Cancelled in the wait: the worker thread is still in flock() on the file. A
+                # close now would wait for it on the event loop (macOS close(2) waits for a
+                # flock(2) in progress on the same file), and the next coroutine of the path
+                # would start a second waiting thread. Both go once the flock returns.
+                flocking.add_done_callback(leave)
 
     @contextmanager
     def try_saving(self) -> Generator[bool]:
@@ -349,10 +369,8 @@ class CacheEntry:
         Raises:
             OSError: the use lock cannot be opened (out of file handles, a disk error)
         """
-        if not os.path.exists(self.path):  # noqa: PTH110 - never raises (an error reads as gone): Path.exists can
-            return None
         try:
-            return _lease(self.path, wait=False)
+            return _lease(self.path, wait=False)  # checks first that the entry is there
         except BlockingIOError:
             pass
         future = asyncio.get_running_loop().run_in_executor(None, functools.partial(_lease, self.path, wait=True))

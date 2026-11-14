@@ -12,11 +12,9 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import ctypes.util
 import errno
 import fcntl
 import os
-import platform
 import re
 import sys
 from pathlib import Path
@@ -25,6 +23,7 @@ from typing import TYPE_CHECKING, Final
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Iterator
     from typing import BinaryIO
 
@@ -32,6 +31,8 @@ _FICLONE = 0x40049409  # Linux ioctl: reflink the whole file (btrfs, XFS, bcache
 _AT_FDCWD = -2  # macOS <sys/fcntl.h>: a path relative to the current folder
 _COPY_CHUNK = 8 * 1024 * 1024
 _STAT_BLOCK_BYTES = 512  # the unit of st_blocks on Linux and macOS (POSIX leaves it open)
+_libc = ctypes.CDLL(None, use_errno=True)
+"""The C library of this process, loaded once: fclonefileat and F_RDADVISE (macOS), statfs (Linux)."""
 
 
 def allocated_bytes(st: os.stat_result) -> int:
@@ -94,16 +95,16 @@ def create_file(path: str | Path, *, mode: int, dir_fd: int | None) -> BinaryIO:
         raise
 
 
-def clone_sparse(src: Path, dst: Path) -> bool:
+def clone_sparse(src: Path, dst: Path, *, stop: threading.Event | None) -> bool:
     """Copy `src` to a new file `dst`, sharing blocks when the filesystem can (see clone_sparse_fd)."""
     fd = os.open(src, os.O_RDONLY)
     try:
-        return clone_sparse_fd(fd, dst, dst_dir_fd=None)
+        return clone_sparse_fd(fd, dst, dst_dir_fd=None, stop=stop)
     finally:
         os.close(fd)
 
 
-def clone_sparse_fd(src_fd: int, dst: str | Path, *, dst_dir_fd: int | None) -> bool:
+def clone_sparse_fd(src_fd: int, dst: str | Path, *, dst_dir_fd: int | None, stop: threading.Event | None) -> bool:
     """Copy the file open at `src_fd` to a new file `dst`, sharing blocks when the filesystem can.
 
     `dst` is a name in the folder open at `dst_dir_fd`, or a path when None. The
@@ -115,7 +116,9 @@ def clone_sparse_fd(src_fd: int, dst: str | Path, *, dst_dir_fd: int | None) -> 
     (clonefile(2)): set them after, if needed. The other ways make a new file of
     mode 0600. Raises FileExistsError when `dst` exists (also a symlink).
     Returns True for a copy-on-write clone (the blocks stay shared until written),
-    False for a copy of the data (its blocks take free space at once).
+    False for a copy of the data (its blocks take free space at once). A copy of the data
+    checks `stop` before each chunk: once it is set, `dst` is removed and InterruptedError
+    raised (aio_utils.run_stoppable; a clone is one call and does not stop).
     """
     if _clonefile(src_fd, dst, dst_dir_fd=dst_dir_fd):
         return True
@@ -123,18 +126,21 @@ def clone_sparse_fd(src_fd: int, dst: str | Path, *, dst_dir_fd: int | None) -> 
         if _ficlone(src_fd, fout.fileno()):
             return True
         size = os.fstat(src_fd).st_size
-        _copy_data_ranges(src_fd, fout.fileno(), size)
+        try:
+            _copy_data_ranges(src_fd, fout.fileno(), size, stop=stop)
+        except InterruptedError:
+            os.unlink(dst, dir_fd=dst_dir_fd)
+            raise
         fout.truncate(size)
     return False
 
 
 def _clonefile(src_fd: int, dst: str | Path, *, dst_dir_fd: int | None) -> bool:
     """macOS fclonefileat(2): instant copy-on-write clone on APFS."""
-    if not hasattr(os, "uname") or os.uname().sysname != "Darwin":
+    if sys.platform != "darwin":
         return False
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
     at = _AT_FDCWD if dst_dir_fd is None else dst_dir_fd
-    if libc.fclonefileat(src_fd, at, os.fsencode(dst), 0) == 0:
+    if _libc.fclonefileat(src_fd, at, os.fsencode(dst), 0) == 0:
         return True
     err = ctypes.get_errno()
     if err in (errno.ENOTSUP, errno.EXDEV):
@@ -195,13 +201,15 @@ def pwrite_all(fd: int, data: bytes, offset: int) -> None:
         view, offset = view[written:], offset + written
 
 
-def _copy_data_ranges(src_fd: int, dst_fd: int, size: int) -> None:
+def _copy_data_ranges(src_fd: int, dst_fd: int, size: int, *, stop: threading.Event | None) -> None:
     """Copy only the allocated ranges of a sparse file (exact: a hole is never
     written as zeros). Without SEEK_DATA the OSError stays: a copy that writes the
-    holes would allocate the whole disk."""
+    holes would allocate the whole disk. InterruptedError once `stop` is set."""
     for start, end in data_ranges(src_fd, size, grain=1):
         offset = start
         while offset < end:
+            if stop is not None and stop.is_set():
+                raise InterruptedError(errno.EINTR, "The copy was stopped")
             chunk = os.pread(src_fd, min(_COPY_CHUNK, end - offset), offset)
             if not chunk:
                 return
@@ -232,25 +240,13 @@ memory (shmem) since Linux 2.4; glibc and systemd tell /dev/shm by the same two 
 filesystem on a RAM block device (zram, brd) is a disk filesystem to the kernel."""
 
 
-def statfs(path: Path) -> bytes | None:
-    """The raw ``struct statfs`` of the file system that holds `path` (one system call), or
-    None when statfs fails. Linux: ``long f_type`` first; macOS (64-bit inodes): ``u32
-    f_flags`` at 64 and ``char f_fstypename[16]`` at 72."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    # macOS on Intel: the 64-bit inode struct has its own symbol (one struct on arm64)
-    call = (
-        getattr(libc, "statfs$INODE64", None) if sys.platform == "darwin" and platform.machine() == "x86_64" else None
-    )
-    buffer = ctypes.create_string_buffer(4096)  # larger than struct statfs on both OSes
-    if (call or libc.statfs)(os.fsencode(path), buffer) != 0:
-        return None
-    return buffer.raw
-
-
 def statfs_type(path: Path) -> int | None:
-    """The statfs f_type of the filesystem that holds `path`, or None. Linux only."""
-    raw = statfs(path)
-    return None if raw is None else int.from_bytes(raw[:8], sys.byteorder) & 0xFFFFFFFF
+    """The f_type of the filesystem that holds `path` (one statfs call: ``struct statfs`` starts
+    with ``long f_type``), or None when statfs fails. Linux only."""
+    buffer = ctypes.create_string_buffer(4096)  # larger than struct statfs
+    if _libc.statfs(os.fsencode(path), buffer) != 0:
+        return None
+    return int.from_bytes(buffer.raw[:8], sys.byteorder) & 0xFFFFFFFF
 
 
 OVERLAYFS_SUPER_MAGIC: Final = 0x794C7630
@@ -298,13 +294,10 @@ def memory_filesystem(path: Path) -> str | None:
     existing = path
     while not existing.exists() and existing != existing.parent:
         existing = existing.parent
-    raw = statfs(existing)
-    if raw is None:
-        return None
-    return LINUX_MEMORY_FILESYSTEMS.get(int.from_bytes(raw[:8], sys.byteorder) & 0xFFFFFFFF)
+    fs_type = statfs_type(existing)
+    return None if fs_type is None else LINUX_MEMORY_FILESYSTEMS.get(fs_type)
 
 
-# macOS ctypes plumbing (module-level so the CDLL is loaded once)
 _F_RDADVISE = 44  # from darwin-xnu/bsd/sys/fcntl.h
 
 
@@ -315,10 +308,6 @@ class _Radvisory(ctypes.Structure):
         ("ra_offset", ctypes.c_int64),  # off_t
         ("ra_count", ctypes.c_int),  # int
     ]
-
-
-_libc_path = ctypes.util.find_library("c")
-_libc = ctypes.CDLL(_libc_path) if _libc_path else None
 
 
 def advise_willneed(path: Path) -> None:
@@ -340,7 +329,7 @@ def advise_willneed(path: Path) -> None:
         fd = os.open(str(path), os.O_RDONLY)
         size = os.fstat(fd).st_size
         host = detect_host_os()
-        if host is HostOS.MACOS and _libc is not None:
+        if host is HostOS.MACOS:
             advisory = _Radvisory(ra_offset=0, ra_count=min(size, 2**31 - 1))
             _libc.fcntl(fd, _F_RDADVISE, ctypes.byref(advisory))
         elif host is HostOS.LINUX:
