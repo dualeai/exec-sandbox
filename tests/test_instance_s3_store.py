@@ -13,8 +13,8 @@ import pytest
 from botocore.loaders import Loader
 from botocore.retries.standard import ExponentialBackoff
 
+from exec_sandbox import s3_parts
 from exec_sandbox.exceptions import ConfigError, ErrorCode, InstanceGoneError, SandboxError, TransientError
-from exec_sandbox.instance import s3_store
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import Applied, InstanceStore, NotApplied, probe
 from tests.instance_support import NO_VM_TIMEOUT, await_until, descriptors_of
@@ -23,7 +23,7 @@ from tests.s3_faults import BUCKET, After, Before, DropAfter, DropBefore, Edit, 
 pytestmark = NO_VM_TIMEOUT
 
 _MAX = 1024 * 1024
-_PART = s3_store._PART_BYTES  # pyright: ignore[reportPrivateUsage]
+_PART = s3_parts.PART_BYTES
 """Multipart part and ranged-GET size of the S3 store, read from the code (a tuning value: no setting
 gives it). A larger object is a multipart upload and a download of several ranges (the round trip checks it)."""
 

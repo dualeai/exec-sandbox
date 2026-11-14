@@ -1953,8 +1953,8 @@ class TestCacheHierarchy:
         self, make_keyed_manager, s3_proxy, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A store that never answers the upload (the S3 proxy holds the PUT): stop() (Scheduler
-        exit) returns once the grace has passed, with no object in the store, no compressed
-        file left, and the image free for eviction again."""
+        exit) waits the grace, then returns, with no compressed file left and the image free
+        for eviction again."""
         monkeypatch.setattr(constants, "L3_UPLOAD_STOP_GRACE_SECONDS", 0.2)
         snapshot_manager, settings = await make_keyed_manager(
             s3_bucket=BUCKET,
@@ -1972,13 +1972,46 @@ class TestCacheHierarchy:
         async with asyncio.timeout(5):
             await held.reached.wait()
 
+        started = time.monotonic()
         async with asyncio.timeout(5):
+            await snapshot_manager.stop()
+        waited = time.monotonic() - started
+
+        held.release()
+        assert waited >= 0.2  # the grace, not an immediate cancel
+        assert _entries(settings.disk_snapshot_cache_dir) == [f"{_KEY}.qcow2"]
+        assert evictable(entry)
+
+    async def test_stop_aborts_a_multipart_upload_held_after_the_grace(
+        self, make_keyed_manager, s3_proxy, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A layer above one part (10 MiB of random bytes: zstd cannot make it smaller) goes up
+        in parts; the S3 proxy holds them. stop() cancels the upload after the grace and the
+        upload is aborted: no incomplete multipart upload stays in the bucket (a cancel is no
+        Exception, so an abort only on Exception left it there)."""
+        monkeypatch.setattr(constants, "L3_UPLOAD_STOP_GRACE_SECONDS", 0.2)
+        snapshot_manager, _settings = await make_keyed_manager(
+            s3_bucket=BUCKET,
+            s3_region="us-east-1",
+            s3_endpoint_url=s3_proxy.endpoint_url,
+            s3_snapshot_prefix=s3_proxy.prefix,
+        )
+        held = s3_proxy.add("MPU_PART", r"\.qcow2\.zst$", Hold(), times=None)
+        _fake_builds(snapshot_manager, monkeypatch, content=os.urandom(10 * 1024 * 1024), failures=[])
+        lease = await snapshot_manager.get_or_create_snapshot(
+            Language.PYTHON, _PACKAGES, tenant_id="t", task_id="t", memory_mb=256
+        )
+        lease.release()
+        async with asyncio.timeout(10):
+            await held.reached.wait()
+
+        async with asyncio.timeout(10):
             await snapshot_manager.stop()
 
         held.release()
-        assert s3_proxy.bucket.listing() == []
-        assert _entries(settings.disk_snapshot_cache_dir) == [f"{_KEY}.qcow2"]
-        assert evictable(entry)
+        assert s3_proxy.count("MPU_ABORT", r"\.qcow2\.zst$") == 1
+        uploads = s3_proxy.bucket.s3.list_multipart_uploads(Bucket=BUCKET, Prefix=s3_proxy.prefix)
+        assert uploads.get("Uploads", []) == []
 
     async def test_built_snapshot_is_leased_when_returned(
         self, make_keyed_manager, monkeypatch: pytest.MonkeyPatch

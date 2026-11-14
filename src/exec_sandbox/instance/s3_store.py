@@ -7,8 +7,8 @@ that answers a conditional PUT with HTTP 501 has no conditional writes:
 ConfigError INSTANCE_CONFIG (FIX_CONFIG), never a retry.
 
 Keys are the store's keys (store.py) under the store prefix. Bodies are
-streamed with at most _PART_BYTES x _PARTS_IN_FLIGHT bytes per transfer in
-memory. ETags of `get` and of conditional writes stay as the server sent them
+streamed with at most PART_BYTES x PARTS_IN_FLIGHT bytes per transfer in
+memory (s3_parts). ETags of `get` and of conditional writes stay as the server sent them
 (If-Match sends them back exactly); `upload` and `list_objects` give them
 without their quotes, the form a PUT answer and a LIST entry share.
 """
@@ -17,10 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard, cast, final
 
 import aiohttp
@@ -31,8 +29,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 from exec_sandbox._imports import aws_session
 from exec_sandbox.aio_utils import gather_or_cancel
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
-from exec_sandbox.files.disk import pwrite_all
 from exec_sandbox.instance.store import Applied, InstanceStore, ListedObject, NotApplied, wrong_size
+from exec_sandbox.s3_parts import PART_BYTES, PARTS_IN_FLIGHT, FileJobs, upload_object
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Sequence
@@ -41,7 +39,7 @@ if TYPE_CHECKING:
     from aiobotocore.response import StreamingBody
     from aiobotocore.session import AioSession, ClientCreatorContext
     from types_aiobotocore_s3 import S3Client
-    from types_aiobotocore_s3.type_defs import CompletedPartTypeDef, DeleteTypeDef, ListObjectsV2OutputTypeDef
+    from types_aiobotocore_s3.type_defs import DeleteTypeDef, ListObjectsV2OutputTypeDef
 
     from exec_sandbox.instance.store import CondResult
 
@@ -66,9 +64,6 @@ _CONFIG_CODES = frozenset(
 _TRANSPORT_ERRORS = (BotoCoreError, aiohttp.ClientError, TimeoutError)
 """No answer, or the connection broke mid-body (aiobotocore lets aiohttp payload errors through)."""
 _ERRORS = (ClientError, *_TRANSPORT_ERRORS)
-_PART_BYTES = 8 * 1024 * 1024
-"""Multipart part and ranged-GET size (S3: parts >= 5 MiB except the last, <= 10,000 parts)."""
-_PARTS_IN_FLIGHT = 4
 _READ_CHUNK = 1024 * 1024
 
 
@@ -166,53 +161,20 @@ class S3InstanceStore(InstanceStore):
         return size
 
     async def upload(self, key: str, /, *, src: Path) -> str:
-        """One PUT up to _PART_BYTES, else multipart."""
-        # Opened here, not in a thread: a cancelled to_thread(os.open) leaks the fd.
-        jobs = _FileJobs(os.open(src, os.O_RDONLY))
+        """One PUT up to PART_BYTES, else multipart (s3_parts.upload_object: a failed or
+        cancelled multipart upload is aborted)."""
         try:
-            size = jobs.size()
-            if size <= _PART_BYTES:
-                data = await jobs.pread(size, 0)
-                try:
-                    response = await self._client.put_object(Bucket=self._bucket, Key=self._full(key), Body=data)
-                except _ERRORS as e:
-                    raise _failure("PUT", key, e) from e
-                return _unquoted(_etag_of(response.get("ETag"), "PUT", key))
-            return await self._upload_parts(key, jobs, size)
-        finally:
-            await jobs.close()
-
-    async def _upload_parts(self, key: str, jobs: _FileJobs, size: int) -> str:
-        full = self._full(key)
-        try:
-            created = await self._client.create_multipart_upload(Bucket=self._bucket, Key=full)
+            response = await upload_object(
+                self._client,
+                bucket=self._bucket,
+                key=self._full(key),
+                src=src,
+                extra={},
+                part_etag=lambda etag: _etag_of(etag, "PUT", key),
+                abort_errors=_ERRORS,
+            )
         except _ERRORS as e:
             raise _failure("PUT", key, e) from e
-        upload_id = created["UploadId"]
-        gate = asyncio.Semaphore(_PARTS_IN_FLIGHT)
-
-        async def send(number: int, offset: int) -> CompletedPartTypeDef:
-            async with gate:
-                data = await jobs.pread(min(_PART_BYTES, size - offset), offset)
-                response = await self._client.upload_part(
-                    Bucket=self._bucket, Key=full, UploadId=upload_id, PartNumber=number, Body=data
-                )
-            return {"PartNumber": number, "ETag": _etag_of(response.get("ETag"), "PUT", key)}
-
-        try:
-            parts = await gather_or_cancel(
-                [send(number, offset) for number, offset in enumerate(range(0, size, _PART_BYTES), start=1)]
-            )
-            response = await self._client.complete_multipart_upload(
-                Bucket=self._bucket, Key=full, UploadId=upload_id, MultipartUpload={"Parts": parts}
-            )
-        except BaseException as e:
-            # Best effort; the bucket's AbortIncompleteMultipartUpload rule removes what stays.
-            with contextlib.suppress(*_ERRORS):
-                await self._client.abort_multipart_upload(Bucket=self._bucket, Key=full, UploadId=upload_id)
-            if isinstance(e, _ERRORS):
-                raise _failure("PUT", key, e) from e
-            raise
         return _unquoted(_etag_of(response.get("ETag"), "PUT", key))
 
     async def download(self, key: str, /, *, dest: Path, max_bytes: int, expected_size: int | None) -> bool:
@@ -225,10 +187,10 @@ class S3InstanceStore(InstanceStore):
         (HEAD) before any read: the same size twice is INSTANCE_INTEGRITY (a
         changed object)."""
         # Opened here, not in a thread: a cancelled to_thread(os.open) leaks the fd and the file.
-        jobs = _FileJobs(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        jobs = FileJobs(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
         try:
             try:
-                if expected_size is not None and expected_size <= _PART_BYTES:
+                if expected_size is not None and expected_size <= PART_BYTES:
                     await self._get_whole(key, jobs, max_bytes=max_bytes, expected_size=expected_size)
                 else:
                     await self._get_ranges(key, jobs, max_bytes=max_bytes, expected_size=expected_size)
@@ -241,7 +203,7 @@ class S3InstanceStore(InstanceStore):
             raise
         return True
 
-    async def _get_whole(self, key: str, jobs: _FileJobs, *, max_bytes: int, expected_size: int) -> None:
+    async def _get_whole(self, key: str, jobs: FileJobs, *, max_bytes: int, expected_size: int) -> None:
         """One GET without Range or ETag pin: no HEAD round trip."""
         try:
             response = await self._client.get_object(Bucket=self._bucket, Key=self._full(key))
@@ -261,7 +223,7 @@ class S3InstanceStore(InstanceStore):
             raise _failure("GET", key, e) from e
         await self._confirm_wrong_size(key, size=size, expected=expected_size)  # body closed, unread
 
-    async def _get_ranges(self, key: str, jobs: _FileJobs, *, max_bytes: int, expected_size: int | None) -> None:
+    async def _get_ranges(self, key: str, jobs: FileJobs, *, max_bytes: int, expected_size: int | None) -> None:
         full = self._full(key)
         try:
             meta = await self._client.head_object(Bucket=self._bucket, Key=full)
@@ -276,7 +238,7 @@ class S3InstanceStore(InstanceStore):
             await self._confirm_wrong_size(key, size=size, expected=expected_size)
         if size > max_bytes:
             raise wrong_size(key, size, expected=f"at most {max_bytes}")
-        gate = asyncio.Semaphore(_PARTS_IN_FLIGHT)
+        gate = asyncio.Semaphore(PARTS_IN_FLIGHT)
 
         async def fetch(start: int, end: int) -> None:
             async with gate:
@@ -294,7 +256,7 @@ class S3InstanceStore(InstanceStore):
                     raise _failure("GET", key, e) from e
 
         jobs.truncate(size)
-        await gather_or_cancel([fetch(start, min(start + _PART_BYTES, size)) for start in range(0, size, _PART_BYTES)])
+        await gather_or_cancel([fetch(start, min(start + PART_BYTES, size)) for start in range(0, size, PART_BYTES)])
 
     async def _confirm_wrong_size(self, key: str, *, size: int, expected: int) -> NoReturn:
         try:
@@ -407,7 +369,7 @@ def _s3_client(
     )
 
 
-async def _receive(body: StreamingBody, jobs: _FileJobs, *, key: str, start: int, end: int) -> None:
+async def _receive(body: StreamingBody, jobs: FileJobs, *, key: str, start: int, end: int) -> None:
     """Write the answer's body at its place in the file: exactly bytes start to end - 1."""
     offset = start
     while chunk := await body.read(_READ_CHUNK):
@@ -417,45 +379,6 @@ async def _receive(body: StreamingBody, jobs: _FileJobs, *, key: str, start: int
         offset += len(chunk)
     if offset != end:
         raise _malformed("GET", key, what=f"body shorter than range {start}-{end - 1}")
-
-
-class _FileJobs:
-    """Blocking reads and writes on one fd, in worker threads.
-
-    The fd closes only once every job has finished (a job a thread has started
-    cannot be cancelled): a closed fd number that the process reuses must never
-    get another file's bytes, or have them uploaded.
-    """
-
-    def __init__(self, fd: int) -> None:
-        self._fd = fd
-        self._pool = ThreadPoolExecutor(max_workers=_PARTS_IN_FLIGHT, thread_name_prefix="instance-store")
-
-    def size(self) -> int:
-        return os.fstat(self._fd).st_size
-
-    def truncate(self, size: int) -> None:
-        os.ftruncate(self._fd, size)
-
-    async def pread(self, length: int, offset: int) -> bytes:
-        return await asyncio.get_running_loop().run_in_executor(self._pool, _read_exactly, self._fd, length, offset)
-
-    async def pwrite(self, data: bytes, offset: int) -> None:
-        await asyncio.get_running_loop().run_in_executor(self._pool, pwrite_all, self._fd, data, offset)
-
-    async def close(self) -> None:
-        """Wait for running jobs (queued ones are dropped), then close the fd, even if cancelled."""
-        loop = asyncio.get_running_loop()
-        done = loop.run_in_executor(None, functools.partial(self._pool.shutdown, wait=True, cancel_futures=True))
-        done.add_done_callback(lambda _: os.close(self._fd))
-        await asyncio.shield(done)
-
-
-def _read_exactly(fd: int, length: int, offset: int) -> bytes:
-    data = os.pread(fd, length, offset)
-    if len(data) != length:
-        raise OSError(f"file changed during upload: read {len(data)} of {length} bytes at {offset}")
-    return data
 
 
 def _status(error: ClientError) -> int:

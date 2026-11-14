@@ -76,6 +76,7 @@ from exec_sandbox.migration_client import MigrationClient
 from exec_sandbox.permission_utils import get_expected_socket_uid
 from exec_sandbox.qemu_vm import guest_error_to_exception
 from exec_sandbox.resource_cleanup import cleanup_process
+from exec_sandbox.s3_parts import upload_object
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
 from exec_sandbox.subprocess_utils import communicate_managed_process
 from exec_sandbox.vm_spec import VmSpec
@@ -237,6 +238,13 @@ def _classify_install_error(error_output: str) -> ErrorCode | None:
 def _is_package_download(error: BaseException) -> bool:
     """The install retry predicate: a network failure of the package manager."""
     return isinstance(error, SandboxError) and error.code is ErrorCode.PACKAGE_DOWNLOAD
+
+
+def _part_etag(etag: str | None) -> str:
+    """The ETag of a part answer of an L3 upload (the upload fails without one)."""
+    if not etag:
+        raise ValueError("S3 part upload answer without an ETag")
+    return etag
 
 
 class DiskSnapshotManager(BaseCacheManager):
@@ -1195,14 +1203,19 @@ class DiskSnapshotManager(BaseCacheManager):
                     # Upload compressed qcow2; the digest of the uncompressed
                     # bytes lets downloads verify the content end to end.
                     s3_key = self._s3_key(snapshot_path.with_suffix(".qcow2.zst").name)
-                    await s3.upload_file(  # type: ignore[union-attr]
-                        str(compressed_path),
-                        self.settings.s3_bucket,
-                        s3_key,
-                        ExtraArgs={
+                    # Not upload_file: its multipart upload is not aborted on a cancel (stop()
+                    # after the grace), and an incomplete upload would stay in the bucket
+                    await upload_object(
+                        s3,
+                        bucket=self.settings.s3_bucket,
+                        key=s3_key,
+                        src=compressed_path,
+                        extra={
                             "Tagging": f"ttl_days={self.settings.snapshot_cache_ttl_days}",
                             "Metadata": {"sha256": snapshot_sha256},
                         },
+                        part_etag=_part_etag,
+                        abort_errors=(Exception,),  # a fire-and-forget cache fill: any abort error
                     )
 
                 # Cleanup compressed file (up to GBs)

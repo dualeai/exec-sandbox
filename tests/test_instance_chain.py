@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from exec_sandbox import s3_parts
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
@@ -30,7 +31,7 @@ from exec_sandbox.exceptions import (
     TransientError,
 )
 from exec_sandbox.images import image_digest
-from exec_sandbox.instance import ids, s3_store
+from exec_sandbox.instance import ids
 from exec_sandbox.instance.head import MAX_HEAD_BYTES, open_head, seal_head
 from exec_sandbox.instance.keyring import Keyring
 from exec_sandbox.instance.manager import MAX_CHAIN_PACKS
@@ -88,7 +89,7 @@ pytestmark = NO_VM_TIMEOUT
 
 _MAX = 1024 * 1024
 _REGION = "us-east-1"
-_PART = s3_store._PART_BYTES  # pyright: ignore[reportPrivateUsage]
+_PART = s3_parts.PART_BYTES
 """S3 part and ranged-GET size, read from the code (a tuning value: no setting gives it). A body
 object of at most one part loads with one GET; a larger one with a HEAD, then ranged GETs pinned to its ETag."""
 _POSITION = {"full": 0, "first": 1, "middle": 2, "last": 3}
