@@ -29,7 +29,7 @@ lint:
 
 build:
 	mkdir -p bin
-	# Output with platform suffix so vm_manager can find it
+	# Output with platform suffix so the host (assets.py) can find it
 	go build -ldflags="-s -w" -o bin/gvproxy-wrapper-$$(go env GOOS)-$$(go env GOARCH) .
 
 build-all:

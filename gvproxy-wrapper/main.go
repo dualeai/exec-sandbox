@@ -27,7 +27,6 @@ var (
 	outboundAllow = flag.String("outbound-allow", "", "OutboundAllow JSON: list of regex patterns for allowed outbound domains (DNS + TLS filtering)")
 	portForward   = flag.String("port-forward", "", "Port forwards JSON: {\"local\": \"remote\"} e.g. {\"127.0.0.1:8080\": \"192.168.127.2:8080\"}")
 	blockOutbound = flag.Bool("block-outbound", false, "Block all guest-initiated outbound connections (Mode 1: port-forward only)")
-	debug         = flag.Bool("debug", false, "Enable debug logging")
 )
 
 func main() {
@@ -63,7 +62,6 @@ func main() {
 
 	// Build configuration
 	config := types.Configuration{
-		Debug:             *debug,
 		MTU:               1500,
 		Subnet:            "192.168.127.0/24",
 		GatewayIP:         "192.168.127.1",
@@ -72,11 +70,6 @@ func main() {
 		Forwards:          forwards,       // Port forwarding: host -> guest
 		BlockAllOutbound:  *blockOutbound, // Block guest-initiated outbound (Mode 1)
 		OutboundAllow:     allowPatterns,  // Outbound filtering: DNS + TLS (Mode 2)
-	}
-
-	if *debug {
-		configJSON, _ := json.MarshalIndent(config, "", "  ")
-		log.Printf("Starting gvproxy-wrapper with configuration:\n%s", string(configJSON))
 	}
 
 	// Create virtual network
@@ -127,7 +120,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	acceptLoop(ctx, listener, time.Sleep, func(conn net.Conn) {
+	acceptLoop(listener, time.Sleep, func(conn net.Conn) {
 		// The host reads "QEMU connected from" on stdout: keep the text.
 		log.Printf("QEMU connected from: %s", conn.RemoteAddr())
 		go func() {
@@ -138,20 +131,15 @@ func main() {
 	})
 }
 
-// acceptLoop hands each connection of listener to handle until ctx ends or the
-// listener closes. A failing Accept (EMFILE, ENFILE) is retried after a pause
-// (sleep) that doubles from acceptRetryFirst to acceptRetryMax, never in a busy
-// loop; an accepted connection resets the pause.
-func acceptLoop(ctx context.Context, listener net.Listener, sleep func(time.Duration), handle func(net.Conn)) {
+// acceptLoop hands each connection of listener to handle until the listener
+// closes (the shutdown handler closes it). A failing Accept (EMFILE, ENFILE) is
+// retried after a pause (sleep) that doubles from acceptRetryFirst to
+// acceptRetryMax, never in a busy loop; an accepted connection resets the pause.
+func acceptLoop(listener net.Listener, sleep func(time.Duration), handle func(net.Conn)) {
 	delay := acceptRetryFirst
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}

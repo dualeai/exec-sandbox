@@ -126,6 +126,9 @@ def generate_outbound_allow_json(
     Returns:
         JSON string for gvproxy -outbound-allow flag
 
+    Raises:
+        ValueError: A domain is not valid (validate_domain)
+
     Example:
         >>> json_str = generate_outbound_allow_json(None, "python")
         >>> "pypi" in json_str

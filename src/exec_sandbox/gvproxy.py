@@ -18,7 +18,7 @@ from exec_sandbox.assets import get_gvproxy_path
 from exec_sandbox.dns_filter import generate_outbound_allow_json
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError, spawn_error
 from exec_sandbox.models import ExposedPort
-from exec_sandbox.permission_utils import grant_qemu_vm_access
+from exec_sandbox.permission_utils import grant_qemu_vm_access, probe_qemu_as_qemu_vm
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.socket_auth import create_unix_socket
@@ -113,9 +113,9 @@ async def start_gvproxy(  # noqa: PLR0915
     language: str,
     workdir: VmWorkingDirectory,
     images_dir: Path,
-    expose_ports: list[ExposedPort] | None = None,
-    block_outbound: bool = False,
-    on_process_started: Callable[[ProcessWrapper, asyncio.Task[None] | None], None] | None = None,
+    expose_ports: list[ExposedPort] | None,
+    block_outbound: bool,
+    on_process_started: Callable[[ProcessWrapper, asyncio.Task[None] | None], None] | None,
 ) -> tuple[ProcessWrapper, asyncio.Task[None], Callable[[], Awaitable[None]]]:
     r"""Start gvproxy-wrapper with outbound filtering for this VM.
 
@@ -125,7 +125,7 @@ async def start_gvproxy(  # noqa: PLR0915
     Chosen: gvisor-tap-vsock
     - Built-in outbound filtering via OutboundAllow (DNS + TLS, regex-based)
     - Production-ready (Podman default since 2022)
-    - 10MB memory overhead per VM
+    - ~15-30 MB of memory per VM (measured: constants.DEFAULT_VM_MEMORY_OVERHEAD_MB)
     - Simple JSON pattern configuration
     - Zero CVEs (vs SLIRP: CVE-2021-3592/3/4/5, CVE-2020-29129/30)
 
@@ -167,7 +167,9 @@ async def start_gvproxy(  # noqa: PLR0915
         expose_ports: List of ports to expose (Mode 1/2 port forwarding)
         block_outbound: Block all guest-initiated outbound connections (Mode 1)
         on_process_started: Called with the process once it is spawned (no drain task
-            yet: None), then again with its drain task; the caller then owns its cleanup
+            yet: None), then again with its drain task; the caller then owns both on every
+            path, and start_gvproxy never stops them. None: start_gvproxy stops them when it
+            fails
 
     Returns:
         Tuple of (gvproxy_process, gvproxy_log_task, wait_ready). It returns once the process
@@ -180,7 +182,8 @@ async def start_gvproxy(  # noqa: PLR0915
     Raises:
         TransientError: GVPROXY_FAILED: failed to create socket, or the fork of
             gvproxy-wrapper hit a process, memory or file-handle limit
-        ConfigError: HOST_DEPENDENCY: gvproxy-wrapper binary not found or cannot run
+        ConfigError: HOST_DEPENDENCY: gvproxy-wrapper binary not found or cannot run, or
+            qemu-vm (when QEMU runs as qemu-vm) cannot get access to the socket (setfacl)
     """
     socket_path = workdir.gvproxy_socket
 
@@ -196,113 +199,6 @@ async def start_gvproxy(  # noqa: PLR0915
             "outbound_allow_json": outbound_allow_json,
         },
     )
-
-    # Pre-create and bind socket in parent process (systemd socket activation pattern)
-    # This eliminates polling latency - socket is ready before gvproxy starts
-    try:
-        parent_sock = create_unix_socket(str(socket_path))
-        socket_fd = parent_sock.fileno()
-    except OSError as e:
-        raise TransientError(
-            f"Failed to create gvproxy socket: {e}",
-            code=ErrorCode.GVPROXY_FAILED,
-            context={
-                "vm_id": vm_id,
-                "language": language,
-                "socket_path": str(socket_path),
-            },
-            hint=None,
-            instance_id=None,
-        ) from e
-
-    # Start gvproxy-wrapper with pre-bound FD
-    gvproxy_binary = await get_gvproxy_path(override=images_dir)
-    if gvproxy_binary is None:
-        parent_sock.close()
-        raise ConfigError(
-            f"gvproxy-wrapper binary not found in {images_dir}, gvproxy-wrapper/bin, "
-            "EXEC_SANDBOX_IMAGES_DIR, images/dist or the download cache. Run `sbx prefetch` with "
-            "network access, or turn on auto_download_assets with network access, or build it "
-            "(make build).",
-            code=ErrorCode.HOST_DEPENDENCY,
-            context=None,
-            hint=None,
-            instance_id=None,
-        )
-
-    # Build gvproxy-wrapper command arguments
-    gvproxy_args = [
-        str(gvproxy_binary),
-        "-listen-fd",
-        str(socket_fd),
-    ]
-
-    # Add OutboundAllow patterns for outbound filtering (Mode 2)
-    # Only pass when there are patterns (non-empty JSON array)
-    if outbound_allow_json != "[]":
-        gvproxy_args.extend(["-outbound-allow", outbound_allow_json])
-
-    # Add outbound blocking for Mode 1 (port-forward only, no internet)
-    # This blocks all guest-initiated TCP/UDP connections at the gvproxy level
-    if block_outbound:
-        gvproxy_args.append("-block-outbound")
-        logger.info(
-            "Enabling outbound blocking (Mode 1: port-forward only)",
-            extra={"vm_id": vm_id},
-        )
-
-    # Add port forwarding configuration if needed (Mode 1/2)
-    # Port forwards are configured at gvproxy startup via the Forwards config field
-    # Format: {"local_addr:port": "guest_ip:port", ...}; a UDP forward's key has the "udp:"
-    # prefix (gvisor-tap-vsock forwardHostVM: a key without it is TCP)
-    # Guest IP in gvproxy is always 192.168.127.2
-    if expose_ports:
-        forwards_dict = {
-            f"{'udp:' if p.protocol == 'udp' else ''}{p.host}:{p.external}": f"192.168.127.2:{p.internal}"
-            for p in expose_ports
-        }
-        port_forward_json = json.dumps(forwards_dict)
-        gvproxy_args.extend(["-port-forward", port_forward_json])
-        logger.info(
-            "Configuring gvproxy port forwarding (Modes 1 and 2)",
-            extra={
-                "vm_id": vm_id,
-                "expose_ports": [(p.internal, p.external) for p in expose_ports],
-                "forwards": forwards_dict,
-            },
-        )
-
-    started_proc: ProcessWrapper | None = None
-
-    def publish_process(proc: ProcessWrapper) -> None:
-        nonlocal started_proc
-        started_proc = proc
-        if on_process_started is not None:
-            on_process_started(proc, None)
-
-    try:
-        # Ends with this process (Linux): with no VM cgroup, nothing else ends it
-        proc = await start_managed_process(
-            gvproxy_args,
-            steps=(),
-            end_with_this_process=True,
-            pass_fds=(socket_fd,),
-            on_process_started=publish_process,
-        )
-    except OSError as e:
-        parent_sock.close()
-        raise spawn_error(
-            e,
-            binary=str(gvproxy_binary),
-            code=ErrorCode.GVPROXY_FAILED,
-            context={"vm_id": vm_id, "language": language, "allowed_domains": allowed_domains},
-            hint=None,
-        ) from e
-    except BaseException:
-        parent_sock.close()
-        if started_proc is not None:
-            await cleanup_process(started_proc, "gvproxy", vm_id, kill_first=False)
-        raise
 
     # gvproxy-wrapper prints "Listening on QEMU socket" once virtualnetwork.New() is done
     # and it adopted the inherited listener. Event-based: the drain reads its stdout, no
@@ -329,18 +225,137 @@ async def start_gvproxy(  # noqa: PLR0915
         level = _stderr_level(line, qemu_connected=qemu_connected)
         logger.log(level, f"[gvproxy-wrapper error] {line}", extra={"vm_id": vm_id, "output": line})
 
-    # Background task to drain gvproxy output (prevent pipe deadlock)
-    gvproxy_log_task = start_drain(
-        proc, process_name="gvproxy-wrapper", context_id=vm_id, stdout_handler=check_ready, stderr_handler=check_error
-    )
-    if on_process_started is not None:
-        on_process_started(proc, gvproxy_log_task)
+    started_proc: ProcessWrapper | None = None
+    gvproxy_log_task: asyncio.Task[None] | None = None
+
+    def publish_process(proc: ProcessWrapper) -> None:
+        nonlocal started_proc
+        started_proc = proc
+        if on_process_started is not None:
+            on_process_started(proc, None)
+
+    # Pre-create and bind socket in parent process (systemd socket activation pattern)
+    # This eliminates polling latency - socket is ready before gvproxy starts
+    try:
+        parent_sock = create_unix_socket(str(socket_path))
+    except OSError as e:
+        raise TransientError(
+            f"Failed to create gvproxy socket: {e}",
+            code=ErrorCode.GVPROXY_FAILED,
+            context={
+                "vm_id": vm_id,
+                "language": language,
+                "socket_path": str(socket_path),
+            },
+            hint=None,
+            instance_id=None,
+        ) from e
 
     try:
-        # qemu-vm (QEMU through sudo) needs access to the socket before QEMU connects
-        await grant_qemu_vm_access(socket_path)
+        # Start gvproxy-wrapper with pre-bound FD
+        gvproxy_binary = await get_gvproxy_path(override=images_dir)
+        if gvproxy_binary is None:
+            raise ConfigError(
+                f"gvproxy-wrapper binary not found in {images_dir}, gvproxy-wrapper/bin, "
+                "EXEC_SANDBOX_IMAGES_DIR, images/dist or the download cache. Run `sbx prefetch` with "
+                "network access, or turn on auto_download_assets with network access, or build it "
+                "(make build).",
+                code=ErrorCode.HOST_DEPENDENCY,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
+
+        # Build gvproxy-wrapper command arguments
+        socket_fd = parent_sock.fileno()
+        gvproxy_args = [
+            str(gvproxy_binary),
+            "-listen-fd",
+            str(socket_fd),
+        ]
+
+        # Add OutboundAllow patterns for outbound filtering (Mode 2)
+        # Only pass when there are patterns (non-empty JSON array)
+        if outbound_allow_json != "[]":
+            gvproxy_args.extend(["-outbound-allow", outbound_allow_json])
+
+        # Add outbound blocking for Mode 1 (port-forward only, no internet)
+        # This blocks all guest-initiated TCP/UDP connections at the gvproxy level
+        if block_outbound:
+            gvproxy_args.append("-block-outbound")
+            logger.info(
+                "Enabling outbound blocking (Mode 1: port-forward only)",
+                extra={"vm_id": vm_id},
+            )
+
+        # Add port forwarding configuration if needed (Mode 1/2)
+        # Port forwards are configured at gvproxy startup via the Forwards config field
+        # Format: {"local_addr:port": "guest_ip:port", ...}; a UDP forward's key has the "udp:"
+        # prefix (gvisor-tap-vsock forwardHostVM: a key without it is TCP)
+        # Guest IP in gvproxy is always 192.168.127.2
+        if expose_ports:
+            forwards_dict = {
+                f"{'udp:' if p.protocol == 'udp' else ''}{p.host}:{p.external}": f"192.168.127.2:{p.internal}"
+                for p in expose_ports
+            }
+            port_forward_json = json.dumps(forwards_dict)
+            gvproxy_args.extend(["-port-forward", port_forward_json])
+            logger.info(
+                "Configuring gvproxy port forwarding (Modes 1 and 2)",
+                extra={
+                    "vm_id": vm_id,
+                    "expose_ports": [(p.internal, p.external) for p in expose_ports],
+                    "forwards": forwards_dict,
+                },
+            )
+
+        try:
+            # Ends with this process (Linux): with no VM cgroup, nothing else ends it
+            proc = await start_managed_process(
+                gvproxy_args,
+                steps=(),
+                end_with_this_process=True,
+                pass_fds=(socket_fd,),
+                on_process_started=publish_process,
+            )
+        except OSError as e:
+            raise spawn_error(
+                e,
+                binary=str(gvproxy_binary),
+                code=ErrorCode.GVPROXY_FAILED,
+                context={"vm_id": vm_id, "language": language, "allowed_domains": allowed_domains},
+                hint=None,
+            ) from e
+
+        # Background task to drain gvproxy output (prevent pipe deadlock)
+        gvproxy_log_task = start_drain(
+            proc,
+            process_name="gvproxy-wrapper",
+            context_id=vm_id,
+            stdout_handler=check_ready,
+            stderr_handler=check_error,
+        )
+        if on_process_started is not None:
+            on_process_started(proc, gvproxy_log_task)
+
+        # qemu-vm (QEMU through sudo) needs access to the socket before QEMU connects: without
+        # it, the VM would fail later at its boot
+        if await probe_qemu_as_qemu_vm() and not await grant_qemu_vm_access(socket_path):
+            raise ConfigError(
+                "Could not give qemu-vm access to the gvproxy socket (needs setfacl, package acl)",
+                code=ErrorCode.HOST_DEPENDENCY,
+                context={"vm_id": vm_id, "socket": str(socket_path)},
+                hint="Install setfacl (package acl) on this host.",
+                instance_id=None,
+            )
     except BaseException:
-        await cleanup_process(proc, "gvproxy", vm_id, kill_first=False)
+        # With on_process_started, the caller owns the process and its drain task
+        if on_process_started is None and started_proc is not None:
+            stopped = await cleanup_process(
+                started_proc, "gvproxy", vm_id, term_timeout=3.0, kill_timeout=2.0, kill_first=False
+            )
+            if stopped and gvproxy_log_task is not None:
+                await asyncio.wait((gvproxy_log_task,))  # its pipes are at their end
         raise
     finally:
         parent_sock.close()  # gvproxy-wrapper has its own copy since its exec (pass_fds)
