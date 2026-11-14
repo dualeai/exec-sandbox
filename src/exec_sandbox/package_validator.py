@@ -21,6 +21,12 @@ from exec_sandbox.models import Language  # noqa: TC001 - Used at runtime (langu
 _PACKAGE_NAME_PATTERN = re.compile(r"^([a-zA-Z0-9_\-\.]+)[@=<>~]")
 
 
+def _load_allow_lists(paths: dict[str, Path]) -> dict[str, set[str]]:
+    """The allow-list of each language value from its JSON file (a list of package names),
+    lowercase for case-insensitive matching. Blocking: create() runs it in a worker thread."""
+    return {language: {pkg.lower() for pkg in json.loads(path.read_text())} for language, path in paths.items()}
+
+
 class PackageValidator:
     """Validates packages against bundled allow-lists.
 
@@ -66,24 +72,7 @@ class PackageValidator:
         npm_path = npm_allow_list_path or catalogs_dir / "npm_top_10k.json"
 
         # One worker-thread job: reading and parsing both files takes about 2 ms
-        return cls(await asyncio.to_thread(cls._load_allow_lists, pypi_path, npm_path))
-
-    @classmethod
-    def _load_allow_lists(cls, pypi_path: Path, npm_path: Path) -> dict[str, set[str]]:
-        return {"python": cls._load_allow_list(pypi_path), "javascript": cls._load_allow_list(npm_path)}
-
-    @staticmethod
-    def _load_allow_list(path: Path) -> set[str]:
-        """Load allow-list from bundled JSON file.
-
-        Args:
-            path: Path to JSON file containing list of package names
-
-        Returns:
-            Set of allowed package names (lowercase for case-insensitive matching)
-        """
-        packages: list[str] = json.loads(path.read_text())
-        return {pkg.lower() for pkg in packages}
+        return cls(await asyncio.to_thread(_load_allow_lists, {"python": pypi_path, "javascript": npm_path}))
 
     def validate(self, packages: list[str], language: Language) -> None:
         """Validate packages against allow-list.
