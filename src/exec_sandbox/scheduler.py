@@ -46,8 +46,7 @@ from pydantic import ValidationError
 from exec_sandbox import constants
 from exec_sandbox._imports import require_instance_manager
 from exec_sandbox._logging import get_logger
-from exec_sandbox.aio_utils import await_settled
-from exec_sandbox.asset_downloader import get_current_arch
+from exec_sandbox.aio_utils import gather_or_cancel, settle_and_report
 from exec_sandbox.assets import ensure_assets, ensure_base_image, images_download_dir
 from exec_sandbox.config import MAX_SESSION_IDLE_TIMEOUT_SECONDS, MIN_SESSION_IDLE_TIMEOUT_SECONDS, SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
@@ -67,7 +66,7 @@ from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.migration_client import rejected_by_qemu
 from exec_sandbox.models import ExposedPort, Language, StartupTiming
 from exec_sandbox.package_validator import PackageValidator
-from exec_sandbox.platform_utils import arch_of
+from exec_sandbox.platform_utils import detect_host_arch
 from exec_sandbox.port_forward import resolve_port_mappings
 from exec_sandbox.session import Session
 from exec_sandbox.settings import Settings
@@ -107,19 +106,7 @@ def _internal(message: str) -> InternalError:
 
 _NOT_STARTED = "Scheduler not started. Use: async with Scheduler() as scheduler:"
 _NOT_INITIALIZED = "Scheduler resources not initialized"
-
-
-async def _wait_for_owned_task(task: asyncio.Task[None]) -> BaseException | None:
-    """Wait through repeated caller cancellation and return an owned task error.
-
-    Deliberate trade-off: caller cancellation (including Ctrl-C) is absorbed
-    until the owned task finishes, so a wedged startup rollback cannot be
-    aborted — leaked VM processes would be worse than a slow interrupt.
-    """
-    await await_settled(task)
-    if task.cancelled():
-        return asyncio.CancelledError()
-    return task.exception()
+_STILL_STARTING = "Scheduler is still starting"
 
 
 class Scheduler:
@@ -156,13 +143,14 @@ class Scheduler:
         self.config = config or SchedulerConfig()
         self._instances: InstanceManager | None = None
         self._instances_exit: contextlib.AsyncExitStack | None = None
-        self._settings: Settings | None = None
         self._vm_manager: VmManager | None = None
         self._snapshot_manager: DiskSnapshotManager | None = None
         self._memory_snapshot_manager: MemorySnapshotManager | None = None
         self._warm_pool: WarmVMPool | None = None
         self._package_validator: PackageValidator | None = None
         self._started = False
+        # A start is in progress: a second start or a stop meanwhile would take or stop its components
+        self._starting = False
         self._shutdown_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> Self:
@@ -176,18 +164,23 @@ class Scheduler:
 
         Raises:
             TransientError: ASSET_DOWNLOAD (a VM image download failed),
-                INSTANCE_STORE_UNAVAILABLE (the instance store check got no answer)
-            InvalidInputError: SCHEDULER_STATE: already started, or still shutting down
+                INSTANCE_STORE_UNAVAILABLE (the instance store check got no answer),
+                LOCAL_DISK (a host error on a cache folder: disk full, I/O error)
+            InvalidInputError: SCHEDULER_STATE: already started, still starting, or still
+                shutting down
             ConfigError: ASSET_NOT_FOUND (a VM image is missing and was not downloaded),
                 EXTRA_MISSING (instance_store set without the extra it needs),
                 INSTANCE_CONFIG (the instance store check failed), MIGRATION_UNSUPPORTED
                 (instance_store set and QEMU below 11.0), HOST_DEPENDENCY,
                 SETTING_INVALID (an EXEC_SANDBOX_* variable is not valid: the message names it, never
                 its value; EXEC_SANDBOX_HOME_DISK_DIR is not a folder of this user that only it can write;
-                or a cache folder, disk_snapshot_cache_dir or memory_snapshot_cache_dir, cannot be made)
+                or a cache folder cannot be made or written: disk_snapshot_cache_dir,
+                memory_snapshot_cache_dir, or the download cache under EXEC_SANDBOX_CACHE_DIR)
         """
         if self._started:
             raise _scheduler_state("Scheduler already started")
+        if self._starting:
+            raise _scheduler_state(_STILL_STARTING)
         if self._shutdown_task is not None:
             if not self._shutdown_task.done():
                 raise _scheduler_state("Scheduler is still shutting down")
@@ -196,6 +189,18 @@ class Scheduler:
             self._shutdown_task.result()
             self._shutdown_task = None
 
+        self._starting = True
+        try:
+            await self._start()
+        finally:
+            self._starting = False
+        self._started = True
+        logger.info("Scheduler started successfully")
+        return self
+
+    async def _start(self) -> None:
+        """__aenter__ after its state checks: the host checks, then each component. A failure
+        (a cancel too) rolls back what was made, through the shutdown task, then raises."""
         # A completed lifecycle never lends component references to the next
         # one. This also makes a pre-manager startup failure an inert state.
         self._vm_manager = None
@@ -222,13 +227,13 @@ class Scheduler:
         )
 
         # Create Settings from SchedulerConfig
-        self._settings = settings_from_config(self.config, images_dir=images_dir)
+        settings = settings_from_config(self.config, images_dir=images_dir)
 
         logger.info(
             "Starting scheduler",
             extra={
                 "warm_pool_size": self.config.warm_pool_size,
-                "s3_enabled": self._settings.s3_bucket is not None,
+                "s3_enabled": settings.s3_bucket is not None,
                 "auto_download_assets": self.config.auto_download_assets,
             },
         )
@@ -236,26 +241,26 @@ class Scheduler:
         # Initialize VmManager (handles backpressure internally via admission controller).
         # From this publication onward, every startup failure rolls the whole
         # partial lifecycle back through one scheduler-owned shutdown task.
-        self._vm_manager = VmManager(self._settings)
+        self._vm_manager = VmManager(settings)
         try:
             await self._vm_manager.start()  # Pre-warms all system probe caches
 
             # Saved instances: keyring, store settings, QEMU floor and store probe fail the start (fail fast)
-            if self._settings.instance_store is not None:
+            if settings.instance_store is not None:
                 self._instances_exit = contextlib.AsyncExitStack()
-                manager = require_instance_manager(store=self._settings.instance_store)
+                manager = require_instance_manager(store=settings.instance_store)
                 self._instances = await self._instances_exit.enter_async_context(
                     manager.open(
-                        self._settings, work_dir=self._vm_manager.work_dir / "instances", vm_manager=self._vm_manager
+                        settings, work_dir=self._vm_manager.work_dir / "instances", vm_manager=self._vm_manager
                     )
                 )
 
             # Initialize DiskSnapshotManager (L2 local cache always available, L3 S3 optional)
-            self._snapshot_manager = DiskSnapshotManager(self._settings, self._vm_manager)
+            self._snapshot_manager = DiskSnapshotManager(settings, self._vm_manager)
             await self._snapshot_manager.start()  # removes .part files of killed processes
 
             # Initialize MemorySnapshotManager (L1 cache)
-            self._memory_snapshot_manager = MemorySnapshotManager(self._settings, self._vm_manager)
+            self._memory_snapshot_manager = MemorySnapshotManager(settings, self._vm_manager)
 
             # Admission evicts L2 and L1 entries before a VM waits for home disk space
             self._vm_manager.add_cache(self._snapshot_manager)
@@ -267,35 +272,35 @@ class Scheduler:
                 # hashes each base image (compute_cache_key -> VmManager.images.base_image).
                 # On a fresh cache ensure_assets() fetched only kernel/initramfs, so
                 # download every pooled base image first, else start() raises
-                # ConfigError (ASSET_NOT_FOUND). Mirrors the per-run fetch in _launch_for
-                # and _get_or_create_snapshot.
+                # ConfigError (ASSET_NOT_FOUND). Mirrors the per-run fetch in _prepare_vm
+                # and _launch_for.
                 if self.config.auto_download_assets:
-                    await asyncio.gather(*(ensure_base_image(language, images_dir=images_dir) for language in Language))
+                    await gather_or_cancel(ensure_base_image(language, images_dir=images_dir) for language in Language)
                 self._warm_pool = WarmVMPool(
-                    self._vm_manager,
-                    self.config,
-                    self._snapshot_manager,
-                    memory_snapshot_manager=self._memory_snapshot_manager,
+                    self._vm_manager, self.config, memory_snapshot_manager=self._memory_snapshot_manager
                 )
                 await self._warm_pool.start()
         except BaseException:
+            # Caller cancellation (Ctrl-C too) waits for the rollback: leaked VM processes
+            # would be worse than a slow interrupt
             self._shutdown_task = asyncio.create_task(self._shutdown())
-            rollback_error = await _wait_for_owned_task(self._shutdown_task)
-            if rollback_error is not None:
+            if (rollback_error := await settle_and_report(self._shutdown_task)) is not None:
                 logger.error(
                     "Scheduler startup rollback failed",
                     extra={"error": str(rollback_error)},
                 )
             raise
 
-        self._started = True
-        logger.info("Scheduler started successfully")
-        return self
-
     async def __aexit__(
         self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
     ) -> None:
-        """Stop the Scheduler: wait for the saves in progress, destroy every VM, then close the instance store."""
+        """Stop the Scheduler: wait for the saves in progress, destroy every VM, then close the instance store.
+
+        Raises InvalidInputError SCHEDULER_STATE while a start is in progress (cancel the start
+        instead: it stops what it made).
+        """
+        if self._starting:
+            raise _scheduler_state(_STILL_STARTING)
         self._started = False
         if self._shutdown_task is None:
             self._shutdown_task = asyncio.create_task(self._shutdown())
@@ -307,9 +312,11 @@ class Scheduler:
         Shutdown sequence:
         1. Stop WarmVMPool (drains and destroys pre-booted VMs, frees resource slots)
         2. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
-        3. Wait for instance saves in flight (InstanceManager.drain)
-        4. Destroy any remaining active VMs
-        5. Stop VmManager (overlay pool cleanup)
+        3. Stop DiskSnapshotManager (awaits in-flight L3 uploads)
+        4. Wait for instance saves in flight (InstanceManager.stop: new ones are refused)
+        5. Stop VmManager: refuses new launches, waits for those in flight (new() and
+           reuse() calls), then destroys the remaining VMs (sessions not closed) and
+           cleans up the overlay pool
         6. Close the instance store (after every VM that could save is gone)
 
         IMPORTANT: WarmVMPool must stop BEFORE MemorySnapshotManager. Background
@@ -327,6 +334,7 @@ class Scheduler:
         # task is pending, and local references make that boundary explicit.
         warm_pool = self._warm_pool
         memory_snapshot_manager = self._memory_snapshot_manager
+        snapshot_manager = self._snapshot_manager
         vm_manager = self._vm_manager
         instances = self._instances
         instances_exit = self._instances_exit
@@ -342,7 +350,7 @@ class Scheduler:
                 deferred_error = e
                 logger.error("WarmVMPool stop aborted", extra={"error": str(e)})
 
-        # Stop MemorySnapshotManager (wait for background saves — now has resource slots)
+        # Stop MemorySnapshotManager (wait for background saves: the drained pool freed their resource slots)
         if memory_snapshot_manager:
             logger.info("Waiting for in-flight background snapshot saves to complete")
             try:
@@ -350,27 +358,26 @@ class Scheduler:
             except (OSError, RuntimeError, TimeoutError) as e:
                 logger.error("MemorySnapshotManager stop error", extra={"error": str(e)})
             except BaseException as e:  # noqa: BLE001 - core VM cleanup must still run
-                if deferred_error is None:
-                    deferred_error = e
+                deferred_error = deferred_error or e
                 logger.error("MemorySnapshotManager stop aborted", extra={"error": str(e)})
+
+        # Wait for the L3 uploads in flight: a task left running is cancelled when the loop closes
+        if snapshot_manager is not None:
+            upload_error = await _cleanup_step(snapshot_manager.stop())  # runs even after an earlier failed step
+            deferred_error = deferred_error or upload_error
 
         # Let instance saves in flight end before their VMs and the work folder go
         if instances is not None:
-            drain_error = await _cleanup_step(instances.drain())  # runs even after an earlier failed step
+            drain_error = await _cleanup_step(instances.stop())  # runs even after an earlier failed step
             deferred_error = deferred_error or drain_error
 
-        # Destroy any remaining VMs
+        # Stop VmManager: it refuses new launches and closes admission, waits for the launches
+        # in flight (a new() or reuse() past its start check: the VM it makes is tracked),
+        # then destroys every VM it tracks (overlay pool cleanup last). The count below is
+        # for the log only: it can miss a VM of a launch in flight.
         if vm_manager:
-            active_vms = vm_manager.get_active_vms()
-            if active_vms:
-                logger.warning(
-                    "Destroying remaining VMs on shutdown",
-                    extra={"count": len(active_vms)},
-                )
-                destroy_tasks = [vm_manager.destroy_vm(vm) for vm in active_vms.values()]
-                await asyncio.gather(*destroy_tasks, return_exceptions=True)
-
-            # Stop VmManager (includes overlay pool cleanup)
+            if active_vms := vm_manager.get_active_vms():
+                logger.warning("Destroying remaining VMs on shutdown", extra={"count": len(active_vms)})
             stop_error = await _cleanup_step(vm_manager.stop())
             deferred_error = deferred_error or stop_error
 
@@ -430,7 +437,9 @@ class Scheduler:
                 allow-list), PACKAGE_INSTALL_FAILED.
             ConfigError: INSTANCE_CONFIG (`instance_id` is set, but no instance store
                 is configured), HOST_DEPENDENCY, SETTING_INVALID (no write access to
-                disk_snapshot_cache_dir, a read-only disk, or the folder cannot be made again).
+                disk_snapshot_cache_dir or, when a base image is downloaded, to the download
+                cache under EXEC_SANDBOX_CACHE_DIR; a read-only disk; or the folder cannot be
+                made again).
             RouteError: CAPACITY_NEVER_FITS: the spec is larger than the whole budget
                 (raised at once).
             InternalError: VM creation failed (a bug or a broken host).
@@ -496,7 +505,8 @@ class Scheduler:
                 (`idle_timeout_seconds` out of range, no request is sent).
             ConfigError: INSTANCE_CONFIG (no instance store, or the store refuses this
                 worker), INSTANCE_KEY_MISSING (this worker's keyring lacks the instance's
-                key; do not delete the instance).
+                key; do not delete the instance), HOST_DEPENDENCY (for example qemu-vm
+                cannot get access to the loaded migration file).
             RouteError: INSTANCE_HOST_MISMATCH: this worker cannot run it: arch,
                 accelerator, CPU vendor, guest CPU model or exec-sandbox release differ
                 from the saved ones (checked before any download), a missing guest image,
@@ -683,6 +693,8 @@ class Scheduler:
         return idle_timeout_seconds
 
     def _require_instances(self, instance_id: str | None) -> InstanceManager:
+        """The instance manager. InvalidInputError SCHEDULER_STATE before the start (checked
+        first), ConfigError INSTANCE_CONFIG without an instance store."""
         if not self._started:
             raise _scheduler_state(_NOT_STARTED)
         if self._instances is None:
@@ -715,7 +727,7 @@ class Scheduler:
         """
         if not self._started:
             raise _scheduler_state(_NOT_STARTED)
-        if self._vm_manager is None or self._settings is None:
+        if self._vm_manager is None:
             raise _internal(_NOT_INITIALIZED)
 
         # Resolve port mappings (allocate ephemeral ports for those without explicit external;
@@ -724,9 +736,13 @@ class Scheduler:
         if spec.expose_ports:
             resolved_ports = resolve_port_mappings(list(spec.expose_ports))
 
-        # Validate packages against allowlist
+        # Validate packages against allowlist. The bundled catalogs never change: parsed on
+        # first use, then kept. Two first requests at the same instant may both parse them
+        # (same result).
         if spec.packages and self.config.enable_package_validation:
-            await self._validate_packages(list(spec.packages), spec.language)
+            if self._package_validator is None:
+                self._package_validator = await PackageValidator.create()
+            self._package_validator.validate(list(spec.packages), spec.language)
 
         # Check L2 snapshot cache for disk caching (only if packages specified)
         # Only use snapshots when packages need to be installed - empty packages case
@@ -735,7 +751,19 @@ class Scheduler:
         # entries for disk space, never this one. Each VM launch takes its own share.
         snapshot: EntryLease | None = None
         if spec.packages:
-            snapshot = await self._get_or_create_snapshot(spec.language, list(spec.packages), spec.memory_mb)
+            if self._snapshot_manager is None:
+                raise _internal(_NOT_INITIALIZED)
+            # The L2 cache key hashes the base image: it must be on disk first
+            if self.config.auto_download_assets:
+                await ensure_base_image(spec.language, images_dir=self._vm_manager.images.images_dir)
+            # L2 (local qcow2), then L3 (S3), else a build: DiskSnapshotManager.get_or_create_snapshot
+            snapshot = await self._snapshot_manager.get_or_create_snapshot(
+                language=spec.language,
+                packages=list(spec.packages),
+                tenant_id=constants.SCHEDULER_TENANT_ID,
+                task_id=f"snapshot-{hash(tuple(sorted(spec.packages)))}",
+                memory_mb=spec.memory_mb,
+            )
         try:
             return await self._launch_for(
                 spec, task_id=task_id, on_boot_log=on_boot_log, snapshot=snapshot, resolved_ports=resolved_ports
@@ -859,6 +887,10 @@ class Scheduler:
                     snapshot_drive=snapshot_path,
                     cache_leases=(snapshot,) if snapshot is not None else (),
                     reservation=reservation,
+                    direct_write_target=None,
+                    retry_profile=constants.RETRY_USER_FACING,
+                    mem_path=None,
+                    mem_path_share=False,
                 )
 
                 # Schedule background L1 save for next time
@@ -872,68 +904,6 @@ class Scheduler:
                         await self._vm_manager.destroy_vm(vm)
                         raise
         return vm, admission_ms
-
-    async def _validate_packages(self, packages: list[str], language: Language) -> None:
-        """Validate packages against allowlist.
-
-        Args:
-            packages: List of package specifiers (e.g., ["pandas==3.0.1"])
-            language: Programming language
-
-        Raises:
-            InvalidInputError: PACKAGE_NOT_ALLOWED: package not in allowlist; ARGUMENT_INVALID:
-                a package spec without a version, packages for a language that has none
-        """
-        # The bundled catalogs never change: parsed on first use, then kept. Two
-        # first requests at the same instant may both parse them (same result).
-        if self._package_validator is None:
-            self._package_validator = await PackageValidator.create()
-        self._package_validator.validate(packages, language)
-
-    async def _get_or_create_snapshot(self, language: Language, packages: list[str], memory_mb: int) -> EntryLease:
-        """Get cached snapshot or create new one with packages.
-
-        Checks L2 (local qcow2) and L3 (S3) caches before building.
-
-        Args:
-            language: Programming language
-            packages: List of packages to install
-            memory_mb: VM memory in MB of the VM that builds the snapshot (not in the cache key)
-
-        Returns:
-            A lease on the snapshot qcow2 (lease.path): the caller releases it.
-
-        Raises:
-            InternalError: INTERNAL: snapshot manager not configured.
-            SandboxError: Snapshot creation failed (see
-                DiskSnapshotManager.get_or_create_snapshot).
-        """
-        if not self._snapshot_manager:
-            raise _internal("Packages requested but snapshot manager is not configured")
-
-        # Ensure base image is on disk before computing snapshot cache key
-        # (_compute_cache_key hashes the base image that VmManager.images names)
-        if self.config.auto_download_assets:
-            if self._vm_manager is None:
-                raise _internal(_NOT_INITIALIZED)
-            await ensure_base_image(language, images_dir=self._vm_manager.images.images_dir)
-
-        snapshot = await self._snapshot_manager.get_or_create_snapshot(
-            language=language,
-            packages=packages,
-            tenant_id=constants.SCHEDULER_TENANT_ID,
-            task_id=f"snapshot-{hash(tuple(sorted(packages)))}",
-            memory_mb=memory_mb,
-        )
-        logger.debug(
-            "Snapshot ready",
-            extra={
-                "language": language,
-                "packages": packages,
-                "path": str(snapshot.path),
-            },
-        )
-        return snapshot
 
 
 def _startup_timing(vm: QemuVM, *, is_cold_boot: bool, total_ms: int, admission_ms: int) -> StartupTiming:
@@ -975,7 +945,7 @@ def settings_from_config(config: SchedulerConfig, *, images_dir: Path) -> Settin
     try:
         return Settings(
             base_images_dir=images_dir,
-            kernel_path=kernel_dir_of(images_dir, arch=arch_of(get_current_arch())),  # kernels/ when it has the files
+            kernel_path=kernel_dir_of(images_dir, arch=detect_host_arch()),  # kernels/ when it has the files
             base_images_download_dir=images_download_dir(),
             **config.model_dump(include=bridged, exclude_unset=True),
         )

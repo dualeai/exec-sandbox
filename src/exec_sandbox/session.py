@@ -19,10 +19,10 @@ Lifecycle:
     - close() destroys the VM; the context manager calls it.
     - The idle timeout closes the session after a time with no call.
     - These failures close the session: cancellation, an unknown outcome
-      (OutcomeUnknownError), exit 137, a VM found dead, a VM that QEMU stopped
-      because the host disk is full (TransientError LOCAL_DISK at the next
-      call), and the save() failures listed in Session.save. Details: Session.exec
-      and Session.save.
+      (OutcomeUnknownError), each exec() error except InvalidInputError, exit
+      137, a VM found dead, a VM that QEMU stopped because the host disk is full
+      (TransientError LOCAL_DISK at the next call), and the save() failures
+      listed in Session.save. Details: Session.exec and Session.save.
 """
 
 from __future__ import annotations
@@ -122,9 +122,7 @@ class Session:
         self._close_task: asyncio.Task[None] | None = None
         self._exec_count = 0
         self._exec_lock = asyncio.Lock()
-        # loop.call_later handle for the idle deadline. cancel() is synchronous,
-        # allocation-light, and a no-op once fired — no task, no CancelledError
-        # to process, so no strong-ref set is needed.
+        # loop.call_later handle of the idle deadline (None: not armed)
         self._idle_timer_handle: asyncio.TimerHandle | None = None
         # Strong ref to the fire-and-forget close task the timer callback spawns.
         self._idle_close_task: asyncio.Task[None] | None = None
@@ -363,7 +361,7 @@ class Session:
             raise _bad_argument(f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}, got {timeout_seconds}")
         if len(code) > MAX_CODE_SIZE:
             raise InvalidInputError(
-                f"Code too large: {len(code)} bytes exceeds {MAX_CODE_SIZE} byte limit",
+                f"Code too large: {len(code)} characters exceeds the {MAX_CODE_SIZE} character limit",
                 code=ErrorCode.CODE_INVALID,
                 context={"code_size": len(code), "max_code_size": MAX_CODE_SIZE},
                 hint=None,
@@ -397,18 +395,9 @@ class Session:
             self._exec_count += 1
             self._unsaved = True
 
-            # Populate timing with session-measured values.
-            execution_result = ExecutionResult(
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.exit_code,
-                execution_time_ms=result.execution_time_ms,
-                external_cpu_time_ms=result.external_cpu_time_ms,
-                external_memory_peak_mb=result.external_memory_peak_mb,
-                external_cpu_nr_throttled=result.external_cpu_nr_throttled,
-                timing=TimingBreakdown(execute_ms=execute_ms, connect_ms=result.timing.connect_ms),
-                spawn_ms=result.spawn_ms,
-                process_ms=result.process_ms,
+            # The timing the session measured (a copy: no new validation of the output)
+            execution_result = result.model_copy(
+                update={"timing": TimingBreakdown(execute_ms=execute_ms, connect_ms=result.timing.connect_ms)}
             )
             if result.exit_code == SIGKILL_EXIT_CODE or self._vm.state in (VmState.DESTROYING, VmState.DESTROYED):
                 logger.warning(
@@ -457,6 +446,7 @@ class Session:
                 be opened for a reason the caller can fix (missing, no read access, a file
                 in its path, a symlink loop, a NUL byte); PATH_INVALID or GUEST_IO on guest
                 agent validation or write failure. The session stays open.
+            InternalError: GUEST_PROTOCOL: the guest broke the protocol or sent a wrong answer.
         """
         self._check_open()
         # Resolve content to a stream BEFORE acquiring the lock —
@@ -489,12 +479,16 @@ class Session:
                 session). LOCAL_DISK: this host could not write the local destination
                 (disk full, quota, I/O error, out of file handles); or QEMU stopped the VM
                 because the host disk under its home disk is full (the session closes).
+            OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN: the transport was lost after the
+                call was sent, or the host disk filled while the call was in progress; the
+                session closes.
             SessionClosedError: The session is closed (checked first, whatever the arguments).
             InvalidInputError: PATH_INVALID or GUEST_IO: file not found or validation failure.
                 ARGUMENT_INVALID: the destination stream is closed, not writable or a text
                 stream, or the caller can fix the destination Path (no access, a read-only
                 disk, a file in its path, a folder at it, a NUL byte, no file name). The
                 session stays open.
+            InternalError: GUEST_PROTOCOL: the guest broke the protocol or sent a wrong answer.
         """
         self._check_open()
         if not isinstance(destination, Path):  # caller input: refused before the call takes the session
@@ -527,6 +521,7 @@ class Session:
                 session closes.
             SessionClosedError: The session is closed.
             InvalidInputError: PATH_INVALID or GUEST_IO: folder not found or validation failure.
+            InternalError: GUEST_PROTOCOL: the guest broke the protocol or sent a wrong answer.
         """
         async with self._guard():
             return await self._vm.list_files(path)
@@ -556,6 +551,8 @@ class Session:
                 The session is closed (VM discarded).
             SessionClosedError: The session is closed, or close() ran during this save
                 and stopped it.
+            InvalidInputError: SCHEDULER_STATE: the Scheduler is stopping (its exit refuses
+                new saves); nothing was saved and the session is still open.
             ConfigError: INSTANCE_CONFIG: no instance store (instance_store +
                 instance_keyring; checked first, so a closed session without a store
                 raises this, not SessionClosedError), or the store refused this worker or
@@ -637,6 +634,9 @@ class Session:
     async def _close_impl(self) -> None:
         """Perform the single shared cleanup operation."""
         self._cancel_idle_timer()
+        # A save in flight now owns the instance's local files and releases them itself (save());
+        # none starts after this point (_closed is set)
+        release_instance = not self._saving
 
         logger.info(
             "Closing session",
@@ -649,8 +649,8 @@ class Session:
         try:
             await self._vm_manager.destroy_vm(self._vm)
         finally:
-            # The stored instance stays; local files go (a save in flight releases them itself).
-            if self._instances is not None and self._instance is not None and not self._saving:
+            # The stored instance stays; its local files go
+            if release_instance and self._instances is not None and self._instance is not None:
                 await self._instances.release(self._instance)
         # destroy_vm keeps failed workdir/cgroup cleanup owned for retry, and
         # publishes DESTROYED only after QEMU and gvproxy death is confirmed.
@@ -753,4 +753,5 @@ def _open_source(path: Path) -> IO[bytes]:
 
 
 def _ref(state: InstanceState | None) -> InstanceRef | None:
+    """The public InstanceRef of `state` (None when there is no saved instance)."""
     return None if state is None else InstanceRef(instance_id=state.instance_id, generation=state.header.generation)

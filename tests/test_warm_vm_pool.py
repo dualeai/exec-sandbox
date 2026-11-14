@@ -33,7 +33,7 @@ from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import VmState
 from tests.conftest import asyncio_with
 
-from .conftest import l1_hit, skip_unless_hwaccel
+from .conftest import l1_hit, skip_unless_hwaccel, wait_l1_saves
 from .cpu_helpers import (
     CPU_CONSECUTIVE_SPIKE_THRESHOLD,
     CPU_MAX_CONSECUTIVE_SPIKES,
@@ -83,7 +83,7 @@ class TestGetVmLiveness:
     async def test_dead_vm_is_discarded_and_next_healthy_served(self, unit_test_vm_manager) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=2))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=2), memory_snapshot_manager=None)
         pool._shutdown_event.set()  # suppress replenishment side tasks
         dead = self._make_pool_vm(VmState.DESTROYING, None)
         healthy = self._make_pool_vm(VmState.READY, None)
@@ -100,7 +100,7 @@ class TestGetVmLiveness:
         """A failing destroy on a dead VM must not break the checkout."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=2))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=2), memory_snapshot_manager=None)
         dead = self._make_pool_vm(VmState.DESTROYING, None)
         healthy = self._make_pool_vm(VmState.READY, None)
         pool.pools[Language.PYTHON].put_nowait(dead)
@@ -123,7 +123,7 @@ class TestGetVmLiveness:
         its QEMU runs, but it never runs again. Checkout skips it (the caller cold boots)."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         pool._shutdown_event.set()
         paused = self._make_pool_vm(VmState.READY, None)
         paused.host_disk_full = True
@@ -137,7 +137,7 @@ class TestGetVmLiveness:
         """L1-restored VMs never arm the exit watcher; returncode catches them."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         pool._shutdown_event.set()
         dead = self._make_pool_vm(VmState.READY, 137)
         pool.pools[Language.PYTHON].put_nowait(dead)
@@ -190,7 +190,7 @@ class TestHealthCheckConnection:
         vm.channel = channel
         vm.process.is_stopped = AsyncMock(return_value=False)
         vm.process.is_running = AsyncMock(return_value=True)
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         try:
             await channel.connect(timeout_seconds=1)  # the boot wait's connection
             for _ in range(3):
@@ -258,10 +258,10 @@ class TestHealthCheckFailures:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         vm, failing = self._vm(step=step, error=error)
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
 
         assert await pool._check_vm_health(vm) is False
-        assert failing.await_count == constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES  # tried again first
+        assert failing.await_count == 3  # tried again first: 3 tries in all
 
     @pytest.mark.parametrize(
         ("step", "error"),
@@ -295,7 +295,7 @@ class TestHealthCheckFailures:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         vm, failing = self._vm(step=step, error=error)
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
 
         with pytest.raises(type(error)) as raised:
             await pool._check_vm_health(vm)
@@ -307,13 +307,13 @@ class TestHealthCheckFailures:
 
         sent = asyncio.Event()
 
-        async def pong_never_comes(_request: object) -> None:
+        async def pong_never_comes(_request: object, *, timeout: int) -> None:
             sent.set()
             await asyncio.Event().wait()
 
         vm, send_request = self._vm(step="send_request", error=RuntimeError("unused"))
         send_request.side_effect = pong_never_comes
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
 
         check = asyncio.create_task(pool._check_vm_health(vm))
         await asyncio.wait_for(sent.wait(), timeout=1)
@@ -355,7 +355,7 @@ class TestHealthCheckFailures:
         vm.channel = channel
         vm.process.is_stopped = AsyncMock(return_value=False)
         vm.process.is_running = AsyncMock(return_value=True)  # the death is not seen yet
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         try:
             await channel.connect(timeout_seconds=1)  # the boot wait's connection
             assert await pool._check_vm_health(vm) is False
@@ -374,11 +374,11 @@ class TestWarmVMPoolConfig:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=5)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
         assert pool.pool_size_per_language == 5
 
         config = SchedulerConfig(warm_pool_size=50)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
         assert pool.pool_size_per_language == 50
 
     def test_warm_pool_has_all_languages(self, unit_test_vm_manager) -> None:
@@ -386,7 +386,7 @@ class TestWarmVMPoolConfig:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
         assert set(pool.pools.keys()) == set(Language)
 
 
@@ -405,7 +405,7 @@ class TestWarmVMPoolSpec:
     async def test_other_spec_gets_no_pool_vm(self, unit_test_vm_manager, spec_change: dict[str, object]) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         vm = MagicMock()
         await pool.pools[Language.PYTHON].put(vm)
         request = pool.spec_for(Language.PYTHON).model_copy(update=spec_change)
@@ -426,7 +426,7 @@ class TestWarmVMPoolOwnership:
         """A failure after the VM left the queue destroys it (no live VM without an owner)."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         vm = MagicMock()
         vm.vm_id = "checkout-interrupted"
         vm.l1_restored = False
@@ -460,7 +460,7 @@ class TestWarmVMPoolOwnership:
     async def test_cancelled_stop_waiter_cannot_abandon_queued_vm(self, unit_test_vm_manager) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         vm = MagicMock(vm_id="stop-cancelled")
         await pool.pools[Language.PYTHON].put(vm)
         health_entered = asyncio.Event()
@@ -491,14 +491,12 @@ class TestWarmVMPoolOwnership:
 
         destroy.assert_awaited_once_with(vm)
         assert pool.pools[Language.PYTHON].empty()
-        assert pool._stop_task is not None
-        assert pool._stop_task.done()
-        assert not pool._stop_task.cancelled()
+        await pool.stop()  # the shared stop ran to its end, not cancelled: a new call returns at once
 
     async def test_failed_health_task_cannot_abort_pool_drain(self, unit_test_vm_manager) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         vm = MagicMock(vm_id="health-task-failed")
         await pool.pools[Language.PYTHON].put(vm)
 
@@ -521,7 +519,7 @@ class TestWarmVMPoolOwnership:
         """A stubborn boot cannot enqueue a VM after stop reports success."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         all_started = asyncio.Event()
         all_cancelled = asyncio.Event()
         release_cancelled_boots = asyncio.Event()
@@ -681,7 +679,7 @@ class TestWarmVMPoolOwnership:
     async def test_stop_cancels_replenishment_before_final_pool_drain(self, unit_test_vm_manager) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         vm = MagicMock()
         vm.vm_id = "late-replenishment"
         replenisher_entered = asyncio.Event()
@@ -824,7 +822,7 @@ class TestLanguageEnum:
 
 
 # ============================================================================
-# Unit Tests - Healthcheck Pure Functions (No QEMU, No Mocks)
+# Unit Tests - REPL warm-up (no QEMU)
 # ============================================================================
 
 
@@ -855,7 +853,7 @@ class TestWarmReplUnit:
         from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         with patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=True) as destroy:
             vms = await self._start(pool, return_value=WarmReplAckMessage(language="python", status="ok"))
             try:
@@ -888,7 +886,7 @@ class TestWarmReplUnit:
             "pong": PongMessage(version="1.0"),
         }
         send_request = {key: replies.get(value, value) for key, value in answer.items()}
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         with patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=True) as destroy:
             vms = await self._start(pool, **send_request)
             try:
@@ -908,7 +906,7 @@ class TestWarmReplUnit:
         from exec_sandbox.guest_agent_protocol import WarmReplAckMessage
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         served = MagicMock(vm_id="served", state=VmState.READY, host_disk_full=False)
         served.process.returncode = None
         await pool.pools[Language.PYTHON].put(served)
@@ -944,7 +942,7 @@ class TestHealthCheckPass:
         an unexpected way, is destroyed and a new VM takes its place."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=3))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=3), memory_snapshot_manager=None)
         vms = [MagicMock(vm_id=f"vm-{i}") for i in range(3)]
         for vm in vms:
             await pool.pools[Language.PYTHON].put(vm)
@@ -983,7 +981,7 @@ class TestHealthCheckPoolUnit:
                 if not task.done() and getattr(task.get_coro(), "__qualname__", "") == "WarmVMPool._health_check_loop"
             ]
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         with (
             patch.object(
                 pool, "_boot_warm_vm", new_callable=AsyncMock, return_value=MagicMock(l1_restored=True, cgroup=None)
@@ -1001,7 +999,7 @@ class TestHealthCheckPoolUnit:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         # Pool is empty (no startup called)
         # Should return early without error
@@ -1017,7 +1015,7 @@ class TestHealthCheckPoolUnit:
         """Cancellation cannot strand a VM already removed from its pool."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         vm = MagicMock(vm_id="health-cancelled")
         health_entered = asyncio.Event()
 
@@ -1058,12 +1056,12 @@ class TestWarmVMPoolIntegration:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
 
         await pool.start()
 
-        # Pools should be populated
-        assert pool.pools[Language.PYTHON].qsize() > 0
+        # Each language pool holds its one VM
+        assert {language: pool.pools[language].qsize() for language in Language} == dict.fromkeys(Language, 1)
 
         await pool.stop()
 
@@ -1077,7 +1075,7 @@ class TestWarmVMPoolIntegration:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         try:
@@ -1089,6 +1087,9 @@ class TestWarmVMPoolIntegration:
             result = await vm.execute(
                 code="print('warm')",
                 timeout_seconds=30,
+                env_vars=None,
+                on_stdout=None,
+                on_stderr=None,
             )
             assert (result.exit_code, result.stdout) == (0, "warm\n")
 
@@ -1111,16 +1112,29 @@ class TestWarmVMPoolIntegration:
         from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
 
         vm = await vm_manager.create_vm(
-            VmSpec(language=language), tenant_id="test-warm", task_id=f"live-{language.value}", cache_leases=()
+            VmSpec(language=language),
+            tenant_id="test-warm",
+            task_id=f"live-{language.value}",
+            cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
         try:
-            assert (await vm.execute(code=set_x, timeout_seconds=30)).exit_code == 0
+            assert (
+                await vm.execute(code=set_x, timeout_seconds=30, env_vars=None, on_stdout=None, on_stderr=None)
+            ).exit_code == 0
             ack = await vm.channel.send_request(
                 WarmReplRequest(language=language), timeout=constants.WARM_REPL_TIMEOUT_SECONDS
             )
             assert isinstance(ack, WarmReplAckMessage), ack
             assert ack.status == "ok", ack
-            result = await vm.execute(code=read_x, timeout_seconds=30)
+            result = await vm.execute(code=read_x, timeout_seconds=30, env_vars=None, on_stdout=None, on_stderr=None)
             assert (result.exit_code, result.stdout) == (0, "42\n"), result.stderr
         finally:
             await vm_manager.destroy_vm(vm)
@@ -1152,14 +1166,13 @@ class TestWarmVMPoolIntegration:
                 await scheduler.wait_pool_ready()
                 async with await scheduler.new(VmSpec(language=language)) as session:
                     timing = session.startup_timing
-                    pooled = timing.admission_ms == 0 and timing.boot_ms == 0
                     result = await session.exec(code)
-                    if pooled:
-                        seen.add(session._vm.l1_restored)  # pyright: ignore[reportPrivateUsage]
+                    if timing.warm_pool_hit:
+                        seen.add(timing.l1_cache_hit)  # a pool VM restored from L1, or cold booted
                         assert (result.exit_code, result.stdout) == (0, "warm\n")
                 if seen == {False, True}:
                     break
-                await asyncio.sleep(1)  # the background L1 save of the pool's first VM lands
+                await wait_l1_saves(scheduler)  # the next refill can then restore from L1
         assert seen == {False, True}, "expected pool hits on a cold-booted VM and on an L1 refill"
 
 
@@ -1172,6 +1185,9 @@ class TestWarmVMPoolIntegration:
 class TestHealthcheckIntegration:
     """Integration tests for healthcheck with real QEMU VMs.
 
+    _check_vm_health, _check_and_restore_vm and _health_check_pool are called directly: the
+    health loop runs them every 15 s (WARM_POOL_HEALTH_CHECK_INTERVAL).
+
     Slow under TCG: health check correctness tests with no timing
     assertions — work under TCG but boot overhead makes them too slow
     for the default suite.
@@ -1182,17 +1198,13 @@ class TestHealthcheckIntegration:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
 
         await pool.start()
 
         try:
-            # Wait for VMs to stabilize after startup (REPL warm-up, reclaim)
-            # On slow CI, VMs may need time to adjust to reduced memory
-            await asyncio.sleep(0.5)
-
             initial_size = pool.pools[Language.PYTHON].qsize()
-            assert initial_size > 0
+            assert initial_size == 1
 
             # Run health check on Python pool
             await pool._health_check_pool(
@@ -1222,7 +1234,7 @@ class TestHealthcheckIntegration:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
 
         await pool.start()
 
@@ -1240,13 +1252,12 @@ class TestHealthcheckIntegration:
             import os
 
             os.kill(vm.process.pid, signal.SIGKILL)
-
-            # Wait for process to die
-            await asyncio.sleep(0.1)
+            await asyncio.wait_for(vm.process.wait(), timeout=5)
 
             # Health check should now detect unhealthy
             is_healthy = await pool._check_vm_health(vm)
             assert is_healthy is False
+            await vm_manager.destroy_vm(vm)  # out of the pool: the test owns it
 
         finally:
             await pool.stop()
@@ -1268,9 +1279,17 @@ class TestHealthcheckIntegration:
             tenant_id="test",
             task_id="checkout-kill",
             cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         pool.pools[Language.PYTHON].put_nowait(vm)
         pool._shutdown_event.set()  # suppress replenishment side tasks
 
@@ -1285,12 +1304,9 @@ class TestHealthcheckIntegration:
         checked_out = await pool.get_vm(pool.spec_for(Language.PYTHON))
         assert checked_out is None
 
-    async def test_health_check_pool_removes_killed_vm(self, vm_manager) -> None:
-        """Full _health_check_pool correctly removes killed VM from pool.
-
-        Tests the complete health check flow, not just individual VM checks.
-        Uses _check_and_restore_vm to verify killed VM is not restored.
-        """
+    async def test_check_and_restore_drops_a_killed_vm(self, vm_manager) -> None:
+        """_check_and_restore_vm (the step of _health_check_pool for one VM taken out of the
+        pool) puts a healthy VM back and keeps a killed VM out."""
         import signal
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -1301,16 +1317,32 @@ class TestHealthcheckIntegration:
             tenant_id="test",
             task_id="pool-test-1",
             cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
         vm2 = await vm_manager.create_vm(
             VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="pool-test-2",
             cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         python_pool = pool.pools[Language.PYTHON]
 
         try:
@@ -1320,7 +1352,7 @@ class TestHealthcheckIntegration:
             import os
 
             os.kill(vm1.process.pid, signal.SIGKILL)
-            await asyncio.sleep(0.1)
+            await asyncio.wait_for(vm1.process.wait(), timeout=5)
 
             # Run check and restore on both VMs
             result1 = await pool._check_and_restore_vm(vm1, python_pool, Language.PYTHON)
@@ -1359,7 +1391,7 @@ class TestHealthcheckIntegration:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
 
         await pool.start()
 
@@ -1368,19 +1400,8 @@ class TestHealthcheckIntegration:
             vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None
 
-            # Wait for VM to stabilize after checkout
-            # On slow CI, the guest needs time to reclaim memory after deflate
-            await asyncio.sleep(0.5)
-
-            # Verify healthy first (with retries for slow CI where the guest
-            # may be temporarily slow after checkout)
-            is_healthy = False
-            for _ in range(3):
-                is_healthy = await pool._check_vm_health(vm)
-                if is_healthy:
-                    break
-                await asyncio.sleep(0.3)
-            assert is_healthy is True, "VM should be healthy before SIGSTOP"
+            # Healthy first (the check retries a slow ping itself)
+            assert await pool._check_vm_health(vm) is True, "VM should be healthy before SIGSTOP"
 
             # Freeze the QEMU process (simulate hang)
             assert vm.process.pid is not None
@@ -1406,7 +1427,6 @@ class TestHealthcheckIntegration:
             finally:
                 # Unfreeze so cleanup can proceed
                 os.kill(vm.process.pid, signal.SIGCONT)
-                await asyncio.sleep(0.1)
 
             # Clean up
             await vm_manager.destroy_vm(vm)
@@ -1426,7 +1446,7 @@ class TestHealthcheckIntegration:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
 
         await pool.start()
 
@@ -1464,17 +1484,16 @@ SETTLE_SLEEP_S: float = 3.0
 """Post-start settling time (REPL warmup + reclaim)."""
 
 CONTEXT_SWITCHES_MAX_PER_SECOND: float = 50.0
-"""Legacy QEMU-process context-switch regression target.
+"""Context-switch target of an idle QEMU process (a same-host regression signal).
 
 Platform/version baselines require separate qualification; do not raise this
 target from one noisy-host diagnostic. On macOS psutil reports the combined
-kernel counter as voluntary and reports involuntary as zero, so this is a
-same-host regression signal, not a literal guest-wakeup count.
+kernel counter as voluntary and reports involuntary as zero, so this is not a
+literal guest-wakeup count.
 
-Known baseline drift: current macOS/QEMU qualification hosts measure ~105/s
-for an idle QEMU regardless of guest configuration (reproduced on the
-pre-guard base commit). Until the target is requalified, exceeding it is
-reported as xfail instead of failing the suite — see test_idle_zero_cpu.
+macOS/QEMU hosts measure about 105/s for an idle QEMU, whatever the guest
+configuration: a rate above the target is reported as xfail, not a failure
+(test_idle_zero_cpu).
 """
 
 
@@ -1505,7 +1524,7 @@ class TestWarmPoolIdleCpu:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         try:
@@ -1546,7 +1565,7 @@ class TestWarmPoolIdleCpu:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         try:
@@ -1572,7 +1591,7 @@ class TestWarmPoolIdleCpu:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=2)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         vms = []
@@ -1608,7 +1627,7 @@ class TestWarmPoolIdleCpu:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         try:
@@ -1629,7 +1648,7 @@ class TestWarmPoolIdleCpu:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         try:
@@ -1690,7 +1709,7 @@ class TestPostExecutionCpuIdle:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         try:
@@ -1699,7 +1718,7 @@ class TestPostExecutionCpuIdle:
             vm = await pool.get_vm(pool.spec_for(lang))
             assert vm is not None, f"No warm VM available for {lang.value}"
 
-            result = await vm.execute(code=code, timeout_seconds=30)
+            result = await vm.execute(code=code, timeout_seconds=30, env_vars=None, on_stdout=None, on_stderr=None)
             assert result.exit_code == 0
 
             await asyncio.sleep(SETTLE_SLEEP_S)
@@ -1714,7 +1733,7 @@ class TestPostExecutionCpuIdle:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         try:
@@ -1727,6 +1746,9 @@ class TestPostExecutionCpuIdle:
             result = await vm.execute(
                 code="print('x' * 1000, end='\\n')\n" * 100,
                 timeout_seconds=30,
+                env_vars=None,
+                on_stdout=None,
+                on_stderr=None,
             )
             assert result.exit_code == 0
 
@@ -1742,7 +1764,7 @@ class TestPostExecutionCpuIdle:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         try:
@@ -1754,6 +1776,9 @@ class TestPostExecutionCpuIdle:
             result = await vm.execute(
                 code="raise RuntimeError('intentional failure')",
                 timeout_seconds=30,
+                env_vars=None,
+                on_stdout=None,
+                on_stderr=None,
             )
             assert result.exit_code != 0
 
@@ -1769,7 +1794,7 @@ class TestPostExecutionCpuIdle:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
         await pool.start()
 
         try:
@@ -1782,6 +1807,9 @@ class TestPostExecutionCpuIdle:
                 result = await vm.execute(
                     code=f"print('iteration {i}')",
                     timeout_seconds=30,
+                    env_vars=None,
+                    on_stdout=None,
+                    on_stderr=None,
                 )
                 assert result.exit_code == 0
 
@@ -1794,13 +1822,13 @@ class TestPostExecutionCpuIdle:
 
 
 # ============================================================================
-# Unit Tests - Replenish Race Condition Fix
+# Unit Tests - Replenish concurrency (per-language semaphore)
 # ============================================================================
 
 
 @pytest.mark.usefixtures("warm_repl_ok")
 class TestReplenishRaceCondition:
-    """Tests for replenish race condition fix using semaphore serialization.
+    """Concurrent replenishes: a per-language semaphore limits the boots that run at once.
 
     These tests use asyncio.Event for deterministic synchronization instead of
     timing-based sleeps, ensuring reliable CI execution. _replenish_pool is called
@@ -1815,7 +1843,7 @@ class TestReplenishRaceCondition:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         # Tracking variables
         max_concurrent = 0
@@ -1870,7 +1898,7 @@ class TestReplenishRaceCondition:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)  # pool_size = 1
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         boot_count = 0
 
@@ -1898,7 +1926,7 @@ class TestReplenishRaceCondition:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         py_started = asyncio.Event()
         js_started = asyncio.Event()
@@ -1934,7 +1962,7 @@ class TestReplenishRaceCondition:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         call_count = 0
 
@@ -1969,7 +1997,7 @@ class TestReplenishRaceCondition:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         boot_started = asyncio.Event()
 
@@ -2004,7 +2032,7 @@ class TestReplenishRaceCondition:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         created_vm = AsyncMock()
         created_vm.vm_id = "created-then-cancelled"
@@ -2037,8 +2065,7 @@ class TestReplenishRaceCondition:
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-            # VM should have been destroyed due to CancelledError handling
-            await asyncio.sleep(0.01)
+            # The cancel handler destroyed the VM before the task ended
             assert destroy_called.is_set(), "VM should be destroyed on cancellation"
 
     # -------------------------------------------------------------------------
@@ -2053,7 +2080,7 @@ class TestReplenishRaceCondition:
 
         # warm_pool_size=5
         config = SchedulerConfig(warm_pool_size=5)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         boot_count = 0
 
@@ -2087,7 +2114,7 @@ class TestReplenishRaceCondition:
         # warm_pool_size=2
         # replenish_max_concurrent = max(1, int(2 * 0.5)) = 1
         config = SchedulerConfig(warm_pool_size=2)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         max_concurrent = 0
         current_concurrent = 0
@@ -2139,7 +2166,7 @@ class TestReplenishRaceCondition:
         # warm_pool_size=5
         # replenish_max_concurrent = max(1, int(5 * 0.5)) = 2
         config = SchedulerConfig(warm_pool_size=5)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
 
         max_concurrent = 0
         current_concurrent = 0

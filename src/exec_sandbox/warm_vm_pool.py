@@ -16,15 +16,10 @@ Performance:
 - Memory: memory.reclaim moves the pages of idle pool VMs to zswap (Linux); the
   guest kernel zeroes freed pages (init_on_free), so they cost almost nothing there
 
-L2 Disk Snapshots:
-- A cold boot uses the L2 entry of the language with no packages when one exists
-  (check only: the pool never makes one)
-- snapshot_manager: Optional for L2 cache (plain cold boot if None)
-
 Example:
     ```python
     # In Scheduler
-    warm_pool = WarmVMPool(vm_manager, config, snapshot_manager)
+    warm_pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=memory_snapshot_manager)
     await warm_pool.start()
     # Per execution
     vm = await warm_pool.get_vm(VmSpec(language="python"))
@@ -40,11 +35,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from tenacity import (
-    AsyncRetrying,
     before_sleep_log,
     retry_if_exception,
     stop_after_attempt,
@@ -53,7 +48,7 @@ from tenacity import (
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.aio_utils import await_settled, settle_and_report
+from exec_sandbox.aio_utils import AsyncRetrying, await_settled
 from exec_sandbox.exceptions import CommunicationError, ErrorCode, OutcomeUnknownError
 from exec_sandbox.files.disk import advise_willneed
 from exec_sandbox.guest_agent_protocol import PingRequest, PongMessage, WarmReplAckMessage, WarmReplRequest
@@ -62,12 +57,7 @@ from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import VmState
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
-
-    from exec_sandbox.admission import ResourceReservation
     from exec_sandbox.config import SchedulerConfig
-    from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
-    from exec_sandbox.files.locks import EntryLease
     from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.vm_manager import VmManager
@@ -118,19 +108,17 @@ class WarmVMPool:
         self,
         vm_manager: VmManager,
         config: SchedulerConfig,
-        snapshot_manager: DiskSnapshotManager | None = None,
-        memory_snapshot_manager: MemorySnapshotManager | None = None,
+        *,
+        memory_snapshot_manager: MemorySnapshotManager | None,
     ):
         """Initialize warm VM pool.
 
         Args:
             vm_manager: VmManager for VM lifecycle
             config: Scheduler configuration
-            snapshot_manager: Optional DiskSnapshotManager for L2 cache (faster refill)
-            memory_snapshot_manager: Optional MemorySnapshotManager for L1 cache
+            memory_snapshot_manager: MemorySnapshotManager for L1 cache (None: no L1 restore or save)
         """
         self.vm_manager = vm_manager
-        self.snapshot_manager = snapshot_manager
         self.memory_snapshot_manager = memory_snapshot_manager
 
         # Pool size is explicitly configured via warm_pool_size
@@ -176,28 +164,10 @@ class WarmVMPool:
         )
 
     async def start(self) -> None:
-        """Start the pool and roll back every partially-created VM on failure."""
-        if self._stop_task is not None:
-            if not self._stop_task.done():
-                raise RuntimeError("Cannot start warm VM pool while shutdown is in progress")
-            self._stop_task.result()
-            self._stop_task = None
-            self._start_task = None
-
-        if self._start_task is None:
-            self._shutdown_event.clear()
-            self._start_task = asyncio.create_task(self._start_impl())
-        start_task = self._start_task
-        try:
-            await asyncio.shield(start_task)
-        except BaseException:
-            rollback = asyncio.create_task(self.stop())
-            if (rollback_error := await settle_and_report(rollback)) is not None:
-                logger.error(
-                    "Warm pool startup rollback failed",
-                    extra={"error": str(rollback_error)},
-                )
-            raise
+        """Start the pool, once. On a failure the caller calls stop(): it also ends a start
+        in progress and destroys the VMs it made."""
+        self._start_task = asyncio.create_task(self._start_impl())
+        await asyncio.shield(self._start_task)
 
     async def _start_impl(self) -> None:
         """Start the warm VM pool by pre-booting VMs (parallel).
@@ -223,38 +193,24 @@ class WarmVMPool:
                 if vmstate:
                     advise_willneed(vmstate)
 
-        # Build list of all VMs to boot, staggered by 15ms to avoid macOS dyld
-        # contention.  Each QEMU fork+exec resolves ~170 dylibs under a global
-        # dyld lock; overlapping spawns serialize on that lock and degrade from
-        # ~150ms to 250-400ms per VM.  15ms ≈ single-process dyld resolve time,
-        # so the next spawn starts just as the previous one releases the lock.
-        boot_coroutines: list[Coroutine[Any, Any, None]] = []
-        boot_order = 0
-        for language in Language:
-            logger.info(f"Pre-booting {self.pool_size_per_language} {language.value} VMs (parallel)")
-            for i in range(self.pool_size_per_language):
-                boot_coroutines.append(self._boot_and_add_vm(language, index=i, boot_delay=boot_order * 0.015))
-                boot_order += 1
-
+        # Boots staggered by 15ms to avoid macOS dyld contention.  Each QEMU
+        # fork+exec resolves ~170 dylibs under a global dyld lock; overlapping
+        # spawns serialize on that lock and degrade from ~150ms to 250-400ms per
+        # VM.  15ms ≈ single-process dyld resolve time, so the next spawn starts
+        # just as the previous one releases the lock.
         # Publish every initial boot task before awaiting. Shutdown owns this set
         # separately from the parent start task because a child may need to
         # finish cancellation cleanup after gather itself is cancelled.
-        boot_tasks = [asyncio.create_task(coroutine) for coroutine in boot_coroutines]
+        boot_tasks = [
+            asyncio.create_task(self._boot_and_add_vm(language, index=i, boot_delay=order * 0.015))
+            for order, (language, i) in enumerate(itertools.product(Language, range(self.pool_size_per_language)))
+        ]
         self._initial_boot_tasks.update(boot_tasks)
         for task in boot_tasks:
             task.add_done_callback(self._initial_boot_tasks.discard)
 
-        # Boot all VMs in parallel
-        results: list[BaseException | None] = await asyncio.gather(*boot_tasks, return_exceptions=True)
-
-        # Log failures (graceful degradation)
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(
-                    "Failed to boot warm VM",
-                    extra={"task_index": i, "error": str(result)},
-                    exc_info=result,
-                )
+        # Boot all VMs in parallel (_boot_and_add_vm logs each failure: graceful degradation)
+        await asyncio.gather(*boot_tasks, return_exceptions=True)
 
         boot_duration = asyncio.get_running_loop().time() - boot_start
 
@@ -536,8 +492,8 @@ class WarmVMPool:
     async def _boot_and_add_vm(self, language: Language, *, index: int, boot_delay: float) -> None:
         """Boot VM and add to pool (used for parallel startup).
 
-        For index=0: If L1 cache is empty, schedules a background L1 save (a
-        template entry with a warm REPL, made by a sacrificial VM); this VM
+        For index=0 of a cold boot (no L1 entry was restored): schedules a background
+        L1 save (a template entry with a warm REPL, made by a sacrificial VM); this VM
         stays in the pool.
 
         Args:
@@ -598,7 +554,7 @@ class WarmVMPool:
     ) -> QemuVM:
         """Boot single warm VM with placeholder IDs.
 
-        Tries L1 restore first (its REPL runs), falls back to L2/cold boot.
+        Tries L1 restore first (its REPL runs), falls back to a cold boot.
         Uses reservation_context() to acquire admission once for both paths,
         avoiding double admission wait when L1 restore fails and cold boot is
         the fallback.
@@ -609,6 +565,11 @@ class WarmVMPool:
 
         Returns:
             Booted QemuVM in READY state
+
+        Raises:
+            What VmManager.reservation_context and create_vm raise; from the L1 restore,
+            only InternalError CLEANUP_UNCONFIRMED (any other failed restore gives None:
+            the cold boot follows)
         """
         tenant_id = constants.WARM_POOL_TENANT_ID
         task_id = f"warm-{language.value}-{index}"
@@ -640,50 +601,23 @@ class WarmVMPool:
                             extra={"language": language.value, "vm_id": vm.vm_id},
                         )
                         return vm
-                return await self._boot_from_l2(
-                    spec, language=language, tenant_id=tenant_id, task_id=task_id, reservation=reservation
+                return await self.vm_manager.create_vm(
+                    spec,
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    snapshot_drive=None,
+                    cache_leases=(),
+                    reservation=reservation,
+                    retry_profile=constants.RETRY_BACKGROUND,
+                    direct_write_target=None,
+                    expose_ports=None,
+                    on_boot_log=None,
+                    mem_path=None,
+                    mem_path_share=False,
                 )
         finally:
             if l1_entry is not None:  # restore() releases it; this covers a failed admission
                 l1_entry.release()
-
-    async def _boot_from_l2(
-        self, spec: VmSpec, *, language: Language, tenant_id: str, task_id: str, reservation: ResourceReservation
-    ) -> QemuVM:
-        """Cold boot a warm VM with `reservation`, on the L2 entry of its language when there is
-        one. The L2 entry is leased from its lookup on (no eviction removes it); the VM takes
-        its own share."""
-        snapshot: EntryLease | None = None
-        if self.snapshot_manager:
-            try:
-                snapshot = await self.snapshot_manager.check_cache(
-                    language=language,
-                    packages=[],
-                )
-                if snapshot:
-                    logger.debug(
-                        "L2 cache hit for warm pool VM",
-                        extra={"language": language.value, "snapshot_path": str(snapshot.path)},
-                    )
-            except (OSError, RuntimeError) as e:
-                logger.warning(
-                    "L2 cache check failed for warm pool, falling back to cold boot",
-                    extra={"language": language.value, "error": str(e)},
-                )
-
-        try:
-            return await self.vm_manager.create_vm(
-                spec,
-                tenant_id=tenant_id,
-                task_id=task_id,
-                snapshot_drive=snapshot.path if snapshot is not None else None,
-                cache_leases=(snapshot,) if snapshot is not None else (),
-                reservation=reservation,
-                retry_profile=constants.RETRY_BACKGROUND,
-            )
-        finally:
-            if snapshot is not None:
-                snapshot.release()
 
     async def _replenish_pool(self, language: Language) -> None:
         """Replenish pool in background (non-blocking).
@@ -767,10 +701,12 @@ class WarmVMPool:
         await self.pools[language].put(vm)
 
     async def _warm_repl(self, vm: QemuVM, language: Language) -> None:
-        """Pre-warm REPL in guest VM for faster first execution.
+        """Warm the REPL of `language` in the VM (WarmReplRequest: the guest starts the REPL
+        when none runs, then runs a no-op on it).
 
-        A failed warm-up makes this VM ineligible for pooling (and index 0 then schedules no L1 save).
-        The caller destroys it through the normal _boot_and_add_vm error path.
+        A failed warm-up (RuntimeError, or the error of send_request) makes this VM
+        ineligible for pooling (and index 0 then schedules no L1 save). The caller
+        (_boot_and_add_vm or _replenish_pool) destroys it.
         """
         response = await vm.channel.send_request(
             WarmReplRequest(language=language),
@@ -784,7 +720,7 @@ class WarmVMPool:
         """Background health check for warm VMs.
 
         Pings guest agents every WARM_POOL_HEALTH_CHECK_INTERVAL seconds
-        (currently 15s) to detect crashes. Replaces unhealthy VMs automatically.
+        (15 s) to detect crashes. Replaces unhealthy VMs automatically.
         """
         logger.info("Warm pool health check started")
 
@@ -863,20 +799,9 @@ class WarmVMPool:
             True if healthy (restored to pool), False if unhealthy (destroyed).
         """
         try:
-            healthy = await self._check_vm_health(vm)
-            if healthy:
+            if await self._check_vm_health(vm):
                 await pool.put(vm)  # Immediately back in pool
                 return True
-            await self._handle_unhealthy_vm(vm, language)
-            return False
-        except _HEALTH_CHECK_TRANSIENT_ERRORS as e:
-            logger.error(
-                "Health check exception",
-                extra={"language": language.value, "vm_id": vm.vm_id, "error": str(e)},
-                exc_info=e,
-            )
-            await self._handle_unhealthy_vm(vm, language)
-            return False
         except asyncio.CancelledError:
             # The VM was removed from the queue before the health await. A
             # cancelled health pass must not strand that checkout.
@@ -885,11 +810,11 @@ class WarmVMPool:
             raise
         except Exception as e:
             logger.exception(
-                "Unexpected warm VM health-check failure",
+                "Health check exception",
                 extra={"language": language.value, "vm_id": vm.vm_id, "error": str(e)},
             )
-            await self._handle_unhealthy_vm(vm, language)
-            return False
+        await self._handle_unhealthy_vm(vm, language)
+        return False
 
     async def _handle_unhealthy_vm(self, vm: QemuVM, language: Language) -> None:
         """Handle an unhealthy VM by destroying and triggering replenishment."""
@@ -942,7 +867,7 @@ class WarmVMPool:
             """Single ping attempt - may raise on transient failure."""
             await vm.channel.connect(timeout_seconds=5)  # reconnects only a failed connection
             logger.debug("Health check: sending ping request", extra={"vm_id": vm.vm_id})
-            response = await vm.channel.send_request(PingRequest())
+            response = await vm.channel.send_request(PingRequest(), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS)
             logger.debug(
                 "Health check: received response",
                 extra={"vm_id": vm.vm_id, "response_type": type(response).__name__},
@@ -962,10 +887,6 @@ class WarmVMPool:
             ):
                 with attempt:
                     return await _ping_guest()
-        except asyncio.CancelledError:
-            # Don't retry on cancellation - propagate immediately
-            logger.debug("Health check cancelled", extra={"vm_id": vm.vm_id})
-            raise
         except Exception as e:
             if not _is_failed_health_ping(e):
                 raise  # a bug or a setup fault, not a VM that cannot answer
