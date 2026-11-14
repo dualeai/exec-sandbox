@@ -10,14 +10,11 @@ import asyncio
 import shutil
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled
 from exec_sandbox.permission_utils import sudo_rm
-
-if TYPE_CHECKING:
-    from types import TracebackType
 
 logger = get_logger(__name__)
 
@@ -28,17 +25,12 @@ class VmWorkingDirectory:
     """Manages a dedicated temporary directory for a single VM's files.
 
     All VM-related temporary files (overlay image, sockets) are stored in a
-    single directory created atomically via tempfile.mkdtemp().
-    This simplifies cleanup (single rmtree) and ensures socket paths stay
-    under the 108-byte Unix domain socket limit.
+    single directory created atomically via tempfile.mkdtemp() in the temp
+    folder. This simplifies cleanup (one rmtree, plus the home disk, which lives
+    in `home_dir`) and keeps socket paths under the Unix domain socket limit
+    (108 bytes on Linux, 104 on macOS).
 
-    Usage as context manager (preferred for short-lived VMs):
-        async with await VmWorkingDirectory.create(vm_id, home_dir=home_dir) as workdir:
-            overlay = workdir.overlay_image
-            # VM runs...
-        # Directory automatically cleaned up
-
-    Usage with manual lifecycle (for warm pool VMs):
+    Usage (VmManager: each VM keeps its directory until destroy_vm):
         workdir = await VmWorkingDirectory.create(vm_id, home_dir=home_dir)
         try:
             overlay = workdir.overlay_image
@@ -48,11 +40,15 @@ class VmWorkingDirectory:
 
     Attributes:
         vm_id: VM identifier for logging
-        path: Root directory path (created by mkdtemp with mode 0700)
+        path: Root directory path (created by mkdtemp with mode 0700). When QEMU
+            runs as qemu-vm, it gets group qemu-vm and mode 2770
+            (VmManager._apply_overlay_permissions): other users get no access.
         overlay_image: Path to qcow2 overlay file
+        home_disk: Path to the raw home disk file (in `home_dir`, outside `path`)
         cmd_socket: Path to command channel Unix socket (str for QEMU args)
         event_socket: Path to event channel Unix socket (str for QEMU args)
         qmp_socket: Path to QMP control socket
+        qmp_events_socket: Path to the QMP socket that carries QEMU events only
         gvproxy_socket: Path to gvproxy network socket
     """
 
@@ -173,6 +169,11 @@ class VmWorkingDirectory:
         return self._path / "qmp.sock"
 
     @property
+    def qmp_events_socket(self) -> Path:
+        """Path to the QMP socket that only carries QEMU events (QemuVM.start_event_watch)."""
+        return self._path / "qmp-events.sock"
+
+    @property
     def gvproxy_socket(self) -> Path:
         """Path to gvproxy network socket."""
         return self._path / "gvproxy.sock"
@@ -188,10 +189,12 @@ class VmWorkingDirectory:
         self._use_qemu_vm_user = value
 
     async def cleanup(self) -> bool:
-        """Remove working directory and all contents.
+        """Remove the home disk, then the working directory and all its contents.
 
-        Safe to call multiple times (idempotent).
-        Uses sudo rm -rf if files are owned by qemu-vm user.
+        Safe to call multiple times (idempotent); concurrent calls share one attempt.
+        Uses sudo rm -rf if files are owned by qemu-vm user. A cancelled caller
+        gets CancelledError once the attempt has ended; an attempt that failed then
+        goes on as a retry task of this module (drain_workdir_cleanup_tasks).
 
         Returns:
             True if cleanup succeeded, False if errors occurred
@@ -312,21 +315,6 @@ class VmWorkingDirectory:
                 exc_info=True,
             )
             return False
-
-    async def __aenter__(self) -> Self:
-        """Enter async context manager."""
-        return self
-
-    async def __aexit__(
-        self,
-        _exc_type: type[BaseException] | None,
-        _exc_val: BaseException | None,
-        _exc_tb: TracebackType | None,
-    ) -> bool:
-        """Exit async context manager - cleanup directory."""
-        if not await self.cleanup():
-            self._retain_cleanup()
-        return False  # Don't suppress exceptions
 
 
 async def _retry_workdir_cleanup(workdir: VmWorkingDirectory) -> None:

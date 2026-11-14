@@ -21,7 +21,6 @@ from dataclasses import dataclass
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import SocketAuthError
-from exec_sandbox.permission_utils import get_qemu_vm_uid
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 logger = get_logger(__name__)
@@ -31,19 +30,8 @@ _SO_PEERCRED = 17  # Linux socket option
 _UCRED_SIZE = 12  # struct ucred: pid(i), uid(I), gid(I)
 
 # Platform constants for LOCAL_PEERCRED (macOS)
-_LOCAL_PEERCRED = 0x001  # macOS SOL_LOCAL value
+_LOCAL_PEERCRED = 0x001  # macOS LOCAL_PEERCRED option (at level SOL_LOCAL, which is 0)
 _XUCRED_SIZE = 76  # struct xucred size
-
-# Re-export SocketAuthError for convenience
-__all__ = [
-    "PeerCredentials",
-    "SocketAuthError",
-    "connect_and_verify",
-    "create_unix_socket",
-    "get_peer_credentials",
-    "get_qemu_vm_uid",
-    "verify_socket_peer",
-]
 
 
 @dataclass(frozen=True)
@@ -252,8 +240,8 @@ async def connect_and_verify(
     return reader, writer
 
 
-def create_unix_socket(path: str, backlog: int = 128) -> socket.socket:
-    """Create and bind a Unix domain socket (socket activation pattern).
+def create_unix_socket(path: str) -> socket.socket:
+    """Create, bind and listen on a Unix domain socket, backlog 128 (socket activation pattern).
 
     Creates a listening socket that can be passed to a child process via
     file descriptor inheritance. This eliminates polling latency - the
@@ -261,7 +249,6 @@ def create_unix_socket(path: str, backlog: int = 128) -> socket.socket:
 
     Args:
         path: Unix socket path
-        backlog: Listen backlog (default 128)
 
     Returns:
         Bound and listening socket. Caller is responsible for closing it
@@ -279,7 +266,7 @@ def create_unix_socket(path: str, backlog: int = 128) -> socket.socket:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.bind(path)
-        sock.listen(backlog)
+        sock.listen(128)
         return sock
     except OSError:
         sock.close()
