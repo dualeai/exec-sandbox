@@ -278,7 +278,8 @@ class TestVmManagerSweeps:
         try:
             await manager.start()
             assert manager.work_dir.is_dir()
-            assert openers != [] and loop_thread not in openers
+            assert len(openers) == 1
+            assert openers[0] != loop_thread
         finally:
             await manager.stop()
 
@@ -286,14 +287,15 @@ class TestVmManagerSweeps:
         self, make_vm_settings: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The RAM file of a killed L1 save holds memory (/dev/shm): it goes at the next start,
-        off the event loop, not only at the next L1 save."""
+        off the event loop, not only at the next L1 save. A test folder stands in for /dev/shm
+        through the module's private root: no setting moves it."""
         shm = tmp_path / "shm"
         shm.mkdir()
         shm.chmod(0o1777)  # as /dev/shm: sticky, open to every user
         user_root = shm / f"exec-sandbox-{os.geteuid()}"
         user_root.mkdir(mode=0o700)
         dead = _dead_folder(user_root, "vmm-dead")
-        monkeypatch.setattr("exec_sandbox.memory_snapshot_manager._LIVE_RAM_ROOT", shm)
+        monkeypatch.setattr("exec_sandbox.memory_snapshot_files._LIVE_RAM_ROOT", shm)
         loop_thread = threading.get_ident()
         removers: dict[str, int] = {}
         rmtree = shutil.rmtree
@@ -542,7 +544,8 @@ class TestCgroupRecords:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A watcher slow to start (here 0.1 s): record_cgroup returns only once it ignores
-        HUP, INT and TERM (SigIgn in /proc), so a stop right after cannot end it."""
+        HUP, INT and TERM (SigIgn in /proc), so a stop right after cannot end it. The delay is
+        put in the private watcher script: no public path makes the watcher slow."""
         monkeypatch.setattr(private_run_dir, "_WATCHER", "sleep 0.1\n" + private_run_dir._WATCHER)
         run_dir = _open(tmp_path)
         try:
@@ -564,7 +567,8 @@ class TestCgroupRecords:
     ) -> None:
         """A launcher that starts no watcher: its cgroup and record go. The next record then
         starts the watcher in a new cgroup of its own (a cgroup left there would make it fail,
-        and the watcher would run in this process's cgroup)."""
+        and the watcher would run in this process's cgroup). The private launcher script is
+        replaced: no public path makes it fail."""
         monkeypatch.setattr(cgroup, "cgroup_v2_available", lambda: True)
         real_start = private_run_dir._START_WATCHER
         monkeypatch.setattr(private_run_dir, "_START_WATCHER", "exit 0\n")
@@ -850,7 +854,8 @@ class TestFolderRecords:
         (dead / "vm-0.folder").symlink_to(workdir)
         stand_in = tmp_path / "bin" / "sudo"
         stand_in.parent.mkdir()
-        stand_in.write_text("#!/bin/sh\necho \"rm: cannot remove '$6/x': Device or resource busy\" >&2\nexit 1\n")
+        # sudo -n rm -rf -- <folder>: the folder is $5
+        stand_in.write_text("#!/bin/sh\necho \"rm: cannot remove '$5/x': Device or resource busy\" >&2\nexit 1\n")
         stand_in.chmod(0o755)
         monkeypatch.setenv("PATH", f"{stand_in.parent}{os.pathsep}{os.environ['PATH']}")
         monkeypatch.setattr(private_run_dir, "get_qemu_vm_gid", lambda: workdir.stat().st_gid)
@@ -858,7 +863,7 @@ class TestFolderRecords:
             with caplog.at_level(logging.WARNING, logger="exec_sandbox.private_run_dir"):
                 remove_dead_folders(root)
             [record] = [r for r in caplog.records if r.getMessage() == "Could not remove a folder of a stopped process"]
-            assert "Device or resource busy" in record.__dict__["stderr"]
+            assert record.__dict__["stderr"] == f"rm: cannot remove '{workdir}/x': Device or resource busy"
         finally:
             (workdir / "private").chmod(0o700)
 
@@ -953,7 +958,9 @@ class TestFolderRecords:
         assert dead.exists()
 
     def test_sweep_of_a_missing_root_does_nothing(self, tmp_path: Path) -> None:
+        """No error, and the sweep does not make the root."""
         remove_dead_folders(tmp_path / "never-made")
+        assert not (tmp_path / "never-made").exists()
 
 
 class TestRootChecks:
@@ -1089,7 +1096,8 @@ class TestWatcherOwnCgroup:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A launcher that joins its cgroup, then hangs (here past a 0.2 s bound): what is in the
-        cgroup is killed and the cgroup removed, with its record; record_cgroup returns."""
+        cgroup is killed and the cgroup removed, with its record; record_cgroup returns. The
+        private launcher script and bound are replaced: no public path makes the launcher hang."""
         namespace = _delegated_namespace()
         monkeypatch.setattr(
             private_run_dir, "_START_WATCHER", 'exec 3<&0\n{ echo 0 > "$1/cgroup.procs"; } 2>/dev/null\nsleep 5\n'

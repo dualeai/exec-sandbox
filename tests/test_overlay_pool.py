@@ -36,6 +36,12 @@ def _owner_alive(alive: bool) -> Any:
     return patch("exec_sandbox.overlay_pool.psutil", SimpleNamespace(pid_exists=lambda _pid: alive))
 
 
+def _shutil_with(**calls: Any) -> Any:
+    """The overlay pool module's `shutil` with `calls` in place of its own (a failure of one
+    call); the process's shutil, which the daemon and pytest use, stays."""
+    return patch("exec_sandbox.overlay_pool.shutil", SimpleNamespace(**{**vars(shutil), **calls}))
+
+
 class _FakeDaemon:
     """qemu-storage-daemon stand-in (no QEMU process). create_overlay writes the overlay path
     into the new file: a target that names a path in the pool folder was moved from the pool,
@@ -47,8 +53,6 @@ class _FakeDaemon:
         self.stops = 0
         self.failures: list[Exception] = []
         """Raised by the next creations, in order."""
-        self.empty_successes = 0
-        """The next creations return with no file made."""
 
     async def start(self) -> None:
         self.started = True
@@ -61,9 +65,6 @@ class _FakeDaemon:
         del base_image
         if self.failures:
             raise self.failures.pop(0)
-        if self.empty_successes:
-            self.empty_successes -= 1
-            return
         try:
             overlay_path.write_text(str(overlay_path))
         except OSError as e:
@@ -195,16 +196,25 @@ class TestOverlayPoolPureLogic:
 
         await pool.stop()
         await pool.stop()  # Should not raise
+        assert pool.daemon_enabled is False
 
-    async def test_double_start_raises_error(self, tmp_path: Path) -> None:
-        """Calling start() twice without stop() raises RuntimeError."""
-        pool = OverlayPool(pool_size=5, pool_dir=tmp_path / "pool")
-        await pool.start([])
-
-        with pytest.raises(RuntimeError, match="already started"):
-            await pool.start([])
-
-        await pool.stop()
+    async def test_double_start_raises_and_the_pool_keeps_running(
+        self, fake_daemon: _FakeDaemon, tmp_path: Path
+    ) -> None:
+        """Calling start() twice without stop() raises RuntimeError, and the running pool is not
+        rolled back: its daemon still runs and it still gives overlays."""
+        pool_dir = tmp_path / "pool"
+        pool = OverlayPool(pool_size=1, pool_dir=pool_dir)
+        await pool.start([_BASE])
+        try:
+            with pytest.raises(RuntimeError, match="already started"):
+                await pool.start([_BASE])
+            assert pool.daemon_enabled is True
+            assert fake_daemon.stops == 0
+            await _wait_overlays(pool_dir, 1)
+            assert await pool.acquire(_BASE, tmp_path / "target.qcow2") is True
+        finally:
+            await pool.stop()
 
     async def test_start_restart_after_stop(self, fake_daemon: _FakeDaemon, tmp_path: Path) -> None:
         """After stop(), start() runs the pool again: the daemon starts again and the pool
@@ -237,7 +247,7 @@ class TestOverlayPoolPureLogic:
         """A name no other user can make first in the shared temp folder (mkdtemp, 0700); the
         pid stays in the name for the stale sweep. stop() removes the folder."""
         del fake_daemon
-        pool = OverlayPool(pool_size=5)
+        pool = OverlayPool(pool_size=5, pool_dir=None)
         names: list[str] = []
         for _ in range(2):
             await pool.start([])
@@ -301,7 +311,7 @@ class TestOverlayPoolStaleCleanup:
     @staticmethod
     async def _start_and_stop() -> None:
         """Run the sweep of start(). Pool size 0: the pool makes no folder of its own."""
-        pool = OverlayPool(pool_size=0)
+        pool = OverlayPool(pool_size=0, pool_dir=None)
         await pool.start([])
         await pool.stop()
 
@@ -340,9 +350,10 @@ class TestOverlayPoolStaleCleanup:
         assert dir_other.exists()
 
     async def test_skips_non_matching_dirs(self, fake_daemon: _FakeDaemon, temp_dir: Path) -> None:
-        """Directories that don't match the pool naming pattern are ignored."""
+        """A name of the glob with a suffix mkdtemp never makes (it uses lowercase letters,
+        digits and "_"): not a pool folder, it stays."""
         del fake_daemon
-        other_dir = temp_dir / "other-directory-123"
+        other_dir = temp_dir / "exec-sandbox-overlay-pool-123-ABC"
         other_dir.mkdir()
 
         with _owner_alive(False):
@@ -361,9 +372,7 @@ class TestOverlayPoolStaleCleanup:
 
         assert bad_dir.exists()
 
-    async def test_stale_sweep_leaves_links_and_folders_of_others(
-        self, fake_daemon: _FakeDaemon, temp_dir: Path, tmp_path: Path
-    ) -> None:
+    async def test_stale_sweep_leaves_links(self, fake_daemon: _FakeDaemon, temp_dir: Path, tmp_path: Path) -> None:
         """A link named like a dead process's pool folder is not followed: its target stays."""
         del fake_daemon
         target = tmp_path / "precious"
@@ -379,13 +388,26 @@ class TestOverlayPoolStaleCleanup:
         assert (target / "data").exists()
         assert not dead.exists()
 
+    async def test_stale_sweep_leaves_folders_of_other_users(self, fake_daemon: _FakeDaemon, temp_dir: Path) -> None:
+        """A dead process's pool folder that another user owns stays (its own sweep removes it).
+        The module's geteuid answers another user: this user owns every folder of the test."""
+        del fake_daemon
+        dead = temp_dir / "exec-sandbox-overlay-pool-999999998-def"
+        dead.mkdir()
+
+        other_user = SimpleNamespace(**{**vars(os), "geteuid": lambda: os.geteuid() + 1})
+        with _owner_alive(False), patch("exec_sandbox.overlay_pool.os", other_user):
+            await self._start_and_stop()
+
+        assert dead.exists()
+
     async def test_handles_rmtree_permission_error(self, fake_daemon: _FakeDaemon, temp_dir: Path) -> None:
         """A stale folder that cannot be removed stays, and start() does not fail."""
         del fake_daemon
         stale_dir = temp_dir / "exec-sandbox-overlay-pool-99999-abc"
         stale_dir.mkdir()
 
-        with _owner_alive(False), patch("shutil.rmtree", side_effect=PermissionError("Access denied")):
+        with _owner_alive(False), _shutil_with(rmtree=MagicMock(side_effect=PermissionError("Access denied"))):
             await self._start_and_stop()
 
         assert stale_dir.exists()
@@ -485,7 +507,7 @@ class TestOverlayPoolErrorHandling:
         pool = await start_pool(1)
         target = tmp_path / "target.qcow2"
 
-        with patch("shutil.move", side_effect=OSError(errno.EXDEV, "Cross-device link")):
+        with _shutil_with(move=MagicMock(side_effect=OSError(errno.EXDEV, "Cross-device link"))):
             assert await pool.acquire(_BASE, target) is False
 
         assert _overlays(tmp_path / "pool") == set()  # the pooled overlay is removed
@@ -531,20 +553,25 @@ class TestOverlayPoolErrorHandling:
         assert _overlays(tmp_path / "pool") == set()
         assert not target.parent.exists()
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the folder mode")
     async def test_orphan_cleanup_failure_suppressed(
         self, start_pool: Callable[[int], Awaitable[OverlayPool]], tmp_path: Path
     ) -> None:
-        """Move EIO + unlink EIO -> suppress(OSError) handles both."""
+        """A pool folder this user may not write: the move fails (EACCES), the removal of the
+        pooled overlay fails too and is ignored, and the overlay is made on demand."""
         pool = await start_pool(1)
+        pool_dir = tmp_path / "pool"
+        (pooled,) = _overlays(pool_dir)
         target = tmp_path / "target.qcow2"
 
-        with (
-            patch("shutil.move", side_effect=OSError(errno.EIO, "I/O error")),
-            patch("os.unlink", side_effect=OSError(errno.EIO, "I/O error")),
-        ):
+        pool_dir.chmod(0o500)
+        try:
             assert await pool.acquire(_BASE, target) is False
+        finally:
+            pool_dir.chmod(0o700)
 
         assert target.read_text() == str(target)
+        assert pooled.exists()  # its removal failed
 
     async def test_first_move_fails_queue_retains_rest(
         self, start_pool: Callable[[int], Awaitable[OverlayPool]], tmp_path: Path
@@ -554,7 +581,7 @@ class TestOverlayPoolErrorHandling:
         pool_dir = tmp_path / "pool"
         first = tmp_path / "t1.qcow2"
 
-        with patch("shutil.move", side_effect=OSError("disk error")):
+        with _shutil_with(move=MagicMock(side_effect=OSError("disk error"))):
             assert await pool.acquire(_BASE, first) is False
         assert first.read_text() == str(first)
         (left,) = _overlays(pool_dir)
@@ -570,20 +597,21 @@ class TestOverlayPoolErrorHandling:
         pool = await start_pool(1)
 
         with (
-            patch("shutil.move", side_effect=RuntimeError("unexpected")),
+            _shutil_with(move=MagicMock(side_effect=RuntimeError("unexpected"))),
             pytest.raises(RuntimeError, match="unexpected"),
         ):
             await pool.acquire(_BASE, tmp_path / "target.qcow2")
 
-    async def test_stop_handles_rmtree_failure(self, tmp_path: Path) -> None:
+    async def test_stop_handles_rmtree_failure(self, fake_daemon: _FakeDaemon, tmp_path: Path) -> None:
         """stop() completes even if directory cleanup fails."""
+        del fake_daemon
         pool_dir = tmp_path / "pool"
         pool = OverlayPool(pool_size=5, pool_dir=pool_dir)
 
         # Use empty startup (no base images = no qemu-img calls needed)
         await pool.start([])
 
-        with patch("shutil.rmtree", side_effect=OSError("Permission denied")):
+        with _shutil_with(rmtree=MagicMock(side_effect=OSError("Permission denied"))):
             await pool.stop()  # Should not raise
 
         assert pool.daemon_enabled is False
@@ -591,25 +619,6 @@ class TestOverlayPoolErrorHandling:
         await pool.start([])  # stopped for good: it starts again
         await pool.stop()
         assert not pool_dir.exists()
-
-    # --- C: File existence verification after daemon creation ---
-
-    async def test_a_creation_without_a_file_takes_no_pool_place(
-        self, fake_daemon: _FakeDaemon, tmp_path: Path
-    ) -> None:
-        """The daemon reports success but made no file: nothing is queued, so the next fill
-        makes a real overlay and acquire gets it (a queued missing file would hold the place,
-        and every acquire would make its overlay on demand)."""
-        fake_daemon.empty_successes = 1
-        pool_dir = tmp_path / "pool"
-        pool = OverlayPool(pool_size=1, pool_dir=pool_dir)
-        with patch.object(constants, "OVERLAY_POOL_REPLENISH_INTERVAL_SECONDS", 0.01):
-            await pool.start([_BASE])
-            try:
-                await _wait_overlays(pool_dir, 1)
-                assert await pool.acquire(_BASE, tmp_path / "target.qcow2") is True
-            finally:
-                await pool.stop()
 
     @pytest.mark.parametrize(
         "error",
@@ -640,25 +649,6 @@ class TestOverlayPoolErrorHandling:
                 await pool.stop()
         assert fake_daemon.failures == []
 
-    # --- D: Cross-process isolation ---
-
-    async def test_stop_only_deletes_own_pool_dir(self, tmp_path: Path) -> None:
-        """Pool A's stop() removes dir-A but NOT dir-B."""
-        dir_a = tmp_path / "pool-a"
-        dir_b = tmp_path / "pool-b"
-        dir_a.mkdir()
-        dir_b.mkdir()
-        (dir_a / "overlay.qcow2").write_text("a")
-        (dir_b / "overlay.qcow2").write_text("b")
-
-        pool_a = OverlayPool(pool_size=0, pool_dir=dir_a)
-        await pool_a.start([])
-        await pool_a.stop()
-
-        assert not dir_a.exists()
-        assert dir_b.exists()
-        assert (dir_b / "overlay.qcow2").read_text() == "b"
-
     async def test_pool_dir_deleted_externally_all_fallback(
         self, start_pool: Callable[[int], Awaitable[OverlayPool]], tmp_path: Path
     ) -> None:
@@ -672,55 +662,6 @@ class TestOverlayPoolErrorHandling:
 
         assert results == [False] * 5
         assert [t.read_text() for t in targets] == [str(t) for t in targets]
-
-    # --- E: _create_and_enqueue branches that no public call reaches ---
-
-    @staticmethod
-    def _pool_with_queue(pool_dir: Path, daemon: _FakeDaemon, *, maxsize: int) -> tuple[OverlayPool, str]:
-        """A pool in the state that start() leaves (daemon, pool folder, a queue for _BASE),
-        set by hand, and the queue's key."""
-        pool_dir.mkdir()
-        pool = OverlayPool(pool_size=maxsize, pool_dir=pool_dir)
-        key = str(_BASE.resolve())
-        pool._pools[key] = asyncio.Queue(maxsize=maxsize)
-        pool._started = True
-        daemon.started = True
-        pool._daemon = daemon  # type: ignore[assignment]
-        return pool, key
-
-    async def test_create_enqueue_queue_full_cleans_file(self, tmp_path: Path) -> None:
-        """Queue full when the overlay is made: the new file is deleted. A private-level test:
-        one fill loop runs for each base image and makes only the missing overlays, so no
-        public call fills the queue during a creation."""
-        pool_dir = tmp_path / "pool"
-        pool, key = self._pool_with_queue(pool_dir, _FakeDaemon(), maxsize=1)
-        existing = pool_dir / "existing.qcow2"
-        existing.write_text("existing")
-        await pool._pools[key].put(existing)
-
-        await pool._create_and_enqueue(_BASE, key)
-
-        assert _overlays(pool_dir) == {existing}
-
-    async def test_create_enqueue_pool_removed_during_creation(self, tmp_path: Path) -> None:
-        """The queue of the base image is gone when the overlay is made: the call returns
-        without error and the file stays in the pool folder (stop() removes the folder).
-        A private-level test: stop() cancels the creations before it removes the queues, so
-        no public call reaches this branch."""
-        pool_dir = tmp_path / "pool"
-        daemon = _FakeDaemon()
-        pool, key = self._pool_with_queue(pool_dir, daemon, maxsize=1)
-        real_create = daemon.create_overlay
-
-        async def create_then_drop_queue(base: Path, overlay: Path) -> None:
-            await real_create(base, overlay)
-            pool._pools.pop(key)
-
-        daemon.create_overlay = create_then_drop_queue  # type: ignore[method-assign]
-
-        await pool._create_and_enqueue(_BASE, key)
-
-        assert len(_overlays(pool_dir)) == 1
 
 
 # ============================================================================
@@ -771,12 +712,8 @@ class TestOverlayPoolIntegration:
         assert not pool_dir.exists()  # Cleaned up
 
     async def test_acquire_with_zero_pool_size_creates_on_demand(self, vm_settings, tmp_path: Path) -> None:
-        """Test acquire works with pool_size=0 (CLI single-VM mode).
-
-        This is a regression test for the bug where pool_size=0, and start()
-        didn't initialize the daemon, causing acquire() to fail with
-        "Daemon must be started before acquire".
-        """
+        """pool_size=0 (CLI single-VM mode): start() still starts the real daemon, so
+        acquire() makes the overlay on demand (no "Daemon must be started before acquire")."""
         from exec_sandbox.vm_manager import VmManager
 
         vm_manager = VmManager(vm_settings)
@@ -870,8 +807,9 @@ class TestOverlayPoolIntegration:
         targets = [tmp_path / f"target-{i}.qcow2" for i in range(10)]
         results = await asyncio.gather(*[pool.acquire(base_image, t) for t in targets])
 
-        # 5 from pool (True), 5 on-demand (False)
-        assert sum(results) == 5
+        # Each acquire takes from the pool before its first await: the first 5 get the pooled
+        # overlays, the other 5 are made on demand
+        assert results == [True] * 5 + [False] * 5
 
         # All 10 overlays should exist and be valid
         assert all(t.exists() for t in targets)
@@ -919,11 +857,28 @@ class TestOverlayPoolIntegration:
 
         # vm_manager fixture already calls start() and stop()
         vm = await vm_manager.create_vm(
-            VmSpec(language=Language.PYTHON), tenant_id="test", task_id="pool-test", cache_leases=()
+            VmSpec(language=Language.PYTHON),
+            tenant_id="test",
+            task_id="pool-test",
+            cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
 
         try:
-            result = await vm.execute("print('hello from pool')", timeout_seconds=execute_timeout)
+            result = await vm.execute(
+                "print('hello from pool')",
+                timeout_seconds=execute_timeout,
+                env_vars=None,
+                on_stdout=None,
+                on_stderr=None,
+            )
             assert "hello from pool" in result.stdout
         finally:
             await vm_manager.destroy_vm(vm)

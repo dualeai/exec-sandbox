@@ -36,7 +36,6 @@ from typing import Any, Self
 from uuid import uuid4
 
 from tenacity import (
-    AsyncRetrying,
     before_sleep_log,
     retry_if_exception_type,
     stop_after_attempt,
@@ -46,8 +45,8 @@ from tenacity import (
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.admission import EvictableCache, ResourceAdmissionController, ResourceReservation
+from exec_sandbox.aio_utils import AsyncRetrying, run_stoppable, run_to_end
 from exec_sandbox.aio_utils import await_cancellation_safe as _await_cancellation_safe
-from exec_sandbox.aio_utils import run_to_end
 from exec_sandbox.cgroup import Cgroup
 from exec_sandbox.exceptions import (
     CommunicationError,
@@ -60,10 +59,16 @@ from exec_sandbox.exceptions import (
 )
 from exec_sandbox.files.disk import allocated_bytes, clone_sparse, create_sparse
 from exec_sandbox.files.locks import EntryLease
-from exec_sandbox.guest_channel import DualPortChannel, GuestChannel, raise_send_buffer
+from exec_sandbox.guest_channel import DualPortChannel, raise_send_buffer
 from exec_sandbox.gvproxy import start_gvproxy
 from exec_sandbox.images import GuestImages, guest_digests
-from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager, SnapshotMetadata, remove_dead_live_ram_dirs
+from exec_sandbox.memory_snapshot_files import (
+    SnapshotMetadata,
+    home_path_from_vmstate,
+    meta_path_from_vmstate,
+    ram_path_from_vmstate,
+    remove_dead_live_ram_dirs,
+)
 from exec_sandbox.migration_client import MigrationClient, migration_timeout
 from exec_sandbox.models import ExposedPort
 from exec_sandbox.overlay_pool import OverlayPool
@@ -73,7 +78,6 @@ from exec_sandbox.permission_utils import (
     grant_qemu_vm_acl,
     grant_qemu_vm_dir_access,
     grant_qemu_vm_file_access,
-    grant_qemu_vm_private_file_access,
     probe_qemu_as_qemu_vm,
 )
 from exec_sandbox.platform_utils import ProcessWrapper, detect_host_arch
@@ -175,7 +179,7 @@ class _VmInfra:
     overlay_ms: int  # its overlay acquisition (pool hit or on-demand creation)
     accel_type: AccelType  # as built into the QEMU command (force_emulation applied)
     expected_uid: int
-    channel: GuestChannel
+    channel: DualPortChannel
     # The pre-launch owner published during setup; launch/boot logic reuses it
     # instead of re-publishing.
     pending: "_PendingLaunch"
@@ -335,9 +339,22 @@ class VmManager:
     Usage:
         async with VmManager(settings) as manager:
             vm = await manager.create_vm(
-                VmSpec(language="python"), tenant_id="tenant-123", task_id="task-456", cache_leases=()
+                VmSpec(language="python"),
+                tenant_id="tenant-123",
+                task_id="task-456",
+                direct_write_target=None,
+                expose_ports=None,
+                on_boot_log=None,
+                snapshot_drive=None,
+                cache_leases=(),
+                reservation=None,
+                retry_profile=constants.RETRY_USER_FACING,
+                mem_path=None,
+                mem_path_share=False,
             )
-            result = await vm.execute("print('hello')", timeout_seconds=30)
+            result = await vm.execute(
+                "print('hello')", timeout_seconds=30, env_vars=None, on_stdout=None, on_stderr=None
+            )
             await manager.destroy_vm(vm)
     """
 
@@ -367,12 +384,12 @@ class VmManager:
 
         self._vms: dict[str, QemuVM] = {}  # vm_id -> VM object
         self._pending_launches: dict[str, _PendingLaunch] = {}
-        self._vms_lock = asyncio.Lock()  # Protect registry access
         self._failed_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._active_launches = 0
         self._launches_drained = asyncio.Event()
         self._launches_drained.set()
         self._stopping = False
+        self._start_lock = asyncio.Lock()  # one start at a time; a stop waits for the one in progress
         self._stop_task: asyncio.Task[None] | None = None
         self._admission = ResourceAdmissionController(
             memory_overcommit_ratio=settings.memory_overcommit_ratio,
@@ -389,7 +406,7 @@ class VmManager:
 
         # Overlay pool for fast VM boot
         # pool_size=0 initially; computed from admission budget in start()
-        self._overlay_pool = OverlayPool(pool_size=0)
+        self._overlay_pool = OverlayPool(pool_size=0, pool_dir=None)
 
     def add_cache(self, cache: EvictableCache) -> None:
         """Let admission evict the oldest entries of `cache` when the home disks lack space."""
@@ -411,11 +428,32 @@ class VmManager:
         when multiple VMs start concurrently - all probes are pre-warmed here instead
         of racing during VM creation.
 
-        Must be called before creating VMs.
-        """
-        if self._initialized:
-            return
+        Must be called before creating VMs. Concurrent calls run one after the other; a
+        call after a successful start returns at once.
 
+        Raises:
+            InvalidInputError: SCHEDULER_STATE: stop() was called (no restart)
+            ConfigError: HOST_DEPENDENCY: this host cannot run the QEMU binary or
+                qemu-storage-daemon; ASSET_NOT_FOUND: no kernel or initramfs;
+                SETTING_INVALID: home_disk_dir is not a safe folder of this user
+            TransientError: QEMU_CRASHED: the QEMU probe exec hit a process, memory or
+                file-handle limit; OVERLAY_FAILED: qemu-storage-daemon did not start
+            OSError: work_dir could not be made
+        """
+        async with self._start_lock:
+            if self._stopping:  # what this start would start, no stop would end
+                raise InvalidInputError(
+                    "VmManager is stopped and cannot start again",
+                    code=ErrorCode.SCHEDULER_STATE,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                )
+            if not self._initialized:
+                await self._start_once()
+
+    async def _start_once(self) -> None:
+        """start's work, under its lock."""
         # This manager's folder, then the folders of dead processes (worker-thread jobs: the
         # root check reads the user and group databases; whole disks, and the VMs they
         # record are killed and waited for), then the RAM folders of their L1 saves
@@ -511,10 +549,10 @@ class VmManager:
         """Stop VmManager and cleanup resources (tracked VMs, admission, overlay pool).
 
         Destroys all tracked VMs (including checked-out ones that were never
-        returned to a pool) before tearing down overlay services. Concurrent
-        callers share one manager-owned stop task. Cancelling one waiter does
-        not cancel process cleanup; normal return proves all tracked QEMU and
-        gvproxy processes have confirmed death.
+        returned to a pool) before tearing down overlay services. A start in
+        progress ends first. Concurrent callers share one manager-owned stop
+        task. Cancelling one waiter does not cancel process cleanup; normal
+        return proves all tracked QEMU and gvproxy processes have confirmed death.
         """
         if self._stop_task is None:
             self._stop_task = asyncio.create_task(self._stop_impl())
@@ -525,6 +563,9 @@ class VmManager:
         # Synchronous flag flip: single event loop, no await between check
         # sites, so no lock is needed (see _launch_operation).
         self._stopping = True
+        # A start in progress ends first: what it starts after this point would outlive the stop
+        async with self._start_lock:
+            pass
 
         # Reject and wake admission waiters before taking a closed snapshot.
         # Existing reservations remain releasable by their current owners.
@@ -534,10 +575,8 @@ class VmManager:
         # or cleans up its partial resources before decrementing this counter.
         await self._launches_drained.wait()
 
-        # Snapshot the registry under lock, then destroy outside lock
-        # (destroy_vm acquires _vms_lock internally to remove each entry).
-        async with self._vms_lock:
-            vms_to_destroy = list(self._vms.values())
+        # Snapshot the registry, then destroy: destroy_vm removes each entry
+        vms_to_destroy = list(self._vms.values())
         pending_to_destroy = list(self._pending_launches.values())
         await asyncio.gather(
             *(self.destroy_vm(vm) for vm in vms_to_destroy),
@@ -548,8 +587,7 @@ class VmManager:
         # Shield independently owned reapers so cancellation of any stop waiter
         # cannot turn an unconfirmed process into an unowned orphan.
         while True:
-            async with self._vms_lock:
-                remaining_vms = list(self._vms.values())
+            remaining_vms = list(self._vms.values())
             remaining_pending = list(self._pending_launches.values())
             for vm in remaining_vms:
                 self._schedule_failed_cleanup_retry(vm)
@@ -565,8 +603,11 @@ class VmManager:
             await asyncio.shield(asyncio.gather(*retry_tasks, return_exceptions=True))
         await drain_workdir_cleanup_tasks()
         await self._overlay_pool.stop()
-        if self._run_dir is not None:
-            await asyncio.to_thread(self._run_dir.close)  # the home disks: up to GBs
+        # Unpublished before its close: a destroy after the stop (a session closed late) then
+        # leaves the closed folder alone, whose fd numbers the OS gives to the next opens
+        run_dir, self._run_dir = self._run_dir, None
+        if run_dir is not None:
+            await asyncio.to_thread(run_dir.close)  # the home disks: up to GBs
 
     @asynccontextmanager
     async def _launch_operation(self) -> AsyncGenerator[None]:
@@ -643,6 +684,12 @@ class VmManager:
                     vm = None
                 if vm is None:
                     vm = await vm_manager.create_vm(..., reservation=reservation)
+
+        Raises:
+            InvalidInputError: SCHEDULER_STATE: the manager stops
+            TransientError: CAPACITY (no resources within RESOURCE_ADMISSION_TIMEOUT_SECONDS)
+                or LOCAL_DISK (the home disk does not fit): ResourceAdmissionController.acquire
+            RouteError: CAPACITY_NEVER_FITS: the VM is larger than the whole budget
         """
         async with self._launch_operation():
             accel_type = await self._detect_accel_type()
@@ -663,17 +710,15 @@ class VmManager:
                 # this reservation. Destroy each such owner; unconfirmed death
                 # remains registry/reaper-owned.
                 await self._cleanup_reservation_owners(reservation, release_admission=True)
-                if not await self._reservation_is_retained(reservation):
+                if not self._reservation_is_retained(reservation):
                     await _await_cancellation_safe(self._admission.release(reservation))
                 raise
 
-    async def _reservation_is_retained(self, reservation: ResourceReservation) -> bool:
+    def _reservation_is_retained(self, reservation: ResourceReservation) -> bool:
         """Whether a VM or pending launch still owns a reservation."""
-        async with self._vms_lock:
-            retained_by_vm = any(
-                vm.holds_admission_slot and vm.resource_reservation is reservation for vm in self._vms.values()
-            )
-        return retained_by_vm or any(pending.reservation is reservation for pending in self._pending_launches.values())
+        return any(vm.resource_reservation is reservation for vm in self._vms.values()) or any(
+            pending.reservation is reservation for pending in self._pending_launches.values()
+        )
 
     async def _cleanup_reservation_owners(
         self,
@@ -682,10 +727,7 @@ class VmManager:
         release_admission: bool,
     ) -> None:
         """Destroy every resource owner published under one reservation."""
-        async with self._vms_lock:
-            retained_vms = [
-                vm for vm in self._vms.values() if vm.holds_admission_slot and vm.resource_reservation is reservation
-            ]
+        retained_vms = [vm for vm in self._vms.values() if vm.resource_reservation is reservation]
         retained_pending = [
             pending for pending in self._pending_launches.values() if pending.reservation is reservation
         ]
@@ -731,6 +773,11 @@ class VmManager:
 
         Yields:
             QemuVM ready for use
+
+        Raises:
+            What create_vm raises. After a clean exit: InternalError CLEANUP_UNCONFIRMED
+            (the end of QEMU or gvproxy was not confirmed), ConfigError HOST_DEPENDENCY
+            (direct_write_target could not be taken back from qemu-vm: _take_back_drive)
         """
         vm = await self.create_vm(
             spec,
@@ -743,6 +790,8 @@ class VmManager:
             retry_profile=retry_profile,
             mem_path=mem_path,
             mem_path_share=mem_path_share,
+            on_boot_log=None,
+            reservation=None,
         )
         primary_error: BaseException | None = None
         try:
@@ -781,15 +830,15 @@ class VmManager:
         *,
         tenant_id: str,
         task_id: str,
-        direct_write_target: Path | None = None,
-        expose_ports: list[ExposedPort] | None = None,
-        on_boot_log: Callable[[str], None] | None = None,
-        snapshot_drive: Path | None = None,
+        direct_write_target: Path | None,
+        expose_ports: list[ExposedPort] | None,
+        on_boot_log: Callable[[str], None] | None,
+        snapshot_drive: Path | None,
         cache_leases: tuple[EntryLease, ...],
-        reservation: ResourceReservation | None = None,
-        retry_profile: constants.RetryProfile = constants.RETRY_USER_FACING,
-        mem_path: str | None = None,
-        mem_path_share: bool = False,
+        reservation: ResourceReservation | None,
+        retry_profile: constants.RetryProfile,
+        mem_path: str | None,
+        mem_path_share: bool,
     ) -> QemuVM:
         """Create and boot QEMU microVM with automatic retry on transient failures.
 
@@ -822,7 +871,8 @@ class VmManager:
             reservation: Pre-acquired admission reservation from reservation_context().
                 When provided, skips admission acquire (caller owns the reservation).
                 When None, acquires its own reservation.
-            retry_profile: Retry parameters for boot (default: RETRY_USER_FACING).
+            retry_profile: Retry parameters for boot (RETRY_USER_FACING for a caller that waits,
+                RETRY_BACKGROUND for a pool refill).
             mem_path: File that backs guest RAM (L1 template save), or None
             mem_path_share: Whether QEMU writes guest RAM to mem_path (share=on)
 
@@ -830,9 +880,15 @@ class VmManager:
             QemuVM handle for code execution
 
         Raises:
-            TransientError: VM creation failed (retried, then re-raised; VM_BOOT_TIMEOUT
-                when the guest never became ready)
-            SandboxError: VM creation failed (not retryable)
+            TransientError: a boot attempt failed on each of retry_profile.max_attempts
+                (VM_BOOT_TIMEOUT: the guest never became ready; QEMU_CRASHED,
+                OVERLAY_FAILED, GVPROXY_FAILED, LOCAL_DISK); CAPACITY or LOCAL_DISK from
+                admission (no retry: reservation_context)
+            SandboxError: not retried: InvalidInputError SCHEDULER_STATE, RouteError
+                CAPACITY_NEVER_FITS, ConfigError (_create_vm_impl), InternalError INTERNAL
+                or CLEANUP_UNCONFIRMED
+            ValueError: tenant_id or task_id is empty, longer than 128 characters, or has
+                characters other than [a-zA-Z0-9_-]
         """
         async with self._launch_operation():
             if reservation is not None:
@@ -963,10 +1019,14 @@ class VmManager:
                 than [a-zA-Z0-9_-]
             InvalidInputError: SCHEDULER_STATE: start() was not called
             ConfigError: ASSET_NOT_FOUND: missing kernel or initramfs; HOST_DEPENDENCY:
-                missing qemu-vm user, qemu-vm could not get access to the home disk, or
-                QEMU runs as qemu-vm and the VM got no cgroup v2
+                missing qemu-vm user, qemu-vm could not get access to the overlay, the
+                base image, the VM folder or the home disk, the VM cgroup could not be
+                made, or QEMU runs as qemu-vm and the VM got no cgroup v2
             TransientError: OVERLAY_FAILED: overlay creation failed; LOCAL_DISK: the
-                home disk, or the record of the working folder or cgroup, could not be made
+                working folder, the home disk, or the record of the working folder or cgroup,
+                could not be made
+            InternalError: CLEANUP_UNCONFIRMED: the cleanup of the failed setup was not
+                confirmed
         """
         _validate_identifier(tenant_id, "tenant_id")
         _validate_identifier(task_id, "task_id")
@@ -1075,7 +1135,7 @@ class VmManager:
             else:
                 expected_uid = os.getuid()
 
-            channel: GuestChannel = DualPortChannel(
+            channel = DualPortChannel(
                 workdir.cmd_socket,
                 workdir.event_socket,
                 expected_uid=expected_uid,
@@ -1271,13 +1331,11 @@ class VmManager:
             gvproxy_proc=gvproxy_proc,
             qemu_log_task=qemu_log_task,
             gvproxy_log_task=gvproxy_log_task,
-            release_callback=self.destroy_vm,
         )
 
         # Process launch transfers admission ownership immediately, not only
         # after guest readiness. A boot/restore failure can still leave a live
         # QEMU process whose reservation must remain held until confirmed death.
-        vm.holds_admission_slot = True
         vm.resource_reservation = reservation
         vm.cache_leases, pending.cache_leases = pending.cache_leases, ()
         vm.base_image_digest, vm.packages_image_digest = base_digest, packages_digest
@@ -1306,7 +1364,7 @@ class VmManager:
         """Publish the single pre-QemuVM owner for one launch attempt.
 
         Called once per attempt from _setup_vm_infra, which mints a fresh
-        uuid4-suffixed vm_id, so the key is always new — no refine path.
+        uuid4-suffixed vm_id, so the key is always new.
         """
         pending = _PendingLaunch(
             vm_id=vm_id,
@@ -1329,11 +1387,10 @@ class VmManager:
                 when process death is not confirmed; the owner keeps the reservation
                 and the reaper retries.
         """
-        async with self._vms_lock:
-            vm = self._vms.get(vm_id)
+        vm = self._vms.get(vm_id)
         if vm is not None:
             confirmed = await self.destroy_vm(vm, _release_admission=False)
-            retained = vm.holds_admission_slot
+            retained = vm.resource_reservation is not None
         elif (pending := self._pending_launches.get(vm_id)) is not None:
             confirmed = await self._cleanup_pending_launch(pending, _release_admission=False)
             retained = pending.reservation is not None
@@ -1442,7 +1499,8 @@ class VmManager:
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
             reservation: Pre-acquired admission reservation with effective limits
-            direct_write_target: If set, path to ext4 qcow2 for snapshot creation.
+            direct_write_target: If set, path to ext4 qcow2 for snapshot creation
+                (never with snapshot_drive).
             expose_ports: List of ports to expose from guest to host.
             on_boot_log: Optional callback for streaming boot console output.
             snapshot_drive: Path to ext4 qcow2 snapshot (serial=snap, read-only).
@@ -1455,25 +1513,18 @@ class VmManager:
             QemuVM handle for code execution
 
         Raises:
-            InternalError: INTERNAL: invalid configuration (mutually exclusive args)
+            InternalError: CLEANUP_UNCONFIRMED: the failed attempt's QEMU may still run
             ConfigError: ASSET_NOT_FOUND: missing kernel, initramfs or base image;
-                HOST_DEPENDENCY: missing QEMU, gvproxy-wrapper or qemu-vm user, or QEMU runs
-                as qemu-vm and the VM got no cgroup v2
+                HOST_DEPENDENCY: missing QEMU, gvproxy-wrapper or qemu-vm user, QEMU runs
+                as qemu-vm and the VM got no cgroup v2, or this process may not connect
+                to the guest sockets
             TransientError: OVERLAY_FAILED (overlay creation failed), QEMU_CRASHED
                 (QEMU crashed during startup), VM_BOOT_TIMEOUT (guest agent not ready
-                in time), GVPROXY_FAILED (gvproxy startup failed)
+                in time), GVPROXY_FAILED (gvproxy startup failed), LOCAL_DISK (the home
+                disk could not be made, or QEMU paused the VM on a full host disk)
+            Also what _setup_vm_infra raises (ValueError, SCHEDULER_STATE).
         """
         start_time = asyncio.get_running_loop().time()
-
-        # Validate mutual exclusivity (create-specific)
-        if snapshot_drive and direct_write_target:
-            raise InternalError(
-                "snapshot_drive and direct_write_target are mutually exclusive",
-                code=ErrorCode.INTERNAL,
-                context=None,
-                hint=None,
-                instance_id=None,
-            )
 
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
         infra = await self._setup_vm_infra(
@@ -1510,6 +1561,8 @@ class VmManager:
                 mem_path=mem_path,
                 mem_path_share=mem_path_share,
                 guest_port_fds=_listener_fds(listeners),
+                defer_incoming=False,
+                qmp_fd=None,
             )
             qemu_cmd_build_ms = round((asyncio.get_running_loop().time() - cmd_started) * 1000)
         except BaseException as error:
@@ -1574,7 +1627,7 @@ class VmManager:
 
                 await vm.transition_state(VmState.READY)
             except TimeoutError as e:
-                diag = await vm.collect_diagnostics()
+                diag = vm.collect_diagnostics()
                 # The console (QEMU output, kernel, init) goes in the context, never the
                 # message: str(error) is one line.
                 context = {
@@ -1646,7 +1699,7 @@ class VmManager:
             tenant_id: Tenant identifier
             task_id: Task identifier
             vmstate_path: Migration file. Its home disk must sit next to it with
-                the .home suffix (MemorySnapshotManager.home_path_from_vmstate);
+                the .home suffix (memory_snapshot_files.home_path_from_vmstate);
                 it is cloned as the VM's home disk.
             base_image: Backing file of the overlay (for a saved instance: the
                 image with the saved digest)
@@ -1662,13 +1715,16 @@ class VmManager:
 
         Raises:
             TransientError: Restore failed (retryable): LOCAL_DISK, QEMU_CRASHED,
-                MIGRATION_FAILED (its cause chain holds MIGRATION_REJECTED or
-                MIGRATION_UNSUPPORTED when QEMU refused the state),
-                GUEST_SILENT_AFTER_RESTORE, GUEST_UNAVAILABLE (the guest channel failed)
+                OVERLAY_FAILED, GVPROXY_FAILED, MIGRATION_FAILED (its cause chain holds
+                MIGRATION_REJECTED when QEMU refused the state, MIGRATION_UNSUPPORTED when
+                this QEMU cannot load VM state), GUEST_SILENT_AFTER_RESTORE,
+                GUEST_UNAVAILABLE (the guest channel failed)
             ConfigError: ASSET_NOT_FOUND: missing kernel or initramfs; HOST_DEPENDENCY:
-                QEMU cannot run, or qemu-vm could not get access to a file or a cgroup
+                QEMU or gvproxy-wrapper cannot run, or qemu-vm could not get access to a
+                file or a cgroup
             InternalError: CLEANUP_UNCONFIRMED: the failed restore's QEMU may still run
                 (it keeps the reservation)
+            Also what _setup_vm_infra raises (ValueError, SCHEDULER_STATE).
         """
         async with self._launch_operation():
             start_time = asyncio.get_running_loop().time()
@@ -1718,7 +1774,7 @@ class VmManager:
     ) -> QemuVM:
         """Restore VM with an already-acquired reservation. Ownership transfers to VM on success."""
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
-        home_template = MemorySnapshotManager.home_path_from_vmstate(vmstate_path)
+        home_template = home_path_from_vmstate(vmstate_path)
         if not home_template.exists():
             raise TransientError(
                 f"L1 home disk missing (evicted?): {home_template}",
@@ -1735,8 +1791,8 @@ class VmManager:
         # VM Templating: check metadata to see if save used template mode.
         # Template restore only when the save skipped RAM: the RAM template exists
         # and the metadata says use_template=True.
-        ram_path = MemorySnapshotManager.ram_path_from_vmstate(vmstate_path)
-        meta_path = vmstate_path.with_suffix(".vmstate.meta")
+        ram_path = ram_path_from_vmstate(vmstate_path)
+        meta_path = meta_path_from_vmstate(vmstate_path)
 
         # qemu-vm reads the saved state (and the RAM template) by ACL: the host owns
         # them, whichever QEMU saved them; then the snapshot drive, if present.
@@ -1798,6 +1854,8 @@ class VmManager:
                 guest_port_fds=_listener_fds(listeners),
                 mem_path=mem_path_str,
                 mem_path_share=False,  # Clone: MAP_PRIVATE (COW)
+                direct_write=False,
+                debug_boot=False,
             )
 
             # Phase 4: Start gvproxy if network topology requires it
@@ -1877,7 +1935,7 @@ class VmManager:
             except Exception as e:
                 # Check if QEMU died — provides a more informative error
                 _check_qemu_alive()
-                diag = await vm.collect_diagnostics()
+                diag = vm.collect_diagnostics()
                 logger.error(
                     "L1 restore failed",
                     extra={**asdict(diag), "vmstate_path": str(vmstate_path)},
@@ -1893,7 +1951,7 @@ class VmManager:
             # Connect guest channel with reconnection probe.
             # L1 restore needs probing because the virtio-serial chardev was connected
             # at save time — the restored VM needs the host to re-sync the connection.
-            infra.channel._has_been_connected = True  # type: ignore[attr-defined]  # noqa: SLF001
+            infra.channel.mark_restored()
             try:
                 await infra.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
             except (TimeoutError, OSError) as e:  # no answer, or QEMU closed its port (it stopped)
@@ -1958,11 +2016,12 @@ class VmManager:
 
     async def _force_cleanup_all_resources(
         self,
+        *,
         vm_id: str,
-        qemu_proc: ProcessWrapper | None = None,
-        gvproxy_proc: ProcessWrapper | None = None,
-        workdir: VmWorkingDirectory | None = None,
-        vm_cgroup: Cgroup | None = None,
+        qemu_proc: ProcessWrapper | None,
+        gvproxy_proc: ProcessWrapper | None,
+        workdir: VmWorkingDirectory,
+        vm_cgroup: Cgroup | None,
     ) -> dict[str, bool]:
         """Comprehensive cleanup of ALL VM resources in reverse dependency order.
 
@@ -1973,7 +2032,7 @@ class VmManager:
         - Raises only CancelledError (the shielded work goes on); other errors are
           logged and give False for their resource
         - Safe to call multiple times (idempotent)
-        - Handles None/already-cleaned resources
+        - Handles absent (None) or already-cleaned resources
         - Returns status dict for monitoring/debugging
 
         Cleanup order (reverse dependencies):
@@ -1988,9 +2047,9 @@ class VmManager:
 
         Args:
             vm_id: VM identifier for logging
-            qemu_proc: QEMU subprocess (can be None)
-            gvproxy_proc: gvproxy subprocess (can be None)
-            workdir: VM working directory containing all temp files (can be None)
+            qemu_proc: QEMU subprocess (None: not spawned)
+            gvproxy_proc: gvproxy subprocess (None: not spawned, or none needed)
+            workdir: VM working directory containing all temp files
             vm_cgroup: the VM cgroup (None: the VM has none)
 
         Returns:
@@ -2004,8 +2063,7 @@ class VmManager:
         # caller keeps the registry and emergency ownership for a new attempt.
         process_results = await asyncio.shield(
             asyncio.gather(
-                # No working folder: no known identity, SIGTERM as for qemu-vm
-                _stop_qemu(qemu_proc, vm_id=vm_id, as_qemu_vm=workdir is None or workdir.use_qemu_vm_user),
+                _stop_qemu(qemu_proc, vm_id=vm_id, as_qemu_vm=workdir.use_qemu_vm_user),
                 cleanup_process(
                     proc=gvproxy_proc,
                     name="gvproxy",
@@ -2033,11 +2091,6 @@ class VmManager:
 
         # Phase 2: Cleanup workdir and cgroup in parallel (after processes dead)
         # workdir.cleanup() removes the home disk, then the overlay and sockets in one rmtree
-        async def cleanup_workdir() -> bool:
-            if workdir is None:
-                return True
-            return await workdir.cleanup()
-
         async def remove_cgroup() -> bool:
             return vm_cgroup is None or await vm_cgroup.remove()
 
@@ -2054,7 +2107,7 @@ class VmManager:
             # Shield file cleanup from cancellation to ensure resources are fully released
             file_results = await asyncio.shield(
                 asyncio.gather(
-                    cleanup_workdir(),
+                    workdir.cleanup(),
                     remove_cgroup(),
                     return_exceptions=True,
                 )
@@ -2065,7 +2118,7 @@ class VmManager:
             if results["cgroup"] and self._run_dir is not None:
                 with suppress(OSError):
                     self._run_dir.forget_cgroup(vm_id)
-            if results["workdir"] and workdir is not None and self._run_dir is not None:
+            if results["workdir"] and self._run_dir is not None:
                 with suppress(OSError):
                     self._run_dir.forget_folder(workdir.path.name)
 
@@ -2205,7 +2258,6 @@ class VmManager:
                     if processes_destroyed and not _release_admission:
                         # The caller keeps the reservation (a failed attempt it may
                         # retry): the processes are dead, the reaper only removes files.
-                        vm.holds_admission_slot = False
                         vm.resource_reservation = None
 
         except (asyncio.CancelledError, Exception):
@@ -2221,13 +2273,10 @@ class VmManager:
             async def commit_cleanup() -> None:
                 # Admission is released before the VM is unpublished. No await
                 # may follow clearing the ownership fields.
-                if vm.holds_admission_slot and vm.resource_reservation is not None and _release_admission:
+                if vm.resource_reservation is not None and _release_admission:
                     await self._admission.release(vm.resource_reservation)
-                async with self._vms_lock:
-                    self._vms.pop(vm.vm_id, None)
-                    if vm.holds_admission_slot:
-                        vm.holds_admission_slot = False
-                        vm.resource_reservation = None
+                self._vms.pop(vm.vm_id, None)
+                vm.resource_reservation = None
 
             # A cancel comes out only once commit_cleanup completed (await_cancellation_safe)
             try:
@@ -2294,9 +2343,12 @@ class VmManager:
         TransientError (LOCAL_DISK) when the file cannot be made, ConfigError
         (HOST_DEPENDENCY) when qemu-vm cannot get access to it.
         """
+        # Worker-thread jobs that end before a cancel comes out (run_to_end; a clone stops at
+        # its next chunk and removes its partial disk, run_stoppable): the cleanup of the launch
+        # that follows removes the disk, which a job still running would make after it
         try:
             if home_template is None:
-                await asyncio.to_thread(create_sparse, workdir.home_disk, spec.disk_mb * 1024 * 1024)
+                await run_to_end(functools.partial(create_sparse, workdir.home_disk, spec.disk_mb * 1024 * 1024))
             else:
                 # A copy-on-write clone shares its blocks with the template until the guest
                 # overwrites them. Noted before the file exists, so no gate 4 probe meanwhile
@@ -2305,7 +2357,9 @@ class VmManager:
                 self._admission.note_shared_blocks(workdir.home_disk.name, allocated_bytes(home_template.stat()))
                 cloned = False
                 try:
-                    cloned = await asyncio.to_thread(clone_sparse, home_template, workdir.home_disk)
+                    cloned = await run_stoppable(
+                        lambda stop: clone_sparse(home_template, workdir.home_disk, stop=stop), undo=None
+                    )
                 finally:
                     if not cloned:
                         self._admission.forget_shared_blocks(workdir.home_disk.name)
@@ -2324,7 +2378,7 @@ class VmManager:
         # L1 and deletes it without sudo); no account except this user and
         # qemu-vm can read it. Every QEMU shares the qemu-vm uid: see the TODO
         # (security) in qemu_cmd.py.
-        if workdir.use_qemu_vm_user and not await grant_qemu_vm_private_file_access(workdir.home_disk):
+        if workdir.use_qemu_vm_user and not await grant_qemu_vm_acl([workdir.home_disk], perms="rw"):
             raise _host_dependency(
                 "Could not give qemu-vm read-write access to the home disk (needs setfacl, package acl)",
                 context={"vm_id": workdir.vm_id, "home_disk": str(workdir.home_disk)},

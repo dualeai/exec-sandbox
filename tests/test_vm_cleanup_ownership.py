@@ -45,7 +45,6 @@ def _vm(manager: VmManager, reservation: object) -> MagicMock:
     vm.vm_id = "attempt-vm"
     vm.qemu_log_task = None
     vm.gvproxy_log_task = None
-    vm.holds_admission_slot = True
     vm.resource_reservation = reservation
     vm.state = VmState.BOOTING
     vm.begin_destroy = AsyncMock()
@@ -97,8 +96,8 @@ class TestFailedAttemptOwnership:
 
         await manager._cleanup_failed_owner(vm.vm_id, operation="boot_failure_cleanup", error=RuntimeError("boot"))  # pyright: ignore[reportPrivateUsage]
 
-        assert (vm.holds_admission_slot, vm.resource_reservation) == (False, None)
-        assert not await manager._reservation_is_retained(reservation)  # pyright: ignore[reportPrivateUsage]
+        assert vm.resource_reservation is None
+        assert not manager._reservation_is_retained(reservation)  # pyright: ignore[reportPrivateUsage]
         assert manager._vms[vm.vm_id] is vm  # pyright: ignore[reportPrivateUsage]  # the reaper owns the files
         manager.reapers[0].assert_called_once_with(vm)  # type: ignore[attr-defined]
         manager.release.assert_not_awaited()  # type: ignore[attr-defined]
@@ -125,7 +124,7 @@ class TestFailedAttemptOwnership:
         await manager._cleanup_failed_owner("pending-vm", operation="pre_boot_cleanup", error=RuntimeError("x"))  # pyright: ignore[reportPrivateUsage]
 
         assert pending.reservation is None
-        assert not await manager._reservation_is_retained(reservation)  # pyright: ignore[reportPrivateUsage]
+        assert not manager._reservation_is_retained(reservation)  # pyright: ignore[reportPrivateUsage]
         manager.reapers[1].assert_called_once_with(pending)  # type: ignore[attr-defined]
 
         cleanup_results.update(_ALL_DONE)
@@ -140,7 +139,7 @@ class TestFailedAttemptOwnership:
         vm = _vm(manager, reservation)
         with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED):
             await manager._cleanup_failed_owner(vm.vm_id, operation="boot_failure_cleanup", error=RuntimeError("b"))  # pyright: ignore[reportPrivateUsage]
-        assert (vm.holds_admission_slot, vm.resource_reservation) == (True, reservation)
+        assert vm.resource_reservation is reservation
 
     async def test_normal_destroy_keeps_the_slot_until_files_are_gone(
         self, manager: VmManager, cleanup_results: dict[str, bool]
@@ -150,7 +149,7 @@ class TestFailedAttemptOwnership:
         reservation = MagicMock()
         vm = _vm(manager, reservation)
         assert await manager.destroy_vm(vm) is False
-        assert (vm.holds_admission_slot, vm.resource_reservation) == (True, reservation)
+        assert vm.resource_reservation is reservation
 
 
 class TestEphemeralVm:
@@ -165,7 +164,7 @@ class TestEphemeralVm:
         vm.state = state
         with (
             patch.object(unit_test_vm_manager, "create_vm", new_callable=AsyncMock, return_value=vm),
-            patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=False),
+            patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=False) as destroy,
         ):
 
             async def run() -> None:
@@ -187,6 +186,7 @@ class TestEphemeralVm:
                     await run()
             else:
                 await run()
+        destroy.assert_awaited_once_with(vm)
 
 
 class TestCgroupDrain:
@@ -284,11 +284,15 @@ class TestRestoreGrants:
         return vmstate
 
     @staticmethod
-    async def _restore(manager: VmManager, vmstate: Path, *, granted: bool) -> tuple[list[Any], AsyncMock]:
+    async def _restore(
+        manager: VmManager, vmstate: Path, *, granted: bool
+    ) -> tuple[list[tuple[list[Path], str]], AsyncMock, BaseException]:
+        """restore_vm as a qemu-vm QEMU, up to the QEMU command build (it raises there).
+        Returns (the ACL grants asked, the build, the error restore_vm raised)."""
         infra = MagicMock()
         infra.vm_id = "restore-vm"
         infra.workdir.use_qemu_vm_user = True
-        grants: list[Any] = []
+        grants: list[tuple[list[Path], str]] = []
 
         async def grant(paths: list[Path], *, perms: str) -> bool:
             grants.append((list(paths), perms))
@@ -314,18 +318,18 @@ class TestRestoreGrants:
                 expose_ports=None,
                 reservation=MagicMock(),
             )
-        grants.append(exc_info.value)
-        return grants, build
+        return grants, build, exc_info.value
 
     @pytest.mark.parametrize("use_template", [True, False])
     async def test_state_files_get_read_before_qemu_starts(
         self, unit_test_vm_manager: VmManager, tmp_path: Path, use_template: bool
     ) -> None:
         vmstate = self._entry(tmp_path, use_template=use_template)
-        grants, build = await self._restore(unit_test_vm_manager, vmstate, granted=True)
+        grants, build, error = await self._restore(unit_test_vm_manager, vmstate, granted=True)
         files = [vmstate, vmstate.with_suffix(".ram")] if use_template else [vmstate]
-        assert grants[:-1] == [(files, "r")]
+        assert grants == [(files, "r")]
         build.assert_awaited_once()
+        assert (type(error), str(error)) == (RuntimeError, "stop after the grants")
 
     async def test_no_access_is_host_dependency_before_qemu_starts(
         self, unit_test_vm_manager: VmManager, tmp_path: Path
@@ -333,8 +337,8 @@ class TestRestoreGrants:
         """No QEMU that dies at `migrate-incoming` with EACCES: the restore stops before it
         (the L1 layer then cold boots and keeps the entry)."""
         vmstate = self._entry(tmp_path, use_template=True)
-        grants, build = await self._restore(unit_test_vm_manager, vmstate, granted=False)
-        error = grants[-1]
+        grants, build, error = await self._restore(unit_test_vm_manager, vmstate, granted=False)
+        assert grants == [([vmstate, vmstate.with_suffix(".ram")], "r")]
         assert isinstance(error, ConfigError)
         assert error.code is ErrorCode.HOST_DEPENDENCY
         build.assert_not_awaited()

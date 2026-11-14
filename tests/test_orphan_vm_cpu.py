@@ -3,18 +3,17 @@
 These tests verify that orphan VMs (VMs where the host disconnected without
 proper cleanup) consume minimal CPU instead of busy-looping at 100%.
 
-The fix involves two components:
-1. qemu_vm.py: QemuVM.destroy() ends the QEMU and gvproxy processes
+Two components keep it idle:
+1. vm_manager.py: VmManager.destroy_vm() ends the QEMU and gvproxy processes
 2. guest-agent: Detects EPOLLHUP on virtio-serial disconnect and backs off
 
 Background:
 - When host disconnects from virtio-serial, kernel returns POLLHUP immediately
 - Without backoff, guest-agent would busy-loop consuming 100% CPU
-- With the fix, guest-agent uses exponential backoff (50ms -> 1s) allowing
-  the CPU to enter WFI (Wait For Interrupt) idle state
+- The guest agent backs off exponentially (50ms -> 1s), so the CPU can enter
+  WFI (Wait For Interrupt) idle state
 
-These tests intentionally orphan VMs to verify the fix works under various
-scenarios including:
+These tests orphan VMs on purpose, in these cases:
 - Single orphan over ~15 s (no destroy called)
 - Orphan with network (gvproxy)
 - Multiple concurrent orphans
@@ -26,6 +25,7 @@ from typing import TYPE_CHECKING
 import psutil
 import pytest
 
+from exec_sandbox import constants
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.vm_manager import VmManager
@@ -70,6 +70,14 @@ class TestOrphanVmCpu:
             tenant_id="test-orphan-net",
             task_id="idle-net-test",
             cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -108,6 +116,14 @@ class TestOrphanVmCpu:
                     tenant_id="test-multi-orphan",
                     task_id=f"vm-{i}",
                     cache_leases=(),
+                    direct_write_target=None,
+                    expose_ports=None,
+                    on_boot_log=None,
+                    snapshot_drive=None,
+                    reservation=None,
+                    retry_profile=constants.RETRY_USER_FACING,
+                    mem_path=None,
+                    mem_path_share=False,
                 )
                 for i in range(num_vms)
             ]
@@ -142,6 +158,14 @@ class TestOrphanVmCpu:
             tenant_id="test-orphan-time",
             task_id="extended-test",
             cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -162,7 +186,7 @@ class TestOrphanVmCpu:
 @pytest.mark.asyncio
 @pytest.mark.slow
 class TestDestroyProcessCleanup:
-    """Tests for QemuVM.destroy() process termination.
+    """Tests for VmManager.destroy_vm() process termination.
 
     Slow under TCG: process kill correctness tests — OS-level, not
     speed-dependent, but VM boot overhead makes them too slow for
@@ -170,12 +194,20 @@ class TestDestroyProcessCleanup:
     """
 
     async def test_destroy_kills_qemu_process(self, vm_manager: VmManager) -> None:
-        """QemuVM.destroy() should terminate the QEMU process."""
+        """VmManager.destroy_vm() should terminate the QEMU process."""
         vm = await vm_manager.create_vm(
             VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-destroy",
             task_id="kill-test",
             cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -183,17 +215,25 @@ class TestDestroyProcessCleanup:
         # Verify process is running
         assert is_process_alive(vm.process), "QEMU should be running before destroy"
 
-        # destroy() returns once the process is gone: no wait after it
-        assert await vm.destroy() is True
+        # destroy_vm() returns once the process is gone: no wait after it
+        assert await vm_manager.destroy_vm(vm) is True
         assert not is_process_alive(vm.process), "QEMU process should be dead after destroy"
 
     async def test_destroy_kills_gvproxy_process(self, vm_manager: VmManager) -> None:
-        """QemuVM.destroy() should terminate the gvproxy process."""
+        """VmManager.destroy_vm() should terminate the gvproxy process."""
         vm = await vm_manager.create_vm(
             VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=True, allowed_domains=("example.com",)),
             tenant_id="test-destroy-net",
             task_id="kill-gvproxy-test",
             cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -204,7 +244,7 @@ class TestDestroyProcessCleanup:
         assert is_process_alive(vm.process), "QEMU should be running"
         assert is_process_alive(vm.gvproxy_proc), "gvproxy should be running"
 
-        # destroy() returns once both processes are gone: no wait after it
-        assert await vm.destroy() is True
+        # destroy_vm() returns once both processes are gone: no wait after it
+        assert await vm_manager.destroy_vm(vm) is True
         assert not is_process_alive(vm.process), "QEMU should be dead"
         assert not is_process_alive(vm.gvproxy_proc), "gvproxy should be dead"
