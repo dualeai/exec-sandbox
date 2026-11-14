@@ -2,7 +2,8 @@
 
 Two categories:
 - fingerprint(): SHA-256 cache keys with a canonical, separator-free encoding
-- SHA256: Cryptographic hashes for file integrity verification
+- file_hash, parse_hash_spec: cryptographic hashes that check the integrity of a
+  file (asset downloads)
 """
 
 from __future__ import annotations
@@ -47,44 +48,6 @@ def fingerprint(*parts: str) -> str:
 # =============================================================================
 
 
-class IncrementalHasher:
-    """Incremental hasher for streaming hash computation.
-
-    Use when you need to compute hash while processing data (e.g., during download).
-
-    Example:
-        hasher = IncrementalHasher("sha256")
-        for chunk in stream:
-            hasher.update(chunk)
-            process(chunk)
-        digest = hasher.hexdigest()
-    """
-
-    def __init__(self, algorithm: str = "sha256") -> None:
-        """Initialize incremental hasher.
-
-        Args:
-            algorithm: Hash algorithm (default: sha256)
-        """
-        self._hasher = hashlib.new(algorithm)
-
-    def update(self, data: bytes) -> None:
-        """Update hash with data chunk.
-
-        Args:
-            data: Bytes to add to hash
-        """
-        self._hasher.update(data)
-
-    def hexdigest(self) -> str:
-        """Return hex digest of all data added so far.
-
-        Returns:
-            Hex digest string
-        """
-        return self._hasher.hexdigest()
-
-
 async def file_hash(path: Path, algorithm: str = "sha256") -> str:
     """Compute cryptographic hash of a file asynchronously.
 
@@ -114,6 +77,9 @@ def parse_hash_spec(hash_spec: str) -> tuple[str, str]:
 
     Returns:
         Tuple of (algorithm, expected_digest)
+
+    Raises:
+        ValueError: `hash_spec` has no ':'
 
     Example:
         >>> parse_hash_spec("sha256:abc123")
