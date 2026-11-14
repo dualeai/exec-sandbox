@@ -20,6 +20,9 @@ CVE references per subsystem:
 - userfaultfd: used as race condition primitive in many kernel UAF exploits
 - KVM: CVE-2025-40300 (VMSCAPE Spectre-BTI guest-to-host memory leak)
 
+The shipped kernel (images/kernel/exec-sandbox.config) and the guest agent's sysctls fix
+each outcome: each test asserts that one outcome, so a config regression fails it.
+
 Test categories:
 - Normal: verify sysctls and kernel settings that restrict attack surface
 - Edge: attempt operations that exploit these subsystems
@@ -47,7 +50,7 @@ class TestEbpfRestricted:
     """
 
     async def test_bpf_syscall_blocked(self, dual_scheduler: Scheduler) -> None:
-        """bpf() syscall returns EPERM for unprivileged user.
+        """bpf() syscall returns ENOSYS: CONFIG_BPF_SYSCALL=n.
 
         CVE-2020-8835: eBPF verifier fails to restrict register values,
         enabling arbitrary kernel memory read/write. Pwn2Own 2020.
@@ -65,14 +68,11 @@ print(f"ret={ret} errno={err}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # EPERM=1 or ENOSYS=38 (both acceptable — blocked or syscall unavailable)
-        errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
-        assert errno_val in {1, 38}, (
-            f"Expected bpf() EPERM(1) or ENOSYS(38), got errno={errno_val}. stdout: {result.stdout}"
-        )
+        assert result.stdout.strip() == "ret=-1 errno=38"  # ENOSYS
 
     async def test_bpf_jit_harden_sysctl(self, dual_scheduler: Scheduler) -> None:
-        """net.core.bpf_jit_harden should be 2 (hardened for all).
+        """net.core.bpf_jit_harden is root-only (mode 0600): UID 1000 can neither read nor change
+        it (the guest agent sets 2, hardened for all).
 
         CVE-2024-56615: eBPF DEVMAP integer overflow. JIT hardening blinds
         constants in BPF JIT output, preventing JIT spraying attacks.
@@ -89,10 +89,7 @@ except PermissionError:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        assert "VALUE:2" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
-            f"Expected bpf_jit_harden=2. stdout: {stdout}"
-        )
+        assert result.stdout.strip() == "PERM_DENIED", f"Expected a root-only sysctl. stdout: {result.stdout}"
 
     async def test_unprivileged_bpf_disabled_sysctl(self, dual_scheduler: Scheduler) -> None:
         """The eBPF-specific unprivileged-BPF sysctl must not exist.
@@ -133,7 +130,7 @@ class TestIoUringDisabled:
     """
 
     async def test_io_uring_setup_returns_enosys(self, dual_scheduler: Scheduler) -> None:
-        """io_uring_setup() returns ENOSYS (compiled out) or succeeds (stock kernel)."""
+        """io_uring_setup() returns ENOSYS: CONFIG_IO_URING=n."""
         code = """\
 import ctypes
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -150,16 +147,10 @@ print(f"ret={ret} errno={err}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        ret_val = int(stdout.split("ret=")[1].split()[0])
-        errno_val = int(stdout.rsplit("errno=", 1)[1])
-        # ENOSYS=38 (compiled out) or success (stock kernel without our config)
-        assert ret_val >= 0 or errno_val == 38, (
-            f"io_uring_setup should return ENOSYS(38) or succeed, got ret={ret_val} errno={errno_val}. stdout: {stdout}"
-        )
+        assert result.stdout.strip() == "ret=-1 errno=38"  # ENOSYS
 
     async def test_io_uring_invalid_params_returns_enosys(self, dual_scheduler: Scheduler) -> None:
-        """io_uring_setup(0, &params) returns ENOSYS (compiled out) or EINVAL (stock kernel)."""
+        """io_uring_setup(0, &params) returns ENOSYS too: no argument check runs (compiled out)."""
         code = """\
 import ctypes
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -174,10 +165,7 @@ print(f"ret={ret} errno={err}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        errno_val = int(stdout.rsplit("errno=", 1)[1])
-        # ENOSYS=38 (compiled out) or EINVAL=22 (stock kernel, reaches validation)
-        assert errno_val in {22, 38}, f"Expected ENOSYS(38) or EINVAL(22), got errno={errno_val}. stdout: {stdout}"
+        assert result.stdout.strip() == "ret=-1 errno=38"  # ENOSYS, not EINVAL
 
 
 # =============================================================================
@@ -187,71 +175,53 @@ class TestNfTablesRestricted:
     """nf_tables use-after-free bugs enable root + container escape.
 
     CVE-2024-1086 ("Flipping Pages") was actively exploited by ransomware.
-    Mitigations: UID 1000 lacks CAP_NET_ADMIN, blocking nftables operations.
+    Mitigations: neither nf_tables nor nfnetlink (NETFILTER_NETLINK) is in the guest kernel,
+    and UID 1000 lacks CAP_NET_ADMIN.
     """
 
-    async def test_nftables_socket_blocked(self, dual_scheduler: Scheduler) -> None:
-        """Netlink nftables socket requires CAP_NET_ADMIN — blocked for UID 1000.
-
-        CVE-2024-1086: use-after-free in nf_tables nft_verdict_init(),
-        exploited by RansomHub and Akira ransomware groups.
-        """
-        code = """\
-import socket
-try:
-    # AF_NETLINK=16, SOCK_RAW=3, NETLINK_NETFILTER=12
-    s = socket.socket(16, 3, 12)
-    s.close()
-    print("SOCKET_CREATED")
-except PermissionError:
-    print("EPERM")
-except OSError as e:
-    print(f"ERROR:{e.errno}")
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        # Socket creation may succeed (AF_NETLINK doesn't always require CAP_NET_ADMIN).
-        # The real protection is that nftables operations fail without CAP_NET_ADMIN,
-        # tested in test_nftables_operation_blocked. Here we just verify no crash.
-        assert "EPERM" in stdout or "ERROR:" in stdout or "SOCKET_CREATED" in stdout, (
-            f"Unexpected nftables socket result. stdout: {stdout}"
-        )
-
     async def test_nftables_operation_blocked(self, dual_scheduler: Scheduler) -> None:
-        """nftables rule creation requires CAP_NET_ADMIN.
+        """No nftables request reaches the kernel: the NETLINK_NETFILTER socket cannot open
+        (EPROTONOSUPPORT, 93): nfnetlink is not built in (exec-sandbox.config).
 
-        CVE-2023-32233: use-after-free in nf_tables anonymous set handling.
+        CVE-2024-1086: use-after-free in nf_tables nft_verdict_init(), exploited by RansomHub
+        and Akira ransomware groups. CVE-2023-32233: use-after-free in nf_tables anonymous set
+        handling.
         """
         code = """\
-import ctypes, struct, platform
-libc = ctypes.CDLL("libc.so.6", use_errno=True)
-import socket
-
+import socket, struct
 try:
-    # AF_NETLINK=16, SOCK_RAW=3, NETLINK_NETFILTER=12
-    s = socket.socket(16, 3, 12)
-
-    # NFNL_SUBSYS_NFTABLES=10, NFT_MSG_NEWTABLE=0
-    # Try to create a netfilter table — requires CAP_NET_ADMIN
-    msg_type = (10 << 8) | 0  # NFNL_SUBSYS_NFTABLES << 8 | NFT_MSG_NEWTABLE
-    flags = 0x0001 | 0x0400  # NLM_F_REQUEST | NLM_F_CREATE
-    # Minimal netlink message header
-    nlmsg = struct.pack('=IHHII', 20, msg_type, flags, 1, 0)
-    s.sendto(nlmsg, (0, 0))
-    s.close()
-    print("SENT")
-except PermissionError:
-    print("EPERM")
+    s = socket.socket(16, 3, 12)  # AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER
 except OSError as e:
-    print(f"ERROR:{e.errno}")
+    print(f"SOCKET:{e.errno}")
+else:
+    msg_type = (10 << 8) | 0  # NFNL_SUBSYS_NFTABLES << 8 | NFT_MSG_NEWTABLE
+    flags = 0x0001 | 0x0004 | 0x0400  # NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE
+    # nlmsghdr (16 B), then nfgenmsg (family AF_INET, version 0, res_id 0); send() goes to the
+    # kernel (port 0): this Python has no AF_NETLINK address support for sendto()
+    s.send(struct.pack('=IHHII', 20, msg_type, flags, 1, 0) + struct.pack('=BBH', 2, 0, 0))
+    s.settimeout(5)
+    reply = s.recv(4096)
+    print(f"REPLY:{struct.unpack_from('=H', reply, 4)[0]}:{-struct.unpack_from('=i', reply, 16)[0]}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        # Operation should fail at socket creation or sendto
-        assert "SENT" not in result.stdout, (
-            f"nftables message was sent — expected EPERM or socket error. stdout: {result.stdout}"
-        )
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.strip() == "SOCKET:93", result.stdout  # EPROTONOSUPPORT
+
+    async def test_sctp_socket_blocked(self, dual_scheduler: Scheduler) -> None:
+        """SCTP (a long CVE history: CVE-2021-23133, CVE-2019-8956) is not in the guest kernel:
+        socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP) gives EPROTONOSUPPORT (93) on both arches
+        (IP_SCTP is =m in Alpine's x86 config, and MODULES=n would build it in)."""
+        code = """\
+import socket
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM, 132).close()  # IPPROTO_SCTP
+    print("opened")
+except OSError as e:
+    print(f"SOCKET:{e.errno}")
+"""
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.strip() == "SOCKET:93", result.stdout  # EPROTONOSUPPORT
 
 
 # =============================================================================
@@ -265,7 +235,8 @@ class TestAfPacketRestricted:
     """
 
     async def test_af_packet_socket_blocked(self, dual_scheduler: Scheduler) -> None:
-        """AF_PACKET socket requires CAP_NET_RAW — blocked for UID 1000."""
+        """AF_PACKET is not in the guest kernel (CONFIG_PACKET off: the guest sets its address
+        over rtnetlink): socket() gives EAFNOSUPPORT (97)."""
         code = """\
 import socket
 try:
@@ -280,10 +251,24 @@ except OSError as e:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "blocked" in result.stdout or "ERROR:" in result.stdout, (
-            f"AF_PACKET socket should be blocked. stdout: {result.stdout}"
-        )
-        assert "unexpected_success" not in result.stdout
+        assert result.stdout.strip() == "ERROR:97", result.stdout  # EAFNOSUPPORT
+
+
+class TestNetworkStackMinimal:
+    """The guest network stack is TCP/UDP/Unix/IPv6 over one virtio-net link
+    (exec-sandbox.config): no extra congestion control, no packet generator."""
+
+    async def test_congestion_control_and_pktgen(self, dual_scheduler: Scheduler) -> None:
+        """Only reno (built in) and cubic (the default) are available; /proc/net/pktgen does
+        not exist (NET_PKTGEN off: no kpktgend thread per CPU at boot)."""
+        code = """\
+import os
+print(open("/proc/sys/net/ipv4/tcp_available_congestion_control").read().strip())
+print(os.path.exists("/proc/net/pktgen"))
+"""
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines() == ["reno cubic", "False"], result.stdout
 
 
 # =============================================================================
@@ -298,10 +283,9 @@ class TestAfVsockRestricted:
     """
 
     async def test_af_vsock_socket_blocked(self, dual_scheduler: Scheduler) -> None:
-        """AF_VSOCK socket should be blocked for UID 1000.
+        """AF_VSOCK socket creation fails with EAFNOSUPPORT: CONFIG_VSOCKETS=n.
 
         exec-sandbox uses virtio-serial (not vsock) for guest-host communication.
-        No vsock device should be present.
         """
         code = """\
 import socket
@@ -318,14 +302,7 @@ except OSError as e:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # With CONFIG_VSOCK=n (custom kernel): EAFNOSUPPORT (blocked:errno=97)
-        # With CONFIG_VSOCK=y: may succeed if vsock device present, or EPERM
-        assert "blocked:" in result.stdout or "unexpected_success" in result.stdout, (
-            f"AF_VSOCK socket returned unexpected result. stdout: {result.stdout}"
-        )
-        # If VSOCK is compiled out, socket creation fails (good).
-        # If VSOCK is compiled in but no device, socket may succeed but connect fails (acceptable).
-        # Flag unexpected_success only if VSOCK was supposed to be disabled.
+        assert result.stdout.strip() == "blocked:errno=97", f"Expected EAFNOSUPPORT. stdout: {result.stdout}"
 
 
 # =============================================================================
@@ -353,15 +330,11 @@ print(f"ret={ret} errno={err}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # EPERM=1 (no CAP_SYS_ADMIN), ENODEV=19 (cgroup v1 fs not available),
-        # ENOENT=2 (cgroup subsystem not found)
-        errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
-        assert errno_val in {1, 2, 19}, (
-            f"Expected cgroup mount to fail with EPERM(1), ENOENT(2), or ENODEV(19), got errno={errno_val}"
-        )
+        # EPERM: the CAP_SYS_ADMIN check comes before any file system lookup
+        assert result.stdout.strip() == "ret=-1 errno=1"
 
     async def test_cgroupfs_not_mounted(self, dual_scheduler: Scheduler) -> None:
-        """cgroupfs is intentionally not mounted inside the VM.
+        """cgroupfs is intentionally not mounted inside the VM: /sys/fs/cgroup is an empty folder.
 
         Resource limits are enforced host-side on the QEMU process via
         cgroup v2. Not mounting cgroupfs eliminates escape vectors:
@@ -382,8 +355,7 @@ else:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        assert stdout in {"NO_DIR", "EMPTY"}, f"cgroupfs should not be mounted inside VM. Found: {stdout}"
+        assert result.stdout == "EMPTY\n"
 
     async def test_cgroup_release_agent_not_writable(self, dual_scheduler: Scheduler) -> None:
         """No writable cgroup release_agent files exist.
@@ -409,7 +381,7 @@ else:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "WRITABLE:" not in result.stdout, f"release_agent should not be writable. stdout: {result.stdout}"
+        assert result.stdout == "NO_RELEASE_AGENT_FILES\n"  # no cgroupfs: no file to write
 
 
 # =============================================================================
@@ -425,10 +397,9 @@ class TestUserNamespaceRestricted:
     """
 
     async def test_unshare_user_namespace(self, dual_scheduler: Scheduler) -> None:
-        """unshare(CLONE_NEWUSER) behavior — document whether restricted.
+        """unshare(CLONE_NEWUSER) fails with ENOSPC: user.max_user_namespaces=0.
 
         Many kernel exploits require user namespaces to gain CAP_SYS_ADMIN.
-        Even if allowed, no_new_privs prevents further escalation.
         """
         code = """\
 import ctypes
@@ -448,12 +419,7 @@ else:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        if "UNSHARE:ok" in stdout:
-            # User namespace was created, but mount should still fail
-            # because no_new_privs is set
-            assert "MOUNT_ret=-1" in stdout, f"Mount in user namespace should fail. stdout: {stdout}"
-        # If unshare is blocked entirely, that's also fine
+        assert result.stdout.strip() == "UNSHARE:blocked errno=28"  # ENOSPC
 
     async def test_max_user_namespaces_sysctl(self, dual_scheduler: Scheduler) -> None:
         """user.max_user_namespaces should be 0 (portable alternative to
@@ -474,12 +440,8 @@ except PermissionError:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
         # Value 0 blocks user namespace creation entirely
-        # NOT_FOUND or PERM_DENIED also acceptable
-        assert "MAX_USERNS:0" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
-            f"Expected max_user_namespaces=0. stdout: {stdout}"
-        )
+        assert result.stdout.strip() == "MAX_USERNS:0"
 
     async def test_unshare_mount_namespace_blocked(self, dual_scheduler: Scheduler) -> None:
         """unshare(CLONE_NEWNS) requires CAP_SYS_ADMIN — blocked for UID 1000."""
@@ -493,9 +455,7 @@ print(f"ret={ret} errno={err}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # EPERM=1 (requires CAP_SYS_ADMIN outside user namespace)
-        errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
-        assert errno_val == 1, f"Expected unshare(CLONE_NEWNS) EPERM(1), got errno={errno_val}. stdout: {result.stdout}"
+        assert result.stdout == "ret=-1 errno=1\n"  # EPERM: CAP_SYS_ADMIN outside a user namespace
 
 
 # =============================================================================
@@ -521,11 +481,8 @@ print(f"ret={ret} errno={err}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # EPERM=1 (different UID + YAMA) or ESRCH=3 (process not ptraceable)
-        errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
-        assert errno_val in {1, 3}, (
-            f"Expected ptrace EPERM(1) or ESRCH(3), got errno={errno_val}. stdout: {result.stdout}"
-        )
+        # EPERM: another UID, and YAMA ptrace_scope=2 (hidepid hides /proc/1, not the process)
+        assert result.stdout.strip() == "ret=-1 errno=1"
 
     async def test_ptrace_self_dumpable_zero(self, dual_scheduler: Scheduler) -> None:
         """PR_SET_DUMPABLE=0 prevents ptrace attachment from any process.
@@ -541,8 +498,6 @@ with open("/proc/self/status") as f:
     for line in f:
         if line.startswith("TracerPid:"):
             print(f"TRACER:{line.split(':')[1].strip()}")
-        if line.startswith("Seccomp:"):
-            print(f"SECCOMP:{line.split(':')[1].strip()}")
 # Check dumpable flag
 import ctypes
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -552,13 +507,11 @@ print(f"DUMPABLE:{dumpable}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # PR_SET_DUMPABLE must be 0 to prevent ptrace from other UID 1000 processes
-        assert "DUMPABLE:0" in result.stdout, f"Expected dumpable=0. stdout: {result.stdout}"
-        # No tracer should be attached
-        assert "TRACER:0" in result.stdout, f"Expected no tracer. stdout: {result.stdout}"
+        # No tracer attached; PR_SET_DUMPABLE 0 keeps other UID 1000 processes from ptrace
+        assert result.stdout == "TRACER:0\nDUMPABLE:0\n"
 
     async def test_yama_ptrace_scope(self, dual_scheduler: Scheduler) -> None:
-        """YAMA ptrace_scope must be >= 2 (admin-only ptrace).
+        """YAMA ptrace_scope is 2 (admin-only ptrace).
 
         Level 2 means only CAP_SYS_PTRACE holders can ptrace. This is the
         primary ptrace defense — dumpable=0 is defense-in-depth but exec()
@@ -578,16 +531,8 @@ except PermissionError:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        # YAMA scope >= 2 blocks ptrace for non-CAP_SYS_PTRACE processes
-        if "YAMA:" in stdout and stdout.split(":")[1].isdigit():
-            scope = int(stdout.split(":")[1])
-            assert scope >= 2, f"Expected YAMA ptrace_scope >= 2, got {scope}"
-        else:
-            # NOT_FOUND (kernel lacks YAMA) or PERM_DENIED (/proc/sys restricted)
-            assert "not_found" in stdout or "perm_denied" in stdout, (
-                f"Expected YAMA scope >= 2, not_found, or perm_denied. stdout: {stdout}"
-            )
+        # YAMA scope 2 blocks ptrace for non-CAP_SYS_PTRACE processes
+        assert result.stdout.strip() == "YAMA:2"
 
 
 # =============================================================================
@@ -601,10 +546,10 @@ class TestSuidProtection:
     """
 
     async def test_no_suid_binaries_exist(self, dual_scheduler: Scheduler) -> None:
-        """No SUID/SGID binaries should exist in the guest filesystem.
+        """No SUID/SGID binaries exist in the guest filesystem.
 
-        Defense-in-depth: even though no_new_privs blocks SUID execution,
-        removing SUID binaries eliminates the attack surface entirely.
+        Defense-in-depth: no_new_privs blocks SUID execution too (test_no_new_privs_set),
+        and with no SUID binary there is nothing to execute.
         """
         code = """\
 import os, stat
@@ -629,18 +574,7 @@ else:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # If SUID binaries exist, no_new_privs still protects us,
-        # but ideally there should be none
-        if "SUID:" in result.stdout:
-            # Verify no_new_privs is set (defense-in-depth)
-            nnp_result = await run_once(
-                dual_scheduler,
-                VmSpec(language=Language.PYTHON),
-                'with open("/proc/self/status") as f:\n    for l in f:\n        if l.startswith("NoNewPrivs:"): print(l.strip())',
-            )
-            assert "NoNewPrivs:\t1" in nnp_result.stdout, (
-                f"SUID binaries exist and no_new_privs is not set! SUID files: {result.stdout}"
-            )
+        assert result.stdout.strip() == "NO_SUID_BINARIES", result.stdout
 
     async def test_no_new_privs_set(self, dual_scheduler: Scheduler) -> None:
         """no_new_privs must be set, preventing SUID bit from taking effect.
@@ -659,7 +593,7 @@ with open("/proc/self/status") as f:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "NO_NEW_PRIVS:1" in result.stdout, f"Expected no_new_privs=1. stdout: {result.stdout}"
+        assert result.stdout == "NO_NEW_PRIVS:1\n"
 
 
 # =============================================================================
@@ -707,7 +641,7 @@ except FileNotFoundError:
         assert stdout == "NOT_FOUND", f"CONFIG_KALLSYMS=n requires /proc/kallsyms to be absent, got: {stdout!r}"
 
     async def test_proc_kcore_not_readable(self, dual_scheduler: Scheduler) -> None:
-        """Kernel memory via /proc/kcore must not be readable."""
+        """/proc/kcore does not exist: CONFIG_PROC_KCORE=n."""
         code = """\
 try:
     with open('/proc/kcore', 'rb') as f:
@@ -722,26 +656,7 @@ except OSError as e:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "READ:" not in result.stdout, f"/proc/kcore should not be readable. stdout: {result.stdout}"
-
-    async def test_proc_pid1_maps_not_readable(self, dual_scheduler: Scheduler) -> None:
-        """PID 1 memory map must not be readable by UID 1000.
-
-        Reference: CVE-2023-3269 (StackRot) — memory layout leak aids exploitation.
-        """
-        code = """\
-try:
-    with open('/proc/1/maps') as f:
-        data = f.read()
-    print(f"READ:{len(data)}")
-except PermissionError:
-    print("BLOCKED")
-except FileNotFoundError:
-    print("NOT_FOUND")
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "BLOCKED" in result.stdout or "NOT_FOUND" in result.stdout
+        assert result.stdout.strip() == "NOT_FOUND", f"/proc/kcore should not exist. stdout: {result.stdout}"
 
     async def test_proc_hidepid_mount_option(self, dual_scheduler: Scheduler) -> None:
         """Proc must be mounted with hidepid=2 to hide other users' processes.
@@ -768,13 +683,14 @@ with open('/proc/mounts') as f:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "HIDEPID:enabled" in result.stdout, f"stdout: {result.stdout}"
+        assert result.stdout == "HIDEPID:enabled\n"
 
     async def test_proc_pid1_directory_invisible(self, dual_scheduler: Scheduler) -> None:
         """/proc/1 must be invisible to UID 1000 with hidepid=2.
 
         This is stronger than permission-denied — the directory does not exist
-        at the VFS level, preventing any information leakage about PID 1.
+        at the VFS level, preventing any information leakage about PID 1 (its memory map
+        among them: CVE-2023-3269, StackRot, used such a leak of the memory layout).
         """
         code = """\
 import os
@@ -790,8 +706,7 @@ except PermissionError:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "EXISTS:False" in result.stdout
-        assert "LISTDIR:ENOENT" in result.stdout
+        assert result.stdout == "EXISTS:False\nLISTDIR:ENOENT\n"
 
     async def test_proc_self_still_accessible(self, dual_scheduler: Scheduler) -> None:
         """/proc/self and /proc/{pid} must remain readable for the current process.
@@ -814,8 +729,7 @@ print(f'OWN_PID_STATUS:{"Name:" in status}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "SELF_STATUS:True" in result.stdout
-        assert "OWN_PID_STATUS:True" in result.stdout
+        assert result.stdout == "SELF_STATUS:True\nOWN_PID_STATUS:True\n"
 
     async def test_proc_sensitive_files_masked(self, dual_scheduler: Scheduler) -> None:
         """Sensitive /proc files must be masked (empty) to block reconnaissance.
@@ -847,17 +761,16 @@ for p in paths:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        lines = result.stdout.strip().splitlines()
-        # One status line per masked path — truncated output must fail, not
-        # silently skip the loop below. /proc/cmdline masking also means boot
-        # posture (mitigations=off) is asserted host-side, in
+        # Empty (a /dev/null bind mount), or absent: /proc/keys (CONFIG_KEYS=n). /proc/cmdline
+        # masking also means boot posture (mitigations=off) is asserted host-side, in
         # test_vm_manager.py::TestKernelCmdlineMitigations.
-        assert len(lines) == 5, f"expected 5 mask-status lines, got {len(lines)}: {result.stdout!r}"
-        for line in lines:
-            path = line.split(":")[0]
-            assert ":len=0:" in line or ":EPERM" in line or ":ENOENT" in line, (
-                f"{path} should be masked (empty/blocked), got: {line}"
-            )
+        assert result.stdout.splitlines() == [
+            "/proc/cmdline:len=0:content=",
+            "/proc/version:len=0:content=",
+            "/proc/interrupts:len=0:content=",
+            "/proc/keys:ENOENT",
+            "/proc/timer_list:len=0:content=",
+        ]
 
 
 # =============================================================================
@@ -891,7 +804,7 @@ except PermissionError:
         )
 
     async def test_userfaultfd_restricted(self, dual_scheduler: Scheduler) -> None:
-        """userfaultfd is commonly used in kernel race condition exploits.
+        """userfaultfd() returns ENOSYS: CONFIG_USERFAULTFD=n.
 
         Many kernel UAF exploits use userfaultfd to pause execution at
         precise points during memory operations.
@@ -913,13 +826,10 @@ else:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        # userfaultfd should be blocked (EPERM=1 or ENOSYS=38)
-        # If it's available, it's a potential race condition exploit primitive
-        assert "BLOCKED:" in stdout, f"userfaultfd should be blocked for UID 1000. stdout: {stdout}"
+        assert result.stdout.strip() == "BLOCKED:errno=38", f"userfaultfd should be ENOSYS. stdout: {result.stdout}"
 
     async def test_keyctl_blocked(self, dual_scheduler: Scheduler) -> None:
-        """keyctl operations used in kernel exploitation for heap spraying."""
+        """keyctl() returns ENOSYS: CONFIG_KEYS=n (keys are a heap spray tool of kernel exploits)."""
         code = """\
 import ctypes, platform
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -932,18 +842,11 @@ print(f"ret={ret} errno={err}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # keyctl may succeed (returns keyring ID) or fail (ENOSYS/EPERM).
-        # We can't block it without seccomp, but we document its availability.
-        assert "ret=" in result.stdout, f"Unexpected keyctl output. stdout: {result.stdout}"
+        assert result.stdout.strip() == "ret=-1 errno=38"  # ENOSYS
 
     async def test_modules_disabled_sysctl(self, dual_scheduler: Scheduler) -> None:
-        """The custom CONFIG_MODULES=n kernel exposes no module-loading support.
-
-        Asserts module loading is unavailable: with the shipped
-        CONFIG_MODULES=n kernel the sysctl does not exist (NOT_FOUND); the
-        assertion also tolerates the weaker modules_disabled=1 / EPERM
-        outcomes as defense-in-depth.
-        """
+        """The CONFIG_MODULES=n kernel has no module loading: the modules_disabled sysctl does
+        not exist."""
         code = """\
 try:
     with open('/proc/sys/kernel/modules_disabled') as f:
@@ -956,16 +859,10 @@ except PermissionError:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        # modules_disabled=1 means module loading is permanently blocked
-        # NOT_FOUND means CONFIG_MODULES=n (custom kernel) — no module support at all
-        # PERM_DENIED means /proc/sys is restricted (also acceptable)
-        assert "MODULES_DISABLED:1" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
-            f"Expected modules_disabled=1 or NOT_FOUND. stdout: {stdout}"
-        )
+        assert result.stdout.strip() == "NOT_FOUND", f"Expected CONFIG_MODULES=n. stdout: {result.stdout}"
 
     async def test_kernel_module_loading_blocked(self, dual_scheduler: Scheduler) -> None:
-        """finit_module/init_module blocked for UID 1000.
+        """finit_module() returns ENOSYS: CONFIG_MODULES=n.
 
         Prevents loading malicious kernel modules even if user manages
         to craft one.
@@ -981,15 +878,10 @@ print(f"ret={ret} errno={err}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # EPERM=1 (no CAP_SYS_MODULE or modules_disabled=1)
-        # ENOSYS=38 (CONFIG_MODULES=n — syscall doesn't exist, even stronger)
-        errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
-        assert errno_val in {1, 38}, (
-            f"Expected finit_module EPERM(1) or ENOSYS(38), got errno={errno_val}. stdout: {result.stdout}"
-        )
+        assert result.stdout.strip() == "ret=-1 errno=38"  # ENOSYS
 
     async def test_kexec_blocked(self, dual_scheduler: Scheduler) -> None:
-        """kexec_load blocked — prevents replacing the running kernel."""
+        """kexec_load (kexec_file_load on aarch64) returns ENOSYS: CONFIG_KEXEC=n, no KEXEC_FILE."""
         code = """\
 import ctypes, platform
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -1005,11 +897,7 @@ print(f"ret={ret} errno={err}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # EPERM=1 (no CAP_SYS_BOOT) or ENOSYS=38 (not compiled into kernel)
-        errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
-        assert errno_val in {1, 38}, (
-            f"Expected kexec EPERM(1) or ENOSYS(38), got errno={errno_val}. stdout: {result.stdout}"
-        )
+        assert result.stdout.strip() == "ret=-1 errno=38"  # ENOSYS
 
 
 # =============================================================================
@@ -1030,9 +918,7 @@ except (FileNotFoundError, PermissionError):
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "PROTECTED_SYMLINKS:1" in result.stdout or "INACCESSIBLE" in result.stdout, (
-            f"Expected protected_symlinks=1. stdout: {result.stdout}"
-        )
+        assert result.stdout.strip() == "PROTECTED_SYMLINKS:1"
 
     async def test_protected_hardlinks(self, dual_scheduler: Scheduler) -> None:
         """fs.protected_hardlinks=1 prevents hardlink attacks."""
@@ -1046,12 +932,10 @@ except (FileNotFoundError, PermissionError):
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "PROTECTED_HARDLINKS:1" in result.stdout or "INACCESSIBLE" in result.stdout, (
-            f"Expected protected_hardlinks=1. stdout: {result.stdout}"
-        )
+        assert result.stdout.strip() == "PROTECTED_HARDLINKS:1"
 
     async def test_protected_fifos(self, dual_scheduler: Scheduler) -> None:
-        """fs.protected_fifos=2 prevents FIFO attacks in sticky dirs."""
+        """fs.protected_fifos=2 prevents FIFO attacks in sticky dirs (the guest agent sets it)."""
         code = """\
 try:
     with open('/proc/sys/fs/protected_fifos') as f:
@@ -1062,12 +946,7 @@ except (FileNotFoundError, PermissionError):
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        if "PROTECTED_FIFOS:" in stdout and stdout.split(":")[1].isdigit():
-            val = int(stdout.split(":")[1])
-            assert val >= 2, f"Expected protected_fifos >= 2, got {val}"
-        else:
-            assert "INACCESSIBLE" in stdout, f"Expected protected_fifos >= 2 or INACCESSIBLE. stdout: {stdout}"
+        assert result.stdout.strip() == "PROTECTED_FIFOS:2"
 
     async def test_protected_regular(self, dual_scheduler: Scheduler) -> None:
         """fs.protected_regular=2 prevents regular file attacks in sticky dirs."""
@@ -1081,12 +960,7 @@ except (FileNotFoundError, PermissionError):
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        if "PROTECTED_REGULAR:" in stdout and stdout.split(":")[1].isdigit():
-            val = int(stdout.split(":")[1])
-            assert val >= 2, f"Expected protected_regular >= 2, got {val}"
-        else:
-            assert "INACCESSIBLE" in stdout, f"Expected protected_regular >= 2 or INACCESSIBLE. stdout: {stdout}"
+        assert result.stdout.strip() == "PROTECTED_REGULAR:2"
 
     async def test_suid_dumpable(self, dual_scheduler: Scheduler) -> None:
         """fs.suid_dumpable=0 prevents core dumps for setuid processes."""
@@ -1100,9 +974,7 @@ except (FileNotFoundError, PermissionError):
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "SUID_DUMPABLE:0" in result.stdout or "INACCESSIBLE" in result.stdout, (
-            f"Expected suid_dumpable=0. stdout: {result.stdout}"
-        )
+        assert result.stdout.strip() == "SUID_DUMPABLE:0"
 
 
 # =============================================================================
@@ -1127,9 +999,7 @@ except (FileNotFoundError, PermissionError):
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "DMESG_RESTRICT:1" in result.stdout or "INACCESSIBLE" in result.stdout, (
-            f"Expected dmesg_restrict=1. stdout: {result.stdout}"
-        )
+        assert result.stdout.strip() == "DMESG_RESTRICT:1"
 
     async def test_perf_event_paranoid(self, dual_scheduler: Scheduler) -> None:
         """perf is restricted by sysctl on x86 and compiled out on arm64.
@@ -1151,12 +1021,8 @@ except PermissionError:
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
-        if IS_X86:
-            assert "PERF_PARANOID:" in stdout and stdout.split(":", 1)[1].lstrip("-").isdigit(), (
-                f"x86 force-selects CONFIG_PERF_EVENTS; expected readable perf_event_paranoid, got: {stdout!r}"
-            )
-            val = int(stdout.split(":")[1])
-            assert val >= 3, f"Expected perf_event_paranoid >= 3, got {val}"
+        if IS_X86:  # x86 force-selects CONFIG_PERF_EVENTS: the guest agent sets 3
+            assert stdout == "PERF_PARANOID:3"
         else:
             assert stdout == "NOT_FOUND", (
                 f"arm64 CONFIG_PERF_EVENTS=n requires no perf_event_paranoid sysctl, got: {stdout!r}"
@@ -1177,12 +1043,7 @@ except (FileNotFoundError, PermissionError):
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        if "KPTR_RESTRICT:" in stdout and stdout.split(":")[1].isdigit():
-            val = int(stdout.split(":")[1])
-            assert val >= 2, f"Expected kptr_restrict >= 2, got {val}"
-        else:
-            assert "INACCESSIBLE" in stdout, f"Expected kptr_restrict >= 2 or INACCESSIBLE. stdout: {stdout}"
+        assert result.stdout.strip() == "KPTR_RESTRICT:2"
 
 
 # =============================================================================
@@ -1197,39 +1058,27 @@ class TestSequoiaMitigation:
     """
 
     async def test_deep_directory_creation_bounded(self, dual_scheduler: Scheduler) -> None:
-        """Inode limit on /tmp prevents creating deep directory structures.
+        """Inode limit on /tmp stops a deep directory tree at 16,382 levels (ENOSPC): /tmp and
+        /tmp/sequoia_test take two of its 16,384 inodes.
 
         Sequoia requires creating >1GB of path components (~8 million nested
-        directories). The 16384 inode limit on /tmp caps this at ~16K dirs.
+        directories). The code walks down with chdir and a relative name, as an
+        exploit would: PATH_MAX (4096) does not stop it, only the inode limit.
         """
         code = """\
 import os
+os.makedirs('/tmp/sequoia_test', exist_ok=True)
+os.chdir('/tmp/sequoia_test')
 count = 0
-base = '/tmp/sequoia_test'
 try:
-    os.makedirs(base, exist_ok=True)
-    path = base
-    # Try creating 20K nested dirs (should fail well before Sequoia threshold)
     for i in range(20000):
-        path = os.path.join(path, 'a')
-        os.mkdir(path)
+        os.mkdir('a')
+        os.chdir('a')
         count += 1
     print(f"CREATED:{count}")
 except OSError as e:
     print(f"STOPPED:{count} errno={e.errno}")
-finally:
-    # Cleanup
-    import shutil
-    try:
-        shutil.rmtree(base)
-    except Exception:
-        pass
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        if "STOPPED:" in stdout:
-            # Extract count — should be well below the millions needed for Sequoia
-            count = int(stdout.split(":")[1].split()[0])
-            assert count < 20000, f"Created {count} dirs, should be bounded"
-        # If all 20K created, still far below the ~8M needed for Sequoia
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == "STOPPED:16382 errno=28\n"  # ENOSPC: out of inodes
