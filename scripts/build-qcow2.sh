@@ -56,14 +56,16 @@ BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 
 # Package lists for each variant
 # Common: essential tools for AI agent workflows
-# iputils: provides ping for guest-agent gvproxy connectivity check at boot
-# e2fsprogs: mkfs.ext4 needed by tiny-init for snapshot creation (format vdb overlay drive)
+# iputils: ping for user code (guest-agent checks gvproxy with a DNS query, not ping)
+# e2fsprogs: mkfs.ext4, run by tiny-init to format the home disk (serial "home") at each
+#   cold boot and the snapshot drive (serial "snap") when it creates a snapshot
 # grep/findutils/sed/gawk/diffutils: GNU versions replace busybox (PCRE, gensub, -printf, etc.)
 # patch/less/make/tree: small utilities commonly expected by AI agents and developer scripts
+# openssl: the CLI (~800KB; libcrypto/libssl are already there for curl): certificates, s_client, rand, HMAC
 #
 # NOTE: Tier 2 candidates for future inclusion (evaluate based on user feedback):
 #   wget (~590KB), xz (~163KB), zip (~373KB), tzdata (~436KB), rsync (~375KB)
-COMMON_PKGS="ca-certificates curl git jq bash coreutils grep findutils sed gawk diffutils patch less make tree tar gzip unzip file iputils e2fsprogs"
+COMMON_PKGS="ca-certificates curl git jq openssl bash coreutils grep findutils sed gawk diffutils patch less make tree tar gzip unzip file iputils e2fsprogs"
 
 # Python: jemalloc for guest-agent LD_PRELOAD (no build tools — prebuilt wheels only)
 PYTHON_PKGS="$COMMON_PKGS jemalloc"
@@ -352,8 +354,8 @@ create_python_rootfs() {
     # cloudpickle serializes functions defined in exec() (lambdas, closures, dynamic functions)
     # by extracting only referenced globals via bytecode analysis — the industry standard
     # approach used by PySpark, Ray, Dask, and joblib/loky.
-    # Installed to /usr/lib/python3/site-packages (not /home/user/) because /home/user
-    # is a tmpfs mount at runtime (writable scratch space on read-only rootfs).
+    # Installed to /usr/lib/python3/site-packages (not /home/user/) because at runtime
+    # tiny-init mounts the VM's home disk on /home/user, which hides the image's copy.
     # Uses Docker because uv/python in rootfs are Linux binaries (can't run on macOS host).
     # See: https://github.com/cloudpipe/cloudpickle
     mkdir -p "$rootfs_dir/usr/lib/python3/site-packages"
@@ -434,7 +436,7 @@ create_raw_rootfs() {
     create_alpine_rootfs "$rootfs_dir" "$docker_platform" $RAW_PKGS
 }
 
-# Build or reuse the guestfs Docker image (shared by full rebuild and patch paths)
+# Build or reuse the host-arch Docker image with mkfs.erofs and qemu-img
 # Sets GUESTFS_IMAGE and HOST_PLATFORM variables for callers
 ensure_guestfs_image() {
     GUESTFS_IMAGE="exec-sandbox-guestfs:latest"
@@ -471,9 +473,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 DOCKERFILE
 }
 
-## NOTE: guestfish patch fast-path removed — EROFS is read-only, can't patch in-place.
-## Any change (including guest-agent-only) triggers a full rebuild.
-
 build_qcow2() {
     local variant=$1
     local target_arch=$2
@@ -508,10 +507,7 @@ build_qcow2() {
         return 0
     fi
 
-    # Case 2 (guestfish patch) removed — EROFS is read-only, can't patch in-place.
-    # Any change triggers a full rebuild.
-
-    # Case 3: hash miss — full rebuild
+    # Case 2: hash miss — full rebuild
     echo "Building $output_name..."
     echo "  Using guest-agent: $guest_agent"
 
@@ -533,9 +529,10 @@ build_qcow2() {
     chmod 555 "$rootfs_dir/usr/local/bin/guest-agent"
 
     # Configure DNS (gvproxy gateway).
-    # Duplicate entry: musl-libc's resolver reads only the first TWO nameserver
-    # lines and falls back to 127.0.0.1 if fewer than two are present. With a
-    # single entry, transient UDP loss causes immediate SERVFAIL instead of retry.
+    # Duplicate entry: musl-libc's resolver sends each query to every listed
+    # nameserver at once, and retries only after timeout/attempts (2.5s by
+    # default). With two entries, each query goes out twice, so one lost UDP
+    # packet does not stall the lookup until the retry.
     echo "nameserver 192.168.127.1" > "$rootfs_dir/etc/resolv.conf"
     echo "nameserver 192.168.127.1" >> "$rootfs_dir/etc/resolv.conf"
 
@@ -545,9 +542,9 @@ build_qcow2() {
 
     # Create sandbox user (UID 1000) for REPL execution
     # Guest-agent runs as root (PID 1), but REPL subprocess drops to this user.
-    # This blocks mount(2), ptrace, module loading, etc. without needing seccomp.
-    # Note: passwd/group are text files (no permission issues on macOS), but chown
-    # to UID 1000 requires root — so it's done inside Docker below.
+    # Without root, user code cannot call mount(2) or ptrace root processes,
+    # with no need for seccomp. No file in the image belongs to UID 1000
+    # (mkfs.erofs --all-root); tiny-init gives /home/user to it at boot.
     echo "user:x:1000:1000:sandbox:/home/user:/sbin/nologin" >> "$rootfs_dir/etc/passwd"
     echo "user:x:1000:" >> "$rootfs_dir/etc/group"
 
@@ -559,9 +556,9 @@ build_qcow2() {
     ensure_guestfs_image
 
     # Run mkfs.erofs + qemu-img using cached image
-    # Note: cleanup inside Docker because files created by Docker (root) and chowned
-    # to UID 1000 cannot be deleted by the CI runner (UID 1001) on the host due to
-    # /tmp sticky bit. Removing inside the container (as root) avoids this.
+    # Note: remove the build tree inside the container (as root): earlier docker run
+    # steps create root-owned files that the host user (e.g. the CI runner) cannot
+    # delete.
     docker run --rm \
         -v "$tmp_dir:/build" \
         -v "$OUTPUT_DIR:/output" \
@@ -588,7 +585,7 @@ build_qcow2() {
             #                  - Sequential reads: ~850 MiB/s (vs 907 at 64KB, ~6% less)
             #                Python startup reads hundreds of scattered .pyc files (4-16KB
             #                each); 16KB clusters minimize read amplification per file.
-            #                Guest read_ahead_kb is set to 128 (8 pclusters, guest-agent/init.rs).
+            #                Guest read_ahead_kb is set to 16 (1 pcluster, guest-agent/src/init.rs).
             #                Ref: erofs-utils PERFORMANCE.md (Debian rootfs dataset)
             #
             # Metadata compression:
@@ -614,10 +611,11 @@ build_qcow2() {
             #
             # Reproducibility & ownership:
             #   -T0          Epoch-0 timestamps for deterministic/reproducible builds.
-            #   --all-root   All files uid=0/gid=0 in the EROFS image. /home/user is
-            #                always tmpfs in the guest, so no user-owned files needed.
+            #   --all-root   All files uid=0/gid=0 in the EROFS image. tiny-init mounts
+            #                the home disk (owned by uid 1000) on /home/user, so no
+            #                user-owned files needed.
             #
-            # EROFS vs ext4 for read-only rootfs (why we switched):
+            # EROFS vs ext4 for read-only rootfs:
             #   - 20x faster random reads (EROFS PERFORMANCE.md benchmark)
             #   - 2.6x faster sequential reads
             #   - Inline data for small files (no block allocation overhead)
@@ -655,7 +653,7 @@ build_qcow2() {
         "
 
     rm -rf "$tmp_dir"
-    # Save full hash (line 1) + rootfs hash (line 2) for cache key
+    # Save full hash (line 1, the cache key) + rootfs hash (line 2, not read by cache_hit)
     save_hash "$qcow2_img" "$current_hash" "$rootfs_hash"
     echo "Built: $qcow2_img"
 }

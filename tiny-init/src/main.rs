@@ -1,9 +1,9 @@
 //! Minimal init for QEMU microVMs
 //!
 //! Custom kernel (CONFIG_MODULES=n): all drivers are built-in.
-//! Handles devtmpfs, the read-only rootfs mount, the move into the new root
-//! (busybox switch_root steps), the home disk on /home/user, and the exec of
-//! the guest agent.
+//! Mounts devtmpfs, /proc, /sys, /tmp and the rootfs (EROFS, with an optional
+//! ext4 snapshot layer), moves into the new root (busybox switch_root steps),
+//! formats and mounts the home disk on /home/user, then execs the guest agent.
 
 #[macro_use]
 mod sys;
@@ -32,8 +32,8 @@ fn mount_virtual_filesystems() {
     // (UID 1000) only needs read or getrandom() syscall.
     device::chmod_paths(0o644, &["/dev/urandom", "/dev/random"]);
 
-    // B4: /dev/shm mount deferred to guest-agent (only needed for Python multiprocessing).
-    // Guest-agent mounts it lazily before first use, saving ~2-5ms on critical path.
+    // The guest agent mounts /dev/shm in its phase-2 setup (setup_dev_shm).
+    // Only Python multiprocessing and similar code need it.
 
     // hidepid=2: hide /proc/[pid] entries for processes not owned by the
     // querying user. Prevents UID 1000 from reading /proc/1/maps (memory layout
@@ -46,8 +46,8 @@ fn mount_virtual_filesystems() {
 
     // Security: cgroupfs is intentionally NOT mounted.
     // Resource limits (memory, CPU, PIDs) are enforced on the host via cgroup v2
-    // on the QEMU process (see src/exec_sandbox/cgroup.py). The guest runs a
-    // single process (guest-agent), so internal cgroup subdivision is unnecessary.
+    // on the QEMU process (see src/exec_sandbox/cgroup.py). The guest runs one
+    // workload (the guest agent and its children), so it needs no cgroup split.
     //
     // Not mounting cgroupfs eliminates cgroup-based escape vectors:
     // - CVE-2022-0492: write release_agent for root code execution
@@ -260,10 +260,10 @@ fn mount_rootfs() {
 /// Format the VM's home disk (serial=home) and mount it on /home/user.
 ///
 /// Every VM has one: a raw sparse file the host attaches. tiny-init runs only
-/// at a cold boot (restores and loads resume RAM), so the disk is always blank
-/// here. Runs inside the new root (after enter_rootfs): mkfs runs from the
-/// rootfs directly, with no /dev bind mount, whose umount would wait a full RCU
-/// grace period (~12 ms at HZ=100 with rcu_normal_after_boot).
+/// at a cold boot (a restore or a load resumes saved RAM), so the disk is
+/// always blank here. Runs inside the new root (after enter_rootfs): mkfs runs
+/// from the rootfs directly, with no /dev bind mount, whose umount would wait a
+/// full RCU grace period (~12 ms at HZ=100 with rcu_normal_after_boot).
 ///
 /// mkfs.ext4 options:
 /// - assume_storage_prezeroed: the sparse file reads as zeros, so mke2fs skips
@@ -374,7 +374,7 @@ fn exec_agent() -> ! {
         std::env::set_var("HOME", "/root");
     }
 
-    // Stage 1: Ensure stdin is valid (open /dev/null if needed)
+    // Stage 1: point stdin at /dev/null (stage 3 replaces it when a console opens)
     let devnull = CString::new("/dev/null").unwrap();
     let stdin_fd = unsafe { libc::open(devnull.as_ptr(), libc::O_RDONLY) };
     if stdin_fd > 0 {
@@ -385,30 +385,21 @@ fn exec_agent() -> ! {
     }
 
     // Stage 2: Verify stdout/stderr are valid, fix if needed
-    let stdout_valid = unsafe { libc::fcntl(1, libc::F_GETFD) } >= 0;
-    let stderr_valid = unsafe { libc::fcntl(2, libc::F_GETFD) } >= 0;
-
-    if !stdout_valid || !stderr_valid {
-        let mut fds_buf = [0i32; 2];
-        let mut count = 0;
-        if !stdout_valid {
-            fds_buf[count] = 1;
-            count += 1;
-        }
-        if !stderr_valid {
-            fds_buf[count] = 2;
-            count += 1;
-        }
+    let invalid: Vec<libc::c_int> = [1, 2]
+        .into_iter()
+        .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0)
+        .collect();
+    if !invalid.is_empty() {
         device::open_console(
             device::CONSOLE_DEVICES_WITH_FALLBACK,
             libc::O_WRONLY,
-            &fds_buf[..count],
+            &invalid,
         );
     }
 
-    // Stage 3: Redirect console for guest-agent
-    // Order: hvc0 (virtio-console), ttyS0 (ISA serial), ttyAMA0 (ARM PL011 UART)
-    // vm_manager uses hvc0 for x86 and ttyAMA0 for ARM64
+    // Stage 3: point stdin, stdout and stderr at the first console that opens.
+    // Order: hvc0 (virtio-console), ttyS0 (ISA serial), ttyAMA0 (ARM PL011 UART).
+    // The host (qemu_cmd.py) sets console=hvc0 on x86_64, console=ttyAMA0 on aarch64.
     device::open_console(device::CONSOLE_DEVICES, libc::O_RDWR, &[0, 1, 2]);
 
     // exec /usr/local/bin/guest-agent

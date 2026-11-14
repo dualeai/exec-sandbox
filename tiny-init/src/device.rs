@@ -43,8 +43,8 @@ pub(crate) fn open_console(devices: &[&str], mode: libc::c_int, fds: &[libc::c_i
 pub(crate) fn redirect_to_console() {
     // Redirect stdout/stderr to console device
     // Directly try to open each device (avoids TOCTOU race)
-    // hvc0: virtio-console (microvm, virt with virtio-console)
-    // ttyS0: x86 serial (pc machine, TCG)
+    // hvc0: virtio-console (x86 microvm and ARM64 virt both attach one)
+    // ttyS0: x86 ISA serial (fallback only: the host passes -serial none)
     // ttyAMA0: ARM64 PL011 UART (virt machine)
     open_console(CONSOLE_DEVICES, libc::O_WRONLY, &[1, 2]);
 }
@@ -57,7 +57,7 @@ pub(crate) fn wait_for_block_device(path: &str) -> bool {
         Err(_) => return false,
     };
 
-    // Tighter exponential backoff: 0.1+0.2+0.5+1+2+4+8 = 15.8ms max
+    // Exponential backoff: 0.1+0.2+0.5+1+2+4+8 = 15.8 ms of sleep at most
     poll_backoff(&[100, 200, 500, 1000, 2000, 4000, 8000], || {
         let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
         if fd >= 0 {
@@ -74,7 +74,7 @@ pub(crate) fn wait_for_virtio_ports() -> bool {
     // agent ports to be named so the one-shot symlink setup cannot miss one.
     const REQUIRED_NAMES: [&str; 2] = ["org.dualeai.cmd", "org.dualeai.event"];
 
-    // Tighter exponential backoff: 0.1+0.2+0.5+1+2+4+8 = 15.8ms max
+    // Exponential backoff: 0.1+0.2+0.5+1+2+4+8 = 15.8 ms of sleep at most
     poll_backoff(&[100, 200, 500, 1000, 2000, 4000, 8000], || {
         let Ok(entries) = fs::read_dir("/sys/class/virtio-ports") else {
             return false;
@@ -117,7 +117,7 @@ pub(crate) fn setup_virtio_ports() {
         if let Ok(port_name) = fs::read_to_string(entry.path().join("name")) {
             let port_name = port_name.trim();
             if !port_name.is_empty() {
-                // ln -sf "../$dev_name" "/dev/virtio-ports/$port_name"
+                // ln -s "../$dev_name" "/dev/virtio-ports/$port_name"
                 let _ = symlink(
                     format!("../{}", name_str),
                     format!("/dev/virtio-ports/{}", port_name),

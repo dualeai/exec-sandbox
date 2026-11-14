@@ -22,6 +22,7 @@ RAW_IMAGE_TOOLS = [
     ("curl", "curl --version"),
     ("git", "git --version"),
     ("jq", "jq --version"),
+    ("openssl", "openssl version"),
     ("bash", "bash --version"),
     ("tar", "tar --version"),
     ("gzip", "gzip --version"),
@@ -68,6 +69,10 @@ PYTHON_IMAGE_TOOLS = [
         "git",
         "import subprocess; r = subprocess.run(['git', '--version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
     ),
+    (
+        "openssl",
+        "import subprocess; r = subprocess.run(['openssl', 'version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
+    ),
 ]
 
 
@@ -90,6 +95,7 @@ JAVASCRIPT_IMAGE_TOOLS = [
     ("bun", "console.log(Bun.version)"),
     ("curl", "const p = Bun.spawn(['curl', '--version']); await p.exited; process.exit(p.exitCode)"),
     ("git", "const p = Bun.spawn(['git', '--version']); await p.exited; process.exit(p.exitCode)"),
+    ("openssl", "const p = Bun.spawn(['openssl', 'version']); await p.exited; process.exit(p.exitCode)"),
 ]
 
 
