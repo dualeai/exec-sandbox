@@ -66,6 +66,7 @@ def kernel_names(arch: HostArch) -> tuple[str, ...]:
 
 
 def initramfs_name(arch: HostArch) -> str:
+    """The initramfs file name for `arch` (initramfs-x86_64)."""
     return f"initramfs-{arch_name(arch)}"
 
 
@@ -146,6 +147,7 @@ class GuestImages:
 
     @property
     def initramfs(self) -> Path:
+        """The initramfs QEMU boots (its absence is reported where it is opened)."""
         return self.kernel_dir / initramfs_name(self.arch)
 
 
@@ -191,9 +193,13 @@ def image_digest(path: Path) -> str | None:
     with contextlib.suppress(OSError):
         tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
         tmp.unlink(missing_ok=True)  # left by a killed process with this pid
-        with create_file(tmp, mode=0o600, dir_fd=None) as f:  # only this user reads it
-            f.write(f"{stamp} {digest}".encode())
-        tmp.replace(sidecar)
+        try:
+            with create_file(tmp, mode=0o600, dir_fd=None) as f:  # only this user reads it
+                f.write(f"{stamp} {digest}".encode())
+            tmp.replace(sidecar)
+        except OSError:  # a full disk: no temp file stays beside the image
+            tmp.unlink(missing_ok=True)
+            raise
     return digest
 
 

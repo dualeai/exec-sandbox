@@ -9,6 +9,7 @@ finished download (retrieve uses it when its digest is right), and the fetch unp
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import platform
@@ -30,7 +31,7 @@ else:
     from backports import zstd
 
 from exec_sandbox import assets
-from exec_sandbox.asset_downloader import AsyncPooch, get_current_arch
+from exec_sandbox.asset_downloader import AsyncPooch
 from exec_sandbox.assets import (
     ensure_assets,
     ensure_assets_available,
@@ -45,7 +46,7 @@ from exec_sandbox.assets import (
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.images import BASE_IMAGES, kernel_dir_of
 from exec_sandbox.models import Language
-from exec_sandbox.platform_utils import arch_of
+from exec_sandbox.platform_utils import detect_host_arch
 
 HOST_ARCH = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}[
     platform.machine().lower()
@@ -133,7 +134,7 @@ class TestLocalLookup:
         folders.put(tmp_path / "   ", HOST_GVPROXY)
         expected = folders.put(folders.cache, HOST_GVPROXY)
 
-        assert await get_gvproxy_path() == expected
+        assert await get_gvproxy_path(override=None) == expected
 
     async def test_symlink_is_followed(self, folders: Folders) -> None:
         """A symlink to a file counts as the file; the path of the link is returned."""
@@ -141,7 +142,7 @@ class TestLocalLookup:
         folders.env.mkdir()
         (folders.env / HOST_GVPROXY).symlink_to(real)
 
-        assert await get_gvproxy_path() == folders.env / HOST_GVPROXY
+        assert await get_gvproxy_path(override=None) == folders.env / HOST_GVPROXY
 
     async def test_folder_path_with_spaces(
         self, folders: Folders, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -150,7 +151,7 @@ class TestLocalLookup:
         monkeypatch.setenv("EXEC_SANDBOX_IMAGES_DIR", str(env))
         expected = folders.put(env, HOST_GVPROXY)
 
-        assert await get_gvproxy_path() == expected
+        assert await get_gvproxy_path(override=None) == expected
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every folder")
     async def test_folder_this_process_cannot_read_is_skipped(self, folders: Folders) -> None:
@@ -160,7 +161,7 @@ class TestLocalLookup:
         expected = folders.put(folders.cache, HOST_GVPROXY)
         folders.env.chmod(0)
         try:
-            assert await get_gvproxy_path() == expected
+            assert await get_gvproxy_path(override=None) == expected
         finally:
             folders.env.chmod(0o700)
 
@@ -170,7 +171,7 @@ class TestLocalLookup:
         for name in (
             f"vmlinuz-{HOST_ARCH}",
             f"initramfs-{HOST_ARCH}",
-            BASE_IMAGES[Language.PYTHON].file_name(arch_of(get_current_arch())),
+            BASE_IMAGES[Language.PYTHON].file_name(detect_host_arch()),
             HOST_GVPROXY,
         ):
             folders.put(folders.override, name)
@@ -251,7 +252,7 @@ class TestEnsureAssets:
         images_dir = await ensure_assets(override=None, download=True)
 
         assert images_dir == folders.cache
-        assert kernel_dir_of(images_dir, arch=arch_of(get_current_arch())) == folders.cache
+        assert kernel_dir_of(images_dir, arch=detect_host_arch()) == folders.cache
 
     @pytest.mark.parametrize("download", [True, False])
     async def test_a_local_images_folder_gets_gvproxy_when_downloads_are_allowed(
@@ -317,10 +318,11 @@ class TestEnsureAssets:
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND) as exc_info:
             await ensure_assets(override=folders.override, download=False)
 
-        message = str(exc_info.value)
-        assert "auto_download_assets=False" in message
-        for folder in (folders.override, folders.env, folders.local, folders.cache):
-            assert str(folder) in message
+        searched = [str(folder) for folder in (folders.override, folders.env, folders.local, folders.cache)]
+        assert str(exc_info.value) == (
+            f"Assets not found and auto_download_assets=False. Searched: {searched}. "
+            "Set EXEC_SANDBOX_IMAGES_DIR or enable auto_download_assets."
+        )
 
     async def test_empty_dir_triggers_download(self, folders: Folders) -> None:
         """The first folder exists but has no kernel: with download=True, the kernel, the
@@ -351,6 +353,32 @@ class TestEnsureAssetsAvailable:
         assert await ensure_assets_available() == (folders.cache, folders.env / HOST_GVPROXY)
         assert (folders.cache / f"initramfs-{HOST_ARCH}").read_bytes() == b"initramfs"
 
+    async def test_a_failed_fetch_ends_the_others_before_the_call_raises(self, folders: Folders) -> None:
+        """The release has no kernel (ASSET_NOT_FOUND at once) while the initramfs download
+        waits for a server that never answers: the call raises the kernel's error with no
+        fetch left running."""
+        folders.put(folders.env, HOST_GVPROXY)  # found: no gvproxy-wrapper fetch
+        get_assets().registry[f"initramfs-{HOST_ARCH}.zst"] = f"sha256:{'0' * 64}"
+
+        async def no_answer(_url: object, **_kwargs: object) -> None:
+            await asyncio.Event().wait()
+
+        others = asyncio.all_tasks()
+        try:
+            with aioresponses() as m:
+                m.get(re.compile(r".*/initramfs-[a-z0-9_]+\.zst$"), callback=no_answer)
+                with pytest.raises(
+                    ConfigError,
+                    check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND,
+                    match=rf"^File 'vmlinuz-{HOST_ARCH}\.zst' not in registry$",
+                ):
+                    await ensure_assets_available()
+                left = asyncio.all_tasks() - others
+                assert left == set()
+        finally:
+            for task in asyncio.all_tasks() - others:
+                task.cancel()
+
 
 class TestEnsureBaseImage:
     """ensure_base_image: the base image where GuestImages reads it, the images folder or else
@@ -358,7 +386,7 @@ class TestEnsureBaseImage:
 
     @staticmethod
     def _name() -> str:
-        return BASE_IMAGES[Language.PYTHON].file_name(arch_of(get_current_arch()))
+        return BASE_IMAGES[Language.PYTHON].file_name(detect_host_arch())
 
     @pytest.mark.parametrize("where", ["images", "cache"])
     async def test_a_present_image_is_not_fetched(self, folders: Folders, where: str) -> None:
@@ -421,9 +449,10 @@ class TestGetAssets:
         monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR")
         monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(assets, "__version__", "9.8.7")
         user_cache = tmp_path / "home" / ("Library/Caches" if sys.platform == "darwin" else ".cache") / "exec-sandbox"
 
-        assert get_assets().path == user_cache / f"v{assets.__version__}"
+        assert get_assets().path == user_cache / "v9.8.7"
 
 
 # =============================================================================
@@ -491,7 +520,7 @@ class TestReleaseNames:
 
         result = await prefetch_all_assets(arch=arch)
 
-        assert {"python base", "javascript base", "raw base"} <= set(result.downloaded)
+        assert sorted(result.downloaded) == ["javascript base", "python base", "raw base"]  # no boot files released
         for image in expected:
             assert (folders.cache / image).read_bytes() == image.encode()
 
@@ -511,7 +540,7 @@ class TestFetchGvproxy:
 
     async def test_get_gvproxy_path_returns_none_when_not_found(self, folders: Folders) -> None:
         """get_gvproxy_path returns None when binary not found."""
-        assert await get_gvproxy_path() is None
+        assert await get_gvproxy_path(override=None) is None
 
     async def test_fetch_gvproxy_returns_cached_and_makes_executable(self, folders: Folders) -> None:
         """fetch_gvproxy returns cached binary and actually makes it executable."""
@@ -689,5 +718,15 @@ class TestPrefetchAllAssets:
 
         assert (result.success, result.cache_dir) == (False, None)
         assert {name for name, _ in result.errors} == missing
-        assert len(result.downloaded) == 6 - len(missing)
-        assert not set(result.downloaded) & missing
+        assert (
+            set(result.downloaded)
+            == {
+                "kernel",
+                "initramfs",
+                "gvproxy",
+                "python base",
+                "javascript base",
+                "raw base",
+            }
+            - missing
+        )

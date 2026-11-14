@@ -13,20 +13,22 @@ import functools
 import hashlib
 import http
 import os
+import sys
 from typing import TYPE_CHECKING, BinaryIO
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Callable
     from pathlib import Path
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.aio_utils import run_to_end
+from exec_sandbox.aio_utils import run_stoppable, run_to_end
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.files.disk import create_file
 from exec_sandbox.files.locks import CacheEntry
 from exec_sandbox.hash_utils import file_hash, parse_hash_spec
-from exec_sandbox.permission_utils import make_owned_dir
-from exec_sandbox.platform_utils import get_arch_name, get_os_name
+from exec_sandbox.permission_utils import cache_dir_error, make_cache_dir
+from exec_sandbox.platform_utils import get_os_name
 
 logger = get_logger(__name__)
 
@@ -58,7 +60,7 @@ connection in 10 s, or no byte in 30 s. The retry loop then tries again."""
 RETRY_DELAY = 1.0  # seconds, doubled at each attempt
 
 
-async def retrieve(url: str, known_hash: str, *, path: Path, decompress: bool) -> Path:
+async def retrieve(url: str, known_hash: str, *, path: Path, setting: str, decompress: bool) -> Path:
     """
     Download a file and cache it locally (async version of pooch.retrieve).
 
@@ -70,26 +72,37 @@ async def retrieve(url: str, known_hash: str, *, path: Path, decompress: bool) -
         url: URL to download from
         known_hash: Expected hash in format "sha256:abc123..."
         path: Local cache directory
+        setting: The setting that chose `path`, named by its errors
         decompress: Unpack the download (a .zst) with decompress_zstd
 
     Returns:
         Path to the downloaded (or unpacked) file
 
     Raises:
-        TransientError: ASSET_DOWNLOAD: download or hash verification failed after retries
-        ConfigError: SETTING_INVALID: `path` is not a private folder of this user (make_owned_dir)
+        TransientError: ASSET_DOWNLOAD: download or hash verification failed after retries;
+            LOCAL_DISK: a host error on the files of `path` (disk full, quota, I/O error), at
+            once (no retry)
+        ConfigError: SETTING_INVALID: `path` is not a private folder of this user, or this
+            user cannot make it or write its files (cache_dir_error); it names `setting`
 
     Example:
         fname = await retrieve(
             url="https://github.com/dualeai/exec-sandbox/releases/download/v0.1.0/vmlinuz-x86_64.zst",
             known_hash="sha256:abc123...",
             path=cache_dir,
+            setting="EXEC_SANDBOX_CACHE_DIR",
             decompress=True,
         )
     """
-    make_owned_dir(path, setting="path")  # 0700 whatever the umask and group (sg qemu-vm, umask 002)
+    make_cache_dir(path, setting=setting)  # 0700 whatever the umask and group (sg qemu-vm, umask 002)
+    try:
+        return await _retrieve_into(url, known_hash, path=path, decompress=decompress)
+    except OSError as e:  # an existing folder this user cannot write, a full disk
+        raise cache_dir_error(e, path=path, failure="cannot hold the download", setting=setting) from e
 
-    # Extract filename from URL
+
+async def _retrieve_into(url: str, known_hash: str, *, path: Path, decompress: bool) -> Path:
+    """retrieve in a folder that exists: lock, download, verify and unpack the asset."""
     fname = url.rsplit("/", maxsplit=1)[-1]
     dest = path / fname
 
@@ -135,7 +148,9 @@ async def _verify_hash(path: Path, expected_hash: str) -> bool:
 
 
 async def _download_with_retry(url: str, dest: Path, *, expected_hash: str) -> None:
-    """Download file with exponential backoff retry."""
+    """Download file with exponential backoff retry. Network errors, timeouts and a hash
+    mismatch are retried; a file error of the cache folder (an OSError that is not aiohttp's)
+    is raised at once: a retry gets it again or fills the same disk (retrieve maps it)."""
     import aiohttp  # noqa: PLC0415 - only a download needs it (~50 ms at `import exec_sandbox`)
 
     last_error: Exception | None = None
@@ -144,11 +159,8 @@ async def _download_with_retry(url: str, dest: Path, *, expected_hash: str) -> N
         try:
             await _download_file(url, dest, expected_hash=expected_hash)
             return
-        except (aiohttp.ClientError, TransientError, OSError) as e:  # TransientError: hash mismatch
+        except (aiohttp.ClientError, TimeoutError, TransientError) as e:  # TransientError: hash mismatch
             last_error = e
-            if dest.exists():
-                dest.unlink()
-
             if attempt < MAX_RETRIES - 1:
                 delay = RETRY_DELAY * (2**attempt)
                 logger.warning(
@@ -172,7 +184,8 @@ async def _download_file(url: str, dest: Path, *, expected_hash: str) -> None:
 
     Uses chunked reads to bound memory usage (1 MiB per download).
     Hash is computed incrementally during download (no second pass).
-    Uses atomic write pattern (temp file -> rename).
+    Uses atomic write pattern (temp file -> rename): the temp file goes on every path that
+    does not rename it, a cancel too.
     """
     import aiohttp  # noqa: PLC0415 - only a download needs it (~50 ms at `import exec_sandbox`)
 
@@ -232,7 +245,7 @@ async def _download_file(url: str, dest: Path, *, expected_hash: str) -> None:
 
         logger.info("Download complete", extra={"file": str(dest)})
 
-    except Exception:
+    except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
 
@@ -249,37 +262,30 @@ class AsyncPooch:
     Example:
         ASSETS = AsyncPooch(
             path=images_download_dir(),
-            base_url="https://github.com/dualeai/exec-sandbox/releases/download/{version}",
+            base_url="https://github.com/dualeai/exec-sandbox/releases/download/v{version}",
             version=__version__,
-            registry={
-                "vmlinuz-x86_64.zst": "sha256:abc123...",
-                "python-3.14-base-x86_64.qcow2.zst": "sha256:def456...",
-            },
+            setting="EXEC_SANDBOX_CACHE_DIR",
         )
+        await ASSETS.load_registry_from_github("dualeai", "exec-sandbox", f"v{__version__}")
 
         kernel_path = await ASSETS.fetch("vmlinuz-x86_64.zst", decompress=True)
     """
 
-    def __init__(
-        self,
-        path: Path,
-        base_url: str,
-        version: str,
-        registry: dict[str, str] | None = None,
-    ) -> None:
+    def __init__(self, path: Path, base_url: str, version: str, *, setting: str) -> None:
         """
-        Initialize AsyncPooch registry.
+        Initialize AsyncPooch registry: empty until load_registry_from_github fills it.
 
         Args:
             path: Local cache directory
             base_url: Base URL template with {version} placeholder
             version: Current version string (used as fallback if GitHub API not called)
-            registry: Dict mapping filename to hash (e.g., {"file.txt": "sha256:abc123..."})
+            setting: The setting that chose `path`, for its errors
         """
         self.path = path
+        self.setting = setting
         self.base_url = base_url
         self.version = version
-        self.registry: dict[str, str] = registry or {}
+        self.registry: dict[str, str] = {}  # file name -> hash ("sha256:abc123...")
         self._resolved_version: str | None = None  # Actual tag from GitHub API
 
     async def fetch(
@@ -300,8 +306,10 @@ class AsyncPooch:
 
         Raises:
             ConfigError: ASSET_NOT_FOUND: file not in registry; SETTING_INVALID: the cache
-                folder is not a private folder of this user (retrieve)
-            TransientError: ASSET_DOWNLOAD: download or hash verification failed
+                folder is not a private folder of this user, or this user cannot make it or
+                write its files (retrieve)
+            TransientError: ASSET_DOWNLOAD: download or hash verification failed after
+                retries; LOCAL_DISK: a host error on the cache folder (disk full, I/O error)
         """
         if fname not in self.registry:
             raise ConfigError(
@@ -324,6 +332,7 @@ class AsyncPooch:
             url=url,
             known_hash=known_hash,
             path=self.path,
+            setting=self.setting,
             decompress=decompress,
         )
 
@@ -420,7 +429,9 @@ async def decompress_zstd(fname: Path) -> Path:
     pattern (temp file → rename) so partial results are never visible.
 
     Concurrency safety is provided by the caller (``retrieve``'s cross-process
-    file lock).  This function must not be called without external serialization.
+    file lock).  This function must not be called without external serialization:
+    a cancel stops the worker-thread job at its next chunk and returns once the job
+    ended (its temp file removed, the .zst kept), so no write outlives the lock.
 
     Args:
         fname: Path to .zst compressed file
@@ -428,8 +439,6 @@ async def decompress_zstd(fname: Path) -> Path:
     Returns:
         Path to decompressed file (original .zst is deleted)
     """
-    import sys  # noqa: PLC0415
-
     # Use native zstd module (Python 3.14+) or backports.zstd
     if sys.version_info >= (3, 14):
         from compression import zstd  # noqa: PLC0415
@@ -443,19 +452,22 @@ async def decompress_zstd(fname: Path) -> Path:
     # Use atomic write pattern: write to temp file, then rename
     temp_dest = dest.with_suffix(".tmp")
 
-    def _decompress_sync() -> None:
+    def _decompress_sync(stop: threading.Event) -> None:
         try:
             temp_dest.unlink(missing_ok=True)  # left by a killed process: create_file needs the name free
             with fname.open("rb") as src, create_file(temp_dest, mode=_ASSET_MODE, dir_fd=None) as dst:
                 # Use streaming decompression with incremental decompressor
                 decompressor = zstd.ZstdDecompressor()
-                while True:
+                while not stop.is_set():
                     chunk = src.read(CHUNK_SIZE)
                     if not chunk:
                         break
                     decompressed = decompressor.decompress(chunk)
                     if decompressed:
                         dst.write(decompressed)
+            if stop.is_set():  # the call was cancelled: the next fetch unpacks the .zst again
+                temp_dest.unlink()
+                return
             # Atomic rename (POSIX guarantees atomicity)
             temp_dest.rename(dest)
             # Remove compressed file only after successful rename
@@ -465,24 +477,14 @@ async def decompress_zstd(fname: Path) -> Path:
             temp_dest.unlink(missing_ok=True)
             raise
 
-    await asyncio.to_thread(_decompress_sync)
+    await run_stoppable(_decompress_sync, undo=None)
 
     logger.debug("Decompression complete", extra={"file": str(dest)})
     return dest
 
 
-def get_current_arch() -> str:
-    """
-    Get current machine architecture in a normalized format.
-
-    Returns:
-        Architecture string: "x86_64" or "aarch64"
-    """
-    return get_arch_name()
-
-
 _GO_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}
-"""get_current_arch's names to the Go names of the gvproxy-wrapper binaries."""
+"""get_arch_name's names to the Go names of the gvproxy-wrapper binaries."""
 
 
 def get_gvproxy_suffix(arch: str) -> str:
@@ -490,7 +492,7 @@ def get_gvproxy_suffix(arch: str) -> str:
     Get gvproxy binary suffix of this OS for an architecture.
 
     Args:
-        arch: "x86_64" or "aarch64" (get_current_arch's names).
+        arch: "x86_64" or "aarch64" (get_arch_name's names).
 
     Returns:
         Suffix like "darwin-arm64", "darwin-amd64", "linux-arm64", "linux-amd64"

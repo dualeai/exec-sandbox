@@ -1,7 +1,5 @@
-"""Tests for image tool availability.
-
-Verifies each image has the expected tools installed and working.
-Uses a parameterized matrix for easy maintenance.
+"""The tools of each guest image: each one is installed and runs, and the runtimes are the
+versions the image names give (python-3.14, node-1.4 for Bun 1.4).
 """
 
 import pytest
@@ -56,7 +54,7 @@ async def test_raw_tool_available(scheduler: Scheduler, tool: str, command: str)
 
 # Python image tool tests - use Python subprocess to verify tools
 PYTHON_IMAGE_TOOLS = [
-    ("python", "import sys; print(sys.version)"),
+    ("python", "import sys; print(sys.version); exit(0 if sys.version_info[:2] == (3, 14) else 1)"),
     (
         "uv",
         "import subprocess; r = subprocess.run(['uv', '--version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
@@ -92,7 +90,7 @@ async def test_python_tool_available(scheduler: Scheduler, tool: str, code: str)
 
 # JavaScript image tool tests - use Bun to verify tools
 JAVASCRIPT_IMAGE_TOOLS = [
-    ("bun", "console.log(Bun.version)"),
+    ("bun", "console.log(Bun.version); process.exit(Bun.version.startsWith('1.4.') ? 0 : 1)"),
     ("curl", "const p = Bun.spawn(['curl', '--version']); await p.exited; process.exit(p.exitCode)"),
     ("git", "const p = Bun.spawn(['git', '--version']); await p.exited; process.exit(p.exitCode)"),
     ("openssl", "const p = Bun.spawn(['openssl', 'version']); await p.exited; process.exit(p.exitCode)"),
@@ -132,7 +130,9 @@ async def test_raw_functional(scheduler: Scheduler, name: str, command: str, exp
     assert result.exit_code == 0, (
         f"Command failed: {name}\nCommand: {command}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
     )
-    assert expected in result.stdout, f"Expected '{expected}' in output.\nCommand: {command}\nStdout: {result.stdout}"
+    assert result.stdout.strip() == expected, (
+        f"Expected '{expected}' as output.\nCommand: {command}\nStdout: {result.stdout}"
+    )
 
 
 # Python functional tests (native Python code)
@@ -150,7 +150,7 @@ async def test_python_functional(scheduler: Scheduler, name: str, code: str, exp
     assert result.exit_code == 0, (
         f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
     )
-    assert expected in result.stdout, f"Expected '{expected}' in output.\nCode: {code}\nStdout: {result.stdout}"
+    assert result.stdout.strip() == expected, f"Expected '{expected}' as output.\nCode: {code}\nStdout: {result.stdout}"
 
 
 # JavaScript functional tests (native Bun/JS code)
@@ -170,4 +170,4 @@ async def test_javascript_functional(scheduler: Scheduler, name: str, code: str,
     assert result.exit_code == 0, (
         f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
     )
-    assert expected in result.stdout, f"Expected '{expected}' in output.\nCode: {code}\nStdout: {result.stdout}"
+    assert result.stdout.strip() == expected, f"Expected '{expected}' as output.\nCode: {code}\nStdout: {result.stdout}"

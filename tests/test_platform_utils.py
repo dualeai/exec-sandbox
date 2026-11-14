@@ -49,12 +49,8 @@ class TestDetectHostOS:
     """Tests for detect_host_os function."""
 
     def test_detect_matches_sys_platform(self) -> None:
-        """detect_host_os (from psutil) matches sys.platform."""
-        result = detect_host_os()
-        if sys.platform == "darwin":
-            assert result == HostOS.MACOS
-        elif sys.platform.startswith("linux"):
-            assert result == HostOS.LINUX
+        """detect_host_os (from psutil) matches sys.platform (the tests run on macOS or Linux)."""
+        assert detect_host_os() is {"darwin": HostOS.MACOS, "linux": HostOS.LINUX}[sys.platform]
 
 
 # ============================================================================
@@ -312,7 +308,7 @@ class TestProcessWrapperInit:
         assert wrapper.psutil_proc is None
 
     async def test_a_missing_process_is_looked_up_once(self) -> None:
-        """NoSuchProcess never clears with time: one lookup, no sleep on the event loop."""
+        """NoSuchProcess never clears with time: one lookup, no retry."""
         raw = await asyncio.create_subprocess_exec("sleep", "5")
         try:
             gone = psutil.NoSuchProcess(raw.pid)
@@ -494,13 +490,13 @@ class TestPlatformArchCombinations:
     @skip_unless_macos_x86_64
     def test_darwin_amd64_naming_combination(self) -> None:
         """Verify darwin-amd64 naming for Intel Mac."""
-        from exec_sandbox.asset_downloader import get_current_arch, get_gvproxy_suffix
+        from exec_sandbox.asset_downloader import get_gvproxy_suffix
 
-        assert get_gvproxy_suffix(get_current_arch()) == "darwin-amd64"
+        assert get_gvproxy_suffix(get_arch_name()) == "darwin-amd64"
 
     @skip_unless_macos_arm64
     def test_darwin_arm64_naming_combination(self) -> None:
         """Verify darwin-arm64 naming for Apple Silicon."""
-        from exec_sandbox.asset_downloader import get_current_arch, get_gvproxy_suffix
+        from exec_sandbox.asset_downloader import get_gvproxy_suffix
 
-        assert get_gvproxy_suffix(get_current_arch()) == "darwin-arm64"
+        assert get_gvproxy_suffix(get_arch_name()) == "darwin-arm64"

@@ -7,7 +7,7 @@ Uses AsyncPooch for caching and checksum verification.
 Path Resolution Priority:
     1. override (explicit from SchedulerConfig.images_dir)
     2. EXEC_SANDBOX_IMAGES_DIR env var
-    3. ./images/dist/ (local build directory)
+    3. images/dist/ of the source tree (local build directory)
     4. Download cache (images_download_dir): v{version}/ in the user cache folder
        (~/.cache/exec-sandbox on Linux, ~/Library/Caches/exec-sandbox on macOS), or
        EXEC_SANDBOX_CACHE_DIR itself when it is set
@@ -21,18 +21,18 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from exec_sandbox import __version__
 from exec_sandbox._logging import get_logger
+from exec_sandbox._version import __version__
+from exec_sandbox.aio_utils import gather_or_cancel
 from exec_sandbox.asset_downloader import (
     AsyncPooch,
-    get_current_arch,
     get_gvproxy_suffix,
 )
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.images import BASE_IMAGES, RELEASE_SUFFIX, initramfs_name, kernel_dir_of, kernel_names
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import chmod_executable
-from exec_sandbox.platform_utils import UserDir, arch_of, get_user_dir
+from exec_sandbox.platform_utils import UserDir, arch_of, detect_host_arch, get_arch_name, get_user_dir
 
 logger = get_logger(__name__)
 
@@ -41,10 +41,12 @@ __all__ = [
     "PrefetchResult",
     "ensure_assets",
     "ensure_assets_available",
+    "ensure_base_image",
     "ensure_registry_loaded",
     "fetch_gvproxy",
     "get_assets",
     "get_gvproxy_path",
+    "images_download_dir",
     "is_offline_mode",
     "prefetch_all_assets",
 ]
@@ -99,7 +101,7 @@ def _create_assets_registry() -> AsyncPooch:
         path=images_download_dir(),
         base_url=f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/v{{version}}",
         version=pooch_version,
-        registry={},  # Loaded dynamically from GitHub API
+        setting="EXEC_SANDBOX_CACHE_DIR",  # images_download_dir() is under it
     )
 
 
@@ -132,6 +134,10 @@ async def ensure_registry_loaded() -> None:
     Ensure the asset registry is loaded from GitHub.
 
     In offline mode, this is a no-op (assumes assets are pre-cached).
+
+    Raises:
+        ConfigError: ASSET_NOT_FOUND: no such release on GitHub
+        TransientError: ASSET_DOWNLOAD: the release metadata could not be read
     """
     assets = get_assets()
 
@@ -150,18 +156,6 @@ async def ensure_registry_loaded() -> None:
     await assets.load_registry_from_github(GITHUB_OWNER, GITHUB_REPO, version)
 
 
-async def _download_kernel(arch: str) -> Path:
-    """The kernel of `arch` from the release, unpacked into images_download_dir(): the first
-    of kernel_names that the release has (vmlinux for x86_64, then vmlinuz); the last one when
-    none is listed (its fetch reports it missing)."""
-    await ensure_registry_loaded()
-    assets = get_assets()
-    download_candidates = [f"{name}{RELEASE_SUFFIX}" for name in kernel_names(arch_of(arch))]
-    name = next((name for name in download_candidates if name in assets.registry), download_candidates[-1])
-    logger.debug("Fetching kernel", extra={"arch": arch, "file": name})
-    return await assets.fetch(name, decompress=True)
-
-
 async def _download(fname: str) -> Path:
     """`fname` (a release name, .zst) from the release, unpacked into images_download_dir()."""
     await ensure_registry_loaded()
@@ -176,8 +170,18 @@ async def _cached(names: tuple[str, ...]) -> Path | None:
 
 
 async def _kernel_in_cache(arch: str) -> Path:
-    """The kernel of `arch` in images_download_dir(), downloaded there when missing."""
-    return await _cached(kernel_names(arch_of(arch))) or await _download_kernel(arch)
+    """The kernel of `arch` in images_download_dir(), downloaded there when missing: the first
+    of kernel_names that the release has (vmlinux for x86_64, then vmlinuz); the last one when
+    none is listed (its fetch reports it missing)."""
+    names = kernel_names(arch_of(arch))
+    if cached := await _cached(names):
+        return cached
+    await ensure_registry_loaded()
+    assets = get_assets()
+    download_candidates = [f"{name}{RELEASE_SUFFIX}" for name in names]
+    name = next((name for name in download_candidates if name in assets.registry), download_candidates[-1])
+    logger.debug("Fetching kernel", extra={"arch": arch, "file": name})
+    return await assets.fetch(name, decompress=True)
 
 
 async def _in_cache(name: str) -> Path:
@@ -191,10 +195,14 @@ async def ensure_base_image(language: Language, *, images_dir: Path) -> None:
     search folder, which GuestImages does not read.
 
     Raises:
-        ConfigError: ASSET_NOT_FOUND: not in the release, or offline mode
-        TransientError: ASSET_DOWNLOAD: the download or its hash check failed after retries
+        ConfigError: ASSET_NOT_FOUND: not in the release, no such release, or offline mode;
+            SETTING_INVALID: the download cache (under EXEC_SANDBOX_CACHE_DIR) cannot be made
+            or written
+        TransientError: ASSET_DOWNLOAD: the release metadata could not be read, or the download
+            or its hash check failed after retries; LOCAL_DISK: a host error on the download
+            cache (disk full, I/O error)
     """
-    arch = get_current_arch()
+    arch = get_arch_name()
     name = BASE_IMAGES[language].file_name(arch_of(arch))
     if await asyncio.to_thread(_first_existing, [images_dir / name, images_download_dir() / name]):
         return
@@ -202,7 +210,7 @@ async def ensure_base_image(language: Language, *, images_dir: Path) -> None:
     await _download(name + RELEASE_SUFFIX)
 
 
-async def get_gvproxy_path(override: Path | None = None) -> Path | None:
+async def get_gvproxy_path(*, override: Path | None) -> Path | None:
     """
     Get path to gvproxy-wrapper binary for current platform (without downloading).
 
@@ -210,16 +218,16 @@ async def get_gvproxy_path(override: Path | None = None) -> Path | None:
     0. override (explicit from SchedulerConfig.images_dir)
     1. Repo-relative path (gvproxy-wrapper/bin/ - for local development builds)
     2. EXEC_SANDBOX_IMAGES_DIR env var
-    3. Local build directory (./images/dist/)
+    3. Local build directory (images/dist/ of the source tree)
     4. Download cache directory (images_download_dir)
 
     Args:
-        override: Explicit path to search first (from SchedulerConfig.images_dir).
+        override: Explicit path to search first (from SchedulerConfig.images_dir), or None.
 
     Returns:
         Path to the gvproxy-wrapper binary if found, None otherwise.
     """
-    return await _find_gvproxy(override, arch=get_current_arch())
+    return await _find_gvproxy(override, arch=get_arch_name())
 
 
 async def _find_gvproxy(override: Path | None, *, arch: str) -> Path | None:
@@ -233,8 +241,8 @@ async def _find_gvproxy(override: Path | None, *, arch: str) -> Path | None:
     repo_root = Path(__file__).parent.parent.parent
     candidates.append(repo_root / "gvproxy-wrapper" / "bin" / fname)
 
-    # 2-4. Fall back to standard asset cache lookup
-    candidates.extend(directory / fname for directory in _get_search_paths(override))
+    # 2-4. Fall back to standard asset cache lookup (the override is first already)
+    candidates.extend(directory / fname for directory in _get_search_paths(None))
     return await asyncio.to_thread(_first_existing, candidates)
 
 
@@ -248,6 +256,13 @@ async def fetch_gvproxy(*, override: Path | None, arch: str) -> Path:
 
     Returns:
         Path to the gvproxy-wrapper binary (executable).
+
+    Raises:
+        ConfigError: ASSET_NOT_FOUND: not found here and not in the release (or offline mode);
+            SETTING_INVALID: the download cache cannot be made or written
+        TransientError: ASSET_DOWNLOAD: the release metadata could not be read, or the download
+            failed after retries; LOCAL_DISK: a host error on the download cache
+        OSError: the binary cannot be made executable (a read-only folder, a file of another user)
     """
     # Check local paths first
     if local_path := await _find_gvproxy(override, arch=arch):
@@ -287,17 +302,20 @@ async def ensure_assets_available() -> tuple[Path, Path]:
 
     Raises:
         ConfigError: ASSET_NOT_FOUND: release not found on GitHub, or offline mode
-            and assets missing.
+            and assets missing. SETTING_INVALID: the download cache (under
+            EXEC_SANDBOX_CACHE_DIR) cannot be made or written.
         TransientError: ASSET_DOWNLOAD: the release metadata could not be read, or a
-            download or hash verification failed after retries.
+            download or hash verification failed after retries. LOCAL_DISK: a host error
+            on the download cache (disk full, I/O error).
+        OSError: gvproxy-wrapper cannot be made executable (fetch_gvproxy).
     """
-    arch = get_current_arch()
-    kernel_path, _, gvproxy_path = await asyncio.gather(
-        _kernel_in_cache(arch),
-        _in_cache(initramfs_name(arch_of(arch))),
-        fetch_gvproxy(override=None, arch=arch),
+    arch = get_arch_name()
+    # The first failure cancels the other fetches and waits for them: no download runs on
+    # after this call
+    kernel, _initramfs, gvproxy_path = await gather_or_cancel(
+        [_kernel_in_cache(arch), _in_cache(initramfs_name(arch_of(arch))), fetch_gvproxy(override=None, arch=arch)]
     )
-    images_dir = kernel_path.parent
+    images_dir = kernel.parent
 
     logger.info(
         "Assets ready",
@@ -323,7 +341,11 @@ async def ensure_assets(*, override: Path | None, download: bool) -> Path:
 
     Raises:
         ConfigError: ASSET_NOT_FOUND: assets not found and download=False, or release not found on GitHub.
-        TransientError: ASSET_DOWNLOAD: download or hash verification failed after retries.
+            SETTING_INVALID: the download cache (under EXEC_SANDBOX_CACHE_DIR) cannot be made or written.
+        TransientError: ASSET_DOWNLOAD: the release metadata could not be read, or a download or
+            hash verification failed after retries. LOCAL_DISK: a host error on the download cache
+            (disk full, I/O error).
+        OSError: gvproxy-wrapper cannot be made executable (only when no images folder is found).
     """
     # The first folder, in search order, that holds the boot files: a folder that exists
     # with none or one of them (an empty images/dist) must not hide one that has both
@@ -335,7 +357,7 @@ async def ensure_assets(*, override: Path | None, download: bool) -> Path:
             # HOST_DEPENDENCY at its start. OSError: a read-only folder or a file of another
             # user refuses the chmod
             try:
-                await fetch_gvproxy(override=images_dir, arch=get_current_arch())
+                await fetch_gvproxy(override=images_dir, arch=get_arch_name())
             except (ConfigError, TransientError, OSError) as e:
                 logger.warning("gvproxy-wrapper not available: VMs with network cannot start", extra={"error": str(e)})
         return images_dir
@@ -365,7 +387,7 @@ def _get_search_paths(override: Path | None) -> list[Path]:
     Priority order:
     1. override (explicit from SchedulerConfig.images_dir)
     2. EXEC_SANDBOX_IMAGES_DIR env var
-    3. Local build directory (./images/dist/ relative to package root)
+    3. Local build directory (images/dist/ of the source tree, three folders above this file)
     4. Download cache directory (images_download_dir)
 
     Args:
@@ -402,7 +424,7 @@ async def _find_images_dir(override: Path | None) -> Path | None:
     passed over: VMs read both from the images folder. None when no folder does.
     One worker-thread job (a few stat calls).
     """
-    host = arch_of(get_current_arch())
+    host = detect_host_arch()
     kernels = kernel_names(host)
     initramfs = initramfs_name(host)
 
@@ -425,9 +447,7 @@ def _first_existing(paths: list[Path]) -> Path | None:
     return next((path for path in paths if os.path.exists(path)), None)  # noqa: PTH110
 
 
-async def prefetch_all_assets(
-    arch: str | None = None,
-) -> PrefetchResult:
+async def prefetch_all_assets(*, arch: str | None) -> PrefetchResult:
     """
     Pre-download all VM assets for offline use.
 
@@ -438,12 +458,12 @@ async def prefetch_all_assets(
     pre-populating cache in container builds before running with EXEC_SANDBOX_OFFLINE=1.
 
     Args:
-        arch: Target architecture ("x86_64" or "aarch64"). Defaults to current machine.
+        arch: Target architecture ("x86_64" or "aarch64"), or None for this machine's.
 
     Returns:
         PrefetchResult with success status, downloaded assets, and any errors.
     """
-    arch = arch or get_current_arch()
+    arch = arch or get_arch_name()
     logger.info("Prefetching all assets", extra={"arch": arch})
 
     # Load registry first
