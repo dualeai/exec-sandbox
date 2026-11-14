@@ -304,8 +304,9 @@ class DiskSnapshotManager(BaseCacheManager):
         """Wait for the L3 uploads in flight at most L3_UPLOAD_STOP_GRACE_SECONDS, then cancel
         the ones left and wait until each ended; no upload starts once stop() began. An upload
         is a cache fill: a store that does not answer (minutes of botocore retries) does not
-        hold the exit. An interrupted upload leaves no object (S3 writes an object whole) and
-        its compressed file is removed."""
+        hold the exit (the abort of a cancelled multipart upload waits at most
+        s3_parts.ABORT_SECONDS). An interrupted upload leaves no object (S3 writes an object
+        whole) and its compressed file is removed."""
         self._stopping = True
         if self._background_tasks:  # only uploads: _schedule_upload is the one tracker
             await asyncio.wait(list(self._background_tasks), timeout=constants.L3_UPLOAD_STOP_GRACE_SECONDS)

@@ -32,7 +32,7 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
-from exec_sandbox import constants
+from exec_sandbox import constants, s3_parts
 from exec_sandbox._imports import _api_models
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.exceptions import (
@@ -2009,6 +2009,71 @@ class TestCacheHierarchy:
             await snapshot_manager.stop()
 
         held.release()
+        assert s3_proxy.count("MPU_ABORT", r"\.qcow2\.zst$") == 1
+        uploads = s3_proxy.bucket.s3.list_multipart_uploads(Bucket=BUCKET, Prefix=s3_proxy.prefix)
+        assert uploads.get("Uploads", []) == []
+
+    async def _multipart_upload_held(
+        self, make_keyed_manager, s3_proxy, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[DiskSnapshotManager, Any]:
+        """A manager whose L3 upload of a 10 MiB random layer (zstd cannot make it smaller)
+        is a multipart upload whose parts the S3 proxy holds, and whose abort it holds too.
+        Returns the manager and the abort rule (release it to let the abort through)."""
+        monkeypatch.setattr(constants, "L3_UPLOAD_STOP_GRACE_SECONDS", 0.2)
+        snapshot_manager, _settings = await make_keyed_manager(
+            s3_bucket=BUCKET,
+            s3_region="us-east-1",
+            s3_endpoint_url=s3_proxy.endpoint_url,
+            s3_snapshot_prefix=s3_proxy.prefix,
+        )
+        parts = s3_proxy.add("MPU_PART", r"\.qcow2\.zst$", Hold(), times=None)
+        abort = s3_proxy.add("MPU_ABORT", r"\.qcow2\.zst$", Hold(), times=None)
+        _fake_builds(snapshot_manager, monkeypatch, content=os.urandom(10 * 1024 * 1024), failures=[])
+        lease = await snapshot_manager.get_or_create_snapshot(
+            Language.PYTHON, _PACKAGES, tenant_id="t", task_id="t", memory_mb=256
+        )
+        lease.release()
+        async with asyncio.timeout(10):
+            await parts.reached.wait()
+        return snapshot_manager, abort
+
+    async def test_stop_ends_when_the_store_does_not_answer_the_abort(
+        self, make_keyed_manager, s3_proxy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The store answers neither the parts nor the abort: stop() cancels the upload after
+        the grace and waits for the abort at most ABORT_SECONDS (cut to 0.2 s), not for the
+        botocore retries (minutes); the abort that did not end is logged."""
+        monkeypatch.setattr(s3_parts, "ABORT_SECONDS", 0.2)
+        snapshot_manager, abort = await self._multipart_upload_held(make_keyed_manager, s3_proxy, monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger="exec_sandbox.s3_parts"):
+            async with asyncio.timeout(5):
+                await snapshot_manager.stop()
+
+        assert abort.reached.is_set()
+        assert [r.getMessage() for r in caplog.records if r.name == "exec_sandbox.s3_parts"] == [
+            "S3 multipart upload not aborted: its parts stay until a bucket rule removes them"
+        ]
+
+    async def test_a_second_cancel_waits_for_the_abort(
+        self, make_keyed_manager, s3_proxy, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """stop() cancels the upload after the grace; its caller is cancelled while the abort
+        is under way (a bound on the exit, a second Ctrl-C): stop() still waits for the abort,
+        then raises the cancel, and no incomplete upload stays in the bucket."""
+        snapshot_manager, abort = await self._multipart_upload_held(make_keyed_manager, s3_proxy, monkeypatch)
+        stopping = asyncio.create_task(snapshot_manager.stop())
+        async with asyncio.timeout(10):
+            await abort.reached.wait()
+
+        stopping.cancel()
+        await asyncio.wait([stopping], timeout=0.2)
+        assert not stopping.done()  # the abort is still held
+        abort.release()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(10):
+                await stopping
+
         assert s3_proxy.count("MPU_ABORT", r"\.qcow2\.zst$") == 1
         uploads = s3_proxy.bucket.s3.list_multipart_uploads(Bucket=BUCKET, Prefix=s3_proxy.prefix)
         assert uploads.get("Uploads", []) == []

@@ -756,7 +756,7 @@ How each tier works: [Snapshot cache internals](#snapshot-cache-internals).
 
 L3 shares L2 between hosts: each new L2 disk snapshot uploads to S3 in the background, and other hosts download it into their own L2 cache in place of installing the same packages again.
 
-Setting `s3_bucket` turns L3 on (under `s3_snapshot_prefix`). L3 needs `s3:GetObject`, `s3:PutObject` and `s3:PutObjectTagging` on `<s3_snapshot_prefix>*`. Each upload has the tag `ttl_days=14` (`EXEC_SANDBOX_SNAPSHOT_CACHE_TTL_DAYS`), but nothing deletes the objects: add a lifecycle rule that expires them. An L3 error only logs a warning: after a failed download, the run builds the L2 entry on this host.
+Setting `s3_bucket` turns L3 on (under `s3_snapshot_prefix`). L3 needs `s3:GetObject`, `s3:PutObject`, `s3:PutObjectTagging` and `s3:AbortMultipartUpload` on `<s3_snapshot_prefix>*`. Add two lifecycle rules on that prefix: one that expires objects (uploads have the tag `ttl_days=14`, `EXEC_SANDBOX_SNAPSHOT_CACHE_TTL_DAYS`), and `AbortIncompleteMultipartUpload` (1 day). An L3 error only logs a warning: after a failed download, the run builds the L2 entry on this host.
 
 ### Clean up
 

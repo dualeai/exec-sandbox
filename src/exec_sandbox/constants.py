@@ -194,7 +194,8 @@ L3_UPLOAD_STOP_GRACE_SECONDS: Final[float] = 30.0
 """How long DiskSnapshotManager.stop() (Scheduler exit) waits for the L3 uploads in flight
 before it cancels them. An upload saves another host the build (a package install of
 minutes); its compression and PUT of a few hundred MB take seconds. The bound keeps a store
-that does not answer (botocore retries: minutes) from holding the exit."""
+that does not answer (botocore retries: minutes) from holding the exit; the abort of a
+cancelled multipart upload adds at most s3_parts.ABORT_SECONDS."""
 
 PACKAGE_INSTALL_RETRY_MIN_SECONDS: Final[float] = 1.0
 """Minimum backoff between package install retries (1s base).
