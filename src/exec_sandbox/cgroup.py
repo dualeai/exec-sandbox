@@ -97,9 +97,8 @@ guest RAM, which takes milliseconds to some hundreds of ms."""
 
 
 # cgroup v1 "unlimited" sentinel: values at or above this threshold are treated
-# as "no limit set".  The kernel uses PAGE_COUNTER_MAX which on 64-bit is
-# 2^63 / PAGE_SIZE ≈ 9.2e18 / 4096 ≈ 2.25e15.  Checking > 2^62 safely covers
-# both raw byte values (memory.limit_in_bytes) and page-counter representations.
+# as "no limit set".  memory.limit_in_bytes shows "no limit" as PAGE_COUNTER_MAX
+# pages in bytes: 2^63 rounded down to a page on 64-bit (9223372036854771712), above 2^62.
 _CGROUP_V1_UNLIMITED_THRESHOLD: Final[int] = 2**62
 
 
@@ -161,7 +160,7 @@ def detect_cgroup_memory_limit_mb() -> float | None:
                 extra={"limit_mb": round(limit_mb), "path": str(v2_path)},
             )
             return limit_mb
-    except (FileNotFoundError, OSError, ValueError):
+    except (OSError, ValueError):
         pass
 
     # --- cgroup v1 ---
@@ -175,7 +174,7 @@ def detect_cgroup_memory_limit_mb() -> float | None:
                 extra={"limit_mb": round(limit_mb), "path": str(v1_path)},
             )
             return limit_mb
-    except (FileNotFoundError, OSError, ValueError):
+    except (OSError, ValueError):
         pass
 
     return None
@@ -204,7 +203,7 @@ def detect_cgroup_cpu_limit() -> float | None:
                     extra={"cpus": round(cpus, 2), "path": str(v2_path)},
                 )
                 return cpus
-    except (FileNotFoundError, OSError, ValueError):
+    except (OSError, ValueError):
         pass
 
     # --- cgroup v1: cpu.cfs_quota_us / cpu.cfs_period_us ---
@@ -220,7 +219,7 @@ def detect_cgroup_cpu_limit() -> float | None:
                 extra={"cpus": round(cpus, 2)},
             )
             return cpus
-    except (FileNotFoundError, OSError, ValueError):
+    except (OSError, ValueError):
         pass
 
     return None
@@ -242,7 +241,7 @@ def read_container_available_memory_mb() -> float | None:
             limit = int(max_raw)
             current = int(Path(CGROUP_V2_BASE_PATH, "memory.current").read_text().strip())
             return max(0, limit - current) / (1024 * 1024)
-    except (FileNotFoundError, OSError, ValueError):
+    except (OSError, ValueError):
         pass
 
     # --- cgroup v1 ---
@@ -251,7 +250,7 @@ def read_container_available_memory_mb() -> float | None:
         if limit < _CGROUP_V1_UNLIMITED_THRESHOLD:
             usage = int(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text().strip())
             return max(0, limit - usage) / (1024 * 1024)
-    except (FileNotFoundError, OSError, ValueError):
+    except (OSError, ValueError):
         pass
 
     return None
@@ -297,7 +296,7 @@ def cgroup_v2_available() -> bool:
             logger.warning("cgroup v2 mounted but no controllers enabled")
         else:
             logger.debug(f"cgroup v2 available with controllers: {controllers}")
-    except (OSError, PermissionError) as e:
+    except OSError as e:  # PermissionError too
         logger.debug(f"cgroup v2 not available: cannot read controllers: {e}")
         return False
 
@@ -896,9 +895,9 @@ def wrap_with_ulimit(cmd: list[str], cgroup_memory_mb: int) -> list[str]:
 
     Note: ``ulimit -u`` (RLIMIT_NPROC) is intentionally NOT set here.
     Unlike cgroup ``pids.max`` (which is per-cgroup, per-VM), RLIMIT_NPROC is
-    per-UID: ALL processes under the same UID share a single counter.  Setting
-    it to 256 (the per-VM cgroup pids limit) caused ``qemu_thread_create:
-    Resource temporarily unavailable`` at ~23 concurrent VMs because
+    per-UID: ALL processes under the same UID share a single counter.  At 256
+    (the per-VM cgroup pids limit), QEMU fails with ``qemu_thread_create:
+    Resource temporarily unavailable`` at ~23 concurrent VMs:
     23 QEMUs x 12 threads = 276 > 256.  The system's default RLIMIT_NPROC
     (typically 126K+ on Linux, 2784 on macOS) already prevents fork bombs.
 

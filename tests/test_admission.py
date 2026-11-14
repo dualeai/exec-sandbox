@@ -27,18 +27,12 @@ import psutil
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
 
 from exec_sandbox.admission import (
     _AFTER_COMMIT,  # pyright: ignore[reportPrivateUsage]
     _AT_REMOVAL,  # pyright: ignore[reportPrivateUsage]
     _BACKGROUND,  # pyright: ignore[reportPrivateUsage]
-    _BTRFS_IOC_START_SYNC,  # pyright: ignore[reportPrivateUsage]
-    _BTRFS_IOC_WAIT_SYNC,  # pyright: ignore[reportPrivateUsage]
-    _BTRFS_SUPER_MAGIC,  # pyright: ignore[reportPrivateUsage]
-    _OTHER,  # pyright: ignore[reportPrivateUsage]
-    _XFS_SUPER_MAGIC,  # pyright: ignore[reportPrivateUsage]
-    _ZFS_SUPER_MAGIC,  # pyright: ignore[reportPrivateUsage]
     ResourceAdmissionController,
     ResourceReservation,
     _DiskSpace,  # pyright: ignore[reportPrivateUsage]
@@ -55,22 +49,22 @@ from exec_sandbox.constants import (
     DEFAULT_HOST_CPU_RESERVE_CORES,
     DEFAULT_HOST_MEMORY_RESERVE_RATIO,
     DEFAULT_MEMORY_OVERCOMMIT_RATIO,
-    DEFAULT_VM_CPU_CORES,
     RESOURCE_ADMISSION_TIMEOUT_SECONDS,
 )
 from exec_sandbox.exceptions import ErrorAction, ErrorCode, InvalidInputError, RouteError, TransientError
 from exec_sandbox.files.disk import overlay_upper
 from exec_sandbox.files.locks import CacheEntry
 from exec_sandbox.platform_utils import HostOS, detect_host_os
-from tests.conftest import skip_unless_linux, skip_unless_macos
+from tests.conftest import skip_unless_linux, skip_unless_macos, time_with
 from tests.test_files_locks import SizedCache, evicted_in_child, leased_in_child
 
 # ============================================================================
 # Helpers
 # ============================================================================
 
-# Shorthand for test acquire calls
-_CPU = DEFAULT_VM_CPU_CORES
+_CPU = 1.0
+"""Guest cores of most test acquire calls: 1.25 cores with the overhead, as the hand-computed
+figures below count."""
 # No such folder: gate 4 reads no free space and admits, so the free disk of the host
 # never changes the outcome of the tests of the other gates (TestDiskGate covers gate 4)
 _DISK_DIR = Path(tempfile.gettempdir()) / f"no-home-disks-{uuid4().hex}"
@@ -119,24 +113,34 @@ def _probed_controller(*, memory_overcommit: float = 1.0, cpu_overcommit: float 
         cpu_overcommit_ratio=cpu_overcommit,
         disk_overcommit_ratio=DEFAULT_DISK_OVERCOMMIT_RATIO,
         host_memory_reserve_ratio=0.1,
+        host_memory_mb=None,
+        host_cpu_count=None,
+        available_memory_floor_mb=0,
         host_cpu_reserve_cores=0.5,
     )
 
 
-def _invalidate_probe_caches(*controllers: ResourceAdmissionController) -> None:
-    """Clear the 100 ms probe caches: the next probe reads the (faked) host again. It stands for
-    the cache time that passes between two steps of a test."""
-    for ctrl in controllers:
-        for attr in list(vars(ctrl)):
-            if attr.startswith("_ttl_"):
-                delattr(ctrl, attr)
+@contextmanager
+def _probe_clock() -> Generator[Callable[[], None]]:
+    """The clock of the 100 ms probe caches (time.monotonic of the admission module) for the
+    block. Each call of the returned function moves it 1 s on: the next probe reads the (faked)
+    host again. It stands for the cache time that passes between two steps of a test."""
+    offset = [0.0]
+
+    def later() -> None:
+        offset[0] += 1.0
+
+    with patch("exec_sandbox.admission.time", time_with(monotonic=lambda: time.monotonic() + offset[0])):
+        yield later
 
 
 async def _budgets(ctrl: ResourceAdmissionController) -> dict[str, str]:
     """The memory and CPU budgets of `ctrl`, as the error of a request above both gives them
     (RouteError CAPACITY_NEVER_FITS, `found`: memory in whole MB, CPU to 0.1 core)."""
     with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS) as exc_info:
-        await ctrl.acquire("vm-huge", memory_mb=10**12, cpu_cores=10**6, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+        await ctrl.acquire(
+            "vm-huge", memory_mb=10**12, cpu_cores=10**6, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
     return dict(exc_info.value.found)
 
 
@@ -145,7 +149,7 @@ async def _blocking_gate_of(ctrl: ResourceAdmissionController, *, memory_mb: flo
     `blocking_gate`), or None when it is admitted (then released)."""
     try:
         reservation = await ctrl.acquire(
-            "vm-1", memory_mb=memory_mb, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, held=frozenset()
+            "vm-1", memory_mb=memory_mb, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
         )
     except TransientError as e:
         assert e.code is ErrorCode.CAPACITY
@@ -203,12 +207,14 @@ async def test_memory_gate_blocks_when_budget_exhausted() -> None:
 
     reservations = []
     for i in range(10):
-        r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+        r = await ctrl.acquire(
+            f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
         reservations.append(r)
 
     # Next should block (budget exhausted)
     acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-block", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0, held=frozenset())
+        ctrl.acquire("vm-block", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
     )
     await _until_waiting_or_done(ctrl, acquire_task)
     assert not acquire_task.done()
@@ -243,12 +249,16 @@ async def test_cpu_gate_blocks_when_budget_exhausted() -> None:
         cpu_reserve_cores=0.0,
     )
 
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
-    r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+    r1 = await ctrl.acquire(
+        "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
+    r2 = await ctrl.acquire(
+        "vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
 
     # 3rd should block (2.5 + 1.25 = 3.75 > 3.0)
     acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0, held=frozenset())
+        ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
     )
     await _until_waiting_or_done(ctrl, acquire_task)
     assert not acquire_task.done()
@@ -280,12 +290,16 @@ async def test_multi_core_vms_consume_proportional_budget() -> None:
         cpu_reserve_cores=0.0,
     )
 
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
-    r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+    r1 = await ctrl.acquire(
+        "vm-1", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
+    r2 = await ctrl.acquire(
+        "vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
 
     # 3rd 2-core VM should block (4.5 + 2.25 = 6.75 > 5.0)
     acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-3", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=1.0, held=frozenset())
+        ctrl.acquire("vm-3", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
     )
     await _until_waiting_or_done(ctrl, acquire_task)
     assert not acquire_task.done()
@@ -313,22 +327,33 @@ async def test_mixed_core_vms_share_budget() -> None:
     )
 
     # 1-core (1.25 eff) + 2-core (2.25 eff) = 3.50 (fits in 4.0 budget)
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
-    r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+    r1 = await ctrl.acquire(
+        "vm-1", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
+    r2 = await ctrl.acquire(
+        "vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
 
     # Even a 1-core VM should block now (1.25 > 0.50 remaining)
     acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-3", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=1.0, held=frozenset())
+        ctrl.acquire("vm-3", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
     )
     await _until_waiting_or_done(ctrl, acquire_task)
     assert not acquire_task.done()
 
-    # The 0.50 left holds a 0.25-core VM (0.50 effective), and nothing more
-    r_fill = await ctrl.acquire("vm-fill", memory_mb=256, cpu_cores=0.25, disk_mb=0, timeout=_REFUSED, held=frozenset())
+    # The 0.50 left holds a 0.25-core VM (0.50 effective), and nothing more (0.01 core: 0.26)
+    r_fill = await ctrl.acquire(
+        "vm-fill", memory_mb=256, cpu_cores=0.25, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+    )
+    with pytest.raises(TransientError, check=lambda e: e.context["blocking_gate"] == "cpu_budget"):
+        await ctrl.acquire(
+            "vm-more", memory_mb=256, cpu_cores=0.01, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+        )
     await ctrl.release(r_fill)
 
     await ctrl.release(r1)
     r3 = await asyncio.wait_for(acquire_task, timeout=5.0)
+    assert r3.vm_id == "vm-3"
 
     await ctrl.release(r2)
     await ctrl.release(r3)
@@ -349,12 +374,14 @@ async def test_overcommit_allows_more_cpu_than_physical() -> None:
 
     reservations = []
     for i in range(8):
-        r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+        r = await ctrl.acquire(
+            f"vm-{i}", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
         reservations.append(r)
 
     # 9th should block
     acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-block", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=1.0, held=frozenset())
+        ctrl.acquire("vm-block", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
     )
     await _until_waiting_or_done(ctrl, acquire_task)
     assert not acquire_task.done()
@@ -373,32 +400,54 @@ async def test_overcommit_allows_more_cpu_than_physical() -> None:
 
 
 @pytest.mark.parametrize(
-    ("memory_mb", "cpu_cores", "too_big"),
-    [pytest.param(1_000_000, _CPU, "memory_mb", id="memory"), pytest.param(256, 64.0, "cpu", id="cpu")],
+    ("memory_mb", "cpu_cores", "required", "found"),
+    [
+        # 1000000 + 80 MB of overhead, above the 21600 MB budget
+        pytest.param(1_000_000, _CPU, {"memory_mb": "1000080"}, {"memory_mb": "21600"}, id="memory"),
+        # 64 + 0.25 cores of overhead, above the 30-core budget
+        pytest.param(256, 64.0, {"cpu": "64.25"}, {"cpu": "30.0"}, id="cpu"),
+    ],
 )
-async def test_acquire_never_fits_fails_at_once(memory_mb: float, cpu_cores: float, too_big: str) -> None:
+async def test_acquire_never_fits_fails_at_once(
+    memory_mb: float, cpu_cores: float, required: dict[str, str], found: dict[str, str]
+) -> None:
     """A request above the whole budget fails at once, without waiting for the timeout.
 
     It is a RouteError (a worker with a larger budget can run it); `required` and
-    `found` list only the value that is too big.
+    `found` list only the value that is too big. Budgets as in test_budget_calculation:
+    21600 MB of memory, 30 cores.
     """
-    ctrl = _make_controller()
+    ctrl = _make_controller(
+        host_memory_mb=16_000.0,
+        reserve_ratio=0.1,
+        memory_overcommit=1.5,
+        host_cpu_count=8.0,
+        cpu_overcommit=4.0,
+        cpu_reserve_cores=0.5,
+    )
 
     async with asyncio.timeout(1.0):
         with pytest.raises(
             RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS, match="can never fit"
         ) as exc_info:
             await ctrl.acquire(
-                "vm-huge", memory_mb=memory_mb, cpu_cores=cpu_cores, disk_mb=0, timeout=_TIMEOUT, held=frozenset()
+                "vm-huge",
+                memory_mb=memory_mb,
+                cpu_cores=cpu_cores,
+                disk_mb=0,
+                timeout=_TIMEOUT,
+                use_tcg=False,
+                held=frozenset(),
             )
 
     error = exc_info.value
     assert error.action is ErrorAction.ROUTE
-    assert set(error.required) == set(error.found) == {too_big}
-    assert float(error.required[too_big]) > float(error.found[too_big])
+    assert (dict(error.required), dict(error.found)) == (required, found)
     async with asyncio.timeout(1.0):  # nothing was reserved: a request that fits is admitted at once
         await ctrl.release(
-            await ctrl.acquire("vm-ok", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+            await ctrl.acquire(
+                "vm-ok", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+            )
         )
 
 
@@ -406,14 +455,18 @@ async def test_acquire_timeout_raises_capacity_error() -> None:
     """TransientError CAPACITY raised when timeout expires waiting for resources."""
     # Tight CPU budget: only 1 VM fits (1.5 host CPUs, 0 reserve, each VM 1.25 effective)
     ctrl = _make_controller(host_cpu_count=1.5, cpu_overcommit=1.0, cpu_reserve_cores=0.0)
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+    r1 = await ctrl.acquire(
+        "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
 
     with pytest.raises(
         TransientError,
         check=lambda e: e.code is ErrorCode.CAPACITY,
         match=r"Resource admission timeout after 0\.2s for VM vm-2, blocked by CPU budget",
     ) as exc_info:
-        await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2, held=frozenset())
+        await ctrl.acquire(
+            "vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2, use_tcg=False, held=frozenset()
+        )
 
     assert exc_info.value.context["blocking_gate"] == "cpu_budget"
     await ctrl.release(r1)
@@ -463,7 +516,9 @@ def _one_vm_controller(count: int = 1) -> ResourceAdmissionController:
 async def test_release_frees_resources() -> None:
     """Release returns the memory and the CPU of the VM to the budget: the same VM fits again."""
     ctrl = _one_vm_controller()
-    r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+    r = await ctrl.acquire(
+        "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
     assert await _blocking_gate_of(ctrl) == "memory_budget"
 
     await ctrl.release(r)
@@ -475,12 +530,18 @@ async def test_double_release_is_idempotent() -> None:
     admitted meanwhile (the counters snap to zero only once no VM is left): after the double
     release, one VM fits, not two."""
     ctrl = _one_vm_controller(count=2)
-    other = await ctrl.acquire("vm-other", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
-    r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+    other = await ctrl.acquire(
+        "vm-other", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
+    r = await ctrl.acquire(
+        "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
     await ctrl.release(r)
     await ctrl.release(r)  # a no-op
 
-    again = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, held=frozenset())
+    again = await ctrl.acquire(
+        "vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+    )
     assert await _blocking_gate_of(ctrl) == "memory_budget"
     await ctrl.release(again)
     await ctrl.release(other)
@@ -497,19 +558,27 @@ async def test_concurrent_same_vm_id_no_collision() -> None:
     ctrl = _one_vm_controller(count=2)
 
     # Acquire two reservations with the same vm_id (simulates concurrent requests)
-    r1 = await ctrl.acquire("same-id", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
-    r2 = await ctrl.acquire("same-id", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+    r1 = await ctrl.acquire(
+        "same-id", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
+    r2 = await ctrl.acquire(
+        "same-id", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
     assert r1.reservation_id != r2.reservation_id
 
     # Release first: r2 still holds its share, so one VM fits, not two
     await ctrl.release(r1)
-    r3 = await ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, held=frozenset())
+    r3 = await ctrl.acquire(
+        "vm-3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+    )
     assert await _blocking_gate_of(ctrl) == "memory_budget"
 
     await ctrl.release(r2)
     await ctrl.release(r3)
     both = [
-        await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, held=frozenset())
+        await ctrl.acquire(
+            f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+        )
         for i in range(2)
     ]
     for r in both:
@@ -537,7 +606,13 @@ async def test_psutil_failure_degrades_to_unlimited() -> None:
         await ctrl.start()
         reservations = [
             await ctrl.acquire(
-                f"vm-{i}", memory_mb=10**9, cpu_cores=10**4, disk_mb=0, timeout=_REFUSED, held=frozenset()
+                f"vm-{i}",
+                memory_mb=10**9,
+                cpu_cores=10**4,
+                disk_mb=0,
+                timeout=_REFUSED,
+                use_tcg=False,
+                held=frozenset(),
             )
             for i in range(3)
         ]
@@ -570,13 +645,17 @@ async def test_counters_snap_to_zero_when_empty() -> None:
     )
     sizes = [0.7, 0.4, 0.3]
     held = [
-        await ctrl.acquire(f"vm-{i}", memory_mb=size, cpu_cores=size, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+        await ctrl.acquire(
+            f"vm-{i}", memory_mb=size, cpu_cores=size, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
         for i, size in enumerate(sizes)
     ]
     for r in held:
         await ctrl.release(r)
 
-    whole = await ctrl.acquire("vm-whole", memory_mb=256, cpu_cores=2.25, disk_mb=0, timeout=_REFUSED, held=frozenset())
+    whole = await ctrl.acquire(
+        "vm-whole", memory_mb=256, cpu_cores=2.25, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+    )
     await ctrl.release(whole)
 
 
@@ -723,8 +802,9 @@ async def test_one_manual_override_stands_and_the_other_is_probed(
         cpu_overcommit_ratio=1.0,
         disk_overcommit_ratio=DEFAULT_DISK_OVERCOMMIT_RATIO,
         host_memory_reserve_ratio=0.1,
+        available_memory_floor_mb=0,
         host_cpu_reserve_cores=0.5,
-        **given,
+        **{"host_memory_mb": None, "host_cpu_count": None, **given},
     )
 
     def probe(result: object) -> dict[str, object]:
@@ -808,7 +888,7 @@ async def test_available_memory_floor(floor_mb: int, available_mb: float, admitt
     with _mock_system_memory(available_mb):
         try:
             reservation = await ctrl.acquire(
-                "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, held=frozenset()
+                "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
             )
         except TransientError as e:
             assert not admitted
@@ -850,7 +930,9 @@ async def test_cgroup_probe_preferred_over_psutil() -> None:
         patch("exec_sandbox.admission.detect_host_os", return_value=HostOS.UNKNOWN),
         pytest.raises(TransientError, check=lambda e: e.context["blocking_gate"] == "available_memory") as exc_info,
     ):
-        await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, held=frozenset())
+        await ctrl.acquire(
+            "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+        )
     assert exc_info.value.context["system_available_memory_mb"] == 300
 
 
@@ -871,7 +953,34 @@ async def test_stop_is_idempotent() -> None:
     await ctrl.stop()  # Second stop is a no-op
     assert asyncio.all_tasks() == before
     with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE):
-        await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+        await ctrl.acquire(
+            "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
+
+
+async def test_a_cancelled_stop_raises_its_cancel() -> None:
+    """A cancel of the stop() caller while stop() waits for the end of its timer comes out as
+    CancelledError: the wait for the timer must not take the caller's cancel for the timer's."""
+    ctrl = _make_controller()
+    await ctrl.start()
+    stopping = asyncio.create_task(ctrl.stop())
+    await asyncio.sleep(0)  # stop() now waits for the end of the timer it cancelled
+    stopping.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+    finally:
+        await ctrl.stop()
+
+
+async def test_a_start_after_stop_starts_no_timer() -> None:
+    """start() after stop() leaves no task: nothing would end the self-wake timer of a stopped
+    controller (stop() ran already)."""
+    ctrl = _make_controller()
+    before = asyncio.all_tasks()
+    await ctrl.stop()
+    await ctrl.start()
+    assert asyncio.all_tasks() == before
 
 
 # ============================================================================
@@ -897,7 +1006,9 @@ async def test_self_wake_timer_unblocks_gate3_waiters(gate: str) -> None:
     ):
         await ctrl.start()
         acquire_task = asyncio.create_task(
-            ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=5.0, held=frozenset()),
+            ctrl.acquire(
+                "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=5.0, use_tcg=False, held=frozenset()
+            ),
         )
         await _until_waiting_or_done(ctrl, acquire_task)
         assert not acquire_task.done()
@@ -938,7 +1049,9 @@ async def test_probe_cache_deduplicates_calls() -> None:
         patch("exec_sandbox.admission._read_macos_memory_pressure_level", side_effect=counting_level),
     ):
         reservations = [
-            await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+            await ctrl.acquire(
+                f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+            )
             for i in range(5)
         ]
     for r in reservations:
@@ -1125,14 +1238,20 @@ async def test_n_controllers_converge_to_system_limit(floor_mb: int, expected: i
     reservations: list[tuple[ResourceAdmissionController, ResourceReservation]] = []
     refused: TransientError | None = None
 
-    with _mock_dynamic_system_memory(2048.0) as available_mb:
+    with _mock_dynamic_system_memory(2048.0) as available_mb, _probe_clock() as later:
         # Round-robin across controllers until system is full
         for i in range(20):  # try up to 20 VMs
             ctrl = controllers[i % n_controllers]
-            _invalidate_probe_caches(*controllers)
+            later()
             try:
                 r = await ctrl.acquire(
-                    f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, held=frozenset()
+                    f"vm-{i}",
+                    memory_mb=256,
+                    cpu_cores=_CPU,
+                    disk_mb=0,
+                    timeout=_REFUSED,
+                    use_tcg=False,
+                    held=frozenset(),
                 )
             except TransientError as e:
                 refused = e
@@ -1162,8 +1281,12 @@ async def test_gate1_still_limits_single_controller() -> None:
     )
 
     with _mock_system_memory(100_000.0):  # system has plenty
-        r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
-        r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+        r1 = await ctrl.acquire(
+            "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
+        r2 = await ctrl.acquire(
+            "vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
 
         # Third VM: Gate 3a passes (100GB available) but Gate 1 rejects (672 + 336 > 1000)
         assert await _blocking_gate_of(ctrl) == "memory_budget"
@@ -1182,11 +1305,13 @@ async def test_stop_unblocks_waiting_acquires() -> None:
     # Tight budget: only 1 VM fits (1.5 host CPUs, 0 reserve, each VM 1.25 effective)
     ctrl = _make_controller(host_cpu_count=1.5, cpu_overcommit=1.0, cpu_reserve_cores=0.0)
 
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, held=frozenset())
+    r1 = await ctrl.acquire(
+        "vm-1", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    )
 
     # Second acquire blocks (no CPU left)
     acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-2", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=120.0, held=frozenset()),
+        ctrl.acquire("vm-2", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=120.0, use_tcg=False, held=frozenset()),
     )
     await _until_waiting_or_done(ctrl, acquire_task)
     assert not acquire_task.done()
@@ -1315,7 +1440,11 @@ class _Cache:
         return SimpleNamespace(evict_next=self.evict_oldest)
 
     async def reclaimable_bytes(self, *, held: frozenset[Path]) -> int:
+        """Yields once: requests made together register before the first pass sizes itself.
+        The real listing is a thread job, which yields nothing on 3.13+ when it ends before
+        its await: there the first pass can size itself only (the next passes cover the rest)."""
         del held  # no lease paths here: every entry counts
+        await asyncio.sleep(0)
         self.size_read.set()
         self.size_read_calls.append(asyncio.get_running_loop().time())
         return int(sum(self.entries) * _MIB)
@@ -1355,13 +1484,24 @@ class _SizedDisk:
 
     def usage(self, _path: object) -> SimpleNamespace:
         used = sum(  # the sizes the cache keeps: a read of an entry would set its atime
-            cache.sizes[entry.name] for cache in self._caches for entry in cache.cache_dir.glob(f"*{cache._cache_ext}")
+            size for cache in self._caches for name, size in cache.sizes.items() if (cache.cache_dir / name).exists()
         )
         return SimpleNamespace(free=int((self._capacity_mb - used) * _MIB))
 
 
 class TestDiskGate:
-    """Sparse home disks: each admitted disk reserves a part of what its guest has not written yet."""
+    """Sparse home disks: each admitted disk reserves a part of what its guest has not written yet.
+
+    The free space (shutil.disk_usage), the caches (add_cache) and syncfs are faked at their
+    calls. How the filesystem shows removals (_settle_removals, private) is patched with
+    test-sized times: the filesystems (btrfs, XFS, ZFS, overlay) are not on the test host, and
+    their real times are seconds. TestSettleRemovals covers the real call."""
+
+    @pytest.fixture(autouse=True)
+    async def _executor_thread_started(self) -> None:
+        """The default executor of this test's event loop has its first thread: the start of a
+        thread holds the event loop (15 ms under load), longer than the time windows here."""
+        await asyncio.to_thread(int)
 
     @pytest.fixture(autouse=True)
     def _space_shows_at_removal(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1382,6 +1522,8 @@ class TestDiskGate:
             host_memory_reserve_ratio=0.0,
             host_memory_mb=1_000_000.0,
             host_cpu_count=1000.0,
+            available_memory_floor_mb=0,
+            host_cpu_reserve_cores=DEFAULT_HOST_CPU_RESERVE_CORES,
         )
 
     @staticmethod
@@ -1400,32 +1542,56 @@ class TestDiskGate:
         with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(2566).usage):
             held = [
                 await ctrl.acquire(
-                    f"vm-{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=_REFUSED, held=frozenset()
+                    f"vm-{i}",
+                    memory_mb=1,
+                    cpu_cores=_CPU,
+                    disk_mb=1024,
+                    timeout=_REFUSED,
+                    use_tcg=False,
+                    held=frozenset(),
                 )
                 for i in range(fits)
             ]
             with pytest.raises(TransientError, check=lambda e: e.context["blocking_gate"] == "home_disk_space"):
                 await ctrl.acquire(
-                    "vm-next", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=_REFUSED, held=frozenset()
+                    "vm-next",
+                    memory_mb=1,
+                    cpu_cores=_CPU,
+                    disk_mb=1024,
+                    timeout=_REFUSED,
+                    use_tcg=False,
+                    held=frozenset(),
                 )
         for reservation in held:
             await ctrl.release(reservation)
 
     async def test_sparse_disks_do_not_turn_free_disk_into_one_vm(self, tmp_path: Path) -> None:
-        """The CI case: 2566 MB free, floor 1024 MB, 1024 MB disks. Counting each whole disk
-        admitted 1 VM; the reserve (256 MB each) admits 6 at once (1536 of the 1542 MB of room),
-        then names the gate that blocks."""
+        """The CI case: 2566 MB free, floor 1024 MB, 1024 MB disks. A count of each whole disk admits 1 VM;
+        the reserve (256 MB each) admits 6 at once (1536 of the 1542 MB of room), then names the gate that
+        blocks."""
         ctrl = self._controller(tmp_path, floor_mb=1024)
         with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(2566).usage):
             held = [
                 await ctrl.acquire(
-                    f"vm-{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=_REFUSED, held=frozenset()
+                    f"vm-{i}",
+                    memory_mb=1,
+                    cpu_cores=_CPU,
+                    disk_mb=1024,
+                    timeout=_REFUSED,
+                    use_tcg=False,
+                    held=frozenset(),
                 )
                 for i in range(6)
             ]
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.CAPACITY) as exc_info:
                 await ctrl.acquire(
-                    "vm-next", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=_REFUSED, held=frozenset()
+                    "vm-next",
+                    memory_mb=1,
+                    cpu_cores=_CPU,
+                    disk_mb=1024,
+                    timeout=_REFUSED,
+                    use_tcg=False,
+                    held=frozenset(),
                 )
         for reservation in held:
             await ctrl.release(reservation)
@@ -1448,10 +1614,10 @@ class TestDiskGate:
         ctrl = self._controller(tmp_path, floor_mb=500)
         with disk.patched(tmp_path):
             first = await ctrl.acquire(
-                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=_REFUSED, held=frozenset()
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=_REFUSED, use_tcg=False, held=frozenset()
             )
             second = await ctrl.acquire(
-                "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=_REFUSED, held=frozenset()
+                "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=_REFUSED, use_tcg=False, held=frozenset()
             )
         await ctrl.release(second)
         await ctrl.release(first)
@@ -1463,14 +1629,14 @@ class TestDiskGate:
         disk_file = tmp_path / "vm.img"
         disk_file.write_bytes(os.urandom(4 * _MIB))
         ctrl = self._controller(tmp_path, floor_mb=0, ratio=256.0)
-        with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(2).usage):
+        with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(2).usage), _probe_clock() as later:
             ctrl.note_shared_blocks("vm.img", disk_file.stat().st_blocks * 512)
             assert self._default_disks(ctrl) == 0  # (2 + 0) / 4
             disk_file.unlink()
-            _invalidate_probe_caches(ctrl)
+            later()
             assert self._default_disks(ctrl) == 0  # the probe sees the disk gone: it forgets its note
             disk_file.write_bytes(os.urandom(4 * _MIB))  # a new, fully written disk, same name
-            _invalidate_probe_caches(ctrl)
+            later()
             assert self._default_disks(ctrl) == 1  # (2 + 4) / 4: the old note did not stay
 
     def test_a_note_made_before_the_clone_survives_a_probe(self, tmp_path: Path) -> None:
@@ -1479,21 +1645,21 @@ class TestDiskGate:
         not made yet, and the next one counts the clone's shared blocks as not written. A
         default disk counts 4 MB here (ratio 256), and 2 MB are free."""
         ctrl = self._controller(tmp_path, floor_mb=0, ratio=256.0)
-        with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(2).usage):
+        with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(2).usage), _probe_clock() as later:
             ctrl.note_shared_blocks("vm.img", 4 * _MIB)
             assert self._default_disks(ctrl) == 0  # a probe before the clone is made
             (tmp_path / "vm.img").write_bytes(os.urandom(4 * _MIB))
-            _invalidate_probe_caches(ctrl)
+            later()
             assert self._default_disks(ctrl) == 0  # (2 + 0) / 4
             ctrl.forget_shared_blocks("vm.img")  # the clone was a plain copy
-            _invalidate_probe_caches(ctrl)
+            later()
             assert self._default_disks(ctrl) == 1  # (2 + 4) / 4
 
     async def test_unreadable_disk_dir_skips_the_gate(self, tmp_path: Path) -> None:
         """No free-space figure (disk_dir gone): the gate admits, it does not block every VM."""
         ctrl = self._controller(tmp_path / "gone", floor_mb=10**9)
         reservation = await ctrl.acquire(
-            "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=0.2, held=frozenset()
+            "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=0.2, use_tcg=False, held=frozenset()
         )
         await ctrl.release(reservation)
 
@@ -1518,7 +1684,9 @@ class TestDiskGate:
         ctrl.add_cache(l1)
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
             await ctrl.release(
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=0.2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=0.2, use_tcg=False, held=frozenset()
+                )
             )
         assert (l2.evicted, l1.evicted) == ([100], [200])
         assert (l2.entries, l1.entries) == ([100, 100], [200])
@@ -1541,7 +1709,9 @@ class TestDiskGate:
         try:
             with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, use_tcg=False, held=frozenset()
+                    )
                 )
         finally:
             for lease in leases:
@@ -1565,7 +1735,9 @@ class TestDiskGate:
         try:
             with patch("exec_sandbox.admission.shutil.disk_usage", _SizedDisk(1000 + 450, [only]).usage):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, use_tcg=False, held=frozenset()
+                    )
                 )
         finally:
             lease.release()
@@ -1582,7 +1754,9 @@ class TestDiskGate:
         try:
             with patch("exec_sandbox.admission.shutil.disk_usage", _SizedDisk(1000 + 400, [l2, l1]).usage):
                 await ctrl.release(
-                    await ctrl.acquire("vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, use_tcg=False, held=frozenset()
+                    )
                 )
         finally:
             lease.release()
@@ -1602,7 +1776,9 @@ class TestDiskGate:
         with disk.patched(tmp_path):
             # 8000 MB disk: needs 2000 MB, 1000 MB short
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=30, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=30, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting(ctrl, 1)
             assert sum(len(cache.evicted) for cache in caches) == 10  # 1000 MB: what it lacked
@@ -1629,7 +1805,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission.shutil.disk_usage", disk.usage),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=10**9, timeout=1, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=10**9, timeout=1, use_tcg=False, held=frozenset()
+            )
         assert [cache.evicted for cache in caches] == [[], []]
 
     async def test_wake_up_evicts_entries_saved_meanwhile(self, tmp_path: Path) -> None:
@@ -1640,9 +1818,13 @@ class TestDiskGate:
         cache = _Cache(tmp_path / "l1", disk, [])
         ctrl.add_cache(cache)
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
-            held = await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=0.2, held=frozenset())
+            held = await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=0.2, use_tcg=False, held=frozenset()
+            )
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting(ctrl, 1)
             cache.entries.append(300)  # an L1 save while vm-2 waits
@@ -1663,7 +1845,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission.shutil.disk_usage", disk.usage),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, use_tcg=False, held=frozenset()
+            )
         assert elsewhere.evicted == []
 
     async def test_fails_at_once_when_nothing_can_make_room(self, tmp_path: Path) -> None:
@@ -1678,21 +1862,33 @@ class TestDiskGate:
             patch("exec_sandbox.admission.shutil.disk_usage", disk.usage),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK) as exc_info,
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, use_tcg=False, held=frozenset()
+            )
         assert cache.evicted == []  # 50 MB could not make the 156 MB it lacks
         error = exc_info.value
         assert error.action is ErrorAction.RETRY
-        assert "1100MB free, floor 1000MB, 0MB of disks admitted (0MB reserved), 1024MB requested (256MB reserved)" in (
-            str(error)
+        assert str(error) == (
+            "VM vm-1 does not fit on the filesystem of the home disks: neither cache evictions nor the end "
+            "of this worker's VMs and sessions can make room. Home disk space: 1100MB free, floor 1000MB, "
+            "0MB of disks admitted (0MB reserved), 1024MB requested (256MB reserved)."
         )
-        assert error.context["blocking_gate"] == "home_disk_space"
-        assert (error.context["disk_free_mb"], error.context["disk_needed_mb"]) == (1100, 256)
+        assert error.context == {
+            "vm_id": "vm-1",
+            "blocking_gate": "home_disk_space",
+            "disk_free_mb": 1100,
+            "disk_free_floor_mb": 1000,
+            "disk_admitted_mb": 0,
+            "disk_reserved_mb": 0,
+            "disk_requested_mb": 1024,
+            "disk_needed_mb": 256,
+        }
         disk.free_mb = 1300  # room for one 1024 MB disk: the failed request reserved nothing
-        _invalidate_probe_caches(ctrl)
-        with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
+        with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage), _probe_clock() as later:
+            later()
             await ctrl.release(
                 await ctrl.acquire(
-                    "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=_REFUSED, held=frozenset()
+                    "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=_REFUSED, use_tcg=False, held=frozenset()
                 )
             )
 
@@ -1708,7 +1904,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission.shutil.disk_usage", _SizedDisk(1000 + 500, [cache]).usage),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=1, use_tcg=False, held=frozenset()
+            )
         assert entry.exists()
 
     async def test_entry_under_another_process_eviction_still_counts(self, tmp_path: Path) -> None:
@@ -1724,7 +1922,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission.shutil.disk_usage", _SizedDisk(1000 + 500, [cache]).usage),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.CAPACITY),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=0.2, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=0.2, use_tcg=False, held=frozenset()
+            )
         assert entry.exists()  # this process could not take it meanwhile
 
     async def test_entry_the_request_keeps_leased_does_not_count(self, tmp_path: Path) -> None:
@@ -1743,7 +1943,7 @@ class TestDiskGate:
                 pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
             ):
                 await ctrl.acquire(
-                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset({entry})
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset({entry})
                 )
         finally:
             lease.release()
@@ -1764,7 +1964,9 @@ class TestDiskGate:
                 patch("exec_sandbox.admission.shutil.disk_usage", _SizedDisk(1000 + 500, [cache]).usage),
                 pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
             ):
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
         finally:
             lease.release()
 
@@ -1787,7 +1989,9 @@ class TestDiskGate:
         ):
             async with asyncio.timeout(1):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                    )
                 )
         sync.assert_called_once_with(tmp_path)
         assert cache.evicted == [300]
@@ -1806,14 +2010,16 @@ class TestDiskGate:
             patch("exec_sandbox.admission.shutil.disk_usage", disk.usage),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=2, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=2, use_tcg=False, held=frozenset()
+            )
         assert loop.time() - started < 1
         assert sum(cache.evicted) == 1000  # what it lacked, no more
 
     async def test_space_that_shows_slowly_is_not_evicted_for_again(self, tmp_path: Path) -> None:
-        """The evicted space shows 30 MB at a time, after the pass. The request (it waits:
-        the end of its controller's VMs makes room) does not evict the whole shortfall again
-        at each wake-up (that took 3300 MB for a 512 MB shortfall): one pass, then no more."""
+        """The evicted space shows 30 MB at a time, after the pass. The request (it waits: the end of its
+        controller's VMs makes room) does not evict the whole shortfall again at each wake-up (else 3300 MB go
+        for a 512 MB shortfall): one pass, then no more."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 2048 MB disk needs 512 MB more
         cache = _Cache(tmp_path / "l2", disk, [100] * 40, gives_back=0)
@@ -1822,7 +2028,9 @@ class TestDiskGate:
         disk.written_mb = 5000  # VMs of this controller wrote 5000 MB: their end makes room
         with disk.patched(tmp_path):
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2048, timeout=30, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2048, timeout=30, use_tcg=False, held=frozenset()
+                )
             )
             for _ in range(6):
                 await _until_waiting(ctrl, 1)
@@ -1850,7 +2058,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", return_value=_BACKGROUND),
         ):
             await ctrl.release(
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
         assert loop.time() - started < 0.5
         assert cache.evicted == [300]
@@ -1880,7 +2090,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", return_value=_BACKGROUND),
         ):
             await ctrl.release(
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
         assert wrote
         assert len(cache.evicted) > 1  # the passes after the first one ran
@@ -1900,7 +2112,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", return_value=_BACKGROUND),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=5, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=5, use_tcg=False, held=frozenset()
+            )
         assert 0.15 <= loop.time() - started < 1.0  # XFS: no growth for 0.15 s ends the reads, 1 s at most
         assert sum(cache.evicted) == 1000
 
@@ -1915,7 +2129,9 @@ class TestDiskGate:
         disk.written_mb = 5000  # VMs of this controller wrote 5000 MB: their end makes room
         with disk.patched(tmp_path):
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting_or_done(ctrl, waiter)
             waiter.cancel()
@@ -1931,7 +2147,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission.shutil.disk_usage", disk.usage),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=2, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=2, use_tcg=False, held=frozenset()
+            )
         assert sum(cache.evicted) == 1000
 
     async def test_compressed_entries_give_back_part_of_their_bytes(self, tmp_path: Path) -> None:
@@ -1945,7 +2163,9 @@ class TestDiskGate:
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
             async with asyncio.timeout(1):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                    )
                 )
         assert 256 * 32 <= sum(cache.evicted) < 256 * 32 + 300  # what it lacked, at 1/32
 
@@ -1958,21 +2178,25 @@ class TestDiskGate:
         ctrl.add_cache(cache)
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
             await ctrl.release(
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
         assert (cache.evicted, cache.orders) == ([100, 100, 100], 1)
 
     async def test_a_pass_that_leaves_the_request_short_is_followed_at_once(self, tmp_path: Path) -> None:
-        """A pass gave space back, but less than the request lacks (a third of each entry here):
-        the next pass follows at once, so the request does not wait for the 10 s self-wake
-        (admitted at 10.00 s while the space showed at 0.5 s)."""
+        """A pass gave space back, but less than the request lacks (a third of each entry here): the next pass
+        follows at once, so the request does not wait for the 10 s self-wake (else admitted at 10.00 s, with
+        the space shown at 0.5 s)."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 1024 MB disk needs 256 MB more
         cache = _Cache(tmp_path / "l2", disk, [300] * 5, gives_back=1 / 3)
         ctrl.add_cache(cache)
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
             await ctrl.release(
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
         assert cache.evicted == [300, 300, 300]
 
@@ -1995,18 +2219,22 @@ class TestDiskGate:
         cache = _WrittenMeanwhile(tmp_path / "l2", disk, [300, 300])
         ctrl.add_cache(cache)
         with disk.patched(tmp_path):
-            first = await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=0.2, held=frozenset())
+            first = await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=0.2, use_tcg=False, held=frozenset()
+            )
             # vm-2 needs 256 MB more; after the first pass the free space is 100 MB lower
-            second = await ctrl.acquire("vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+            second = await ctrl.acquire(
+                "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+            )
         await ctrl.release(second)
         await ctrl.release(first)
         assert cache.evicted == [300, 300]
 
     async def test_overlay_space_shows_after_one_sync(self, tmp_path: Path) -> None:
-        """An overlay frees a removed file when its upper filesystem commits (a btrfs below: at
-        +30 s; the request failed with LOCAL_DISK at 0.2 s). Its statfs type does not say which
-        filesystem that is: when the space read again shows nothing, one syncfs makes it show,
-        and the request is admitted with one entry evicted."""
+        """An overlay frees a removed file when its upper filesystem commits (a btrfs below: at +30 s, long
+        after a LOCAL_DISK at 0.2 s). Its statfs type does not say which filesystem that is: when the space
+        read again shows nothing, one syncfs makes it show, and the request is admitted with one entry
+        evicted."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 1024 MB disk needs 256 MB more
         cache = _Cache(tmp_path / "l2", disk, [300, 300], gives_back=0)
@@ -2021,17 +2249,18 @@ class TestDiskGate:
             patch("exec_sandbox.admission._syncfs", side_effect=sync) as syncfs,
         ):
             await ctrl.release(
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
         syncfs.assert_called_once_with(tmp_path)
         assert cache.evicted == [300]
 
     async def test_overlay_gain_hidden_by_dirty_data_is_measured_after_a_first_sync(self, tmp_path: Path) -> None:
-        """An overlay over btrfs shows the removals and the blocks of other files' dirty data in
-        the same commit: after the one syncfs, 300 MB of dirty data of another process made a
-        200 MB gain read as -100 MB, and the pass stopped the request (LOCAL_DISK). That
-        pass gives no verdict: the next one syncs before it evicts, its gain shows alone, and
-        the request is admitted."""
+        """An overlay over btrfs shows the removals and the blocks of other files' dirty data in the same
+        commit: after the one syncfs, 300 MB of dirty data of another process make a 200 MB gain read as -100
+        MB, a verdict that would stop the request (LOCAL_DISK). That pass gives no verdict: the next one syncs
+        before it evicts, its gain shows alone, and the request is admitted."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=894)  # a 1024 MB disk needs 150 MB more
         cache = _Cache(tmp_path / "l2", disk, [200] * 4, gives_back=0)
@@ -2050,7 +2279,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission._syncfs", side_effect=sync),
         ):
             await ctrl.release(
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
         assert cache.evicted == [200, 200, 200]  # 150 MB lacking, then 250 MB once the dirty data took 300
 
@@ -2072,14 +2303,16 @@ class TestDiskGate:
             patch("exec_sandbox.admission._syncfs") as syncfs,
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, use_tcg=False, held=frozenset()
+            )
         assert cache.evicted == [200, 200]
         assert syncfs.call_count == 3  # after pass 1; before and after pass 2
 
     async def test_hidden_overlay_without_zfs_does_not_wait_for_a_transaction_sync(self, tmp_path: Path) -> None:
-        """A container on an ext4 or XFS host (no ZFS module): the overlay's upper folder is
-        hidden, and evicted clones give nothing. Waiting for a ZFS sync there gave LOCAL_DISK at
-        11.57 s instead of 0.66 s: the wait is only where the ZFS module is loaded."""
+        """A container on an ext4 or XFS host (no ZFS module): the overlay's upper folder is hidden, and
+        evicted clones give nothing. A wait for a ZFS sync there gives LOCAL_DISK at 11.57 s instead of 0.66
+        s: the wait is only where the ZFS module is loaded."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=894)  # a 1024 MB disk needs 150 MB more
         cache = _Cache(tmp_path / "l2", disk, [200] * 4, gives_back=0)
@@ -2092,13 +2325,15 @@ class TestDiskGate:
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
             async with asyncio.timeout(1):
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, use_tcg=False, held=frozenset()
+                )
         assert cache.evicted == [200, 200]
 
     async def test_an_unreadable_filesystem_type_reads_as_unknown(self, tmp_path: Path) -> None:
-        """An error out of _settle_removals (a mountinfo line that is not UTF-8, an upper folder
-        under a 0700 folder) came out of acquire() at each pass: it reads as an unknown
-        type (_OTHER), and the request is admitted."""
+        """An error out of _settle_removals (a mountinfo line that is not UTF-8, an upper folder under a 0700
+        folder) does not come out of acquire(): it reads as an unknown type (_OTHER), and the request is
+        admitted."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 1024 MB disk needs 256 MB more
         cache = _Cache(tmp_path / "l2", disk, [300] * 2, after=0.05)  # it shows after the removal: settle runs
@@ -2108,16 +2343,18 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", side_effect=PermissionError(13, "Permission denied")),
         ):
             await ctrl.release(
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
         assert cache.evicted == [300]
 
     async def test_overlay_space_that_shows_at_a_transaction_sync_admits(self, tmp_path: Path) -> None:
-        """An overlay over ZFS (OpenZFS 2.2+ takes overlay upper folders) whose upper folder this
-        process does not see: its syncfs commits the intent log only, so two passes saw nothing
-        and the request got LOCAL_DISK at 0.39 s while 600 MB showed 12 s later. The
-        second pass's space counts as still coming up to one ZFS transaction sync: admitted
-        once it shows. Here the sync comes 0.4 s after each removal; zfs_txg_timeout 0: 1 s."""
+        """An overlay over ZFS (OpenZFS 2.2+ takes overlay upper folders) whose upper folder this process does
+        not see: its syncfs commits the intent log only, so two passes see nothing (on EC2: LOCAL_DISK at 0.39
+        s, and 600 MB shown 12 s later). The second pass's space counts as still coming up to one ZFS
+        transaction sync: admitted once it shows. Here the sync comes 0.4 s after each removal;
+        zfs_txg_timeout 0: 1 s."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=894)  # a 1024 MB disk needs 150 MB more
         cache = _Cache(tmp_path / "l2", disk, [200] * 4, after=0.4)
@@ -2132,7 +2369,9 @@ class TestDiskGate:
         ):
             async with asyncio.timeout(1.5):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, use_tcg=False, held=frozenset()
+                    )
                 )
         assert cache.evicted == [200, 200]
 
@@ -2161,7 +2400,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission._syncfs", side_effect=slow_sync),
         ):
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting_or_done(ctrl, waiter)
             assert not waiter.done()  # it waits for a wake-up: no LOCAL_DISK
@@ -2201,7 +2442,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission._syncfs", side_effect=sync),
         ):
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting_or_done(ctrl, waiter)
             assert not waiter.done()
@@ -2227,7 +2470,9 @@ class TestDiskGate:
         ):
             async with asyncio.timeout(1):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                    )
                 )
         assert cache.evicted == [300]
 
@@ -2246,21 +2491,20 @@ class TestDiskGate:
         ):
             async with asyncio.timeout(1.5):
                 first = await ctrl.acquire(
-                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset()
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
                 )
                 second = await ctrl.acquire(
-                    "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset()
+                    "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
                 )
         await ctrl.release(second)
         await ctrl.release(first)
         assert cache.evicted == [300, 300]
 
     async def test_btrfs_writes_of_its_own_vms_are_no_gain(self, tmp_path: Path) -> None:
-        """btrfs counts a write in st_blocks at once, in its free space only at writeback: a VM
-        of this controller that writes its home disk grew the gain of a pass of clones (no space
-        back) at its write speed, so the request went on evicting the whole cache and got
-        CAPACITY at its timeout. On btrfs the free space alone judges the gain: one pass,
-        then the request waits for its VMs (or fails with LOCAL_DISK without them)."""
+        """btrfs counts a write in st_blocks at once, in its free space only at writeback. For a pass of
+        clones (no space back), a gain net of the writes of this controller's VMs grows at their write speed:
+        the request would evict the whole cache and get CAPACITY at its timeout. On btrfs the free space alone
+        judges the gain: one pass, then the request waits for its VMs (or fails with LOCAL_DISK without them)."""
         disk = _Disk(1000)
         disk.written_mb = 5000  # VMs of this controller wrote 5000 MB: their end makes room
         ctrl = self._controller(tmp_path, floor_mb=0)  # an 8000 MB disk needs 1000 MB more
@@ -2278,7 +2522,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", return_value=_AFTER_COMMIT),
         ):
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting_or_done(ctrl, waiter)
             waiter.cancel()
@@ -2308,15 +2554,17 @@ class TestDiskGate:
         ):
             async with asyncio.timeout(1):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                    )
                 )
         syncfs.assert_called_once_with(tmp_path)
 
     async def test_requests_that_gate_4_blocks_together_are_admitted_after_one_sync(self, tmp_path: Path) -> None:
-        """ZFS shows evictions at its next transaction sync. Each request evicted for itself and
-        held the lock of the passes until its own gain showed: one admission per sync (10
-        requests with a 3 s timeout: 5 CAPACITY). One pass evicts for every request that
-        gate 4 blocks, and does not hold the lock until the sync: all are admitted after it."""
+        """ZFS shows evictions at its next transaction sync. With a pass for each request, each holding the
+        lock of the passes until its own gain shows, one request is admitted per sync (10 requests with a 3 s
+        timeout: 5 CAPACITY). One pass evicts for every request that gate 4 blocks, and does not hold the lock
+        until the sync: all are admitted after it."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # each 400 MB disk needs 100 MB
         shown: list[float] = []
@@ -2337,7 +2585,15 @@ class TestDiskGate:
             ):
                 reservations = await asyncio.gather(
                     *(
-                        ctrl.acquire(f"vm-{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=1, held=frozenset())
+                        ctrl.acquire(
+                            f"vm-{i}",
+                            memory_mb=1,
+                            cpu_cores=_CPU,
+                            disk_mb=400,
+                            timeout=1,
+                            use_tcg=False,
+                            held=frozenset(),
+                        )
                         for i in range(5)
                     )
                 )
@@ -2360,14 +2616,16 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", return_value=_zfs(0.2)),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+            )
         assert sum(cache.evicted) == 300  # the 256 MB it lacked, in whole entries: one pass
 
     async def test_space_still_coming_of_another_request_is_not_a_pass_gain(self, tmp_path: Path) -> None:
-        """A's evicted entry still frees on XFS (10 MB every 30 ms) while B evicts clones that give
-        nothing back: B's passes read A's space as their own gain, and B got CAPACITY at its
-        timeout instead of LOCAL_DISK. No pass starts while the space of an earlier one
-        still shows: B's pass then measures its own, gets no gain, and fails at once."""
+        """A's evicted entry still frees on XFS (10 MB every 30 ms) while B evicts clones that give nothing
+        back: B's passes could read A's space as their own gain (CAPACITY at B's timeout, not LOCAL_DISK). No
+        pass starts while the space of an earlier one still shows: B's pass then measures its own, gets no
+        gain, and fails at once."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)
 
@@ -2390,11 +2648,15 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", return_value=xfs),
         ):
             a = asyncio.create_task(
-                ctrl.acquire("vm-a", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, held=frozenset())
+                ctrl.acquire(
+                    "vm-a", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting_or_done(ctrl, a)  # A's pass ended, its space still shows
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
-                await ctrl.acquire("vm-b", memory_mb=1, cpu_cores=_CPU, disk_mb=3000, timeout=2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-b", memory_mb=1, cpu_cores=_CPU, disk_mb=3000, timeout=2, use_tcg=False, held=frozenset()
+                )
             await ctrl.release(await a)
         assert sum(clones.evicted) <= 800  # one pass: what B lacked once A's space showed
 
@@ -2414,15 +2676,16 @@ class TestDiskGate:
         ):
             async with asyncio.timeout(1):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                    )
                 )
         assert cache.evicted == [300]
 
     async def test_compressed_entries_that_cannot_make_room_fail_after_one_pass(self, tmp_path: Path) -> None:
-        """btrfs compression: the entries give back 1/32 of their st_blocks, so all of them give
-        less than the request lacks. After its first pass the rest counts at what that pass gave
-        back: LOCAL_DISK then, with no more than the shortfall evicted (all 10 of 10 went for
-        +19 MB)."""
+        """btrfs compression: the entries give back 1/32 of their st_blocks, so all of them give less than the
+        request lacks. After its first pass the rest counts at what that pass gave back: LOCAL_DISK then, with
+        no more than the shortfall evicted (else all 10 of 10 go for +19 MB)."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1044)  # a 1024 MB disk needs 300 MB more
         cache = _Cache(tmp_path / "l2", disk, [100] * 10, gives_back=1 / 32)
@@ -2431,14 +2694,15 @@ class TestDiskGate:
             patch("exec_sandbox.admission.shutil.disk_usage", disk.usage),
             pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK),
         ):
-            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+            await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+            )
         assert sum(cache.evicted) == 300
 
     async def test_a_request_checks_its_room_after_the_pass_of_another(self, tmp_path: Path) -> None:
-        """Two requests short of space at once. A's pass removed an entry that the free space
-        shows only at A's commit; B checked its room meanwhile, counted neither, and failed with
-        LOCAL_DISK (4 of 6 runs on btrfs). B checks under the lock of the passes, after
-        A's, and waits for A's VM instead."""
+        """Two requests short of space at once. A's pass removed an entry that the free space shows only at
+        A's commit; a B that checks its room meanwhile counts neither and fails with LOCAL_DISK (4 of 6 runs
+        on btrfs). B checks under the lock of the passes, after A's, and waits for A's VM instead."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 1024 MB disk needs 256 MB more
         cache = _Cache(tmp_path / "l2", disk, [300, 100], gives_back=0)
@@ -2456,16 +2720,17 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", side_effect=commit),
         ):
             a = asyncio.create_task(
-                ctrl.acquire("vm-a", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-a", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await asyncio.to_thread(committing.wait, 5)
             b = asyncio.create_task(
-                ctrl.acquire("vm-b", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-b", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
-            for _ in range(2000):  # B fails at once, or waits for the lock A holds (2 s at most)
-                if b.done() or ctrl._evict_lock._waiters:  # pyright: ignore[reportPrivateUsage]
-                    break
-                await asyncio.sleep(0.001)
+            await _until_queued_for_the_passes(ctrl, b)  # B fails at once, or waits for the lock A holds
             assert not b.done()
             go_on.set()
             first = await a
@@ -2508,15 +2773,14 @@ class TestDiskGate:
             ),
         ):
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting_or_done(ctrl, waiter)
             assert not waiter.done()  # it waits: no LOCAL_DISK
             await _self_wake(ctrl)  # a wake-up while the space still comes: it still counts
-            for _ in range(2000):  # until the waiter checked its room again (2 s at most)
-                if len(checks) > 1 or waiter.done():
-                    break
-                await asyncio.sleep(0.001)
+            await _until(lambda: len(checks) > 1 or waiter.done(), what="the waiter checked its room again")
             assert checks[-1] < 1300  # checked before all of it showed
             await _until_waiting_or_done(ctrl, waiter)
             assert not waiter.done()
@@ -2525,9 +2789,9 @@ class TestDiskGate:
         assert cache.evicted == [300]
 
     async def test_a_dip_of_the_free_space_after_the_commit_is_read_past(self, tmp_path: Path) -> None:
-        """btrfs: 1-2 ms after its commit the free space can dip by a data chunk, then come back.
-        A single read then saw the pass give nothing back and stopped it: it is read
-        again until it has not changed for a moment."""
+        """btrfs: 1-2 ms after its commit the free space can dip by a data chunk, then come back. A single
+        read then sees the pass give nothing back and stops it: the space is read again until it has not
+        changed for a moment."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 1024 MB disk needs 256 MB more
         cache = _Cache(tmp_path / "l2", disk, [300], gives_back=0)
@@ -2544,18 +2808,19 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", side_effect=commit),
         ):
             await ctrl.release(
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
         assert cache.evicted == [300]
 
     async def test_space_that_stops_growing_at_the_end_of_the_reads_lets_the_next_pass_start(
         self, tmp_path: Path
     ) -> None:
-        """XFS frees a shared entry in steps up to 0.06 s, within the last quiet time (0.05 s)
-        before the 0.1 s limit of the reads, and only part of it: the pass ends "growing", and
-        no growth comes after. Its pending space counted no growth then, so it never settled,
-        and no pass started for 10 s (admitted at 11.74 s). It grew to the end of the
-        reads: it settles once it has not grown for a moment."""
+        """XFS frees a shared entry in steps up to 0.06 s, within the last quiet time (0.05 s) before the 0.1
+        s limit of the reads, and only part of it: the pass ends "growing", and no growth comes after. A
+        pending space that counts no growth then never settles, and no pass starts for 10 s (admitted at 11.74
+        s). It grew to the end of the reads: it settles once it has not grown for a moment."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=994)  # a 1024 MB disk needs 250 MB more: one entry a pass
 
@@ -2577,14 +2842,16 @@ class TestDiskGate:
         ):
             async with asyncio.timeout(1.5):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, use_tcg=False, held=frozenset()
+                    )
                 )
         assert cache.evicted == [300, 300]
 
     async def test_a_pass_for_several_waiters_wakes_the_one_that_fits(self, tmp_path: Path) -> None:
-        """A pass made room for A and the waiters W1 (too large still) and W2. A's admission woke
-        one waiter, W1, which did not fit: W2 slept to the 10 s self-wake. With waiters of
-        mixed sizes, an admission wakes them all: W2 is admitted at once."""
+        """A pass made room for A and the waiters W1 (too large still) and W2. An admission that wakes one
+        waiter wakes W1, which does not fit, and W2 sleeps to the 10 s self-wake. With waiters of mixed sizes,
+        an admission wakes them all: W2 is admitted at once."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)
         disk.written_mb = 10_000  # VMs of this controller wrote much: the waiters wait, no LOCAL_DISK
@@ -2592,19 +2859,20 @@ class TestDiskGate:
         ctrl.add_cache(cache)
         with disk.patched(tmp_path):
             w1 = asyncio.create_task(
-                ctrl.acquire("w1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=3, held=frozenset())
+                ctrl.acquire(
+                    "w1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=3, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting_or_done(ctrl, w1)
             w2 = asyncio.create_task(
-                ctrl.acquire("w2", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                ctrl.acquire("w2", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset())
             )
-            for _ in range(2000):  # until both wait (2 s at most)
-                if sum(ctrl._waiting.values()) >= 2:  # pyright: ignore[reportPrivateUsage]
-                    break
-                await asyncio.sleep(0.001)
+            await _until_waiting(ctrl, 2)
             cache.entries.append(300)  # a VM ends and saves an entry: A's pass takes it
             async with asyncio.timeout(1):
-                a = await ctrl.acquire("a", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                a = await ctrl.acquire(
+                    "a", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                )
                 second = await w2  # 300 MB: A's 100 MB reserve and W2's 100 MB
             assert not w1.done()
             w1.cancel()
@@ -2614,11 +2882,10 @@ class TestDiskGate:
         await ctrl.release(a)
 
     async def test_a_no_gain_verdict_stops_every_request_that_gate_4_blocks(self, tmp_path: Path) -> None:
-        """ZFS with a snapshot: no eviction ever shows. The verdict went to the pass's request
-        only, and no pass starts while one is pending: each request waited its own 11 s in turn
-        (LOCAL_DISK at 11/22/33 s, then CAPACITY). Once two passes in a row gave nothing,
-        the cause is the filesystem's (one pass alone can meet entries of its own): every
-        request gate 4 blocks then stops, after two passes for all of them."""
+        """ZFS with a snapshot: no eviction ever shows. With a verdict for the pass's request only, and no
+        pass while one is pending, each request waits its own 11 s in turn (LOCAL_DISK at 11/22/33 s, then
+        CAPACITY). Once two passes in a row gave nothing, the cause is the filesystem's (one pass alone can
+        meet entries of its own): every request gate 4 blocks then stops, after two passes for all of them."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # each 400 MB disk needs 100 MB
         cache = _Cache(tmp_path / "l2", disk, [100] * 30, gives_back=0)
@@ -2631,7 +2898,9 @@ class TestDiskGate:
         ):
             results = await asyncio.gather(
                 *(
-                    ctrl.acquire(f"vm-{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                    ctrl.acquire(
+                        f"vm-{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                    )
                     for i in range(3)
                 ),
                 return_exceptions=True,
@@ -2641,11 +2910,10 @@ class TestDiskGate:
         assert sum(cache.evicted) <= 600  # two passes, each for the requests still waiting
 
     async def test_one_pass_of_nothing_does_not_stop_the_other_requests(self, tmp_path: Path) -> None:
-        """The oldest entry is a clone (its removal gives nothing), the next ones give all. A's
-        pass removes the clone; its verdict stopped B too, A and B got LOCAL_DISK while C, 50 ms
-        later, was admitted from the same cache. One pass of nothing stops only its own
-        request from evicting: B's pass takes the next entries for both, and all three are
-        admitted."""
+        """The oldest entry is a clone (its removal gives nothing), the next ones give all. A's pass removes
+        the clone; a verdict that stops B too gives A and B LOCAL_DISK while C, 50 ms later, is admitted from
+        the same cache. One pass of nothing stops only its own request from evicting: B's pass takes the next
+        entries for both, and all three are admitted."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # each 400 MB disk needs 100 MB
 
@@ -2661,23 +2929,29 @@ class TestDiskGate:
         ctrl.add_cache(cache)
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
             a = asyncio.create_task(
-                ctrl.acquire("vm-a", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, held=frozenset())
+                ctrl.acquire(
+                    "vm-a", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
             b = asyncio.create_task(
-                ctrl.acquire("vm-b", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, held=frozenset())
+                ctrl.acquire(
+                    "vm-b", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
             async with asyncio.timeout(1):
                 reservations = await asyncio.gather(a, b)
                 reservations.append(
-                    await ctrl.acquire("vm-c", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-c", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, use_tcg=False, held=frozenset()
+                    )
                 )
         for reservation in reservations:
             await ctrl.release(reservation)
 
     async def test_requests_after_two_passes_of_nothing_evict_nothing(self, tmp_path: Path) -> None:
-        """ZFS with a snapshot: after two passes in a row gave nothing, each request that came
-        later started from zero, one more pass and 100 MB more evicted each, 11 s each on real
-        ZFS. It inherits the stop: LOCAL_DISK at once, with nothing evicted."""
+        """ZFS with a snapshot: after two passes in a row gave nothing, a request that comes later and starts
+        from zero runs one more pass (100 MB more evicted, 11 s on real ZFS). It inherits the stop: LOCAL_DISK
+        at once, with nothing evicted."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # each 400 MB disk needs 100 MB
         cache = _Cache(tmp_path / "l2", disk, [100] * 40, gives_back=0)
@@ -2688,7 +2962,9 @@ class TestDiskGate:
         ):
             await asyncio.gather(
                 *(
-                    ctrl.acquire(f"vm-{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                    ctrl.acquire(
+                        f"vm-{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                    )
                     for i in range(3)
                 ),
                 return_exceptions=True,
@@ -2699,43 +2975,49 @@ class TestDiskGate:
             for i in range(3):
                 with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
                     await ctrl.acquire(
-                        f"late-{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset()
+                        f"late-{i}",
+                        memory_mb=1,
+                        cpu_cores=_CPU,
+                        disk_mb=400,
+                        timeout=3,
+                        use_tcg=False,
+                        held=frozenset(),
                     )
             assert loop.time() - started < 0.5
         assert sum(cache.evicted) == evicted
 
-    async def test_the_self_wake_ends_a_shared_stop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """No VM of this controller runs (a pool refill): two passes of nothing shared a stop
-        that only a release ended, so every later request failed with LOCAL_DISK forever, 4000
-        MB of good entries left. The self-wake ends it too: the next request evicts."""
-        monkeypatch.setattr("exec_sandbox.admission.GATE3_SELF_WAKE_INTERVAL_SECONDS", 0.1)
+    async def test_the_self_wake_ends_a_shared_stop(self, tmp_path: Path) -> None:
+        """No VM of this controller runs (a pool refill): two passes of nothing share a stop. If only a
+        release ended it, every later request would fail with LOCAL_DISK, with 4000 MB of good entries left.
+        The self-wake ends it too: the next request evicts."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # each 400 MB disk needs 100 MB
         cache = _GivesBack(tmp_path / "l2", disk, [(200, 0.0), (200, 0.0)] + [(200, 1.0)] * 10)
         ctrl.add_cache(cache)
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
-            await ctrl.start()
-            for name in ("a", "b"):  # two passes of nothing, one after the other
+            for name in ("a", "b", "stopped"):  # two passes of nothing, then a request under the shared stop
                 with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
-                    await ctrl.acquire(name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, held=frozenset())
-            await asyncio.sleep(0.25)  # a self-wake
+                    await ctrl.acquire(
+                        name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, use_tcg=False, held=frozenset()
+                    )
+            assert cache.evicted == [200, 200]  # the request under the stop evicted nothing
+            await _self_wake(ctrl)
             async with asyncio.timeout(1):
                 reservation = await ctrl.acquire(
-                    "c", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, held=frozenset()
+                    "c", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, use_tcg=False, held=frozenset()
                 )
             await ctrl.release(reservation)
-            await ctrl.stop()
         assert cache.evicted == [200, 200, 200]
 
     @pytest.mark.parametrize("shows", ["at_removal", "at_commit"])
     async def test_passes_that_make_the_requests_fit_end_a_run_of_passes_of_nothing(
         self, tmp_path: Path, shows: str
     ) -> None:
-        """Entries: a clone, a good one, a clone, good ones. A's pass gives nothing, B's pass
-        makes B fit, C's pass gives nothing: not two in a row, yet the count stayed at 1 after
-        B (its pass returned before any verdict) and C's pass shared a stop: D got LOCAL_DISK at
-        once. A pass that makes the requests fit ends the run, whether the space shows
-        at the removal (ext4) or at the end of the pass (a btrfs commit): D is admitted."""
+        """Entries: a clone, a good one, a clone, good ones. A's pass gives nothing, B's pass makes B fit, C's
+        pass gives nothing: not two in a row. A count that stays at 1 after B (its pass returns before any
+        verdict) makes C's pass share a stop, and D gets LOCAL_DISK at once. A pass that makes the requests
+        fit ends the run, whether the space shows at the removal (ext4) or at the end of the pass (a btrfs
+        commit): D is admitted."""
         disk = _Disk(900)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # each 400 MB disk needs 100 MB: 200 MB short
         cache = _GivesBack(tmp_path / "l2", disk, [(200, 0.0), (200, 1.0), (200, 0.0)] + [(200, 1.0)] * 5)
@@ -2762,11 +3044,12 @@ class TestDiskGate:
         with (
             patch("exec_sandbox.admission.shutil.disk_usage", disk.usage),
             patch("exec_sandbox.admission._settle_removals", side_effect=commit),
+            _probe_clock() as later,
         ):
             for name in ("a", "b", "c", "d"):
                 try:
                     reservation = await ctrl.acquire(
-                        name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=1, held=frozenset()
+                        name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=1, use_tcg=False, held=frozenset()
                     )
                 except TransientError as e:
                     outcomes.append(e.code.name)
@@ -2774,17 +3057,16 @@ class TestDiskGate:
                     outcomes.append("ADMITTED")
                     await ctrl.release(reservation)
                     disk.free_mb = 900  # its VM used the space meanwhile
-                    _invalidate_probe_caches(ctrl)
+                    later()
         assert outcomes == ["LOCAL_DISK", "ADMITTED", "LOCAL_DISK", "ADMITTED"]
 
     async def test_the_end_of_a_sync_makes_the_request_make_room_again(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A request whose first pass showed nothing after its sync (dirty data of another
-        process took the space of the removals) syncs before each next pass, and waits for a
-        slow syncfs: its end woke the request without a change of room, so it waited for the
-        self-wake, whose sync took long again: CAPACITY in a loop (8 s). The end of the
-        sync is a change of room: the pass follows at once."""
+        """A request whose first pass showed nothing after its sync (dirty data of another process took the
+        space of the removals) syncs before each next pass, and waits for a slow syncfs. If the end of that
+        sync wakes the request with no change of room, the request waits for the self-wake, whose sync is slow
+        again: CAPACITY in a loop (8 s). The end of the sync is a change of room: the pass follows at once."""
         monkeypatch.setattr("exec_sandbox.admission._SYNCFS_WAIT_SECONDS", 0.05)
         disk = _Disk(900)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 400 MB disk needs 100 MB: 200 MB short
@@ -2810,16 +3092,18 @@ class TestDiskGate:
         ):
             async with asyncio.timeout(1.5):
                 await ctrl.release(
-                    await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                    await ctrl.acquire(
+                        "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                    )
                 )
         # pass 1 and its sync; the slow sync; the next sync, pass 2 and its sync
         assert (len(syncs), cache.passes) == (4, [[100, 100], [100, 100]])
         await ctrl.stop()
 
     async def test_a_release_during_make_room_is_not_lost(self, tmp_path: Path) -> None:
-        """W runs _make_room (out of the waiting list) while the VM V ends and releases its
-        lease on the only entry that can make room: the release woke nobody, W waited for the
-        self-wake (10.002 s). The room changed since W made room: W makes room again."""
+        """W runs _make_room (out of the waiting list) while the VM V ends and releases its lease on the only
+        entry that can make room: a release that wakes nobody leaves W to the self-wake (10.002 s). The room
+        changed since W made room: W makes room again."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 400 MB disk needs 100 MB
         leased = _Cache(tmp_path / "l2", disk, [300])
@@ -2845,9 +3129,11 @@ class TestDiskGate:
         ctrl.add_cache(leased)
         ctrl.add_cache(_LeasedThenFree())
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
-            v = await ctrl.acquire("v", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, held=frozenset())
+            v = await ctrl.acquire(
+                "v", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, use_tcg=False, held=frozenset()
+            )
             w = asyncio.create_task(
-                ctrl.acquire("w", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, held=frozenset())
+                ctrl.acquire("w", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=2, use_tcg=False, held=frozenset())
             )
             await in_listing.wait()
             lease_held[0] = False  # V ends: its lease goes, then its admission
@@ -2879,16 +3165,17 @@ class TestDiskGate:
             patch("exec_sandbox.admission._syncfs") as syncfs,
         ):
             first = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, use_tcg=False, held=frozenset()
+                )
             )
             await in_pass.wait()
             second = asyncio.create_task(
-                ctrl.acquire("vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, held=frozenset())
+                ctrl.acquire(
+                    "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, use_tcg=False, held=frozenset()
+                )
             )
-            for _ in range(2000):  # until vm-2 waits for the lock of the passes (2 s at most)
-                if ctrl._evict_lock._waiters:  # pyright: ignore[reportPrivateUsage]
-                    break
-                await asyncio.sleep(0.001)
+            await _until_queued_for_the_passes(ctrl, second)
             listings = len(cache.size_read_calls)
             await ctrl.stop()
             go_on.set()
@@ -2909,17 +3196,18 @@ class TestDiskGate:
             disk.patched(tmp_path),
             patch("exec_sandbox.admission._settle_removals", return_value=_AT_REMOVAL),
         ):
-            first = await ctrl.acquire("vm-0", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, held=frozenset())
+            first = await ctrl.acquire(
+                "vm-0", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, use_tcg=False, held=frozenset()
+            )
             requests = {
                 name: asyncio.create_task(
-                    ctrl.acquire(name, memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, held=frozenset())
+                    ctrl.acquire(
+                        name, memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=3, use_tcg=False, held=frozenset()
+                    )
                 )
                 for name in ("vm-b", "vm-c", "vm-d")
             }
-            for _ in range(2000):  # until the three wait (2 s at most)
-                if sum(ctrl._waiting.values()) >= 3:  # pyright: ignore[reportPrivateUsage]
-                    break
-                await asyncio.sleep(0.001)
+            await _until_waiting(ctrl, 3)
             assert sum(clones.evicted) == 1000  # two passes of nothing: all the clones
             fresh = _Cache(tmp_path / "l1", disk, [300, 300])  # saved meanwhile: they give space back
             ctrl.add_cache(fresh)
@@ -2935,12 +3223,11 @@ class TestDiskGate:
         await ctrl.release(await admitted)
 
     def test_lifts_of_the_shared_stop_come_less_often_until_a_pass_gives_space(self, tmp_path: Path) -> None:
-        """A ZFS or btrfs snapshot keeps every block: each lift of the shared stop (a release, the
-        self-wake) let one more pass evict for nothing, every 10 s: 360 passes an hour. One
-        release or self-wake a second: the lifts come 10 s apart, then twice as far each time, up
-        to 640 s; after a pass that gives space back, the next comes at once. The verdicts and
-        the lifts are called directly with the event loop time they take: through acquire(),
-        the schedule takes 32 minutes."""
+        """A ZFS or btrfs snapshot keeps every block: each lift of the shared stop (a release, the self-wake)
+        lets one more pass evict for nothing (one lift every 10 s: 360 passes an hour). One release or self-
+        wake a second: the lifts come 10 s apart, then twice as far each time, up to 640 s; after a pass that
+        gives space back, the next comes at once. The verdicts and the lifts are called directly with the
+        event loop time they take: through acquire(), the schedule takes 32 minutes."""
         ctrl = self._controller(tmp_path, floor_mb=0)
         space = _DiskSpace(
             free_mb=1000, written_mb=0, admitted_mb=0, reserved_mb=0, requested_mb=0, needed_mb=0, floor_mb=0
@@ -2964,9 +3251,9 @@ class TestDiskGate:
         assert ctrl._no_gain_passes == 1  # pyright: ignore[reportPrivateUsage]
 
     async def test_the_pass_after_a_lift_evicts_for_its_own_request_only(self, tmp_path: Path) -> None:
-        """A snapshot keeps every block. After a lift of the shared stop, the pass of the next
-        request evicted what every waiter lacked, for nothing again: it evicts what its
-        own request lacks only, until a pass gives space back."""
+        """A snapshot keeps every block. After a lift of the shared stop, a pass of the next request for what
+        every waiter lacks evicts for nothing again: it evicts what its own request lacks only, until a pass
+        gives space back."""
         disk = _Disk(1000)
         disk.written_mb = 10_000  # VMs of this controller wrote much: the requests wait
         ctrl = self._controller(tmp_path, floor_mb=1000)  # each 400 MB disk needs 100 MB
@@ -2976,10 +3263,14 @@ class TestDiskGate:
             disk.patched(tmp_path),
             patch("exec_sandbox.admission._settle_removals", return_value=_AT_REMOVAL),
         ):
-            vm = await ctrl.acquire("vm-0", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, held=frozenset())
+            vm = await ctrl.acquire(
+                "vm-0", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, use_tcg=False, held=frozenset()
+            )
             requests = [
                 asyncio.create_task(
-                    ctrl.acquire(name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                    ctrl.acquire(
+                        name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                    )
                 )
                 for name in ("vm-b", "vm-c", "vm-d")
             ]
@@ -2988,10 +3279,7 @@ class TestDiskGate:
             # shared, and D waits with it
             assert cache.passes == [[100, 100, 100], [100]]
             await ctrl.release(vm)
-            for _ in range(2000):  # until the pass after the lift (2 s at most)
-                if len(cache.passes) == 3:
-                    break
-                await asyncio.sleep(0.001)
+            await _until(lambda: len(cache.passes) == 3, what="the pass after the lift")
             await _until_waiting(ctrl, 3)  # D waits again: its pass has its verdict
             for task in requests:
                 task.cancel()
@@ -2999,12 +3287,11 @@ class TestDiskGate:
         assert cache.passes == [[100, 100, 100], [100], [100]]
 
     async def test_after_a_pass_that_gives_space_the_passes_evict_for_every_waiter_again(self, tmp_path: Path) -> None:
-        """B's and C's passes take clones (nothing back): the stop is shared, D, E and F wait
-        with it. Once B's pass gave nothing, C's evicts only what C lacks (passes sized for
-        every waiter emptied a reflink cache). A release lifts the stop; D's pass evicts what D
-        lacks only, gives space back and admits D. From then on a pass evicts for every waiter
-        again (one ZFS transaction sync then shows the space of all): E's pass covers the four
-        others."""
+        """B's and C's passes take clones (nothing back): the stop is shared, D, E and F wait with it. Once
+        B's pass gave nothing, C's evicts only what C lacks (passes sized for every waiter empty a reflink
+        cache). A release lifts the stop; D's pass evicts what D lacks only, gives space back and admits D.
+        From then on a pass evicts for every waiter again (one ZFS transaction sync then shows the space of
+        all): E's pass covers the four others."""
         disk = _Disk(20_000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # each 400 MB disk needs 100 MB
         cache = _GivesBack(tmp_path / "l2", disk, [(100, 0.0)] * 2 + [(100, 1.0)] * 10)  # B's and C's clones
@@ -3012,16 +3299,23 @@ class TestDiskGate:
         with (
             disk.patched(tmp_path),
             patch("exec_sandbox.admission._settle_removals", return_value=_AT_REMOVAL),
+            _probe_clock() as later,
         ):
-            vm = await ctrl.acquire("vm-0", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, held=frozenset())
-            long = await ctrl.acquire("long", memory_mb=1, cpu_cores=_CPU, disk_mb=40_000, timeout=1, held=frozenset())
+            vm = await ctrl.acquire(
+                "vm-0", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, use_tcg=False, held=frozenset()
+            )
+            long = await ctrl.acquire(
+                "long", memory_mb=1, cpu_cores=_CPU, disk_mb=40_000, timeout=1, use_tcg=False, held=frozenset()
+            )
             disk.free_mb = 11_000  # its reserve: 10000 MB; each request then lacks 100 MB, and waits for it
-            _invalidate_probe_caches(ctrl)
+            later()
             requests = []
             for count, names in enumerate((["vm-b"], ["vm-c"], ["vm-d", "vm-e", "vm-f"]), start=1):
                 requests += [
                     asyncio.create_task(
-                        ctrl.acquire(name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                        ctrl.acquire(
+                            name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                        )
                     )
                     for name in names
                 ]
@@ -3055,13 +3349,19 @@ class TestDiskGate:
             disk.patched(tmp_path),
             patch("exec_sandbox.admission._settle_removals", return_value=_AT_REMOVAL),
         ):
-            v = await ctrl.acquire("v", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, held=frozenset())
+            v = await ctrl.acquire(
+                "v", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, use_tcg=False, held=frozenset()
+            )
             w_a = asyncio.create_task(
-                ctrl.acquire("w-a", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                ctrl.acquire(
+                    "w-a", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting(ctrl, 1)
             w_b = asyncio.create_task(
-                ctrl.acquire("w-b", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                ctrl.acquire(
+                    "w-b", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting(ctrl, 2)
             leased[0] = False  # V ends: its leases go, then its admission
@@ -3088,14 +3388,18 @@ class TestDiskGate:
         ctrl.add_cache(cache)
         evicted: dict[str, float] = {}
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
-            vm = await ctrl.acquire("vm", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, held=frozenset())
+            vm = await ctrl.acquire(
+                "vm", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, use_tcg=False, held=frozenset()
+            )
             for name in ("a", "b", "c", "release", "d", "e"):
                 if name == "release":
                     await ctrl.release(vm)
                     continue
                 before = sum(cache.evicted)
                 with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
-                    await ctrl.acquire(name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=1, held=frozenset())
+                    await ctrl.acquire(
+                        name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=1, use_tcg=False, held=frozenset()
+                    )
                 evicted[name] = sum(cache.evicted) - before
         assert evicted == {"a": 100, "b": 100, "c": 0, "d": 100, "e": 0}
 
@@ -3112,17 +3416,23 @@ class TestDiskGate:
             disk.patched(tmp_path),
             patch("exec_sandbox.admission._settle_removals", return_value=_AT_REMOVAL),
         ):
-            vm = await ctrl.acquire("vm-0", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, held=frozenset())
+            vm = await ctrl.acquire(
+                "vm-0", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, use_tcg=False, held=frozenset()
+            )
             stopped = []
             for count, name in enumerate(("vm-a", "vm-b"), start=1):  # one pass of nothing each
                 stopped.append(
                     asyncio.create_task(
-                        ctrl.acquire(name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                        ctrl.acquire(
+                            name, memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                        )
                     )
                 )
                 await _until_waiting(ctrl, count)
             w = asyncio.create_task(
-                ctrl.acquire("vm-w", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                ctrl.acquire(
+                    "vm-w", memory_mb=1, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting(ctrl, 3)
             assert sum(cache.evicted) == 200  # the clones: after A's, B's pass evicts for B only; W evicts nothing
@@ -3155,10 +3465,10 @@ class TestDiskGate:
         assert other.stopped and other.shared_stop
 
     async def test_stop_ends_the_passes_of_evictions(self, tmp_path: Path) -> None:
-        """stop() while a request runs its passes (btrfs compression: each eviction gives 1/32
-        back): the passes went on, 156 entries evicted after stop(). The passes end at
-        the next eviction, and no re-check timer starts after stop(). The timer is asked for
-        directly: a pass reaches it after stop() only in a race (a sync that stop() ends)."""
+        """stop() while a request runs its passes (btrfs compression: each eviction gives 1/32 back): passes
+        that go on evict 156 entries after stop(). The passes end at the next eviction, and no re-check timer
+        starts after stop(). The timer is asked for directly: a pass reaches it after stop() only in a race (a
+        sync that stop() ends)."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)
 
@@ -3171,7 +3481,9 @@ class TestDiskGate:
         ctrl.add_cache(cache)
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=8000, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await cache.evicted_one.wait()
             await ctrl.stop()
@@ -3184,10 +3496,9 @@ class TestDiskGate:
         assert ctrl._recheck_task is None  # pyright: ignore[reportPrivateUsage]
 
     async def test_a_request_that_fits_at_the_lock_lists_nothing(self, tmp_path: Path) -> None:
-        """A pass of another request made room while this one waited for the lock of the
-        passes: it fits now, and goes on with no listing of the caches (each queued
-        request listed every cache before it saw that it fit). A's pass evicts one 600 MB entry:
-        room for A and B."""
+        """A pass of another request made room while this one waited for the lock of the passes: it fits at
+        the lock, and goes on with no listing of the caches (else each queued request lists every cache before
+        it sees that it fits). A's pass evicts one 600 MB entry: room for A and B."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 1024 MB disk needs 256 MB more
         in_pass, go_on = asyncio.Event(), asyncio.Event()
@@ -3202,16 +3513,17 @@ class TestDiskGate:
         ctrl.add_cache(cache)
         with patch("exec_sandbox.admission.shutil.disk_usage", disk.usage):
             a = asyncio.create_task(
-                ctrl.acquire("vm-a", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                ctrl.acquire(
+                    "vm-a", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
             await in_pass.wait()  # A holds the lock of the passes
             b = asyncio.create_task(
-                ctrl.acquire("vm-b", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, held=frozenset())
+                ctrl.acquire(
+                    "vm-b", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=2, use_tcg=False, held=frozenset()
+                )
             )
-            for _ in range(2000):  # until B waits for the lock of the passes (2 s at most)
-                if ctrl._evict_lock._waiters:  # pyright: ignore[reportPrivateUsage]
-                    break
-                await asyncio.sleep(0.001)
+            await _until_queued_for_the_passes(ctrl, b)
             listings = len(cache.size_read_calls)
             go_on.set()
             async with asyncio.timeout(1):
@@ -3238,11 +3550,11 @@ class TestDiskGate:
         assert ctrl._others_mb(start, later_mb=2000) == 100  # pyright: ignore[reportPrivateUsage]
 
     async def test_an_admission_does_not_make_the_disk_waiters_list_the_caches(self, tmp_path: Path) -> None:
-        """Requests that gate 4 blocks wait for their VMs; small requests that fit come and go.
-        Each admission woke them all (mixed sizes) and each listed the caches again: 100
-        waiters, 20 admissions, 2000 listings. They make room again only when the room
-        changed (a release, a pass that gave space, the self-wake), and at one room version only
-        until a pass finds nothing to evict."""
+        """Requests that gate 4 blocks wait for their VMs; small requests that fit come and go. Each admission
+        wakes them all (mixed sizes); if each woken waiter listed the caches again, 100 waiters and 20
+        admissions would give 2000 listings. They make room again only when the room changed (a release, a
+        pass that gave space, the self-wake), and at one room version only until a pass finds nothing to
+        evict."""
         disk = _Disk(1000)
         disk.written_mb = 10_000  # VMs of this controller wrote much: the requests wait
         ctrl = self._controller(tmp_path, floor_mb=1000)
@@ -3252,21 +3564,30 @@ class TestDiskGate:
             waiters = [
                 asyncio.create_task(
                     ctrl.acquire(
-                        f"w{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=4000 + 1000 * (i % 2), timeout=5, held=frozenset()
+                        f"w{i}",
+                        memory_mb=1,
+                        cpu_cores=_CPU,
+                        disk_mb=4000 + 1000 * (i % 2),
+                        timeout=5,
+                        use_tcg=False,
+                        held=frozenset(),
                     )
                 )
                 for i in range(10)
             ]
-            for _ in range(2000):  # until all wait (2 s at most)
-                if sum(ctrl._waiting.values()) >= 10:  # pyright: ignore[reportPrivateUsage]
-                    break
-                await asyncio.sleep(0.001)
+            await _until_waiting(ctrl, 10)
             listings = len(cache.size_read_calls)
+
+            def all_wait() -> bool:  # every waiter is back in the wait, no pass runs
+                return sum(ctrl._waiting.values()) >= 10 and not ctrl._evict_lock.locked()  # pyright: ignore[reportPrivateUsage]
+
             for i in range(5):
-                small = await ctrl.acquire(f"s{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, held=frozenset())
-                await asyncio.sleep(0.01)  # the woken waiters run
+                small = await ctrl.acquire(
+                    f"s{i}", memory_mb=1, cpu_cores=_CPU, disk_mb=0, timeout=1, use_tcg=False, held=frozenset()
+                )
                 await ctrl.release(small)  # a release: the room changed
-                await asyncio.sleep(0.01)
+                await _until(lambda i=i: len(cache.size_read_calls) - listings > i, what="the listing of a waiter")
+                await _until(all_wait, what="all waiters in the wait again")
             # one per release: the first waiter finds nothing to evict, the others skip until the
             # room changes again (not one per release and waiter); none per admission
             assert len(cache.size_read_calls) - listings == 5
@@ -3275,21 +3596,23 @@ class TestDiskGate:
             await asyncio.gather(*waiters, return_exceptions=True)
 
     async def test_a_waiter_that_fits_the_disk_only_wakes_nobody(self, tmp_path: Path) -> None:
-        """While its pass is pending, S fits gate 4 (another process freed space) but waits on
-        the memory budget: the timer woke all the waiters every 50 ms for the whole pending time
-        (954 listings/s). It wakes them only when a waiting request passes every gate.
-        The wake-ups are counted on the condition: a woken waiter whose room did not change
-        lists nothing, so no file call shows them; their cost is CPU."""
+        """While its pass is pending, S fits gate 4 (another process freed space) but waits on the memory
+        budget: a timer that wakes all the waiters every 50 ms for the whole pending time costs 954
+        listings/s. It wakes them only when a waiting request passes every gate. The wake-ups are counted on
+        the condition: a woken waiter whose room did not change lists nothing, so no file call shows them;
+        their cost is CPU."""
         disk = _Disk(1050)
         ctrl = ResourceAdmissionController(
             disk_dir=tmp_path,
             disk_free_floor_mb=1000,
             memory_overcommit_ratio=1.0,
             cpu_overcommit_ratio=1.0,
-            disk_overcommit_ratio=DEFAULT_DISK_OVERCOMMIT_RATIO,
+            disk_overcommit_ratio=4.0,  # a 400 MB disk reserves 100 MB: 50 MB lacking in 1050 - 1000
             host_memory_reserve_ratio=0.0,
             host_memory_mb=1000.0,
             host_cpu_count=1000.0,
+            available_memory_floor_mb=0,
+            host_cpu_reserve_cores=DEFAULT_HOST_CPU_RESERVE_CORES,
         )
         cache = _Cache(tmp_path / "l2", disk, [5000] * 4, gives_back=0)  # 60 MB is no gain of a 5000 MB pass
         ctrl.add_cache(cache)
@@ -3298,10 +3621,14 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", return_value=_zfs(5.0)),
         ):
             s_task = asyncio.create_task(
-                ctrl.acquire("s", memory_mb=400, cpu_cores=_CPU, disk_mb=400, timeout=3, held=frozenset())
+                ctrl.acquire(
+                    "s", memory_mb=400, cpu_cores=_CPU, disk_mb=400, timeout=3, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting_or_done(ctrl, s_task)  # its pass is pending: 50 MB lacking
-            held = await ctrl.acquire("held", memory_mb=600, cpu_cores=_CPU, disk_mb=0, timeout=1, held=frozenset())
+            held = await ctrl.acquire(
+                "held", memory_mb=600, cpu_cores=_CPU, disk_mb=0, timeout=1, use_tcg=False, held=frozenset()
+            )
             disk.free_mb += 60  # another process frees 60 MB: S fits gate 4, not the memory budget
             wakes = 0
             notify_all = ctrl._condition.notify_all  # pyright: ignore[reportPrivateUsage]
@@ -3321,9 +3648,8 @@ class TestDiskGate:
 
     @pytest.mark.parametrize("slow", ["reads", "sync"])
     async def test_stop_ends_a_pass_that_reads_the_space_or_waits_for_a_sync(self, tmp_path: Path, slow: str) -> None:
-        """stop() during a pass that reads the space while it grows (XFS, up to 1 s) or waits for
-        a syncfs (up to 1 s): the pass went on, and acquire() ended 1-2 s after stop().
-        It ends at once."""
+        """stop() during a pass that reads the space while it grows (XFS, up to 1 s) or waits for a syncfs (up
+        to 1 s): a pass that goes on ends acquire() 1-2 s after stop(). It ends at once."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 1024 MB disk needs 256 MB more
         cache = _Cache(tmp_path / "l2", disk, [300] * 4, gives_back=0)
@@ -3336,17 +3662,34 @@ class TestDiskGate:
             if slow == "reads"
             else _OVERLAY
         )
-        sync_ends = threading.Event()  # a sync that writes much dirty data: it ends with the test
+        sync_started, sync_ends = threading.Event(), threading.Event()  # a sync that writes much dirty data
+        reads = 0
+
+        def usage(path: object) -> SimpleNamespace:
+            nonlocal reads
+            reads += 1
+            return disk.usage(path)
+
+        def slow_sync(_path: Path) -> None:
+            sync_started.set()
+            sync_ends.wait(5)  # it ends with the test
+
         with (
-            patch("exec_sandbox.admission.shutil.disk_usage", disk.usage),
+            patch("exec_sandbox.admission.shutil.disk_usage", usage),
             patch("exec_sandbox.admission._settle_removals", return_value=settle),
-            patch("exec_sandbox.admission._syncfs", side_effect=lambda _path: sync_ends.wait(5)),
+            patch("exec_sandbox.admission._syncfs", side_effect=slow_sync),
         ):
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await cache.evicted_one.wait()
-            await asyncio.sleep(0.2)  # into the reads, or into the wait for the sync
+            if slow == "reads":  # one read after the eviction, then the reads while the space grows
+                evicted_at = reads
+                await _until(lambda: reads >= evicted_at + 3, what="the reads of the space after the pass")
+            else:
+                assert await asyncio.to_thread(sync_started.wait, 5)
             stopped_at = loop.time()
             await ctrl.stop()
             try:
@@ -3357,10 +3700,10 @@ class TestDiskGate:
                 sync_ends.set()
 
     async def test_waiters_are_not_woken_while_a_pass_is_pending(self, tmp_path: Path) -> None:
-        """While a pass is pending and no waiter fits, the re-check timer woke them all twice a
-        second, and each listed the caches again (100 waiters: 197 listings/s). It wakes
-        them once the pending pass ends, or one fits. The wake-ups are counted on the condition:
-        a woken waiter whose room did not change lists nothing, so no file call shows them."""
+        """While a pass is pending and no waiter fits, a re-check timer that wakes them all twice a second
+        makes each list the caches again (100 waiters: 197 listings/s). It wakes them once the pending pass
+        ends, or one fits. The wake-ups are counted on the condition: a woken waiter whose room did not change
+        lists nothing, so no file call shows them."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=1000)  # a 1024 MB disk needs 256 MB more
         cache = _Cache(tmp_path / "l2", disk, [300] * 4, gives_back=0)
@@ -3370,7 +3713,9 @@ class TestDiskGate:
             patch("exec_sandbox.admission._settle_removals", return_value=_zfs(30.0)),
         ):
             waiter = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting_or_done(ctrl, waiter)
             wakes = 0
@@ -3426,10 +3771,12 @@ class TestDiskGate:
         ctrl = self._controller(tmp_path, floor_mb=1000)
         with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(1000).usage):  # a 64 MB disk needs 16 MB more
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.CAPACITY):
-                await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=64, timeout=_REFUSED, held=frozenset())
+                await ctrl.acquire(
+                    "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=64, timeout=_REFUSED, use_tcg=False, held=frozenset()
+                )
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
                 await ctrl.acquire(
-                    "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=64, timeout=2, held=frozenset({session})
+                    "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=64, timeout=2, use_tcg=False, held=frozenset({session})
                 )
 
     async def test_waits_when_the_end_of_its_own_vm_makes_room(self, tmp_path: Path) -> None:
@@ -3437,9 +3784,13 @@ class TestDiskGate:
         instead of failing at once."""
         ctrl = self._controller(tmp_path, floor_mb=1000)
         with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(1300).usage):
-            first = await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=0.2, held=frozenset())
+            first = await ctrl.acquire(
+                "vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=0.2, use_tcg=False, held=frozenset()
+            )
             second = asyncio.create_task(
-                ctrl.acquire("vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, held=frozenset())
+                ctrl.acquire(
+                    "vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=1024, timeout=5, use_tcg=False, held=frozenset()
+                )
             )
             await _until_waiting(ctrl, 1)
             await ctrl.release(first)
@@ -3460,17 +3811,38 @@ class TestDiskGate:
 
 
 async def _self_wake(ctrl: ResourceAdmissionController) -> None:
-    """One wake-up of the self-wake timer, now (it runs every 10 s)."""
+    """One wake-up of the self-wake timer, now: the body of its loop (private). The timer runs
+    every 10 s, so no test waits for it; test_self_wake_timer_unblocks_gate3_waiters runs it."""
     await ctrl._self_wake()  # pyright: ignore[reportPrivateUsage]
 
 
 async def _until_waiting_or_done(ctrl: ResourceAdmissionController, task: asyncio.Task[object]) -> None:
-    """Until `task` (an acquire) has ended or blocks in the controller (2 s at most)."""
+    """Until `task` (an acquire) has ended or blocks in the controller (2 s at most). The
+    controller has no public waiter count: its counter (private) is polled."""
     for _ in range(2000):
         if task.done() or ctrl._waiting:  # pyright: ignore[reportPrivateUsage]
             return
         await asyncio.sleep(0.001)
     raise AssertionError("the acquire neither ended nor blocked")
+
+
+async def _until_queued_for_the_passes(ctrl: ResourceAdmissionController, task: asyncio.Task[object]) -> None:
+    """Until `task` (an acquire) has ended or waits for the lock of the passes of evictions (2 s
+    at most). No public fact shows that wait: the waiters of that lock (private) are polled."""
+    for _ in range(2000):
+        if task.done() or ctrl._evict_lock._waiters:  # pyright: ignore[reportPrivateUsage]
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError("the acquire neither ended nor waited for the lock of the passes")
+
+
+async def _until(condition: Callable[[], bool], *, what: str) -> None:
+    """Until `condition` holds (5 s at most): order by fact, not by sleep."""
+    for _ in range(5000):
+        if condition():
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError(f"never: {what}")
 
 
 async def _until_waiting(ctrl: ResourceAdmissionController, count: int) -> None:
@@ -3494,16 +3866,16 @@ class TestMixedSizeWakeUp:
         ctrl = _make_controller(host_memory_mb=672.0, memory_overcommit=1.0, reserve_ratio=0.0, cpu_overcommit=100.0)
         held = [
             await ctrl.acquire(
-                f"hold-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, held=frozenset()
+                f"hold-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
             )
             for i in range(2)
         ]
         large = asyncio.create_task(
-            ctrl.acquire("large", memory_mb=592, cpu_cores=_CPU, disk_mb=0, timeout=30, held=frozenset())
+            ctrl.acquire("large", memory_mb=592, cpu_cores=_CPU, disk_mb=0, timeout=30, use_tcg=False, held=frozenset())
         )
         await _until_waiting(ctrl, 1)  # the large one waits first
         small = asyncio.create_task(
-            ctrl.acquire("small", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=30, held=frozenset())
+            ctrl.acquire("small", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=30, use_tcg=False, held=frozenset())
         )
         await _until_waiting(ctrl, 2)
 
@@ -3518,10 +3890,14 @@ class TestMixedSizeWakeUp:
         """A budget of 816 MB holds three VMs of 192 MB (272 MB each). One VM of 736 MB (816
         with its overhead) takes it all; its release admits the three waiters of the same size."""
         ctrl = _make_controller(host_memory_mb=816.0, memory_overcommit=1.0, reserve_ratio=0.0, cpu_overcommit=100.0)
-        big = await ctrl.acquire("big", memory_mb=736, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, held=frozenset())
+        big = await ctrl.acquire(
+            "big", memory_mb=736, cpu_cores=_CPU, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+        )
         waiters = [
             asyncio.create_task(
-                ctrl.acquire(f"w-{i}", memory_mb=192, cpu_cores=_CPU, disk_mb=0, timeout=30, held=frozenset())
+                ctrl.acquire(
+                    f"w-{i}", memory_mb=192, cpu_cores=_CPU, disk_mb=0, timeout=30, use_tcg=False, held=frozenset()
+                )
             )
             for i in range(3)
         ]
@@ -3534,14 +3910,30 @@ class TestMixedSizeWakeUp:
         assert not ctrl._waiting  # pyright: ignore[reportPrivateUsage]
 
 
+_SHOWN_AT_REMOVAL = _Settle(quiet=0.0, limit=0.0, sync_once=False, later=0.0, counts_writes=True)
+"""ext4, tmpfs, APFS: read once."""
+_SHOWN_AFTER_COMMIT = _Settle(quiet=0.01, limit=0.05, sync_once=False, later=0.0, counts_writes=False)
+"""btrfs after its commit: read again for 10 ms of no change, 50 ms at most."""
+_SHOWN_IN_BACKGROUND = _Settle(quiet=0.15, limit=1.0, sync_once=False, later=0.0, counts_writes=True)
+"""XFS: read again until no growth for 150 ms, 1 s at most."""
+_SHOWN_AT_A_SYNC = _Settle(quiet=0.15, limit=1.0, sync_once=True, later=0.0, counts_writes=False)
+"""An overlay with no upper folder in sight: read again as on XFS, then syncfs once."""
+_BTRFS, _XFS, _ZFS, _OVERLAY_FS = 0x9123683E, 0x58465342, 0x2FC12FC1, 0x794C7630
+"""statfs f_type values (linux/magic.h; ZFS: its own ZFS_SUPER_MAGIC)."""
+_START_SYNC, _WAIT_SYNC = 0x80089418, 0x40089416
+"""BTRFS_IOC_START_SYNC: _IOR(0x94, 24, __u64); BTRFS_IOC_WAIT_SYNC: _IOW(0x94, 22, __u64)."""
+
+
 class TestSettleRemovals:
-    """_settle_removals: how long the free space of each filesystem can take to show removals."""
+    """_settle_removals: how long the free space of each filesystem can take to show removals.
+    It is called directly (private): through acquire(), each case needs that filesystem on the
+    host. The statfs type and the ioctl are faked at the OS call."""
 
     def test_the_real_call_on_a_real_folder(self, tmp_path: Path) -> None:
         """No error on a real folder. macOS (APFS) shows a removal at once."""
         settled = _settle_removals(tmp_path)
         if detect_host_os() is HostOS.MACOS:
-            assert settled == _AT_REMOVAL
+            assert settled == _SHOWN_AT_REMOVAL
 
     @staticmethod
     def _on_linux(fs_type: int) -> contextlib.AbstractContextManager[object]:
@@ -3559,28 +3951,30 @@ class TestSettleRemovals:
 
         def ioctl(_fd: int, request: int, arg: bytearray) -> int:
             calls.append((request, bytes(arg)))
-            if request == _BTRFS_IOC_START_SYNC:
+            if request == _START_SYNC:
                 arg[:] = (42).to_bytes(8, sys.byteorder)
             return 0
 
-        with self._on_linux(_BTRFS_SUPER_MAGIC), patch("exec_sandbox.admission.fcntl.ioctl", side_effect=ioctl):
-            assert _settle_removals(tmp_path) == _AFTER_COMMIT
-        assert calls == [(_BTRFS_IOC_START_SYNC, bytes(8)), (_BTRFS_IOC_WAIT_SYNC, (42).to_bytes(8, sys.byteorder))]
+        with self._on_linux(_BTRFS), patch("exec_sandbox.admission.fcntl.ioctl", side_effect=ioctl):
+            assert _settle_removals(tmp_path) == _SHOWN_AFTER_COMMIT
+        assert calls == [(_START_SYNC, bytes(8)), (_WAIT_SYNC, (42).to_bytes(8, sys.byteorder))]
 
     def test_a_failed_btrfs_commit_reads_the_space_again(self, tmp_path: Path) -> None:
+        """A commit ioctl that fails (not btrfs after all): the space is read again, then syncfs
+        once, as for an unknown type."""
         with (
-            self._on_linux(_BTRFS_SUPER_MAGIC),
+            self._on_linux(_BTRFS),
             patch("exec_sandbox.admission.fcntl.ioctl", side_effect=OSError(errno.ENOTTY, "not btrfs")),
         ):
-            assert _settle_removals(tmp_path) == _OTHER
+            assert _settle_removals(tmp_path) == _SHOWN_AT_A_SYNC
 
     @pytest.mark.parametrize(
         ("fs_type", "settled"),
         [
-            (0xEF53, _AT_REMOVAL),
-            (0x01021994, _AT_REMOVAL),
-            (_XFS_SUPER_MAGIC, _BACKGROUND),
-            (0x794C7630, _OTHER),  # overlay, whatever filesystem it writes to
+            (0xEF53, _SHOWN_AT_REMOVAL),
+            (0x01021994, _SHOWN_AT_REMOVAL),
+            (_XFS, _SHOWN_IN_BACKGROUND),
+            (_OVERLAY_FS, _SHOWN_AT_A_SYNC),  # overlay, whatever filesystem it writes to
         ],
         ids=["ext4", "tmpfs", "xfs", "overlay"],
     )
@@ -3593,7 +3987,7 @@ class TestSettleRemovals:
 
     @pytest.mark.parametrize(
         ("upper_type", "settled"),
-        [(0xEF53, _AT_REMOVAL), (_XFS_SUPER_MAGIC, _BACKGROUND), (_BTRFS_SUPER_MAGIC, _AFTER_COMMIT)],
+        [(0xEF53, _SHOWN_AT_REMOVAL), (_XFS, _SHOWN_IN_BACKGROUND), (_BTRFS, _SHOWN_AFTER_COMMIT)],
         ids=["ext4", "xfs", "btrfs"],
     )
     def test_an_overlay_settles_as_its_upper_filesystem(
@@ -3608,7 +4002,7 @@ class TestSettleRemovals:
         calls: list[int] = []
 
         def statfs_type(path: Path) -> int:
-            return upper_type if path == upper else 0x794C7630
+            return upper_type if path == upper else _OVERLAY_FS
 
         with (
             patch("exec_sandbox.admission.detect_host_os", return_value=HostOS.LINUX),
@@ -3617,7 +4011,7 @@ class TestSettleRemovals:
             patch("exec_sandbox.admission.fcntl.ioctl", side_effect=lambda _fd, request, _arg: calls.append(request)),
         ):
             assert _settle_removals(tmp_path) == settled
-        assert calls == ([_BTRFS_IOC_START_SYNC, _BTRFS_IOC_WAIT_SYNC] if upper_type == _BTRFS_SUPER_MAGIC else [])
+        assert calls == ([_START_SYNC, _WAIT_SYNC] if upper_type == _BTRFS else [])
 
     def test_the_upper_folder_of_an_overlay_comes_from_mountinfo(self, tmp_path: Path) -> None:
         """The line of /proc/self/mountinfo with the device of the folder gives the upperdir
@@ -3638,9 +4032,9 @@ class TestSettleRemovals:
             assert overlay_upper(tmp_path) is None
 
     def test_mountinfo_lines_of_any_bytes_and_empty_sources_parse(self, tmp_path: Path) -> None:
-        """A mount point that is not UTF-8 raised UnicodeDecodeError; an empty mount source (two
-        spaces) shifted the fields. The bytes are read as bytes, the fields split on
-        single spaces."""
+        """A mount point that is not UTF-8 and an empty mount source (two spaces) parse: the lines are read as
+        bytes (a text read raises UnicodeDecodeError), the fields split on single spaces (a split on runs of
+        spaces shifts the fields)."""
         upper = tmp_path / "upper"
         upper.mkdir()
         dev = tmp_path.stat().st_dev
@@ -3664,8 +4058,8 @@ class TestSettleRemovals:
             assert overlay_upper(tmp_path) is None
 
     def test_a_zfs_module_this_user_may_not_see_reads_as_none(self, tmp_path: Path) -> None:
-        """Path.exists raised PermissionError out of acquire() when the zfs_txg_timeout path
-        could not be reached: no access reads as no ZFS module."""
+        """A zfs_txg_timeout path this user cannot reach reads as no ZFS module, never as a PermissionError
+        out of acquire() (Path.exists raises it)."""
         locked = tmp_path / "locked"
         locked.mkdir()
         locked.chmod(0)
@@ -3681,7 +4075,7 @@ class TestSettleRemovals:
         it as still coming for two sync intervals and a second (that sync can end late)."""
         txg = tmp_path / "zfs_txg_timeout"
         txg.write_text("5\n")
-        with self._on_linux(_ZFS_SUPER_MAGIC), patch("exec_sandbox.admission._ZFS_TXG_TIMEOUT", txg):
+        with self._on_linux(_ZFS), patch("exec_sandbox.admission._ZFS_TXG_TIMEOUT", txg):
             assert _settle_removals(tmp_path) == _Settle(
                 quiet=0, limit=0, sync_once=False, later=11, counts_writes=True
             )

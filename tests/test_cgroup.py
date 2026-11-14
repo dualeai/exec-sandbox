@@ -24,6 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -37,10 +38,6 @@ from exec_sandbox.cgroup import (
     read_container_available_memory_mb,
     wrap_with_ulimit,
 )
-from exec_sandbox.constants import (
-    DEFAULT_TCG_TB_CACHE_SIZE_MB,
-    DEFAULT_VM_MEMORY_OVERHEAD_MB,
-)
 from exec_sandbox.platform_utils import HostOS
 from tests.conftest import time_with
 
@@ -51,8 +48,8 @@ from .conftest import skip_unless_linux
 # =============================================================================
 
 
-class TestCheckCgroupV2Mounted:
-    """Test the cgroup v2 mount detection logic."""
+class TestCgroupV2Available:
+    """cgroup_v2_available: the cgroup v2 mount detection."""
 
     @pytest.fixture(autouse=True)
     def reset_cache(self) -> Generator[None]:
@@ -313,12 +310,12 @@ async def _created(*, memory_mb: int, cpu_cores: float) -> Path:
     return made.path
 
 
-class TestSetupCgroup:
+class TestCgroupCreate:
     """Cgroup.create: the hierarchy, its modes and limits, its worker thread, and where it gives None."""
 
     # --- Normal cases ---
-    async def test_setup_creates_cgroup_hierarchy(self, cgroup_root: Path):
-        """Normal setup creates tenant and VM cgroups."""
+    async def test_create_makes_the_cgroup_hierarchy(self, cgroup_root: Path):
+        """Cgroup.create makes the tenant and VM cgroups."""
         result = await _created(memory_mb=256, cpu_cores=1.0)
 
         tenant = cgroup_root / CGROUP_APP_NAMESPACE / "tenant1"
@@ -407,7 +404,7 @@ class TestSetupCgroup:
             assert not (result / "memory.high").exists()
         assert not (result / "memory.zswap.writeback").exists()
 
-    async def test_setup_runs_in_one_worker_thread(self, cgroup_root: Path):
+    async def test_create_runs_in_one_worker_thread(self, cgroup_root: Path):
         """The cgroup files are made off the event loop thread (mkdir and cgroup.subtree_control
         can wait for the kernel's cgroup locks)."""
         loop_thread = threading.get_ident()
@@ -421,11 +418,11 @@ class TestSetupCgroup:
         with patch.object(Path, "mkdir", autospec=True, side_effect=mkdir):
             await _created(memory_mb=256, cpu_cores=1.0)
 
-        assert threads
+        assert len(threads) == 1  # one job: every mkdir in the same worker thread
         assert loop_thread not in threads
 
-    async def test_setup_cancel_waits_for_the_job(self, cgroup_root: Path):
-        """A cancel during setup returns only once the job has ended: the owner's cleanup
+    async def test_create_cancel_waits_for_the_job(self, cgroup_root: Path):
+        """A cancel during Cgroup.create returns only once the job has ended: the owner's cleanup
         never removes the folder while the job still makes it."""
         started, release = threading.Event(), threading.Event()
         real_mkdir = Path.mkdir
@@ -440,7 +437,8 @@ class TestSetupCgroup:
             try:
                 await asyncio.to_thread(started.wait, 10)
                 task.cancel()
-                await asyncio.sleep(0.05)
+                for _ in range(3):  # the cancel reaches the task at its next step: one loop turn
+                    await asyncio.sleep(0)
                 assert not task.done(), "the cancel did not wait for the setup job"
             finally:
                 release.set()
@@ -449,7 +447,7 @@ class TestSetupCgroup:
 
         assert (cgroup_root / CGROUP_APP_NAMESPACE / "tenant1" / "vm123" / "pids.max").exists()
 
-    async def test_setup_applies_precomputed_memory_limit(self, cgroup_root: Path):
+    async def test_create_applies_precomputed_memory_limit(self, cgroup_root: Path):
         """memory.max is the memory that admission computed (overheads included there), in
         bytes: Cgroup.create adds nothing."""
         result = await _created(memory_mb=300, cpu_cores=1.0)
@@ -464,7 +462,7 @@ class TestSetupCgroup:
             (4.0, "400000 100000"),
         ],
     )
-    async def test_setup_cpu_max_scales_with_cores(
+    async def test_create_cpu_max_scales_with_cores(
         self, cgroup_root: Path, cgroup_cpu_cores: float, expected_cpu_max: str
     ):
         """cpu.max quota scales proportionally with cgroup_cpu_cores (effective, including overhead)."""
@@ -499,7 +497,7 @@ class TestSetupCgroup:
             assert await Cgroup.create(tenant_id="tenant1", vm_id="vm123", memory_mb=256, cpu_cores=1.0) is None
         assert list(cgroup_root.iterdir()) == []
 
-    async def test_setup_other_oserror_raises_config_error(self, cgroup_root: Path):
+    async def test_create_other_oserror_raises_config_error(self, cgroup_root: Path):
         """Other OSError raises ConfigError HOST_DEPENDENCY."""
         from exec_sandbox.exceptions import ConfigError, ErrorCode
 
@@ -536,8 +534,8 @@ class TestAttach:
             assert await Cgroup(tmp_path).attach(12345) is True
 
         assert (tmp_path / "cgroup.procs").read_text() == "12345"
-        assert threads
-        assert loop_thread not in threads
+        assert len(threads) == 1
+        assert threads[0] != loop_thread
 
     @pytest.mark.parametrize("err", [errno.EACCES, errno.EPERM, errno.ESRCH], ids=["eacces", "eperm", "gone"])
     async def test_denied_attach_degrades_to_false(self, tmp_path: Path, err: int):
@@ -584,8 +582,9 @@ class TestStats:
         assert Cgroup(tmp_path).stats() == CgroupStats(cpu_time_ms=5000, peak_memory_mb=None, nr_throttled=0)
 
     def test_handles_malformed_files(self, tmp_path: Path):
-        (tmp_path / "cpu.stat").write_text("garbage data not_a_number")
-        (tmp_path / "memory.peak").write_text("garbage data not_a_number")
+        """A value that is no number (its line is read, int() fails): no stat, no error."""
+        (tmp_path / "cpu.stat").write_text("usage_usec abc\nnr_throttled 0")
+        (tmp_path / "memory.peak").write_text("not_a_number")
         assert Cgroup(tmp_path).stats() == NO_CGROUP_STATS
 
     def test_handles_oserror_during_read(self, tmp_path: Path):
@@ -598,7 +597,7 @@ class TestStats:
 # =============================================================================
 
 
-class TestCleanupCgroup:
+class TestCgroupRemove:
     """Cgroup.remove: rmdir off the event loop; a missing cgroup is removed; a failure stays (False)."""
 
     async def test_removes_empty_cgroup(self, cgroup_root: Path):
@@ -616,12 +615,20 @@ class TestCleanupCgroup:
             assert await Cgroup(cgroup_path).remove() is True
 
         assert not cgroup_path.exists()
-        assert threads
-        assert loop_thread not in threads
+        assert len(threads) == 1
+        assert threads[0] != loop_thread
 
     async def test_handles_already_deleted_cgroup(self, cgroup_root: Path):
         """FileNotFoundError during rmdir: True (gone)."""
         assert await Cgroup(cgroup_root / "code-exec" / "tenant" / "vm123").remove() is True
+
+    async def test_removes_child_folders_first(self, cgroup_root: Path):
+        """A child cgroup a QEMU made in the VM cgroup goes first: rmdir of the VM cgroup alone
+        would fail."""
+        cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"
+        (cgroup_path / "child").mkdir(parents=True)
+        assert await Cgroup(cgroup_path).remove() is True
+        assert not cgroup_path.exists()
 
     async def test_handles_rmdir_oserror(self, cgroup_root: Path):
         cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"
@@ -663,23 +670,27 @@ class TestCleanupCgroup:
         assert (tenant / "cgroup.procs").read_text() == ""
 
     async def test_close_kills_then_removes(self, cgroup_root: Path) -> None:
-        """close = kill, then remove only once empty; `async with` closes at the block's end."""
-        calls: list[str] = []
+        """close = kill, then remove only once empty; `async with` closes at the block's end. A
+        folder stands in for the cgroup (as in TestKillCgroup): a process that does not leave
+        keeps it; once cgroup.events says populated 0, the rmdir stand-in removes it with its
+        control files, as cgroupfs does."""
+        path = cgroup_root / "code-exec" / "tenant" / "vm123"
+        path.mkdir(parents=True)
+        (path / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+        (path / "cgroup.procs").write_text("4242\n")
+        (path / "cgroup.kill").write_text("")
+        clock = itertools.count(100.0, 3.0)  # 3 s later at each read: the wait ends at its first check
 
-        async def kill(_self: Cgroup) -> bool:
-            calls.append("kill")
-            return len(calls) > 1  # the first wait ends with a process still there
+        with patch.object(Path, "rmdir", autospec=True, side_effect=shutil.rmtree):
+            with patch("exec_sandbox.cgroup.time", time_with(monotonic=lambda: next(clock))):
+                assert await Cgroup(path).close() is False
+            assert (path / "cgroup.kill").read_text() == "1"
+            assert path.exists()  # no rmdir: a process is still there
 
-        async def remove(_self: Cgroup) -> bool:
-            calls.append("remove")
-            return True
-
-        with patch.object(Cgroup, "kill", kill), patch.object(Cgroup, "remove", remove):
-            assert await Cgroup(cgroup_root / "vm").close() is False
-            assert calls == ["kill"]
-            async with Cgroup(cgroup_root / "vm"):
-                pass
-        assert calls == ["kill", "kill", "remove"]
+            (path / "cgroup.events").write_text("populated 0\nfrozen 0\n")
+            async with Cgroup(path):
+                assert path.exists()
+        assert not path.exists()
 
 
 class TestKillCgroup:
@@ -722,9 +733,10 @@ class TestKillCgroup:
     async def test_the_wait_starts_when_the_job_runs(self, cgroup_root: Path) -> None:
         """A busy executor runs the job seconds after Cgroup.kill queues it: the wait still
         gets its whole CGROUP_DRAIN_TIMEOUT_SECONDS (a kill that works is never "unconfirmed").
-        A fake clock: the job starts 3 s after the call."""
+        A fake clock: the job starts 3 s after the call. The private _drain_cgroup stands in for
+        the wait to read the deadline it gets: the real one with a fake clock never reaches
+        poll(2), and its result does not show the deadline."""
         from exec_sandbox import cgroup as cgroup_module
-        from exec_sandbox.cgroup import CGROUP_DRAIN_TIMEOUT_SECONDS
 
         path = self._cgroup(cgroup_root, populated=1, procs="4242\n", kill_file=True)
         now = [100.0]
@@ -745,7 +757,7 @@ class TestKillCgroup:
             patch("exec_sandbox.cgroup._drain_cgroup", side_effect=drain),
         ):
             assert await Cgroup(path).kill() is True
-        assert deadlines == [103.0 + CGROUP_DRAIN_TIMEOUT_SECONDS]
+        assert deadlines == [105.0]  # queued at 100 s, run at 103 s, then 2 s of wait
 
     @staticmethod
     def _late_clock() -> SimpleNamespace:
@@ -779,7 +791,7 @@ class TestKillCgroup:
         path = self._cgroup(cgroup_root, populated=1, procs="4242\n", kill_file=True)
         start = time.monotonic()
         assert _drain_cgroup(path, deadline=start + 0.05) is False
-        assert time.monotonic() - start < 0.5
+        assert 0.05 <= time.monotonic() - start < 0.5  # not before the deadline, not long after
 
     async def test_no_kill_file_is_a_wait_not_an_error(
         self, cgroup_root: Path, caplog: pytest.LogCaptureFixture
@@ -799,10 +811,12 @@ class TestKillCgroup:
         ]
 
 
-class TestEndCgroups:
+class TestCgroupEndAll:
     """Cgroup.end_all: kill then remove for the VM cgroups of a dead process (the
     sweep of its folder). Folders stand in for the cgroups; the kernel side is in
-    TestCgroupIntegration."""
+    TestCgroupIntegration. Where a test needs the order or the deadline of the waits, the
+    private _drain_cgroup stands in for the wait (poll(2) on cgroup.events): a plain file
+    cannot show a process that leaves, and the real wait does not show its deadline."""
 
     def test_every_cgroup_is_killed_before_any_wait_and_only_empty_ones_go(self, cgroup_root: Path) -> None:
         """The waits overlap (each VM unmaps its RAM meanwhile); a cgroup that keeps a process
@@ -814,41 +828,34 @@ class TestEndCgroups:
             (path / "cgroup.kill").write_text("")  # cgroupfs has it; end_all never creates it
             paths.append(path)
         kills_at_first_wait: list[str] = []
-        removed: list[str] = []
 
         def drain(path: Path, *, deadline: float) -> bool:
             if not kills_at_first_wait:
                 kills_at_first_wait.extend((p / "cgroup.kill").read_text() for p in paths)
             return path.name != "vm-2"  # vm-2 keeps a process
 
-        def remove(path: Path) -> bool:
-            removed.append(path.name)
-            return True
-
         with (
             patch("exec_sandbox.cgroup._drain_cgroup", side_effect=drain),
-            patch("exec_sandbox.cgroup._remove_cgroup", side_effect=remove),
+            patch.object(Path, "rmdir", autospec=True, side_effect=shutil.rmtree),  # cgroupfs: the control files go too
         ):
             assert Cgroup.end_all([Cgroup(path) for path in paths]) == [Cgroup(paths[1])]
         assert kills_at_first_wait == ["1", "1", "1"]
-        assert removed == ["vm-1", "vm-3"]
+        assert [path.exists() for path in paths] == [False, True, False]
 
     def test_a_cgroup_that_cannot_be_removed_is_left(self, cgroup_root: Path) -> None:
-        """Empty but its rmdir fails: it is left, so the sweep keeps its record and tries again
-        (a folder with no record would stay for good)."""
+        """Empty but its rmdir fails (a plain folder with files: ENOTEMPTY): it is left, so the
+        sweep keeps its record and tries again (a folder with no record would stay for good)."""
         path = cgroup_root / "code-exec" / "tenant" / "vm-1"
-        with (
-            patch("exec_sandbox.cgroup._drain_cgroup", return_value=True),
-            patch("exec_sandbox.cgroup._remove_cgroup", return_value=False),
-        ):
-            assert Cgroup.end_all([Cgroup(path)]) == [Cgroup(path)]
+        path.mkdir(parents=True)
+        (path / "cgroup.events").write_text("populated 0\nfrozen 0\n")
+        (path / "cgroup.kill").write_text("")
+        assert Cgroup.end_all([Cgroup(path)]) == [Cgroup(path)]
+        assert path.exists()
 
     def test_one_deadline_for_every_cgroup(self, cgroup_root: Path) -> None:
         """Cgroups whose processes do not leave (D state) cost CGROUP_DRAIN_TIMEOUT_SECONDS
         together, not that much each: every wait ends at the same deadline. A fake clock: each
         stuck wait lasts until its deadline."""
-        from exec_sandbox.cgroup import CGROUP_DRAIN_TIMEOUT_SECONDS
-
         paths = [cgroup_root / "code-exec" / "tenant" / f"vm-{index}" for index in range(3)]
         now = [100.0]
         deadlines: list[float] = []
@@ -863,8 +870,8 @@ class TestEndCgroups:
             patch("exec_sandbox.cgroup._drain_cgroup", side_effect=stuck),
         ):
             assert Cgroup.end_all([Cgroup(path) for path in paths]) == [Cgroup(path) for path in paths]
-        assert deadlines == [100.0 + CGROUP_DRAIN_TIMEOUT_SECONDS] * 3
-        assert now[0] == 100.0 + CGROUP_DRAIN_TIMEOUT_SECONDS
+        assert deadlines == [102.0] * 3  # one deadline of 2 s for all
+        assert now[0] == 102.0
 
     def test_gone_cgroups_are_ended(self, cgroup_root: Path) -> None:
         gone = cgroup_root / "code-exec" / "tenant" / "never-made"
@@ -878,19 +885,11 @@ class TestEndCgroups:
 
 
 class TestCgroupConstants:
-    """Where VM cgroups go, and the ranges of the overheads that admission adds."""
+    """Where VM cgroups go."""
 
     def test_path_of_a_vm(self):
         """A VM's cgroup is /sys/fs/cgroup/code-exec/<tenant_id>/<vm_id>."""
         assert Cgroup.path_of(tenant_id="tenant1", vm_id="vm123") == Path("/sys/fs/cgroup/code-exec/tenant1/vm123")
-
-    def test_memory_overhead_is_reasonable(self):
-        """Memory overhead is reasonable for microvm/virt machine types (32-128MB)."""
-        assert 32 <= DEFAULT_VM_MEMORY_OVERHEAD_MB <= 128
-
-    def test_tcg_cache_size_is_reasonable(self):
-        """TCG TB cache size is reasonable (128MB-1GB, shrunk for VM density)."""
-        assert 128 <= DEFAULT_TCG_TB_CACHE_SIZE_MB <= 1024
 
 
 # =============================================================================
@@ -1013,11 +1012,9 @@ class TestCgroupIntegration:
     @pytest.fixture
     def unique_vm_id(self) -> str:
         """Generate unique VM ID for test isolation."""
-        import uuid
+        return f"test-{uuid4().hex}"
 
-        return f"test-{uuid.uuid4().hex[:8]}"
-
-    async def test_setup_creates_real_cgroup(self, unique_vm_id: str) -> None:
+    async def test_create_makes_a_real_cgroup(self, unique_vm_id: str) -> None:
         """Cgroup.create makes a real cgroup on Linux, and the kernel holds its limits."""
         cgroup_path = (await self._create(unique_vm_id, memory_mb=300)).path
 
@@ -1050,8 +1047,7 @@ class TestCgroupIntegration:
             assert await Cgroup(cgroup_path).attach(proc.pid)
 
             # Verify process is in cgroup
-            procs_content = (cgroup_path / "cgroup.procs").read_text()
-            assert str(proc.pid) in procs_content
+            assert (cgroup_path / "cgroup.procs").read_text().split() == [str(proc.pid)]
 
         finally:
             # Cleanup process
@@ -1060,7 +1056,7 @@ class TestCgroupIntegration:
             # Cleanup cgroup
             await Cgroup(cgroup_path).remove()
 
-    async def test_read_real_cgroup_stats(self, unique_vm_id: str) -> None:
+    async def test_stats_of_a_real_cgroup(self, unique_vm_id: str) -> None:
         """Cgroup.stats reads real stats."""
 
         # Create cgroup
@@ -1086,17 +1082,12 @@ class TestCgroupIntegration:
             stats = Cgroup(cgroup_path).stats()
             cpu_ms, mem_mb, nr_throttled = stats.cpu_time_ms, stats.peak_memory_mb, stats.nr_throttled
 
-            # Stats should have values (process did work)
+            # The process did work: a Python start takes CPU time, and the list alone is 8 MB
             assert cpu_ms is not None, "CPU stats not available"
-            assert cpu_ms >= 0, f"CPU time should be non-negative: {cpu_ms}"
-
-            # Memory peak might not be available on all systems
-            if mem_mb is not None:
-                assert mem_mb >= 0, f"Memory should be non-negative: {mem_mb}"
-
-            # nr_throttled should be non-negative if available
-            if nr_throttled is not None:
-                assert nr_throttled >= 0, f"nr_throttled should be non-negative: {nr_throttled}"
+            assert cpu_ms > 0, f"CPU time of the process not counted: {cpu_ms}"
+            if mem_mb is not None:  # memory.peak: Linux 5.19+
+                assert mem_mb >= 8, f"Peak memory below the 8 MB list: {mem_mb}"
+            assert nr_throttled is not None, "cpu.stat has nr_throttled with the cpu controller on"
 
         finally:
             if proc.returncode is None:
@@ -1104,7 +1095,7 @@ class TestCgroupIntegration:
                 await proc.wait()
             await Cgroup(cgroup_path).remove()
 
-    async def test_cleanup_removes_real_cgroup(self, unique_vm_id: str) -> None:
+    async def test_remove_removes_a_real_cgroup(self, unique_vm_id: str) -> None:
         """Cgroup.remove removes a real cgroup."""
 
         # Create cgroup
@@ -1118,7 +1109,7 @@ class TestCgroupIntegration:
         assert result is True, "Cleanup should succeed"
         assert not cgroup_path.exists(), "Cgroup should be removed after cleanup"
 
-    async def test_kill_then_cleanup_removes_a_cgroup_with_a_process(self, unique_vm_id: str) -> None:
+    async def test_kill_then_remove_removes_a_cgroup_with_a_process(self, unique_vm_id: str) -> None:
         """A process that outlives the VM's spawned process (as QEMU's teardown process does):
         rmdir alone fails (EBUSY); Cgroup.kill kills it and waits, then rmdir works."""
 
@@ -1172,7 +1163,7 @@ class TestCgroupIntegration:
                 await Cgroup(path).kill()
                 await Cgroup(path).remove()
 
-    async def test_cleanup_removes_child_cgroups_first(self, unique_vm_id: str) -> None:
+    async def test_remove_removes_child_cgroups_first(self, unique_vm_id: str) -> None:
         """A child cgroup in a VM cgroup (made where a QEMU could write): rmdir of the VM
         cgroup alone fails (EBUSY); Cgroup.remove removes the empty children first."""
 
@@ -1255,7 +1246,7 @@ finally:
             await Cgroup(cgroup_path).remove()
 
 
-class TestReclaimMemory:
+class TestCgroupReclaim:
     """memory.reclaim: EAGAIN means "reclaimed less than asked", not "unsupported"."""
 
     @staticmethod

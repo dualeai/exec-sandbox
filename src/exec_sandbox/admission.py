@@ -51,7 +51,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ctypes
-import ctypes.util
 import fcntl
 import functools
 import math
@@ -75,7 +74,6 @@ from exec_sandbox.cgroup import (
 )
 from exec_sandbox.constants import (
     DEFAULT_DISK_MB,
-    DEFAULT_HOST_CPU_RESERVE_CORES,
     DEFAULT_TCG_TB_CACHE_SIZE_MB,
     DEFAULT_VM_CPU_OVERHEAD_CORES,
     DEFAULT_VM_MEMORY_OVERHEAD_MB,
@@ -173,22 +171,20 @@ class _DiskSpace:
         """Space the request lacks; 0 or less when it fits."""
         return self.floor_mb + self.reserved_mb + self.needed_mb - self.free_mb
 
-    def fits_after(self, *, later_mb: float) -> bool:
-        """The request fits once every VM of this controller is gone (their reserve and the
-        blocks of their disks come back) and `later_mb` more comes back (_later_mb):
-        else only other processes can make room."""
-        return self.shortfall_mb - self.reserved_mb - self.written_mb - later_mb <= 0
-
-    def need_fits_after(self, need_mb: float, *, later_mb: float) -> bool:
-        """fits_after for another request whose reserve is `need_mb` (a waiter of _disk_needs)."""
-        return self.shortfall_mb - self.needed_mb + need_mb - self.reserved_mb - self.written_mb - later_mb <= 0
+    def fits_after(self, need_mb: float, *, later_mb: float) -> bool:
+        """A request whose reserve is `need_mb` (this one: needed_mb; a waiter of _disk_needs)
+        fits once every VM of this controller is gone (their reserve and the blocks of their
+        disks come back) and `later_mb` more comes back (_later_mb): else only other processes
+        can make room."""
+        return self.floor_mb + need_mb - self.free_mb - self.written_mb - later_mb <= 0
 
     def gain_since(self, start: _DiskSpace, *, net_of_writes: bool) -> float:
         """Free space that came back since `start`. With `net_of_writes`, net of the blocks this
         controller's home disks wrote meanwhile (a guest that writes hides the space a removal
         gave back): only where the free space drops as data is written (_Settle.counts_writes);
         btrfs counts a write in st_blocks at once but in its free space only at writeback, so
-        the sum grew at the speed of any writing VM (+143 MB in 3 s at 50 MB/s, from nothing)."""
+        the sum would grow at the speed of any writing VM there (measured: +143 MB in 3 s at
+        50 MB/s, from nothing)."""
         gain = self.free_mb - start.free_mb
         return gain + self.written_mb - start.written_mb if net_of_writes else gain
 
@@ -431,6 +427,10 @@ def _settle_removals(path: Path) -> _Settle:
     return _AFTER_COMMIT
 
 
+_LIBC: Final = ctypes.CDLL(None, use_errno=True)
+"""The C library of this process: syncfs (Linux) and sysctlbyname (macOS)."""
+
+
 def _syncfs(path: Path) -> None:
     """syncfs(2) on the filesystem of `path`: it writes every dirty page of that filesystem
     (of the upper filesystem for an overlay), then commits it. Best effort. Blocking: a worker
@@ -442,7 +442,7 @@ def _syncfs(path: Path) -> None:
     except OSError:
         return
     try:
-        ctypes.CDLL(None, use_errno=True).syncfs(fd)
+        _LIBC.syncfs(fd)
     finally:
         os.close(fd)
 
@@ -464,14 +464,6 @@ _MACOS_PRESSURE_NORMAL: Final[int] = 1
 _MACOS_PRESSURE_WARN: Final[int] = 2
 _MACOS_PRESSURE_CRITICAL: Final[int] = 4
 
-# macOS: reject at CRITICAL only.  WARN is common during normal operation
-# (active compressor, many apps open) — blocking at WARN makes the tool
-# unusable on most dev machines.
-_MACOS_REJECT_AT_LEVEL: Final[int] = _MACOS_PRESSURE_CRITICAL
-
-# Lazily loaded libc handle for macOS sysctl (None on Linux)
-_libc: ctypes.CDLL | None = None
-
 
 def _read_macos_memory_pressure_level() -> int | None:
     """Read macOS kernel memory pressure level via sysctlbyname.
@@ -480,16 +472,9 @@ def _read_macos_memory_pressure_level() -> int | None:
         1 (NORMAL), 2 (WARN), 4 (CRITICAL), or None on failure.
         Cost: ~3-5µs per call (no subprocess, direct syscall).
     """
-    global _libc  # noqa: PLW0603
-    if _libc is None:
-        libc_path = ctypes.util.find_library("c")
-        if libc_path is None:
-            return None
-        _libc = ctypes.CDLL(libc_path)
-
     val = ctypes.c_int32(0)
     sz = ctypes.c_size_t(ctypes.sizeof(val))
-    ret = _libc.sysctlbyname(
+    ret = _LIBC.sysctlbyname(
         b"kern.memorystatus_vm_pressure_level",
         ctypes.byref(val),
         ctypes.byref(sz),
@@ -536,30 +521,9 @@ def _forget_cached(owner: object, method: Callable[[Any], object]) -> None:
 
 
 class ResourceAdmissionController:
-    """Resource-aware admission controller for VM lifecycle.
-
-    Four gates, gate 3 in two checks (all must pass):
-    1. Memory budget: host_total * (1 - reserve_ratio) * overcommit_ratio
-    2. CPU budget: (host_cpus - cpu_reserve) * overcommit_ratio
-    3a. Available-memory floor: system_available - requested >= floor
-    3b. Memory pressure: reject when system is thrashing
-        (Linux: PSI full avg10 >= 10% / macOS: sysctl level == CRITICAL)
-    4.  Home disk space: free space of disk_dir, minus the reserve of admitted
-        home disks and of the request, stays >= the floor. Home disks are
-        sparse: each one reserves its part not written yet / disk_overcommit_ratio
-        (a quarter by default). When this gate blocks, the request evicts
-        cache entries that no VM uses first (add_cache), and fails at once
-        (LOCAL_DISK) when neither evictions nor the end of this controller's VMs
-        and sessions can make room: before any eviction, or after the first pass
-        where the evicted entries gave back only part of their size (btrfs
-        compression).
-
-    Gates 3a/3b probe system memory inline (~3-5µs each, cached 100ms).
-    A self-wake timer periodically notifies blocked waiters so Gate 3
-    re-probes even when no local release() fires (external recovery).
-    With floor=0 (default), 3a rejects only when the system literally
-    cannot fit the requested VM — providing cross-process backpressure.
-    A dimension that neither the cgroup nor the psutil probe sizes has no limit (gate 1 or 2).
+    """Resource-aware admission controller for VM lifecycle: the gates of the module docstring
+    (gate 3a: system_available - requested >= floor). With floor=0 (default), 3a rejects only
+    when the system cannot fit the requested VM: backpressure across processes.
     """
 
     def __init__(
@@ -569,10 +533,10 @@ class ResourceAdmissionController:
         cpu_overcommit_ratio: float,
         disk_overcommit_ratio: float,
         host_memory_reserve_ratio: float,
-        host_memory_mb: float | None = None,
-        host_cpu_count: float | None = None,
-        available_memory_floor_mb: int = 0,
-        host_cpu_reserve_cores: float = DEFAULT_HOST_CPU_RESERVE_CORES,
+        host_memory_mb: float | None,
+        host_cpu_count: float | None,
+        available_memory_floor_mb: int,
+        host_cpu_reserve_cores: float,
         disk_dir: Path,
         disk_free_floor_mb: int,
     ) -> None:
@@ -674,8 +638,9 @@ class ResourceAdmissionController:
         Serialized via asyncio.Lock to prevent concurrent probe races.
         """
         async with self._start_lock:
-            # Start self-wake timer if not already running (idempotent)
-            if self._self_wake_task is None:
+            # Start self-wake timer if not already running (idempotent); none after stop(),
+            # which would not end it
+            if self._self_wake_task is None and not self._stopped:
                 self._self_wake_task = asyncio.create_task(self._self_wake_loop())
             if self._started:
                 return
@@ -707,8 +672,7 @@ class ResourceAdmissionController:
                 try:
                     vmem = await loop.run_in_executor(None, psutil.virtual_memory)
                     known_mem = self._host_memory_mb = vmem.total / (1024 * 1024)
-                    if self._capacity_source == "unknown":
-                        self._capacity_source = "psutil"
+                    self._capacity_source = "psutil"
                 except (OSError, AttributeError):
                     logger.debug("The psutil memory probe failed", exc_info=True)
             if known_cpu is None:
@@ -765,16 +729,12 @@ class ResourceAdmissionController:
         async with self._condition:
             self._condition.notify_all()
 
-        if self._self_wake_task is not None:
-            self._self_wake_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._self_wake_task
-            self._self_wake_task = None
-        if self._recheck_task is not None:
-            self._recheck_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._recheck_task
-            self._recheck_task = None
+        timers = [task for task in (self._self_wake_task, self._recheck_task) if task is not None]
+        for task in timers:
+            task.cancel()
+        # gather, not suppress(CancelledError): a cancel of this caller comes out
+        await asyncio.gather(*timers, return_exceptions=True)
+        self._self_wake_task = self._recheck_task = None
 
     @_ttl_cache(_PROBE_CACHE_TTL_SECONDS)
     def _probe_available_memory(self) -> float | None:
@@ -854,7 +814,9 @@ class ResourceAdmissionController:
             return None
         if level not in {_MACOS_PRESSURE_NORMAL, _MACOS_PRESSURE_WARN, _MACOS_PRESSURE_CRITICAL}:
             return None
-        return level >= _MACOS_REJECT_AT_LEVEL
+        # CRITICAL only: WARN is common during normal operation (active compressor, many apps
+        # open), and blocking at WARN makes the tool unusable on most dev machines
+        return level == _MACOS_PRESSURE_CRITICAL
 
     async def _self_wake_loop(self) -> None:
         """Periodically notify blocked waiters so Gate 3 re-probes.
@@ -893,8 +855,8 @@ class ResourceAdmissionController:
         memory_mb: float,
         cpu_cores: float,
         timeout: float,
-        use_tcg: bool = False,
         *,
+        use_tcg: bool,
         disk_mb: int,
         held: frozenset[Path],
     ) -> ResourceReservation:
@@ -1371,7 +1333,7 @@ class ResourceAdmissionController:
         comes back once this controller's VMs and sessions are gone, and the removed space still
         coming (_pending_mb) once it shows."""
         space = self._disk_space(disk_mb)
-        if space is not None and not space.fits_after(later_mb=later_mb + self._pending_mb(space)):
+        if space is not None and not space.fits_after(space.needed_mb, later_mb=later_mb + self._pending_mb(space)):
             raise self._disk_full_error(vm_id, space)
 
     def _pending_mb(self, space: _DiskSpace) -> float:
@@ -1403,8 +1365,8 @@ class ResourceAdmissionController:
         """The verdict on a pass of `evictions` once its space has shown: what it gave back
         counts for the cache entries left (_Evictions.cache_share), and less than
         _GAIN_MIN_RATIO of its bytes stops the evictions of the request, and of every other
-        request that gate 4 blocks now: the same caches would give them nothing either (on ZFS
-        each learnt it alone, one 11 s pending pass after the other)."""
+        request that gate 4 blocks now: the same caches would give them nothing either (else on
+        ZFS each request learns it alone, one 11 s pending pass after the other)."""
         evictions.evicted_mb += evicted_mb
         evictions.gained_mb += gain_mb
         if gain_mb >= evicted_mb * _GAIN_MIN_RATIO:
@@ -1522,9 +1484,10 @@ class ResourceAdmissionController:
             return False
         after = await self._space_after_pass(disk_mb, start=start, evicted_mb=evicted_mb)
         end = after.space
-        if end is None or end.shortfall_mb <= 0 or self._stopped:
-            if end is not None and end.shortfall_mb <= 0 and not self._stopped:
-                self._gave_space()  # it fits: the run of passes of nothing ends
+        if end is None or self._stopped:
+            return False
+        if end.shortfall_mb <= 0:
+            self._gave_space()  # it fits: the run of passes of nothing ends
             return False
         gain_mb = after.gain_mb  # the largest seen: a writer of another process lowers the last read
         more_s, grown = after.more_s, after.growing
@@ -1571,10 +1534,10 @@ class ResourceAdmissionController:
         listing (`later_mb`: a 16 GB request on a 4 GB disk gets nothing). None once a pass gave
         nothing back (_no_gain_passes; a lift of the shared stop leaves it above 0): until a
         pass gives space back, a pass evicts only for its own request (a reflink or snapshot
-        filesystem keeps every block: each pass sized for every waiter emptied the cache)."""
+        filesystem keeps every block: each pass sized for every waiter would empty the cache)."""
         if self._no_gain_passes:
             return 0.0
-        fitting = sum(need for need, _ in self._disk_needs.values() if start.need_fits_after(need, later_mb=later_mb))
+        fitting = sum(need for need, _ in self._disk_needs.values() if start.fits_after(need, later_mb=later_mb))
         return max(0.0, fitting - start.needed_mb)
 
     async def _evict_entries(self, disk_mb: float, *, lacking_mb: float, others_mb: float) -> float:
@@ -1599,9 +1562,10 @@ class ResourceAdmissionController:
             evicted_mb += freed / _MIB
             _forget_cached(self, ResourceAdmissionController._probe_disk)
             space = self._disk_space(disk_mb)
-            if space is None or space.shortfall_mb + others_mb <= 0:
-                if space is not None:
-                    self._gave_space()  # the requests fit: the run of passes of nothing ends
+            if space is None:
+                return 0.0
+            if space.shortfall_mb + others_mb <= 0:
+                self._gave_space()  # the requests fit: the run of passes of nothing ends
                 return 0.0
         return evicted_mb
 
