@@ -9,7 +9,8 @@
 import { dlopen, FFIType } from 'bun:ffi';
 import { releaseWeakRefs } from 'bun:jsc';
 import { Console } from 'node:console';
-import { createContext, runInContext } from 'node:vm';
+import { writeSync } from 'node:fs';
+import { constants as vmConstants, createContext, runInContext } from 'node:vm';
 import { Readable } from 'node:stream';
 const libc = dlopen('libc.so.6', {
     prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 },
@@ -26,39 +27,41 @@ if (_flags >= 0) libc.symbols.fcntl(0, 4/*F_SETFL*/, _flags & ~2048/*O_NONBLOCK*
 // generic arrow defaults (<T = any>() => {}, see oven-sh/bun#4985) and
 // angle-bracket type assertions are ambiguous with JSX.
 const transpiler = new Bun.Transpiler({ loader: 'ts', replMode: true });
-// Host-scope dynamic import wrapper. The VM's runInContext cannot use the
-// native import() keyword (it's a language feature, not a function). This
-// arrow function captures the host ESM module's import() capability, and
-// is exposed to the VM context so transpiled code can call __import() instead.
-const __import = (specifier) => import(specifier);
+// import() in user code: runInContext uses the main context's module loader,
+// with a script name in /home/user so a relative specifier ("./mod.mjs")
+// resolves there. The code stays as written: no text rewrite, which would also
+// change string literals.
+const EXEC_SCRIPT = { filename: '/home/user/<exec>', importModuleDynamically: vmConstants.USE_MAIN_CONTEXT_DEFAULT_LOADER };
 // Create a null stdin (immediate EOF) so user code that reads process.stdin
 // or Bun.stdin gets EOF instead of blocking on the protocol pipe.
 const nullStdin = new Readable({ read() { this.push(null); } });
 nullStdin.fd = -1;
 nullStdin.isTTY = false;
-// Back-pressure tracking for stdout flush.
-// Bun 1.x bug (oven-sh/bun#20562): writableLength reads 0 immediately after
-// write() returns false, so the writableLength polling loop is ineffective.
-// Track write() return value directly and yield before sentinel when needed.
-let _stdoutBackPressure = false;
+// The end marker and the sentinel of each exec go through the original streams
+// and their original write methods: user code may replace process.stdout,
+// process.stderr or their write.
+const _stdout = process.stdout;
+const _stderr = process.stderr;
 const _origStdoutWrite = process.stdout.write;
-process.stdout.write = function(chunk, enc, cb) {
-    const ok = _origStdoutWrite.call(this, chunk, enc, cb);
-    if (!ok) _stdoutBackPressure = true;
-    return ok;
-};
-// Bun.write(Bun.stdout, data) also bypasses process.stdout.write entirely
-// (native I/O), so we wrap it to flag back-pressure detection.
+const _origStderrWrite = process.stderr.write;
+// Bun.write(Bun.stdout, data) writes natively, outside the process.stdout
+// stream: its pending writes are awaited before the end marker. Only pending
+// ones are kept, so a long exec that streams through Bun.write keeps no list
+// of every write it made. The wrapper replaces Bun.write itself, so
+// require('bun').write goes through it too. The caller gets a promise
+// that settles as Bun's: a rejection it leaves unhandled stays unhandled.
+const _stdoutBunWrites = new Set();
 const _origBunWrite = Bun.write.bind(Bun);
-const _bunWriteWrapper = function(dest, ...args) {
+Bun.write = function write(dest, ...args) {
     const result = _origBunWrite(dest, ...args);
-    if (dest === Bun.stdout) _stdoutBackPressure = true;
-    return result;
+    if (dest !== Bun.stdout) return result;
+    _stdoutBunWrites.add(result);
+    return result.finally(() => { _stdoutBunWrites.delete(result); });
 };
-// Route console through process.stdout so back-pressure is tracked for ALL
-// console methods (log, info, dir, table, etc.). Bun's native console writes
-// directly to fd 1 via syscall, completely bypassing the Node.js stream layer —
-// console.log() would NOT trigger our back-pressure detection without this.
+// Route console through process.stdout, so that the output of ALL console
+// methods (log, info, dir, table, etc.) goes out before the end marker. Bun's
+// native console writes directly to fd 1 via syscall, outside the Node.js
+// stream layer, with no order against the marker.
 const sandboxConsole = new Console({ stdout: process.stdout, stderr: process.stderr });
 // Proxy intercepts stdin access on process, forwarding everything else.
 // set trap prevents user code from corrupting the real process object.
@@ -79,7 +82,6 @@ const sandboxProcess = new Proxy(process, {
 const sandboxBun = new Proxy(Bun, {
     get(target, prop) {
         if (prop === 'stdin') return nullStdin;
-        if (prop === 'write') return _bunWriteWrapper;
         const val = target[prop];
         return typeof val === 'function' ? val.bind(target) : val;
     },
@@ -104,7 +106,6 @@ const ctx = createContext({
     atob, btoa, structuredClone, queueMicrotask,
     crypto, performance,
     require,
-    __import,
     module: { exports: {} },
     exports: {},
     __filename: '<exec>', __dirname: '/tmp',
@@ -138,6 +139,55 @@ process.on('unhandledRejection', (reason) => {
 releaseWeakRefs();
 Bun.gc(true);
 Bun.shrink();
+// A saved stream that user code ended takes no more writes; its queued writes go
+// out first (writableFinished, or closed after an error). Polled, not listened:
+// user code may remove listeners, and more listeners warn. No time
+// limit, as for a write: a slow reader must get all of them before the
+// marker; the exec timeout bounds the wait.
+async function drained(stream) {
+    while (!stream.writableFinished && !stream.closed) {
+        await Bun.sleep(1);
+    }
+}
+// Write `text` to a saved stream with its original `write`; resolve when the write
+// calls back. No time limit: the agent reads both pipes until the sentinel (past
+// the output limit too), so the write ends; with a limit, the REPL would block in
+// the read of the next command while Bun still held the write, and the marker or
+// the sentinel would come late or never. A stream that user code ended: the text
+// goes to its fd once the queued writes are out.
+async function protocolWrite(stream, write, fd, text) {
+    if (!stream.writableEnded && !stream.destroyed) {
+        return new Promise(resolve => write.call(stream, text, () => resolve()));
+    }
+    await drained(stream);
+    let data = Buffer.from(text);
+    while (data.length > 0) {
+        try {
+            data = data.subarray(writeSync(fd, data));
+        } catch (e) {
+            if (e.code !== 'EAGAIN') return;
+            await Bun.sleep(1);
+        }
+    }
+}
+// User errors go to the saved stderr: user code may replace process.stderr or
+// its write. Their text cannot fail: user code can throw anything, such
+// as an object with no prototype, or getters that throw.
+function describe(e) {
+    try {
+        return e && e.stack ? String(e.stack) : String(e);
+    } catch {}
+    try {
+        return Bun.inspect(e);
+    } catch {}
+    try {
+        return Object.prototype.toString.call(e);
+    } catch {}
+    return 'Error: the thrown value cannot be shown';
+}
+function writeError(e) {
+    return protocolWrite(_stderr, _origStderrWrite, 2, describe(e) + '\n');
+}
 // --- Blocking stdin reader via libc.read() ---
 // Thread sleeps in kernel until data arrives, achieving 0% idle CPU.
 // The original Bun.stdin.stream().getReader() polls at ~20-25% due to
@@ -185,21 +235,15 @@ while (true) {
     if (code === null) break;
     let exitCode = 0;
     unhandledRejection = null;
-    _stdoutBackPressure = false;
     try {
         // Bun.Transpiler with replMode transforms code for REPL semantics:
         // - Wraps in async IIFE for top-level await support
         // - Captures last expression as { value: (expr) }
         // - Converts const/let to var for re-declaration across invocations
         const transformed = transpiler.transformSync(code);
-        // Defensive fallback: rewrite any import() the transpiler didn't
-        // catch. Bun's replMode already rewrites import() → __import(),
-        // so this regex normally never matches.
-        // \b prevents false positives on identifiers like "reimport(".
-        const patched = transformed.replace(/\bimport\s*\(/g, '__import(');
-        if (patched.length > 0) {
+        if (transformed.length > 0) {
             randomNext = randomPool.length;
-            let val = runInContext(patched, ctx, { filename: '<exec>' });
+            let val = runInContext(transformed, ctx, EXEC_SCRIPT);
             // replMode wraps in async IIFE only when code has top-level await;
             // otherwise runInContext returns { value: expr } directly.
             if (val && typeof val.then === 'function') {
@@ -212,32 +256,31 @@ while (true) {
             }
         }
     } catch (e) {
-        process.stderr.write((e && e.stack ? e.stack : String(e)) + '\n');
+        await writeError(e);
         exitCode = 1;
     }
+    // Bun.write(Bun.stdout) writes of this exec end before its marker. One whose
+    // source never ends keeps the exec running to its timeout, as an endless loop
+    // does: its output would go into the next exec otherwise.
+    if (_stdoutBunWrites.size > 0) {
+        await Promise.allSettled([..._stdoutBunWrites]);
+    }
+    // One turn of the event loop (about 15 us), so a rejection this exec left
+    // unhandled is reported in this exec, not in the next one.
+    await new Promise(resolve => setImmediate(resolve));
     // Check for unhandled rejections from non-last-expression promises
     if (unhandledRejection !== null) {
-        const r = unhandledRejection;
-        process.stderr.write((r && r.stack ? r.stack : String(r)) + '\n');
+        await writeError(unhandledRejection);
         exitCode = 1;
     }
-    // Flush stdout before sentinel — process.stdout.write() is async for pipes,
-    // so large outputs may still be in Bun's internal buffer. Without this,
-    // the sentinel can arrive before stdout fully drains (~100KB+ truncation).
-    //
-    // Two-phase flush:
-    // 1. writableLength polling: catches data Bun tracks in its stream buffer.
-    // 2. Back-pressure yield: if any write() returned false, Bun has data in
-    //    its native I/O pipeline that writableLength doesn't reflect
-    //    (oven-sh/bun#20562). Yielding 50ms lets the kernel pipe write complete.
-    while (process.stdout.writableLength > 0) {
-        await new Promise(resolve => setTimeout(resolve, 1));
-    }
-    if (_stdoutBackPressure) {
-        await new Promise(resolve => setTimeout(resolve, 50));
-    }
+    // process.stdout and process.stderr writes are async for pipes: a large
+    // output can still be in Bun's buffer here. The read of the next command
+    // blocks the event loop, so each write below is awaited until written
+    // (with a fixed wait, the sentinel can stay behind a large stderr
+    // output). Writes of one stream go out in order: when the
+    // end marker is written, all stdout before it is in the pipe.
     // End of this exec's stdout: the agent stops reading stdout here, without
     // waiting for the pipe to go idle.
-    _origStdoutWrite.call(process.stdout, `__STDOUT_END_${sentinelId}__\n`);
-    process.stderr.write(`__SENTINEL_${sentinelId}_${exitCode}__\n`);
+    await protocolWrite(_stdout, _origStdoutWrite, 1, `__STDOUT_END_${sentinelId}__\n`);
+    await protocolWrite(_stderr, _origStderrWrite, 2, `__SENTINEL_${sentinelId}_${exitCode}__\n`);
 }

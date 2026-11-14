@@ -5,9 +5,10 @@ can use bun:ffi to call arbitrary libc functions. The VM boundary (QEMU)
 is the containment layer, not the JS runtime sandbox. These tests
 document the attack surface and verify containment holds.
 
-bun:ffi is currently accessible to user code via both require() and
-dynamic import(). The REPL wrapper (js_repl.mjs) exposes unfiltered
-`require` and `__import` to the vm.createContext() sandbox.
+bun:ffi is accessible to user code via both require() and dynamic
+import(). The REPL wrapper (js_repl.mjs) passes unfiltered `require` to the
+vm.createContext() sandbox, and runs the code with the main context's module
+loader for import().
 
 CVE references:
 - CVE-2023-38408: ssh-agent PKCS11 arbitrary dlopen for code execution
@@ -35,9 +36,10 @@ from tests.conftest import run_once
 class TestBunFfiImportable:
     """Bun's FFI gives user code arbitrary dlopen/dlsym access to libc.
 
-    The JS REPL wrapper (js_repl.mjs) passes unfiltered `require` and
-    `__import` into the vm.createContext() sandbox. User code can call
-    require('bun:ffi') or import('bun:ffi') to get dlopen().
+    The JS REPL wrapper (js_repl.mjs) passes unfiltered `require` into the
+    vm.createContext() sandbox and runs the code with the main context's module
+    loader. User code can call require('bun:ffi') or import('bun:ffi') to get
+    dlopen().
 
     Mitigations: VM boundary (QEMU hardware virtualization), UID 1000
     privilege drop, PR_SET_NO_NEW_PRIVS, capability restrictions.
@@ -62,11 +64,8 @@ console.log('FFIType_type=' + typeof ffi.FFIType);
         assert "FFIType_type=object" in stdout, f"stdout: {stdout}"
 
     async def test_ffi_import_gives_dlopen(self, dual_scheduler: Scheduler) -> None:
-        """import('bun:ffi') exposes dlopen via the __import() bridge.
-
-        The REPL wrapper exposes __import (host ESM import()) to the sandbox
-        (js_repl.mjs line 77). Bun's transpiler rewrites import() to __import().
-        """
+        """import('bun:ffi') exposes dlopen: the REPL runs the code with the main
+        context's module loader (js_repl.mjs EXEC_SCRIPT)."""
         code = """\
 const ffi = await import('bun:ffi');
 console.log('dlopen_type=' + typeof ffi.dlopen);
