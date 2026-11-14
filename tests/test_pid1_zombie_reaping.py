@@ -18,7 +18,54 @@ Integration tests require QEMU + images (run 'make build-images').
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
-from tests.conftest import run_once, skip_on_python_312_subprocess_bug
+from tests.conftest import run_once
+
+
+def _orphans_code(count: int, *, grandchild_sleep_s: float) -> str:
+    """Python code that makes `count` orphans by double fork, then waits until PID 1 has
+    reaped each of them: kill(pid, 0) finds a zombie, and ESRCH once it is reaped. Not /proc:
+    it hides these processes from the REPL user (hidepid=invisible, and a non-dumpable process
+    belongs to root there), zombies too.
+
+    Each child sends the pid of its grandchild through a pipe, then exits: the grandchild
+    is an orphan (reparented to PID 1). The grandchildren hold the write end of the pipe, so
+    the read ends once all of them have exited. The code then checks each pid (5 s at most)
+    and prints ORPHANS:<count> NOT_REAPED:<count of pids still there>.
+    """
+    return f"""
+import os, time
+
+def exists(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+read_fd, write_fd = os.pipe()
+for _ in range({count}):
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        grandchild = os.fork()
+        if grandchild == 0:
+            time.sleep({grandchild_sleep_s})
+            os._exit(0)
+        os.write(write_fd, f"{{grandchild}}\\n".encode())
+        os._exit(0)  # the grandchild becomes an orphan
+    os.waitpid(pid, 0)
+os.close(write_fd)
+with os.fdopen(read_fd) as pipe:
+    orphans = [int(line) for line in pipe]  # EOF: every grandchild has exited
+
+deadline = time.monotonic() + 5
+left = orphans
+while left and time.monotonic() < deadline:
+    left = [pid for pid in orphans if exists(pid)]
+    if left:
+        time.sleep(0.01)
+print(f"ORPHANS:{{len(orphans)}} NOT_REAPED:{{len(left)}}")
+"""
 
 
 class TestPid1ZombieReaping:
@@ -35,191 +82,49 @@ class TestPid1ZombieReaping:
         Without this verification, we can't be sure we're testing PID 1 reaping.
         """
         code = """
-import os
-import time
+import os, time
 
-# Double-fork: create orphan and verify its parent becomes PID 1
+# Double-fork: the grandchild sends its parent's pid once its first parent has exited
+read_fd, write_fd = os.pipe()
 pid = os.fork()
 if pid == 0:
+    os.close(read_fd)
+    child = os.getpid()
     grandchild = os.fork()
     if grandchild == 0:
-        # Grandchild: wait for parent to exit, then check ppid
-        time.sleep(0.1)
-        ppid = os.getppid()
-        # Write to file since stdout is complicated with forks
-        with open('/tmp/orphan_ppid.txt', 'w') as f:
-            f.write(f'{ppid}')
+        deadline = time.monotonic() + 5
+        while os.getppid() == child and time.monotonic() < deadline:
+            time.sleep(0.001)  # the child exits at once: then the orphan gets a new parent
+        os.write(write_fd, f"{os.getppid()}".encode())
         os._exit(0)
-    else:
-        # Parent: exit immediately
-        os._exit(0)
+    os._exit(0)
 
-# Main: wait for grandchild to write its ppid
-time.sleep(0.5)
-
-with open('/tmp/orphan_ppid.txt') as f:
-    orphan_ppid = f.read().strip()
-
-print(f'ORPHAN_PPID:{orphan_ppid}')
+os.close(write_fd)
+os.waitpid(pid, 0)
+with os.fdopen(read_fd) as pipe:
+    print(f"ORPHAN_PPID:{pipe.read()}")
 """
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
         # Orphan should be reparented to PID 1 (guest-agent)
-        assert "ORPHAN_PPID:1" in result.stdout, f"Orphan not reparented to PID 1, got: {result.stdout}"
+        assert result.stdout == "ORPHAN_PPID:1\n", f"Orphan not reparented to PID 1, got: {result.stdout}"
 
     async def test_multiple_orphans_reaped(self, scheduler: Scheduler) -> None:
-        """Multiple orphan processes are all reaped."""
-        code = """
-import os
-import time
-
-def create_orphan():
-    '''Double-fork: creates orphan that will be reparented to PID 1.'''
-    grandchild = os.fork()
-    if grandchild == 0:
-        # Grandchild: becomes orphan when parent exits
-        time.sleep(0.2)
-        os._exit(0)
-    else:
-        # Parent: exit immediately, orphaning grandchild
-        os._exit(0)
-
-# Create 10 orphans via double-fork
-for _ in range(10):
-    pid = os.fork()
-    if pid == 0:
-        create_orphan()
-        # Never reached - create_orphan always exits
-        os._exit(0)
-
-# Wait for all orphans to exit and be reaped
-time.sleep(2)
-
-# Count zombies whose parent is PID 1 (orphans that guest-agent should reap)
-zombie_count = 0
-for entry in os.listdir('/proc'):
-    if entry.isdigit():
-        try:
-            with open(f'/proc/{entry}/status') as f:
-                content = f.read()
-                is_zombie = False
-                is_orphan = False
-                for line in content.splitlines():
-                    if line.startswith('State:') and 'Z' in line:
-                        is_zombie = True
-                    if line.startswith('PPid:') and line.split()[1] == '1':
-                        is_orphan = True
-                if is_zombie and is_orphan:
-                    zombie_count += 1
-        except (IOError, FileNotFoundError, PermissionError):
-            pass
-
-print(f'ZOMBIE_COUNT:{zombie_count}')
-print('ORPHANS_CREATED:10')
-"""
+        """Ten orphans that are still alive when their parent exits: PID 1 reaps each one."""
+        code = _orphans_code(10, grandchild_sleep_s=0.2)
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
-        assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies after 10 orphans, got: {result.stdout}"
+        assert result.stdout == "ORPHANS:10 NOT_REAPED:0\n", f"Expected every orphan reaped, got: {result.stdout}"
 
     async def test_rapid_orphan_spawning(self, scheduler: Scheduler) -> None:
-        """Rapid spawning of orphans doesn't overwhelm the reaper."""
-        code = """
-import os
-import time
-
-# Rapidly spawn 50 orphans via double-fork
-for i in range(50):
-    pid = os.fork()
-    if pid == 0:
-        # Child: fork grandchild then exit
-        grandchild = os.fork()
-        if grandchild == 0:
-            # Grandchild: minimal work then exit
-            _ = i * 2
-            os._exit(0)
-        # Child exits immediately, orphaning grandchild
-        os._exit(0)
-
-# Allow time for all orphans to exit and be reaped
-# reap_zombies() uses SIGCHLD batching, so this tests that path
-time.sleep(3)
-
-# Count zombies whose parent is PID 1 (orphans that guest-agent should reap)
-zombie_count = 0
-for entry in os.listdir('/proc'):
-    if entry.isdigit():
-        try:
-            with open(f'/proc/{entry}/status') as f:
-                content = f.read()
-                is_zombie = False
-                is_orphan = False
-                for line in content.splitlines():
-                    if line.startswith('State:') and 'Z' in line:
-                        is_zombie = True
-                    if line.startswith('PPid:') and line.split()[1] == '1':
-                        is_orphan = True
-                if is_zombie and is_orphan:
-                    zombie_count += 1
-        except (IOError, FileNotFoundError, PermissionError):
-            pass
-
-print(f'ZOMBIE_COUNT:{zombie_count}')
-print('RAPID_SPAWNS:50')
-"""
+        """Fifty orphans that exit at once (reap_zombies takes SIGCHLD in batches): PID 1 reaps each one."""
+        code = _orphans_code(50, grandchild_sleep_s=0)
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
-        assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies after rapid spawning, got: {result.stdout}"
-
-
-class TestZombieReapingShell:
-    """Shell-based tests for zombie reaping."""
-
-    # NOTE: This test triggers CPython bug #103847 on Python 3.12.
-    # The shell double-fork pattern (`sh -c 'sh -c "..." &' &`) creates complex
-    # subprocess trees that cause asyncio to hang during task cancellation.
-    # Fixed in Python 3.13+ via https://github.com/python/cpython/pull/140805
-    @skip_on_python_312_subprocess_bug
-    async def test_shell_orphan_reaped(self, scheduler: Scheduler) -> None:
-        """Shell-created orphan processes are reaped by PID 1."""
-        # Shell script that creates actual orphans via double-fork pattern
-        # Simple background jobs (&) are NOT orphans - they're children of the shell
-        code = """
-#!/bin/sh
-# Double-fork in shell to create orphan:
-# sh -c '...' runs a subshell that forks, parent exits, child is orphan
-
-# Create 3 orphans
-for i in 1 2 3; do
-    sh -c 'sh -c "sleep 0.2" &' &
-done
-
-# Wait for orphans to exit and be reaped
-sleep 1
-
-# Count zombies whose parent is PID 1 (true orphans)
-zombie_count=0
-for pid_dir in /proc/[0-9]*; do
-    if [ -f "$pid_dir/status" ]; then
-        # Check if zombie AND parent is PID 1
-        if grep -q "^State:.*Z" "$pid_dir/status" 2>/dev/null; then
-            ppid=$(grep "^PPid:" "$pid_dir/status" 2>/dev/null | awk '{print $2}')
-            if [ "$ppid" = "1" ]; then
-                zombie_count=$((zombie_count + 1))
-            fi
-        fi
-    fi
-done
-
-echo "ZOMBIE_COUNT:$zombie_count"
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), code)
-
-        assert result.exit_code == 0, f"Execution failed: {result.stderr}"
-        assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies from shell orphans, got: {result.stdout}"
+        assert result.stdout == "ORPHANS:50 NOT_REAPED:0\n", f"Expected every orphan reaped, got: {result.stdout}"

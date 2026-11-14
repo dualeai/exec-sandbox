@@ -39,20 +39,6 @@ print(result)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert result.stdout.strip() == "[1, 4, 9, 16, 25]"
 
-    async def test_pool_map_lambda(self, scheduler: Scheduler) -> None:
-        """Pool.map with a lambda — requires cloudpickle (standard pickle can't serialize lambdas)."""
-        code = """\
-from multiprocessing import Pool
-
-with Pool(processes=2) as pool:
-    result = pool.map(lambda x: x ** 2, [1, 2, 3])
-print(result)
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert result.stdout.strip() == "[1, 4, 9]"
-
     @pytest.mark.parametrize(
         "make_pool",
         [

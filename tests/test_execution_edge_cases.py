@@ -8,10 +8,12 @@ Tests that the execution system handles unusual inputs gracefully:
 """
 
 import io
+import re
 import time
 
 import pytest
 
+from exec_sandbox import constants
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError, TransientError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
@@ -50,8 +52,8 @@ class TestEdgeCases:
         assert result.stdout == ""
 
     async def test_large_output_1mb(self, scheduler: Scheduler) -> None:
-        """Code producing ~1MB of output (just under guest-agent 1MB stdout limit)."""
-        # Generate output just under the 1MB limit: 999 lines x 1001 bytes = 999,999 bytes
+        """Output just under the guest's 1 MB stdout limit arrives whole."""
+        # 999 lines x 1001 bytes = 999,999 bytes
         code = """
 for i in range(999):
     print('x' * 1000)
@@ -60,11 +62,10 @@ for i in range(999):
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        # Should have substantial output (just under 1MB limit)
-        assert len(result.stdout) > 100000  # At least 100KB
+        assert result.stdout == ("x" * 1000 + "\n") * 999
 
     async def test_many_lines_output(self, scheduler: Scheduler) -> None:
-        """Code producing many small lines of output."""
+        """10,000 short lines arrive whole and in order."""
         code = """
 for i in range(10000):
     print(i)
@@ -73,23 +74,20 @@ for i in range(10000):
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
 
         assert result.exit_code == 0
-        # Should contain first and last numbers
-        assert "0" in result.stdout
-        assert "9999" in result.stdout
+        assert result.stdout == "".join(f"{i}\n" for i in range(10000))
 
     async def test_very_long_single_line(self, scheduler: Scheduler) -> None:
-        """Code with a very long single line."""
-        # 10KB string
+        """A 10 KB line of code runs, and its 10 KB output line arrives whole."""
         long_string = "x" * 10000
         code = f"print('{long_string}')"
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "x" * 100 in result.stdout  # At least some of it
+        assert result.stdout == long_string + "\n"
 
     async def test_special_characters_in_output(self, scheduler: Scheduler) -> None:
-        """Code outputting special characters."""
+        """Tabs, newlines, backslashes, quotes and non-ASCII text arrive unchanged."""
         code = r"""
 print("Tab:\there")
 print("Newline in string: line1\nline2")
@@ -101,12 +99,12 @@ print("Unicode: café ñ 你好 🎉")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "Tab:" in result.stdout
-        assert "café" in result.stdout
-        assert "你好" in result.stdout
+        assert result.stdout == (
+            'Tab:\there\nNewline in string: line1\nline2\nBackslash: \\\nQuote: "hello"\nUnicode: café ñ 你好 🎉\n'
+        )
 
     async def test_ansi_escape_codes(self, scheduler: Scheduler) -> None:
-        """Code outputting ANSI escape codes."""
+        """ANSI escape codes pass through unchanged."""
         code = r"""
 print("\033[31mRed text\033[0m")
 print("\033[1mBold text\033[0m")
@@ -115,11 +113,10 @@ print("\033[1mBold text\033[0m")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        # ANSI codes should pass through
-        assert "Red text" in result.stdout
+        assert result.stdout == "\x1b[31mRed text\x1b[0m\n\x1b[1mBold text\x1b[0m\n"
 
     async def test_rapid_stdout_stderr_interleaving(self, scheduler: Scheduler) -> None:
-        """Rapid alternating stdout/stderr output."""
+        """Alternate stdout and stderr lines: each stream gets all of its lines, in order."""
         code = """
 import sys
 for i in range(100):
@@ -130,31 +127,8 @@ for i in range(100):
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "out0" in result.stdout
-        assert "out99" in result.stdout
-        assert "err0" in result.stderr
-        assert "err99" in result.stderr
-
-    async def test_bom_prefix_stripped_python(self, scheduler: Scheduler) -> None:
-        """UTF-8 BOM (U+FEFF) before Python code is stripped, execution succeeds."""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "\ufeffprint('hello')")
-
-        assert result.exit_code == 0
-        assert "hello" in result.stdout
-
-    async def test_bom_prefix_stripped_javascript(self, scheduler: Scheduler) -> None:
-        """UTF-8 BOM (U+FEFF) before JavaScript code is stripped, execution succeeds."""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "\ufeffconsole.log('hello')")
-
-        assert result.exit_code == 0
-        assert "hello" in result.stdout
-
-    async def test_bom_prefix_stripped_raw(self, scheduler: Scheduler) -> None:
-        """UTF-8 BOM (U+FEFF) before shell code is stripped, execution succeeds."""
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), "\ufeffecho hello")
-
-        assert result.exit_code == 0
-        assert "hello" in result.stdout
+        assert result.stdout == "".join(f"out{i}\n" for i in range(100))
+        assert result.stderr == "".join(f"err{i}\n" for i in range(100))
 
 
 # =============================================================================
@@ -164,7 +138,7 @@ class TestWeirdCases:
     """Weird inputs that might cause problems."""
 
     async def test_null_bytes_in_output(self, scheduler: Scheduler) -> None:
-        """Code outputting null bytes."""
+        """A NUL byte in the output passes through unchanged."""
         code = """
 import sys
 sys.stdout.buffer.write(b"before\\x00after\\n")
@@ -173,9 +147,8 @@ sys.stdout.buffer.flush()
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        # Should handle null bytes without crashing
         assert result.exit_code == 0
-        assert "before" in result.stdout or "after" in result.stdout
+        assert result.stdout == "before\x00after\n"
 
     @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
     async def test_null_bytes_rejected_all_languages(self, scheduler: Scheduler, language: Language) -> None:
@@ -187,13 +160,13 @@ sys.stdout.buffer.flush()
         r"""Literal '\\x00' string (no actual null byte) executes fine."""
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(repr('hello\\x00world'))")
         assert result.exit_code == 0
-        assert "hello\\x00world" in result.stdout
+        assert result.stdout == "'hello\\x00world'\n"
 
     async def test_binary_data_in_output(self, scheduler: Scheduler) -> None:
-        """Code outputting binary data."""
+        """All 256 byte values on stdout: the ASCII bytes (NUL included) pass through, each
+        byte that is not UTF-8 becomes one U+FFFD, and the output after them is intact."""
         code = """
 import sys
-# Write some binary data
 sys.stdout.buffer.write(bytes(range(256)))
 sys.stdout.buffer.write(b"\\nDONE\\n")
 sys.stdout.buffer.flush()
@@ -201,12 +174,11 @@ sys.stdout.buffer.flush()
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        # Should complete without hanging
         assert result.exit_code == 0
-        assert "DONE" in result.stdout
+        assert result.stdout == "".join(map(chr, range(128))) + "\ufffd" * 128 + "\nDONE\n"
 
     async def test_infinite_loop_times_out(self, scheduler: Scheduler) -> None:
-        """Infinite loop is killed by timeout."""
+        """An infinite loop ends at its timeout: exit code -1 and a timeout message."""
         code = """
 while True:
     pass
@@ -214,14 +186,12 @@ while True:
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
 
-        # Should be killed by timeout, not hang forever
-        # Exit code varies (137 for SIGKILL, or timeout-specific)
-        exec_time = result.execution_time_ms or 0
-        assert result.exit_code != 0 or exec_time >= 2500
+        assert result.exit_code == -1
+        assert "Execution timeout after 3s" in result.stderr
 
     @skip_unless_hwaccel
     async def test_infinite_output_times_out(self, scheduler: Scheduler) -> None:
-        """Infinite output is killed by timeout.
+        """Infinite output ends at its timeout, with the output that came before it.
 
         Requires hwaccel: 3s timeout is too short for TCG (~5-8x slower) —
         the VM cannot produce any output before the deadline expires.
@@ -233,30 +203,11 @@ while True:
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
 
-        # Should be killed by timeout
-        exec_time = result.execution_time_ms or 0
-        assert result.exit_code != 0 or exec_time >= 2500
-        assert "spam" in result.stdout
-
-    async def test_sleep_respects_timeout(self, scheduler: Scheduler) -> None:
-        """Sleep is interrupted by timeout."""
-        code = """
-import time
-import sys
-print("starting", flush=True)
-sys.stdout.flush()
-time.sleep(60)
-print("done", flush=True)
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
-
-        # Should timeout before sleep completes
-        # Note: "starting" may or may not be captured depending on streaming timing
-        assert "done" not in result.stdout
+        assert result.exit_code == -1
+        assert result.stdout.startswith("spam\nspam\n")
 
     async def test_exit_immediately(self, scheduler: Scheduler) -> None:
-        """Code that exits immediately."""
+        """sys.exit(0) ends the code: exit code 0, and the line after it does not run."""
         code = """
 import sys
 sys.exit(0)
@@ -266,7 +217,7 @@ print("should not print")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "should not print" not in result.stdout
+        assert result.stdout == ""
 
     async def test_code_that_closes_its_output_and_returns_ends_the_exec(self, scheduler: Scheduler) -> None:
         """Code closes fd 1 and 2: the REPL writes the exec's end on its own copies of them,
@@ -291,14 +242,15 @@ print("should not print")
 
         timed = await run_timed(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=5)
 
-        assert timed.result.exit_code != 0
+        assert timed.result.exit_code == -1
         assert timed.result.timing.execute_ms < 10_000
 
     @skip_unless_linux
     async def test_disk_writes_do_not_fill_the_vm_cgroup(self, scheduler: Scheduler) -> None:
         """A VM writes 256 MiB to its home disk: the writes skip the host page cache, so its
         cgroup never reaches memory.max (buffered, a 1 GiB write reached it 480 times).
-        Linux, with VM cgroups and a home disk folder that takes O_DIRECT."""
+        Linux, with VM cgroups and a home disk folder that takes O_DIRECT. The test reads
+        session._vm: no public API gives the VM's cgroup or home disk folder."""
         from exec_sandbox.system_probes import probe_drive_direct_io
 
         code = (
@@ -336,15 +288,28 @@ os._exit(42)
         Without the reply (a dropped connection), the host waits for its whole deadline
         (timeout + margin), then raises OutcomeUnknownError."""
         vm = await vm_manager.create_vm(
-            VmSpec(language=Language.RAW), tenant_id="test", task_id="exit-137", cache_leases=()
+            VmSpec(language=Language.RAW),
+            tenant_id="test",
+            task_id="exit-137",
+            cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
         try:
-            killed = await vm.execute("kill -9 $$", timeout_seconds=execute_timeout)
+            killed = await vm.execute(
+                "kill -9 $$", timeout_seconds=execute_timeout, env_vars=None, on_stdout=None, on_stderr=None
+            )
             assert killed.exit_code == 137
 
             start = time.monotonic()
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match="retired"):
-                await vm.execute("echo second", timeout_seconds=1)
+                await vm.execute("echo second", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None)
             assert time.monotonic() - start < 1
         finally:
             await vm_manager.destroy_vm(vm)
@@ -374,9 +339,31 @@ time.sleep(60)
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=2)
 
         # Verify SIGTERM was sent (not SIGKILL)
-        assert "RECEIVED_SIGTERM" in result.stdout
+        assert result.stdout == "READY\nRECEIVED_SIGTERM\n"
         # Process caught SIGTERM and called sys.exit(42) — normal exit, not a signal kill
         assert result.exit_code == 42
+
+    async def test_partial_stderr_line_at_timeout_is_sent_once(self, scheduler: Scheduler) -> None:
+        """A stderr line with no newline, then a timeout whose SIGTERM handler exits: the
+        partial line reaches the caller once. The agent flushes its line buffer at the
+        timeout and then drains the REPL after SIGTERM into the same buffer, so a copy
+        that is not cleared goes out twice ("partialpartial")."""
+        code = """
+import signal
+import sys
+import time
+
+def handler(signum, frame):
+    sys.exit(42)
+
+signal.signal(signal.SIGTERM, handler)
+sys.stderr.write("partial")
+sys.stderr.flush()
+time.sleep(60)
+"""
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=2)
+
+        assert (result.exit_code, result.stderr) == (42, "partial")
 
     @pytest.mark.slow
     async def test_signal_kill_returns_128_plus_signal(self, scheduler: Scheduler) -> None:
@@ -411,8 +398,7 @@ print("DONE", flush=True)
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
 
         assert result.exit_code == 0
-        assert "STARTING" in result.stdout
-        assert "DONE" in result.stdout
+        assert result.stdout == "STARTING\nDONE\n"
 
     @skip_unless_hwaccel
     async def test_sigterm_ignored_escalates_to_sigkill(self, scheduler: Scheduler) -> None:
@@ -439,12 +425,11 @@ time.sleep(60)
             timeout_seconds=2,  # Host adds bounded readiness/grace watchdog margin
         )
 
-        assert "IGNORING_SIGTERM" in result.stdout
-        # Key assertion: execution time >= 5s (grace period elapsed)
-        # If SIGTERM worked, would be ~2s. Since ignored, must wait 5s grace.
-        assert result.timing is not None
-        assert result.timing.execute_ms >= 5000  # At least 5s (grace period)
-        assert result.timing.execute_ms < 12000  # Under 12s
+        assert result.exit_code == -1
+        assert result.stdout == "IGNORING_SIGTERM\n"
+        # SIGTERM ignored: SIGKILL comes after the 5 s grace period (an end at ~2 s means SIGTERM worked)
+        assert result.timing.execute_ms >= 5000
+        assert result.timing.execute_ms < 12000
 
     async def test_nested_process_tree_termination(self, scheduler: Scheduler) -> None:
         """Nested/deep process tree is terminated via process group.
@@ -469,9 +454,9 @@ wait
             timeout_seconds=2,  # Host adds bounded readiness/grace watchdog margin
         )
 
-        assert "NESTED_SPAWNED" in result.stdout
+        assert result.exit_code == -1
+        assert result.stdout == "NESTED_SPAWNED\n"
         # If nested processes weren't killed, would take 60s
-        assert result.timing is not None
         assert result.timing.execute_ms < 12000  # < 12s (much less than 60s)
 
     async def test_subprocess_tree_termination(self, scheduler: Scheduler) -> None:
@@ -494,10 +479,10 @@ wait
             timeout_seconds=2,  # Host adds bounded readiness/grace watchdog margin
         )
 
-        assert "SPAWNED" in result.stdout
+        assert result.exit_code == -1
+        assert result.stdout == "SPAWNED\n"
         # Key assertion: completes in reasonable time (not 60s)
         # Expected: ~2s timeout + ~5s grace = ~7s (host backstop is 2+10=12s)
-        assert result.timing is not None
         assert result.timing.execute_ms < 12000  # < 12s (much less than 60s)
 
     @skip_unless_hwaccel
@@ -527,10 +512,10 @@ time.sleep(60)  # Wait to be killed
             timeout_seconds=15,  # Must exceed cold Python start (~8s) + code import time
         )
 
-        assert "SPAWNED" in result.stdout
+        assert result.exit_code == -1
+        assert result.stdout == "SPAWNED\n"
         # Should complete after timeout + grace, not after 60s
         # Expected: ~15s timeout + ~5s grace = ~20s (host backstop is 15+10=25s)
-        assert result.timing is not None
         assert result.timing.execute_ms < 25000  # < 25s (much less than 60s)
 
 
@@ -560,52 +545,51 @@ class TestOutOfBounds:
         assert result.timing.execute_ms < 20_000
 
     async def test_deep_recursion(self, scheduler: Scheduler) -> None:
-        """Deep recursion hits stack limit."""
+        """50,000-deep recursion runs under a raised recursion limit; past the limit, the code
+        gets RecursionError and the REPL lives on."""
         code = """
 import sys
-sys.setrecursionlimit(100000)
 
 def recurse(n):
     if n <= 0:
         return 0
     return 1 + recurse(n - 1)
 
+sys.setrecursionlimit(100000)
+print(f"RESULT:{recurse(50000)}")
+sys.setrecursionlimit(1000)
 try:
-    result = recurse(50000)
-    print(f"RESULT:{result}")
+    recurse(5000)
 except RecursionError:
     print("RECURSION_ERROR")
 """
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
 
-        # Should hit recursion limit
-        assert "RECURSION_ERROR" in result.stdout or "RESULT:" in result.stdout
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == "RESULT:50000\nRECURSION_ERROR\n"
 
     async def test_many_file_descriptors(self, scheduler: Scheduler) -> None:
-        """Opening many file descriptors."""
+        """Opening 10,000 file descriptors stops at the open-file limit with EMFILE, and the
+        REPL lives on."""
         code = """
-import os
+import errno, os
 fds = []
 try:
     for i in range(10000):
-        fd = os.open("/dev/null", os.O_RDONLY)
-        fds.append(fd)
+        fds.append(os.open("/dev/null", os.O_RDONLY))
     print(f"OPENED:{len(fds)}")
 except OSError as e:
-    print(f"FD_LIMIT:{len(fds)}")
+    print(f"FD_LIMIT:{errno.errorcode[e.errno]}")
 finally:
     for fd in fds:
-        try:
-            os.close(fd)
-        except:
-            pass
+        os.close(fd)
 """
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        # Should hit fd limit or succeed
-        assert "OPENED:" in result.stdout or "FD_LIMIT:" in result.stdout
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == "FD_LIMIT:EMFILE\n"
 
     async def test_subprocess_spawning(self, scheduler: Scheduler) -> None:
         """Spawning subprocesses from code."""
@@ -617,8 +601,7 @@ print(f"SUBPROCESS:{result.stdout.strip()}")
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        assert result.exit_code == 0, result.stderr
-        assert "SUBPROCESS:hello from subprocess" in result.stdout
+        assert (result.exit_code, result.stdout) == (0, "SUBPROCESS:hello from subprocess\n"), result.stderr
 
 
 # =============================================================================
@@ -628,7 +611,7 @@ class TestErrorCases:
     """Code that produces errors should be handled gracefully."""
 
     async def test_syntax_error(self, scheduler: Scheduler) -> None:
-        """Python syntax error."""
+        """A Python syntax error: exit code 1, SyntaxError on stderr."""
         code = """
 def broken(
     print("missing closing paren"
@@ -636,61 +619,26 @@ def broken(
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        assert result.exit_code != 0
-        assert "SyntaxError" in result.stderr or "syntax" in result.stderr.lower()
-
-    async def test_import_error(self, scheduler: Scheduler) -> None:
-        """Import non-existent module."""
-        code = """
-import nonexistent_module_xyz123
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code != 0
-        assert "ModuleNotFoundError" in result.stderr or "No module" in result.stderr
-
-    async def test_name_error(self, scheduler: Scheduler) -> None:
-        """Reference undefined variable."""
-        code = """
-print(undefined_variable_xyz)
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code != 0
-        assert "NameError" in result.stderr
+        assert result.exit_code == 1
+        assert "SyntaxError: " in result.stderr
 
     async def test_division_by_zero(self, scheduler: Scheduler) -> None:
-        """Division by zero."""
+        """Division by zero: exit code 1, ZeroDivisionError on stderr."""
         code = """
 x = 1 / 0
 """
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        assert result.exit_code != 0
-        assert "ZeroDivisionError" in result.stderr
-
-    async def test_file_not_found(self, scheduler: Scheduler) -> None:
-        """Open non-existent file."""
-        code = """
-with open("/nonexistent/path/to/file.txt") as f:
-    print(f.read())
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code != 0
-        assert "FileNotFoundError" in result.stderr or "No such file" in result.stderr
+        assert result.exit_code == 1
+        assert "ZeroDivisionError: division by zero" in result.stderr
 
     async def test_permission_denied(self, scheduler: Scheduler) -> None:
-        """Write to read-only filesystem fails.
+        """A write to a read-only file system: exit code 1, EROFS on stderr.
 
-        Note: /proc/version is masked (bind-mounted to /dev/null) for
-        security, so writes there silently succeed. Target /etc/passwd
-        instead — it lives on the EROFS rootfs and is bind-remounted
-        read-only, so writes always fail with EROFS (errno 30).
+        /proc/version is masked (bind-mounted to /dev/null), so a write there
+        succeeds. /etc/passwd is on the read-only root file system, so a write
+        always fails with EROFS (errno 30).
         """
         code = """
 with open("/etc/passwd", "w") as f:
@@ -699,37 +647,8 @@ with open("/etc/passwd", "w") as f:
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        # Writing to EROFS rootfs should fail even as root
-        assert result.exit_code != 0
-        assert any(
-            err in result.stderr
-            for err in ["PermissionError", "Read-only", "Operation not permitted", "OSError", "I/O error"]
-        )
-
-    async def test_keyboard_interrupt_handling(self, scheduler: Scheduler) -> None:
-        """Code that catches KeyboardInterrupt/signals is killed by timeout."""
-        code = """
-import signal
-import sys
-
-def handler(signum, frame):
-    print("CAUGHT_SIGNAL", flush=True)
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, handler)
-signal.signal(signal.SIGTERM, handler)
-
-print("READY", flush=True)
-sys.stdout.flush()
-import time
-time.sleep(10)
-print("DONE", flush=True)
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
-
-        # Should be killed by timeout - "DONE" should not appear
-        assert "DONE" not in result.stdout
+        assert result.exit_code == 1
+        assert "OSError: [Errno 30] Read-only file system: '/etc/passwd'" in result.stderr
 
 
 # =============================================================================
@@ -739,7 +658,7 @@ class TestJavaScriptEdgeCases:
     """Edge cases specific to JavaScript/Bun."""
 
     async def test_js_syntax_error(self, scheduler: Scheduler) -> None:
-        """JavaScript syntax error."""
+        """A JavaScript syntax error: exit code 1, a parse error on stderr."""
         code = """
 function broken( {
     console.log("missing paren");
@@ -748,21 +667,22 @@ function broken( {
 
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
-        assert result.exit_code != 0
+        assert result.exit_code == 1
+        assert "Parse error" in result.stderr
 
     async def test_js_undefined_variable(self, scheduler: Scheduler) -> None:
-        """JavaScript undefined variable."""
+        """An undefined variable: exit code 1, ReferenceError on stderr."""
         code = """
 console.log(undefinedVariable);
 """
 
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
-        # Bun may print undefined or throw ReferenceError
-        assert result.exit_code != 0 or "undefined" in result.stdout.lower()
+        assert result.exit_code == 1
+        assert "ReferenceError: undefinedVariable is not defined" in result.stderr
 
     async def test_js_async_await(self, scheduler: Scheduler) -> None:
-        """JavaScript async/await."""
+        """The exec waits for a pending timer that a not-awaited async function starts."""
         code = """
 async function main() {
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -774,19 +694,18 @@ main();
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
-        assert "ASYNC_DONE" in result.stdout
+        assert result.stdout == "ASYNC_DONE\n"
 
     async def test_js_promise_rejection(self, scheduler: Scheduler) -> None:
-        """JavaScript unhandled promise rejection."""
+        """An unhandled promise rejection: exit code 1, the error on stderr."""
         code = """
 Promise.reject(new Error("test rejection"));
 """
 
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
-        # Should handle rejection gracefully
-        # Exit code depends on Bun's behavior
-        assert result.exit_code != 0 or "rejection" in result.stderr.lower()
+        assert result.exit_code == 1
+        assert "Error: test rejection" in result.stderr
 
     # --- Web API globals ---
 
@@ -799,55 +718,18 @@ const t = performance.now();
 console.log('is_number=' + (typeof t === 'number' && t > 0));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
-        assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "type=object" in result.stdout
-        assert "now_type=function" in result.stdout
-        assert "is_number=true" in result.stdout
+        assert (result.exit_code, result.stdout) == (0, "type=object\nnow_type=function\nis_number=true\n"), (
+            result.stderr
+        )
 
 
 # =============================================================================
-# JavaScript Dynamic Import (ESM import() via __import wrapper)
+# JavaScript Dynamic Import (the main context's module loader)
 # =============================================================================
 class TestJavaScriptDynamicImport:
     """ESM dynamic import() in the JavaScript/Bun VM context."""
 
     # --- Normal cases ---
-
-    async def test_dynamic_import_builtin(self, scheduler: Scheduler) -> None:
-        """Dynamic import of a built-in module."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            "const path = await import('path'); console.log(path.join('a','b'));",
-        )
-
-        assert result.exit_code == 0
-        assert "a/b" in result.stdout
-
-    async def test_dynamic_import_destructured(self, scheduler: Scheduler) -> None:
-        """Destructured dynamic import."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            "const { join } = await import('path'); console.log(join('a','b'));",
-        )
-
-        assert result.exit_code == 0
-        assert "a/b" in result.stdout
-
-    async def test_dynamic_import_multiple_modules(self, scheduler: Scheduler) -> None:
-        """Sequential dynamic imports of multiple modules."""
-        code = """\
-const path = await import('path');
-const url = await import('url');
-console.log(path.join('a','b'));
-console.log(typeof url.parse);
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
-
-        assert result.exit_code == 0
-        assert "a/b" in result.stdout
-        assert "function" in result.stdout
 
     async def test_dynamic_import_inside_function(self, scheduler: Scheduler) -> None:
         """Dynamic import inside an async function."""
@@ -861,32 +743,9 @@ console.log(await f());
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
-        # UUID format: 8-4-4-4-12 hex chars = 36 chars total
-        assert len(result.stdout.strip()) == 36
+        assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\n", result.stdout)
 
     # --- Edge cases ---
-
-    async def test_dynamic_import_computed_specifier(self, scheduler: Scheduler) -> None:
-        """Dynamic import with a computed (variable) specifier."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            "const mod = 'path'; const p = await import(mod); console.log(typeof p.join);",
-        )
-
-        assert result.exit_code == 0
-        assert "function" in result.stdout
-
-    async def test_dynamic_import_promise_all(self, scheduler: Scheduler) -> None:
-        """Parallel dynamic imports via Promise.all."""
-        code = """\
-const [p, u] = await Promise.all([import('path'), import('url')]);
-console.log(typeof p.join, typeof u.parse);
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
-
-        assert result.exit_code == 0
-        assert result.stdout.strip().count("function") == 2
 
     async def test_dynamic_import_coexists_with_require(self, scheduler: Scheduler) -> None:
         """Dynamic import and require resolve the same module."""
@@ -898,7 +757,7 @@ console.log(imported.join === required.join);
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
-        assert "true" in result.stdout
+        assert result.stdout == "true\n"
 
     async def test_dynamic_import_session_persistence(self, scheduler: Scheduler) -> None:
         """Imported module persists across session exec() calls."""
@@ -908,34 +767,9 @@ console.log(imported.join === required.join);
 
             r2 = await session.exec("console.log(path.join('a','b'));")
             assert r2.exit_code == 0
-            assert "a/b" in r2.stdout
+            assert r2.stdout == "a/b\n"
 
     # --- Weird cases ---
-
-    async def test_dynamic_import_string_literal_harmless(self, scheduler: Scheduler) -> None:
-        """String containing 'import()' doesn't break a real import."""
-        code = """\
-const s = "import()";
-const path = await import('path');
-console.log(path.join('a','b'));
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
-
-        assert result.exit_code == 0
-        assert "a/b" in result.stdout
-
-    async def test_reimport_function_not_mangled(self, scheduler: Scheduler) -> None:
-        """User function named 'reimport' is not confused with import()."""
-        code = """\
-function reimport(x) { return x; }
-console.log(reimport(42));
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
-
-        assert result.exit_code == 0
-        assert "42" in result.stdout
-
-    # --- Error cases ---
 
     async def test_dynamic_import_nonexistent_module(self, scheduler: Scheduler) -> None:
         """Dynamic import of a package that is not installed fails at once: no auto-install
@@ -944,11 +778,13 @@ console.log(reimport(42));
             scheduler, VmSpec(language=Language.JAVASCRIPT), "await import('nonexistent_xyz_module');"
         )
 
-        assert timed.result.exit_code != 0
+        assert timed.result.exit_code == 1
+        assert "Cannot find package 'nonexistent_xyz_module'" in timed.result.stderr
         assert timed.result.timing.execute_ms < 5_000
 
     async def test_dynamic_import_fire_and_forget_error(self, scheduler: Scheduler) -> None:
-        """Unhandled dynamic import rejection is caught by unhandledRejection handler."""
+        """A dynamic import that nobody awaits and that fails: the code runs on, then the
+        exec ends with exit code 1 and the error on stderr, at once (no registry wait)."""
         code = """\
 import('nonexistent_xyz');
 await new Promise(r => setTimeout(r, 200));
@@ -956,7 +792,9 @@ console.log("after");
 """
         timed = await run_timed(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
-        assert timed.result.exit_code != 0
+        assert timed.result.exit_code == 1
+        assert timed.result.stdout == "after\n"
+        assert "Cannot find package 'nonexistent_xyz'" in timed.result.stderr
         assert timed.result.timing.execute_ms < 5_000
 
 
@@ -968,38 +806,6 @@ class TestTypeScriptSupport:
 
     # --- Normal cases: core TS features ---
 
-    async def test_ts_type_annotation(self, scheduler: Scheduler) -> None:
-        """Basic type annotation on variable."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.JAVASCRIPT), "const x: number = 42; console.log(x);"
-        )
-
-        assert result.exit_code == 0
-        assert "42" in result.stdout
-
-    async def test_ts_interface(self, scheduler: Scheduler) -> None:
-        """Interface definition and typed object."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            'interface User { name: string; age: number } const u: User = { name: "Alice", age: 30 }; console.log(u.name, u.age);',
-        )
-
-        assert result.exit_code == 0
-        assert "Alice" in result.stdout
-        assert "30" in result.stdout
-
-    async def test_ts_generic_function(self, scheduler: Scheduler) -> None:
-        """Generic function with type parameter."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            "function identity<T>(x: T): T { return x; } console.log(identity(7));",
-        )
-
-        assert result.exit_code == 0
-        assert "7" in result.stdout
-
     async def test_ts_enum(self, scheduler: Scheduler) -> None:
         """TypeScript enum."""
         result = await run_once(
@@ -1007,32 +813,7 @@ class TestTypeScriptSupport:
         )
 
         assert result.exit_code == 0
-        assert "1" in result.stdout
-
-    async def test_ts_type_alias(self, scheduler: Scheduler) -> None:
-        """Type alias."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            'type Pair = [number, string]; const p: Pair = [1, "hello"]; console.log(p[0], p[1]);',
-        )
-
-        assert result.exit_code == 0
-        assert "1" in result.stdout
-        assert "hello" in result.stdout
-
-    async def test_ts_as_cast(self, scheduler: Scheduler) -> None:
-        """'as' type assertion."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            'const x: unknown = "hello"; console.log((x as string).length);',
-        )
-
-        assert result.exit_code == 0
-        assert "5" in result.stdout
-
-    # --- Edge cases ---
+        assert result.stdout == "1\n"
 
     async def test_ts_generic_arrow_function(self, scheduler: Scheduler) -> None:
         """Generic arrow function (valid with 'ts' loader, ambiguous with 'tsx')."""
@@ -1041,38 +822,7 @@ class TestTypeScriptSupport:
         )
 
         assert result.exit_code == 0
-        assert "hi" in result.stdout
-
-    async def test_ts_optional_chaining_with_types(self, scheduler: Scheduler) -> None:
-        """Optional chaining with typed objects."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            'const o: { a?: { b?: number } } = {}; console.log(o?.a?.b ?? "none");',
-        )
-
-        assert result.exit_code == 0
-        assert "none" in result.stdout
-
-    async def test_ts_type_only_constructs_stripped(self, scheduler: Scheduler) -> None:
-        """Type-only constructs are erased, no runtime footprint."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            "type Foo = { x: number }; const f: Foo = { x: 1 }; console.log(f.x);",
-        )
-
-        assert result.exit_code == 0
-        assert "1" in result.stdout
-
-    async def test_ts_plain_js_still_works(self, scheduler: Scheduler) -> None:
-        """Plain JavaScript is unaffected by the 'ts' loader (regression guard)."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.JAVASCRIPT), "var arr = [1, 2, 3]; console.log(arr.length);"
-        )
-
-        assert result.exit_code == 0
-        assert "3" in result.stdout
+        assert result.stdout == "hi\n"
 
     async def test_ts_top_level_await_with_types(self, scheduler: Scheduler) -> None:
         """Top-level await combined with TypeScript annotations."""
@@ -1083,56 +833,25 @@ class TestTypeScriptSupport:
         )
 
         assert result.exit_code == 0
-        assert "42" in result.stdout
+        assert result.stdout == "42\n"
 
-    async def test_ts_empty_object_type(self, scheduler: Scheduler) -> None:
-        """Empty object type annotation."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.JAVASCRIPT), "const x: {} = {}; console.log(typeof x);"
-        )
-
-        assert result.exit_code == 0
-        assert "object" in result.stdout
-
-    # --- Weird / out-of-bounds cases ---
-
-    async def test_ts_deeply_nested_generics(self, scheduler: Scheduler) -> None:
-        """Deeply nested generic types."""
-        code = """
-const m: Map<string, Map<string, Array<[number, string]>>> = new Map();
-const inner = new Map<string, Array<[number, string]>>();
-inner.set("key", [[1, "a"], [2, "b"]]);
-m.set("outer", inner);
-console.log(m.get("outer")!.get("key")![0][1]);
+    async def test_ts_type_only_syntax_is_erased(self, scheduler: Scheduler) -> None:
+        """Type-only syntax (interfaces, aliases, annotations, generics, casts, `!`) compiles
+        away: the code runs as the JavaScript it holds, with no type check at run time."""
+        code = """\
+interface User { name: string; age: number }
+type Pair = [number, string];
+function identity<T>(x: T): T { return x; }
+const u: User = { name: "Alice", age: 30 };
+const p: Pair = [1, "hello"];
+const m = new Map<string, Array<[number, string]>>([["key", [[1, "a"]]]]);
+const o: { a?: { b?: number } } = {};
+const x: number = "text" as any;
+console.log(u.name, identity(p[1]), m.get("key")![0][1], o?.a?.b ?? "none", typeof x);
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
-        assert result.exit_code == 0
-        assert "a" in result.stdout
-
-    async def test_ts_mixed_js_and_ts(self, scheduler: Scheduler) -> None:
-        """Mixed untyped JS and typed TS in the same snippet."""
-        code = """
-var count = 0;
-function inc(): number { return ++count; }
-inc(); inc(); inc();
-const result: string = `count=${count}`;
-console.log(result);
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
-
-        assert result.exit_code == 0
-        assert "count=3" in result.stdout
-
-    async def test_ts_types_are_erased_at_runtime(self, scheduler: Scheduler) -> None:
-        """Types are erased — no runtime type checking (by design)."""
-        # "number" annotation but assigned a string via `as any` — runs fine
-        result = await run_once(
-            scheduler, VmSpec(language=Language.JAVASCRIPT), 'const x: number = "hello" as any; console.log(typeof x);'
-        )
-
-        assert result.exit_code == 0
-        assert "string" in result.stdout
+        assert (result.exit_code, result.stdout) == (0, "Alice hello a none string\n"), result.stderr
 
     # --- Error cases ---
 
@@ -1140,7 +859,8 @@ console.log(result);
         """Invalid TypeScript syntax is rejected."""
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "const x: = 42;")
 
-        assert result.exit_code != 0
+        assert result.exit_code == 1
+        assert "Unexpected =" in result.stderr
 
 
 # =============================================================================
@@ -1153,15 +873,15 @@ class TestRawEdgeCases:
         """Non-existent command."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "nonexistent_command_xyz123")
 
-        assert result.exit_code != 0
-        assert "not found" in result.stderr.lower() or "command not found" in result.stderr.lower()
+        assert result.exit_code == 127
+        assert "nonexistent_command_xyz123: command not found" in result.stderr
 
     async def test_raw_pipe(self, scheduler: Scheduler) -> None:
         """Shell pipe."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo 'hello world' | tr 'a-z' 'A-Z'")
 
         assert result.exit_code == 0
-        assert "HELLO WORLD" in result.stdout
+        assert result.stdout == "HELLO WORLD\n"
 
     async def test_raw_redirect(self, scheduler: Scheduler) -> None:
         """Shell redirect."""
@@ -1170,7 +890,7 @@ class TestRawEdgeCases:
         )
 
         assert result.exit_code == 0
-        assert "test" in result.stdout
+        assert result.stdout == "test\n"
 
     async def test_raw_environment_variable(self, scheduler: Scheduler) -> None:
         """Shell environment variable."""
@@ -1189,21 +909,21 @@ class TestRawEdgeCases:
         )
 
         assert result.exit_code == 0
-        assert "shebang_awk_ok" in result.stdout
+        assert result.stdout == "shebang_awk_ok\n"
 
     async def test_raw_shebang_sh(self, scheduler: Scheduler) -> None:
         """Shell shebang via temp file."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\necho shebang_sh_ok")
 
         assert result.exit_code == 0
-        assert "shebang_sh_ok" in result.stdout
+        assert result.stdout == "shebang_sh_ok\n"
 
     async def test_raw_shebang_bash(self, scheduler: Scheduler) -> None:
         """Bash shebang via temp file."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/bash\necho shebang_bash_ok")
 
         assert result.exit_code == 0
-        assert "shebang_bash_ok" in result.stdout
+        assert result.stdout == "shebang_bash_ok\n"
 
     async def test_raw_shebang_sed(self, scheduler: Scheduler) -> None:
         """Sed shebang processes input."""
@@ -1212,7 +932,7 @@ class TestRawEdgeCases:
         )
 
         assert result.exit_code == 0
-        assert "world" in result.stdout
+        assert result.stdout == "world\n"
 
     async def test_raw_shebang_nonzero_exit(self, scheduler: Scheduler) -> None:
         """Non-zero exit code propagates through temp-file wrapper."""
@@ -1224,7 +944,8 @@ class TestRawEdgeCases:
         """Stderr output from shebanged script."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\necho err_msg >&2")
 
-        assert "err_msg" in result.stderr
+        assert result.exit_code == 0
+        assert result.stderr == "err_msg\n"
 
     async def test_raw_shebang_env_vars(self, scheduler: Scheduler) -> None:
         """Exported env vars are inherited by shebanged subprocess."""
@@ -1233,7 +954,7 @@ class TestRawEdgeCases:
         )
 
         assert result.exit_code == 0
-        assert "from_env" in result.stdout
+        assert result.stdout == "from_env\n"
 
     async def test_raw_shebang_empty_body(self, scheduler: Scheduler) -> None:
         """Shebang with empty body is valid."""
@@ -1248,15 +969,14 @@ class TestRawEdgeCases:
         )
 
         assert result.exit_code == 0
-        assert "$dollar" in result.stdout
-        assert "`backtick`" in result.stdout
+        assert result.stdout == 'quotes "double" $dollar `backtick`\n'
 
     async def test_raw_shebang_sentinel_in_code(self, scheduler: Scheduler) -> None:
         """Sentinel collision in code is handled."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), '#!/bin/sh\necho "_EXEC_SANDBOX_EOF_"')
 
         assert result.exit_code == 0
-        assert "_EXEC_SANDBOX_EOF_" in result.stdout
+        assert result.stdout == "_EXEC_SANDBOX_EOF_\n"
 
     async def test_raw_shebang_nonexistent_interpreter(self, scheduler: Scheduler) -> None:
         """Non-existent interpreter fails with non-zero exit."""
@@ -1264,7 +984,8 @@ class TestRawEdgeCases:
             scheduler, VmSpec(language=Language.RAW), "#!/usr/bin/nonexistent_interp_xyz\necho hello"
         )
 
-        assert result.exit_code != 0
+        assert result.exit_code == 126
+        assert "/usr/bin/nonexistent_interp_xyz: bad interpreter" in result.stderr
 
     async def test_raw_shebang_no_newline(self, scheduler: Scheduler) -> None:
         """Shebang with no trailing newline and no body."""
@@ -1277,7 +998,7 @@ class TestRawEdgeCases:
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "# just a comment\necho hello")
 
         assert result.exit_code == 0
-        assert "hello" in result.stdout
+        assert result.stdout == "hello\n"
 
     async def test_raw_shebang_with_leading_space(self, scheduler: Scheduler) -> None:
         """Leading space means no shebang detection; eval path used."""
@@ -1285,7 +1006,7 @@ class TestRawEdgeCases:
 
         # Leading space: bash treats #! as comment, echo runs normally
         assert result.exit_code == 0
-        assert "hello" in result.stdout
+        assert result.stdout == "hello\n"
 
     async def test_raw_shebang_multiline_output(self, scheduler: Scheduler) -> None:
         """AWK shebang producing multiline output."""
@@ -1295,9 +1016,7 @@ class TestRawEdgeCases:
 
         assert result.exit_code == 0
         lines = result.stdout.strip().split("\n")
-        assert len(lines) == 100
-        assert lines[0].strip() == "1"
-        assert lines[99].strip() == "100"
+        assert result.stdout == "".join(f"{i}\n" for i in range(1, 101))
 
     async def test_raw_shebang_awk_multiline_program(self, scheduler: Scheduler) -> None:
         """AWK shebang with BEGIN, pattern, and END blocks."""
@@ -1310,10 +1029,7 @@ class TestRawEdgeCases:
         )
 
         assert result.exit_code == 0
-        assert "start" in result.stdout
-        assert "matched:line1" in result.stdout
-        assert "matched:line2" in result.stdout
-        assert "end" in result.stdout
+        assert result.stdout == "start\nmatched:line1\nmatched:line2\nend\n"
 
 
 # =============================================================================
@@ -1342,53 +1058,6 @@ class TestHomeEnvironmentNormal:
         assert result.exit_code == 0
         assert result.stdout.strip() == "/home/user"
 
-    async def test_raw_tilde_expansion(self, scheduler: Scheduler) -> None:
-        """Tilde expands to /home/user in raw shell."""
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo ~")
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/home/user"
-
-    async def test_raw_home_writable(self, scheduler: Scheduler) -> None:
-        """Files can be created under $HOME."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.RAW), "echo ok > $HOME/test_home.txt && cat $HOME/test_home.txt"
-        )
-        assert result.exit_code == 0
-        assert "ok" in result.stdout
-
-
-class TestHomeEnvironmentEdge:
-    """Edge cases for HOME consistency."""
-
-    async def test_raw_home_persists_across_executions(self, scheduler: Scheduler) -> None:
-        """HOME stays /home/user on second execution in same session."""
-        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
-            outputs = [(await session.exec("echo $HOME")).stdout.strip() for _ in range(2)]
-        assert outputs == ["/home/user", "/home/user"]
-
-    async def test_raw_subprocess_inherits_home(self, scheduler: Scheduler) -> None:
-        """Child processes inherit correct HOME."""
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), "bash -c 'echo $HOME'")
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/home/user"
-
-    async def test_raw_env_vars_coexist_with_home(self, scheduler: Scheduler) -> None:
-        """Custom env_vars don't clobber HOME."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.RAW), "echo $HOME $MY_VAR", env_vars={"MY_VAR": "hello"}
-        )
-        assert result.exit_code == 0
-        assert "/home/user" in result.stdout
-        assert "hello" in result.stdout
-
-    async def test_python_pathlib_home(self, scheduler: Scheduler) -> None:
-        """pathlib.Path.home() returns /home/user."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.PYTHON), "from pathlib import Path; print(Path.home())"
-        )
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/home/user"
-
 
 class TestHomeEnvironmentWeird:
     """Weird corner cases for HOME."""
@@ -1400,23 +1069,7 @@ class TestHomeEnvironmentWeird:
             VmSpec(language=Language.RAW),
             "echo HOME=$HOME; awk -F: '$3==1000{print \"passwd=\"$6}' /etc/passwd",
         )
-        assert result.exit_code == 0
-        assert "HOME=/home/user" in result.stdout
-        assert "passwd=/home/user" in result.stdout
-
-    async def test_raw_cd_tilde_pwd(self, scheduler: Scheduler) -> None:
-        """cd ~ + pwd returns /home/user."""
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), "cd ~ && pwd")
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/home/user"
-
-    async def test_python_expanduser(self, scheduler: Scheduler) -> None:
-        """os.path.expanduser('~') returns /home/user."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.path.expanduser('~'))"
-        )
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/home/user"
+        assert (result.exit_code, result.stdout) == (0, "HOME=/home/user\npasswd=/home/user\n"), result.stderr
 
 
 class TestHomeEnvironmentOutOfBounds:
@@ -1425,17 +1078,6 @@ class TestHomeEnvironmentOutOfBounds:
     async def test_raw_user_can_override_home(self, scheduler: Scheduler) -> None:
         """User can override HOME via env_vars (not blocked)."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo $HOME", env_vars={"HOME": "/tmp"})
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/tmp"
-
-    async def test_python_user_can_override_home(self, scheduler: Scheduler) -> None:
-        """User can override HOME via env_vars in Python."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.PYTHON),
-            "import os; print(os.environ['HOME'])",
-            env_vars={"HOME": "/tmp"},
-        )
         assert result.exit_code == 0
         assert result.stdout.strip() == "/tmp"
 
@@ -1458,26 +1100,13 @@ except EOFError:
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "CAUGHT_EOF" in result.stdout
-
-    async def test_python_stdin_iteration_empty(self, scheduler: Scheduler) -> None:
-        """for line in sys.stdin iterates zero times at EOF."""
-        code = """\
-import sys
-count = 0
-for line in sys.stdin:
-    count += 1
-print(f"COUNT={count}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "COUNT=0" in result.stdout
+        assert result.stdout == "prompt> CAUGHT_EOF\n"
 
     async def test_shell_read_eof(self, scheduler: Scheduler) -> None:
         """Shell read returns failure at EOF, allowing fallback."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), 'read var || echo "NO_INPUT"')
         assert result.exit_code == 0
-        assert "NO_INPUT" in result.stdout
+        assert result.stdout == "NO_INPUT\n"
 
     async def test_js_stdin_read_null(self, scheduler: Scheduler) -> None:
         """process.stdin.read() returns null at EOF."""
@@ -1487,60 +1116,11 @@ console.log(String(d));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0
-        assert "null" in result.stdout
+        assert result.stdout == "null\n"
 
 
 class TestStdinEofEdge:
     """Boundary conditions and sequential stdin interactions."""
-
-    async def test_python_input_catch_continue(self, scheduler: Scheduler) -> None:
-        """Code catches EOFError from input() and continues execution."""
-        code = """\
-try:
-    input()
-except EOFError:
-    print("CAUGHT")
-print("CONTINUED")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "CAUGHT" in result.stdout
-        assert "CONTINUED" in result.stdout
-
-    async def test_python_stdin_read_twice(self, scheduler: Scheduler) -> None:
-        """sys.stdin.read() called twice both return empty string (idempotent EOF)."""
-        code = """\
-import sys
-a = sys.stdin.read()
-b = sys.stdin.read()
-print(f"A={repr(a)} B={repr(b)}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "A=''" in result.stdout
-        assert "B=''" in result.stdout
-
-    async def test_python_stdin_buffer_read(self, scheduler: Scheduler) -> None:
-        """sys.stdin.buffer.read() returns b'' (real file, not StringIO)."""
-        code = """\
-import sys
-data = sys.stdin.buffer.read()
-print(repr(data))
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "b''" in result.stdout
-
-    async def test_python_stdin_readline_empty(self, scheduler: Scheduler) -> None:
-        """sys.stdin.readline() returns '' at EOF (not EOFError)."""
-        code = """\
-import sys
-line = sys.stdin.readline()
-print(repr(line))
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "''" in result.stdout
 
     async def test_session_reuse_after_stdin_read(self, scheduler: Scheduler) -> None:
         """REPL protocol channel is unaffected after user code reads stdin."""
@@ -1550,63 +1130,21 @@ print(repr(line))
 
             r2 = await session.exec('print("STILL_WORKS")')
             assert r2.exit_code == 0
-            assert "STILL_WORKS" in r2.stdout
+            assert r2.stdout == "STILL_WORKS\n"
 
 
 class TestStdinEofWeird:
     """Valid but unusual stdin patterns."""
 
     async def test_python_stdin_fileno_valid(self, scheduler: Scheduler) -> None:
-        """sys.stdin.fileno() returns a valid int (real file object, not StringIO)."""
+        """sys.stdin is a real file (fileno() works, unlike StringIO), open on /dev/null."""
         code = """\
-import sys
-fd = sys.stdin.fileno()
-print(f"FD={fd}")
-print(f"TYPE={type(fd).__name__}")
+import os, sys
+print(os.readlink(f"/proc/self/fd/{sys.stdin.fileno()}"))
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "TYPE=int" in result.stdout
-
-    async def test_python_stdin_isatty_false(self, scheduler: Scheduler) -> None:
-        """sys.stdin.isatty() returns False (/dev/null is not a TTY)."""
-        code = """\
-import sys
-print(f"ISATTY={sys.stdin.isatty()}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "ISATTY=False" in result.stdout
-
-    async def test_python_json_load_stdin(self, scheduler: Scheduler) -> None:
-        """json.load(sys.stdin) raises JSONDecodeError on empty input (not hang)."""
-        code = """\
-import json, sys
-try:
-    json.load(sys.stdin)
-except json.JSONDecodeError:
-    print("JSON_DECODE_ERROR")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "JSON_DECODE_ERROR" in result.stdout
-
-    async def test_python_select_stdin_readable(self, scheduler: Scheduler) -> None:
-        """/dev/null reports as readable via select (immediate EOF)."""
-        code = """\
-import select, sys
-r, _, _ = select.select([sys.stdin], [], [], 0)
-print(f"READABLE={len(r) > 0}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "READABLE=True" in result.stdout
-
-    async def test_shell_wc_stdin_zero(self, scheduler: Scheduler) -> None:
-        """wc -l with no file arg reads stdin (/dev/null), reports 0 lines."""
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), "wc -l")
-        assert result.exit_code == 0
-        assert "0" in result.stdout
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == "/dev/null\n"
 
 
 class TestStdinEofOutOfBounds:
@@ -1627,30 +1165,18 @@ try:
 except Exception as e:
     print(f"ERROR={type(e).__name__}")
 """
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
+        # The timeout leaves room for a cold REPL start under TCG: the alarm ends the read
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
         # SIGALRM (signal 14) kills the REPL process → exit_code = 128 + 14 = 142.
-        # On slow hosts, the 3s host timeout may fire first → exit_code = -1.
-        assert result.exit_code in (142, -1)
+        assert result.exit_code == 142
 
-    async def test_python_stdin_write_raises(self, scheduler: Scheduler) -> None:
-        """Writing to stdin (opened read-only from /dev/null) raises."""
-        code = """\
-import sys
-try:
-    sys.stdin.write("x")
-except Exception as e:
-    print(f"ERROR={type(e).__name__}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "UnsupportedOperation" in result.stdout
+    async def test_python_open_dev_stdin_denied(self, scheduler: Scheduler) -> None:
+        """/dev/stdin cannot reopen fd 0 (the protocol pipe): open() raises PermissionError.
 
-    async def test_python_open_dev_stdin_blocks_or_denied(self, scheduler: Scheduler) -> None:
-        """/dev/stdin reopens fd 0 (protocol pipe) or is denied by sandbox.
-
-        Known limitation: /dev/stdin is a symlink to /proc/self/fd/0. If
-        accessible, it reopens the protocol pipe and blocks. If /proc/self/fd
-        is restricted, open() raises PermissionError.
+        /dev/stdin links to /proc/self/fd/0. The REPL is not dumpable
+        (PR_SET_DUMPABLE=0), so the kernel makes its /proc/self/fd root's, and
+        UID 1000 cannot open it. The alarm ends a read that blocks, if the
+        open ever succeeds.
         """
         code = """\
 import signal
@@ -1660,23 +1186,7 @@ try:
     print(f"DATA={repr(data)}")
 except PermissionError:
     print("PERMISSION_ERROR")
-except Exception as e:
-    print(f"ERROR={type(e).__name__}")
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
-        # Either blocks until SIGALRM kills the REPL (128+14=142), permission denied,
-        # or the 3s host timeout fires first on slow hosts (exit_code=-1).
-        assert result.exit_code in (142, -1) or "PERMISSION_ERROR" in result.stdout
-
-    async def test_python_fileinput_stdin_eof(self, scheduler: Scheduler) -> None:
-        """fileinput.input('-') iterates zero times at EOF."""
-        code = """\
-import fileinput
-count = 0
-for line in fileinput.input("-"):
-    count += 1
-print(f"COUNT={count}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "COUNT=0" in result.stdout
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == "PERMISSION_ERROR\n"

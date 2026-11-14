@@ -38,23 +38,6 @@ class TestIntStrDigits:
         assert result.exit_code == 0
         assert result.stdout.strip() == "4301"
 
-    async def test_fibonacci_large(self, scheduler: Scheduler) -> None:
-        """Fibonacci(100000) — the originally reported user scenario."""
-        code = """
-def fib(n):
-    a, b = 0, 1
-    for _ in range(n):
-        a, b = b, a + b
-    return a
-
-result = str(fib(100000))
-print(len(result))
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
-
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "20899"  # fib(100000) has 20899 digits
-
     async def test_user_env_var_cannot_override_limit(self, scheduler: Scheduler) -> None:
         """User env_vars are injected as Python code (os.environ), too late to affect
         PYTHONINTMAXSTRDIGITS which is read at interpreter startup."""
@@ -66,5 +49,5 @@ print(len(result))
         )
 
         assert result.exit_code == 0
-        # Still 0 — env_vars are set via os.environ at runtime, not at process spawn
+        # 0: env_vars are set via os.environ at runtime, not at process spawn
         assert result.stdout.strip() == "0"

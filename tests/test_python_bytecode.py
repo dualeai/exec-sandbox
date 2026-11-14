@@ -1,8 +1,8 @@
 """Python bytecode: the REPL reads the image's precompiled stdlib, and L2
 package layers ship their own .pyc (the layer is read-only at run time).
 
-With PYTHONPYCACHEPREFIX set, CPython reads .pyc only under the prefix and
-recompiled ~56 stdlib modules into /home/user at every REPL start.
+With PYTHONPYCACHEPREFIX set, CPython reads .pyc only under the prefix: it
+compiles ~56 stdlib modules again into /home/user at each REPL start.
 """
 
 import pytest
