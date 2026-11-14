@@ -7,14 +7,15 @@ Run with: uv run pytest tests/test_memory_optimization.py -v
 """
 
 import asyncio
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
-from exec_sandbox import Scheduler, SchedulerConfig
+from exec_sandbox import Scheduler, SchedulerConfig, constants
+from exec_sandbox.models import Language
 from exec_sandbox.vm_spec import VmSpec
-from exec_sandbox.warm_vm_pool import Language
 
 if TYPE_CHECKING:
     from exec_sandbox.models import ExecutionResult
@@ -52,6 +53,14 @@ class TestZramConfiguration:
             tenant_id="test",
             task_id="zram-config-192mb",
             cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
         )
         try:
             result = await vm.execute(
@@ -109,68 +118,43 @@ assert swap_size_kib == expected_swap_size_kib, (
 print('PASS: effective zram geometry')
 """,
                 timeout_seconds=execute_timeout,
+                env_vars=None,
+                on_stdout=None,
+                on_stderr=None,
             )
             assert result.exit_code == 0, result.stderr
-            assert "PASS: effective zram geometry" in result.stdout
+            assert result.stdout == "PASS: effective zram geometry\n"
         finally:
             await vm_manager.destroy_vm(vm)
 
     async def test_compression_actually_compresses(self, scheduler: Scheduler) -> None:
-        """zram should achieve real compression on compressible data."""
+        """zram compresses what goes to swap: 130 % of MemAvailable, in 10 MiB chunks of a repeated
+        256-byte sequence, swaps out, and lz4 stores it at least 2x smaller.
+
+        Not one byte repeated: zram keeps a page of one repeated word without compression (same_pages),
+        and compr_data_size would not grow."""
         result = await run_once(
             scheduler,
             VmSpec(language=Language.PYTHON),
             """
-import gc
-gc.collect()
+def zram():
+    with open('/sys/block/zram0/mm_stat') as f:  # orig_data_size compr_data_size ...
+        orig, compr = (int(v) for v in f.read().split()[:2])
+    return orig, compr
 
-def get_zram_stats():
-    '''Get orig_data_size and compr_data_size from mm_stat.'''
-    with open('/sys/block/zram0/mm_stat') as f:
-        parts = f.read().strip().split()
-        # mm_stat format: orig_data_size compr_data_size mem_used_total ...
-        return int(parts[0]), int(parts[1])
-
-initial_orig, initial_compr = get_zram_stats()
-print(f'Initial: orig={initial_orig}, compr={initial_compr}')
-
-# Allocate compressible data (repetitive pattern compresses well)
-# 120MB exceeds available RAM but fits within zram capacity thanks to compression.
-# (zram mem_limit is 20% of RAM; repetitive patterns compress >10x with lz4.)
-chunks = []
-for i in range(12):  # 120MB of compressible data
-    chunk = bytearray(10 * 1024 * 1024)
-    # Fill with repetitive pattern (highly compressible)
-    pattern = bytes([i % 256] * 4096)
-    for j in range(0, len(chunk), 4096):
-        chunk[j:j+4096] = pattern
-    chunks.append(chunk)
-
-# Force some to swap by accessing in reverse order
-for chunk in reversed(chunks):
-    _ = chunk[0]
-
-final_orig, final_compr = get_zram_stats()
-print(f'Final: orig={final_orig}, compr={final_compr}')
-
-# If data was swapped, compression should be significant
-if final_orig > initial_orig:
-    data_swapped = final_orig - initial_orig
-    data_compressed = final_compr - initial_compr
-    if data_compressed > 0:
-        ratio = data_swapped / data_compressed
-        print(f'Compression ratio: {ratio:.2f}x')
-        # lz4 should achieve at least 2x on repetitive data
-        assert ratio >= 1.5, f'Compression ratio {ratio:.2f}x too low'
-        print(f'PASS: Compression ratio {ratio:.2f}x')
-    else:
-        print('PASS: No compression needed (data fit in RAM)')
-else:
-    print('PASS: No swap used (data fit in RAM)')
+with open('/proc/meminfo') as f:
+    available_mb = next(int(line.split()[1]) for line in f if line.startswith('MemAvailable:')) // 1024
+before = zram()
+page = bytearray(range(256)) * 16
+chunks = [page * 2560 for _ in range(available_mb * 13 // 100)]  # 10 MiB each
+after = zram()
+print(after[0] - before[0], after[1] - before[1])
 """,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
+        swapped, compressed = (int(v) for v in result.stdout.split())
+        assert swapped >= 10 * 1024 * 1024, result.stdout  # the data went over RAM
+        assert 0 < compressed <= swapped / 2, result.stdout
 
 
 class TestZramMemoryExpansion:
@@ -222,8 +206,10 @@ except MemoryError:
 """,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
-        assert "exceeded available by" in result.stdout
+        assert re.fullmatch(
+            r"Available memory: \d+MB\nTarget allocation: \d+MB\nPASS: Allocated \d+MB, exceeded available by \d+MB\n",
+            result.stdout,
+        ), result.stdout
 
     async def test_memory_survives_repeated_cycles(self, scheduler: Scheduler) -> None:
         """Memory allocation should work reliably across multiple cycles."""
@@ -266,7 +252,14 @@ print('PASS: All 3 allocation cycles completed without corruption')
 """,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS: All 3 allocation cycles" in result.stdout
+        assert (
+            result.stdout
+            == "".join(
+                f"Cycle {cycle}: Allocating 150MB with pattern {cycle * 42}\nCycle {cycle}: PASS\n"
+                for cycle in (1, 2, 3)
+            )
+            + "PASS: All 3 allocation cycles completed without corruption\n"
+        )
 
 
 # ============================================================================
@@ -330,8 +323,7 @@ class TestZramMemLimit:
                 ),
                 timeout=30,
             )
-            assert cold.exit_code == 137, cold.stderr
-            assert "WORKLOAD_STARTED" in cold.stdout
+            assert (cold.exit_code, cold.stdout) == (137, "WORKLOAD_STARTED\n"), cold.stderr
             assert cold_startup.warm_pool_hit is False
             assert cold_startup.l1_cache_hit is False
 
@@ -358,8 +350,7 @@ class TestZramMemLimit:
                     ),
                     timeout=30,
                 )
-                assert result.exit_code == 137, result.stderr
-                assert "WORKLOAD_STARTED" in result.stdout
+                assert (result.exit_code, result.stdout) == (137, "WORKLOAD_STARTED\n"), result.stderr
                 assert startup.warm_pool_hit is False
                 if startup.l1_cache_hit:
                     restored = result
@@ -426,4 +417,4 @@ print(f'PASS: 180MB allocated, swap_used={swap_used}MB')
                     pytest.fail(f"VM {i + 1} failed with exception: {r}")
                 result: ExecutionResult = r
                 assert result.exit_code == 0, f"VM {i + 1} exit_code={result.exit_code}, stderr={result.stderr}"
-                assert "PASS" in result.stdout, f"VM {i + 1} output: {result.stdout}"
+                assert re.fullmatch(r"PASS: 180MB allocated, swap_used=\d+MB\n", result.stdout), result.stdout

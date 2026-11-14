@@ -12,19 +12,20 @@ Run with: make test-slow
 """
 
 import asyncio
+import contextlib
 import gc
 import os
 import tracemalloc
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import psutil
 import pytest
 
 from exec_sandbox import Scheduler, SchedulerConfig
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError
+from exec_sandbox.models import Language
 from exec_sandbox.vm_spec import VmSpec
-from exec_sandbox.warm_vm_pool import Language
 from tests.conftest import run_once, skip_unless_hwaccel
 
 # Use half CPU count for max concurrency - avoids boot timeouts under load
@@ -129,10 +130,10 @@ async def test_no_memory_leak_without_network(iterations: int, scheduler_config:
 
     A warmup run absorbs one-time initialization costs (Scheduler startup,
     Pydantic model compilation, psutil caching, asyncio thread-pool warmup)
-    before taking the RSS baseline.  Without warmup, the first parametrized
-    variant ([50]) absorbs all init overhead into its delta while [200] starts
-    from a warm process and sees near-zero growth — causing false positives on
-    free-threaded Python where mimalloc per-thread arenas inflate the init cost.
+    before taking the RSS baseline.  Without warmup, the first test of a
+    process counts all init overhead as growth, while a later one starts from
+    a warm process — a false positive on free-threaded Python, where mimalloc
+    per-thread arenas inflate the init cost.
     """
     process, baseline_rss = await _warmup_and_baseline(scheduler_config)
 
@@ -215,30 +216,28 @@ def allow_network(request: pytest.FixtureRequest) -> bool:
 
 
 class PeakMemoryTracker:
-    """Track peak RSS memory during async operations (a sample every 50 ms)."""
+    """Peak RSS of this process while its `async with` block runs (a sample every 50 ms), from
+    `baseline_rss` up. The sampling task ends with the block, also when the block raises."""
 
-    def __init__(self) -> None:
+    def __init__(self, baseline_rss: int) -> None:
         self.process = psutil.Process()
-        self.peak_rss = 0
-        self._running = False
+        self.peak_rss = baseline_rss
         self._task: asyncio.Task[None] | None = None
 
     async def _monitor(self) -> None:
-        while self._running:
-            current_rss = self.process.memory_info().rss
-            self.peak_rss = max(self.peak_rss, current_rss)
+        while True:
+            self.peak_rss = max(self.peak_rss, self.process.memory_info().rss)
             await asyncio.sleep(0.05)
 
-    def start(self, baseline_rss: int) -> None:
-        self.peak_rss = baseline_rss
-        self._running = True
+    async def __aenter__(self) -> Self:
         self._task = asyncio.create_task(self._monitor())
+        return self
 
-    async def stop(self) -> int:
-        self._running = False
-        if self._task:
+    async def __aexit__(self, *_exc_info: object) -> None:
+        assert self._task is not None
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
             await self._task
-        return self.peak_rss
 
 
 # =============================================================================
@@ -463,19 +462,17 @@ async def test_peak_ram_file_io(file_io_size_mb: int, scheduler_config: Schedule
 
     _, baseline_rss = await _warmup_and_baseline(scheduler_config)
 
-    tracker = PeakMemoryTracker()
     dest = tmp_path / "peak_test.bin"
 
     async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            tracker.start(baseline_rss)
-            content = os.urandom(size_bytes)
-            await session.write_file("peak_test.bin", content)
-            await session.read_file("peak_test.bin", destination=dest)
-            peak_rss = await tracker.stop()
+            async with PeakMemoryTracker(baseline_rss) as tracker:
+                content = os.urandom(size_bytes)
+                await session.write_file("peak_test.bin", content)
+                await session.read_file("peak_test.bin", destination=dest)
             assert dest.stat().st_size == len(content)
 
-    peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
+    peak_growth_mb = (tracker.peak_rss - baseline_rss) / 1024 / 1024
 
     threshold_mb = file_io_size_mb + _FILE_IO_RSS_OVERHEAD_MB
     assert peak_growth_mb < threshold_mb, (
@@ -515,7 +512,6 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
         allow_network=allow_network,
     )
 
-    tracker = PeakMemoryTracker()
     code = _NETWORK_TEST_CODE if allow_network else "print('ok')"
     process = psutil.Process()
 
@@ -523,20 +519,17 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
         # Baseline inside the Scheduler so startup cost isn't counted as per-VM growth
         gc.collect()
         baseline_rss = process.memory_info().rss
-        tracker.start(baseline_rss)
-
-        tasks = [
-            run_once(scheduler, VmSpec(language=Language.PYTHON, allow_network=allow_network), code)
-            for _ in range(concurrent_vms)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        gc.collect()
-        peak_rss = await tracker.stop()
+        async with PeakMemoryTracker(baseline_rss) as tracker:
+            tasks = [
+                run_once(scheduler, VmSpec(language=Language.PYTHON, allow_network=allow_network), code)
+                for _ in range(concurrent_vms)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            gc.collect()
 
         _assert_success_rate(results, concurrent_vms, check_exit_code=True)
 
-    peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
+    peak_growth_mb = (tracker.peak_rss - baseline_rss) / 1024 / 1024
     per_vm_mb = peak_growth_mb / concurrent_vms
     network_label = " with network" if allow_network else ""
 
@@ -581,14 +574,12 @@ async def test_peak_ram_read_file(file_io_size_mb: int, scheduler_config: Schedu
             baseline_rss = process.memory_info().rss
 
             # Measure peak during read only
-            tracker = PeakMemoryTracker()
-            tracker.start(baseline_rss)
-            await session.read_file("peak_read_test.bin", destination=dest)
-            peak_rss = await tracker.stop()
+            async with PeakMemoryTracker(baseline_rss) as tracker:
+                await session.read_file("peak_read_test.bin", destination=dest)
 
             assert dest.stat().st_size == len(content)
 
-    peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
+    peak_growth_mb = (tracker.peak_rss - baseline_rss) / 1024 / 1024
 
     assert peak_growth_mb < _FILE_IO_RSS_OVERHEAD_MB, (
         f"Peak RAM too high during read: {peak_growth_mb:.1f}MB for {file_io_size_mb}MB file "
@@ -651,19 +642,16 @@ async def test_peak_ram_concurrent_file_io(
             assert dest.stat().st_size == size_bytes
         dest.unlink(missing_ok=True)
 
-    tracker = PeakMemoryTracker()
-
     async with Scheduler(scheduler_config) as scheduler:
-        tracker.start(baseline_rss)
-        results = await asyncio.gather(
-            *(session_cycle(scheduler, i) for i in range(concurrent_sessions)),
-            return_exceptions=True,
-        )
-        peak_rss = await tracker.stop()
+        async with PeakMemoryTracker(baseline_rss) as tracker:
+            results = await asyncio.gather(
+                *(session_cycle(scheduler, i) for i in range(concurrent_sessions)),
+                return_exceptions=True,
+            )
 
         _assert_success_rate(results, concurrent_sessions)
 
-    peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
+    peak_growth_mb = (tracker.peak_rss - baseline_rss) / 1024 / 1024
 
     # Per session: VM overhead + the write frames in flight
     streaming_mb = _WRITE_FRAMES_IN_FLIGHT_MB[file_io_size_mb]
@@ -822,18 +810,15 @@ async def test_peak_ram_large_file_io(large_file_mb: int, scheduler_config: Sche
 
     _, baseline_rss = await _warmup_and_baseline(scheduler_config)
 
-    tracker = PeakMemoryTracker()
-
     async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            tracker.start(baseline_rss)
-            await session.write_file("large_file.bin", src)
-            await session.read_file("large_file.bin", destination=dest)
-            peak_rss = await tracker.stop()
+            async with PeakMemoryTracker(baseline_rss) as tracker:
+                await session.write_file("large_file.bin", src)
+                await session.read_file("large_file.bin", destination=dest)
 
             assert dest.stat().st_size == size_bytes
 
-    peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
+    peak_growth_mb = (tracker.peak_rss - baseline_rss) / 1024 / 1024
 
     # Flat threshold: VM lifecycle + full pipeline RSS overhead.
     # During sustained large-file transfers the write pipeline (about 14.5 MiB:
