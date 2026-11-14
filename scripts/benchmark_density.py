@@ -14,20 +14,22 @@ Answers: "How much host RAM does each additional VM actually cost?"
 Methodology:
   1. Measure host baseline memory (no VMs)
   2. Boot N VMs, keep them alive
-  3. Optionally execute a workload on each VM
-  4. Sample host memory at steady state
-  5. Compute per-VM marginal cost = (used_after - used_before) / N
+  3. Sample host memory at steady state (VMs idle, median of 5 samples)
+  4. Optionally execute a workload on each VM (its sample is printed only)
+  5. Compute per-VM marginal cost = (steady_used - baseline_used) / N
 
-Runs multiple "scenarios" to compare density techniques:
-  - Baseline (current config)
+Each scenario is one (N, language) pair: --sweep gives more than one N,
+--lang more than one language.
 
-Supports both macOS (vm_stat) and Linux (/proc/meminfo, KSM, PSI).
+Host memory comes from psutil on macOS and Linux. Linux adds QEMU PSS, KSM
+and PSI; macOS adds the memory pressure level (sysctl).
 
 Usage:
-    uv run --script scripts/benchmark_density.py               # Quick: 5 VMs
-    uv run --script scripts/benchmark_density.py -n 10         # 10 VMs
-    uv run --script scripts/benchmark_density.py --workload     # Run code on each VM
-    uv run --script scripts/benchmark_density.py --lang python  # Python only
+    uv run --script scripts/benchmark_density.py                    # Quick: 5 VMs
+    uv run --script scripts/benchmark_density.py -n 10              # 10 VMs
+    uv run --script scripts/benchmark_density.py --workload         # Run code on each VM
+    uv run --script scripts/benchmark_density.py --lang python raw  # Python and Raw
+    uv run --script scripts/benchmark_density.py --sweep 5 10 20    # N=5, 10, 20
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ import asyncio
 import contextlib
 import json
 import math
+import mmap
 import os
 import statistics
 import subprocess
@@ -90,8 +93,6 @@ SETTLE_SECONDS: Final[float] = 3.0
 class HostMemorySample:
     """Single host memory measurement."""
 
-    timestamp: float
-    total_mb: int
     available_mb: int
     used_mb: int  # total - available
     # QEMU-specific
@@ -102,8 +103,6 @@ class HostMemorySample:
     ksm_pages_sharing: int | None  # Pages saved by KSM
     ksm_pages_shared: int | None  # Unique pages being shared
     psi_some_avg10: float | None  # Memory pressure (some, avg10)
-    swap_used_mb: int | None
-    committed_mb: int | None  # Committed_AS from /proc/meminfo
 
 
 def _collect_qemu_metrics() -> tuple[int, int, int | None]:
@@ -119,16 +118,10 @@ def _collect_qemu_metrics() -> tuple[int, int, int | None]:
                 continue
             count += 1
             rss_bytes += proc.memory_info().rss
-            # PSS from smaps_rollup (Linux, may need root)
+            # PSS (Linux; psutil reads smaps_rollup, which may need root)
             if pss_bytes is not None:
-                try:
-                    smaps = Path(f"/proc/{proc.pid}/smaps_rollup").read_text()
-                    for line in smaps.splitlines():
-                        if line.startswith("Pss:"):
-                            pss_bytes += int(line.split()[1]) * 1024  # KB -> bytes
-                            break
-                except (OSError, ValueError):
-                    pass  # Permission denied or process exited
+                with contextlib.suppress(psutil.Error):
+                    pss_bytes += int(getattr(proc.memory_full_info(), "pss", 0))  # Linux only field
 
     rss_mb = rss_bytes // (1024 * 1024)
     pss_mb = pss_bytes // (1024 * 1024) if pss_bytes is not None else None
@@ -148,7 +141,7 @@ def _read_ksm_stats() -> tuple[int | None, int | None]:
 
 
 def _read_psi_memory() -> float | None:
-    """Read memory PSI some avg10 (Linux only)."""
+    """Memory pressure: Linux PSI "some" avg10 (%); on macOS, the pressure level as 0, 25 or 75."""
     if _HOST_OS != HostOS.LINUX:
         # macOS: try kern.memorystatus_vm_pressure_level
         try:
@@ -187,20 +180,7 @@ def sample_host_memory() -> HostMemorySample:
     ksm_sharing, ksm_shared = _read_ksm_stats()
     psi = _read_psi_memory()
 
-    swap_used_mb: int | None = None
-    committed_mb: int | None = None
-    if _HOST_OS == HostOS.LINUX:
-        swap = psutil.swap_memory()
-        swap_used_mb = swap.used // (1024 * 1024)
-        with contextlib.suppress(OSError, ValueError):
-            for line in Path("/proc/meminfo").read_text().splitlines():
-                if line.startswith("Committed_AS:"):
-                    committed_mb = int(line.split()[1]) // 1024
-                    break
-
     return HostMemorySample(
-        timestamp=time.monotonic(),
-        total_mb=total_mb,
         available_mb=avail_mb,
         used_mb=used_mb,
         qemu_count=qemu_count,
@@ -209,8 +189,6 @@ def sample_host_memory() -> HostMemorySample:
         ksm_pages_sharing=ksm_sharing,
         ksm_pages_shared=ksm_shared,
         psi_some_avg10=psi,
-        swap_used_mb=swap_used_mb,
-        committed_mb=committed_mb,
     )
 
 
@@ -222,7 +200,7 @@ def sample_host_memory() -> HostMemorySample:
 class MemorySampler:
     """Background thread that samples host memory at fixed intervals."""
 
-    def __init__(self, interval: float = 0.5) -> None:
+    def __init__(self, *, interval: float) -> None:
         self.interval = interval
         self.samples: list[HostMemorySample] = []
         self._stop = threading.Event()
@@ -252,10 +230,6 @@ class MemorySampler:
     def peak_qemu_rss_mb(self) -> int:
         return max((s.qemu_rss_mb for s in self.samples), default=0)
 
-    @property
-    def peak_qemu_count(self) -> int:
-        return max((s.qemu_count for s in self.samples), default=0)
-
 
 # ============================================================================
 # Density measurement result
@@ -277,7 +251,6 @@ class DensityResult:
     steady_available_mb: int
     steady_qemu_rss_mb: int
     steady_qemu_pss_mb: int | None
-    steady_qemu_count: int
     # Peak during lifetime
     peak_used_mb: int
     peak_qemu_rss_mb: int
@@ -321,11 +294,12 @@ class DensityResult:
 
         pages_sharing = extra virtual mappings pointing to shared physical pages (= savings).
         pages_shared = unique physical pages being shared (metadata cost, not savings).
-        Per kernel docs: savings = pages_sharing * page_size.
+        Per kernel docs: savings = pages_sharing * page_size (this host's page size:
+        4 KiB on x86_64, 16 or 64 KiB on some arm64 kernels).
         """
         if self.ksm_pages_sharing is None:
             return None
-        return self.ksm_pages_sharing * 4096 / (1024 * 1024)
+        return self.ksm_pages_sharing * mmap.PAGESIZE / (1024 * 1024)
 
     @property
     def estimated_max_vms(self) -> int | None:
@@ -366,14 +340,14 @@ async def measure_density(  # noqa: PLR0915
     language: Language,
     scenario: str,
     *,
-    run_workload: bool = False,
-    memory_mb: int = 192,
-    overcommit_cpu: float = DEFAULT_CPU_OVERCOMMIT_RATIO,
-    overcommit_mem: float = DEFAULT_MEMORY_OVERCOMMIT_RATIO,
+    run_workload: bool,
+    memory_mb: int,
+    overcommit_cpu: float,
+    overcommit_mem: float,
 ) -> DensityResult:
     """Boot N VMs, hold them alive, measure host memory impact."""
     images_dir = Path(__file__).parent.parent / "images" / "dist"
-    code = WORKLOAD_CODE.get(language, "echo ok")
+    code = WORKLOAD_CODE[language]
 
     # -- Baseline sample (no VMs from us) --
     await asyncio.sleep(SETTLE_SECONDS)
@@ -390,7 +364,7 @@ async def measure_density(  # noqa: PLR0915
     config = SchedulerConfig(
         images_dir=images_dir,
         auto_download_assets=False,
-        warm_pool_size=0,  # Cold boot everything for fair measurement
+        warm_pool_size=0,  # No warm pool: every VM starts on request
         cpu_overcommit_ratio=overcommit_cpu,
         memory_overcommit_ratio=overcommit_mem,
     )
@@ -400,8 +374,8 @@ async def measure_density(  # noqa: PLR0915
     exec_wall_ms: int | None = None
 
     async with Scheduler(config) as scheduler:
-        # -- Boot all VMs concurrently using session() --
-        # Use sessions to keep VMs alive for measurement
+        # -- Boot all VMs concurrently with scheduler.new() --
+        # The open sessions keep the VMs alive for the measurement
         sessions: list[Session] = []
         boot_errors = 0
         boot_wall_start = time.monotonic()
@@ -485,7 +459,6 @@ async def measure_density(  # noqa: PLR0915
         steady_available_mb=steady.available_mb,
         steady_qemu_rss_mb=steady.qemu_rss_mb,
         steady_qemu_pss_mb=steady.qemu_pss_mb,
-        steady_qemu_count=steady.qemu_count,
         peak_used_mb=sampler.peak_used_mb,
         peak_qemu_rss_mb=sampler.peak_qemu_rss_mb,
         boot_total_ms=boot_wall_ms,
@@ -573,7 +546,8 @@ def print_comparison(results: list[DensityResult]) -> None:
     print(header)
     print(f"  {'─' * 88}")
 
-    baseline_marginal = results[0].marginal_mb_per_vm if results else 0
+    baseline_marginal = results[0].marginal_mb_per_vm
+    same_n = len({res.n_vms for res in results}) == 1
 
     for r in results:
         pss_str = f"{r.pss_per_vm_mb:.1f}" if r.pss_per_vm_mb is not None else "-"
@@ -583,7 +557,6 @@ def print_comparison(results: list[DensityResult]) -> None:
 
         # Show cost change vs first result (negative = cheaper, positive = more expensive)
         savings = ""
-        same_n = len({res.n_vms for res in results}) == 1
         if same_n and baseline_marginal > 0 and r is not results[0]:
             pct = (r.marginal_mb_per_vm / baseline_marginal - 1) * 100
             savings = f" ({pct:+.0f}%)"

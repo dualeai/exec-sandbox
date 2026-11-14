@@ -205,10 +205,7 @@ async def _process_job(repo: str, job_id: int) -> tuple[dict[str, Failure], str]
     except RuntimeError:
         log = ""
 
-    if log:
-        failures, monitor = _parse_log(log)
-    else:
-        failures, monitor = {}, ""
+    failures, monitor = _parse_log(log)  # an empty log gives ({}, "")
 
     # Fallback: check-run annotations (runner crashes, OOM)
     if not failures:

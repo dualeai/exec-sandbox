@@ -10,7 +10,8 @@ result (exec()); teardown is the close() time measured here:
 - admission_ms: Time blocked in admission queue (0 for warm pool hits)
 - setup_ms: Infra setup (cache, overlay, cgroup) — excludes admission
 - boot_ms: VM boot (QEMU + kernel + initramfs + guest-agent)
-- execute_ms: Code execution (connect + run + response)
+- execute_ms: Code execution (connect + run + response); after a cold boot it
+  also holds the REPL start (warm-pool and L1 VMs have a started REPL)
 - teardown: close() (destroy + cleanup)
 
 Usage:
@@ -106,13 +107,13 @@ class TimingStats:
     execute: list[float] = field(default_factory=list[float])
     teardown: list[float] = field(default_factory=list[float])
     guest_exec: list[float] = field(default_factory=list[float])
-    # Granular setup timing
+    # Admission and setup parts
     admission: list[float] = field(default_factory=list[float])  # Admission queue wait (0 for warm pool hits)
     overlay: list[float] = field(default_factory=list[float])  # Overlay acquisition (pool or on-demand)
     # Granular execute timing
     connect: list[float] = field(default_factory=list[float])  # Host: channel.connect()
-    spawn: list[float] = field(default_factory=list[float])  # Guest: cmd.spawn() fork/exec
-    process: list[float] = field(default_factory=list[float])  # Guest: actual process runtime
+    spawn: list[float] = field(default_factory=list[float])  # Guest: get the REPL (spawn it when none runs)
+    process: list[float] = field(default_factory=list[float])  # Guest: code run time in the REPL
     # Granular boot timing
     qemu_cmd_build: list[float] = field(default_factory=list[float])
     gvproxy_start: list[float] = field(default_factory=list[float])
@@ -157,12 +158,13 @@ def _vm_source(startup: StartupTiming) -> str:
 
 def _collect_results(
     results: list[Sample | None],
-    expected_source: str | None = None,
+    *,
+    expected_source: str,
 ) -> TimingStats:
     """Collect timing from results.
 
-    Failed runs and (when expected_source is set) runs served by another VM
-    source are excluded from the samples and counted instead — a lone
+    Failed runs and runs served by a VM source other than expected_source
+    are excluded from the samples and counted instead — a lone
     transient failure must not abort minutes of benchmark, and a run that
     became e.g. an L1 hit through admission queuing must not pollute cold
     numbers.
@@ -175,7 +177,7 @@ def _collect_results(
         result = item.result
         # Source classification first: a fallback that also failed must count
         # as off_source, or the warm-phase purity check would miss it.
-        if expected_source is not None and _vm_source(item.startup) != expected_source:
+        if _vm_source(item.startup) != expected_source:
             stats.off_source += 1
             continue
         if result.exit_code != 0:
@@ -204,10 +206,10 @@ async def benchmark_concurrent(
     spec: VmSpec,
     concurrency: int,
     *,
-    expected_source: str | None,
+    expected_source: str,
 ) -> TimingStats:
     """Benchmark VM boot + execution latency with concurrent requests."""
-    code = CODE_MAP.get(spec.language, "echo ok")
+    code = CODE_MAP[spec.language]
 
     async def single_run() -> Sample | None:
         start = time.perf_counter()
@@ -237,7 +239,7 @@ async def benchmark_concurrent(
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float:
-    """Compute the p-th percentile using the nearest-rank method (0-indexed)."""
+    """Return the p quantile (p in (0, 1]) of sorted values by the nearest-rank method."""
     idx = min(math.ceil(len(sorted_vals) * p) - 1, len(sorted_vals) - 1)
     return sorted_vals[idx]
 
