@@ -4,6 +4,7 @@ guards, and what each worker must have (QEMU floor, host facts at load).
 The "s3" store reuses the S3 config (bucket, region, endpoint) under its own prefix.
 """
 
+import asyncio
 import stat
 import subprocess
 import sys
@@ -23,7 +24,8 @@ from exec_sandbox._imports import (
     require_instance_manager,
     require_s3_instance_store,
 )
-from exec_sandbox.exceptions import ConfigError, ErrorCode, RouteError
+from exec_sandbox.exceptions import ConfigError, ErrorCode, InstanceGoneError, RouteError
+from exec_sandbox.instance.local_store import LocalInstanceStore
 from exec_sandbox.instance.manager import InstanceManager
 from exec_sandbox.instance.models import HostFacts
 from exec_sandbox.platform_utils import HostArch, HostOS, child_env
@@ -38,6 +40,7 @@ from tests.instance_support import (
     Saver,
     SparseImage,
     new_keyring,
+    no_packages,
     seed_instance,
 )
 from tests.s3_faults import Edit, Request, S3Proxy
@@ -66,6 +69,7 @@ class TestS3Settings:
         settings = Settings()
         assert settings.s3_bucket == "from-env"
         assert settings.instance_keyring is not None
+        assert settings.instance_keyring.get_secret_value() == key
         assert key not in repr(settings)
         assert key not in repr(SchedulerConfig(instance_keyring=key))
         assert Settings(s3_bucket="argument").s3_bucket == "argument"  # argument wins
@@ -188,7 +192,8 @@ class TestSchedulerStart:
         keyring: str | None,
         bucket: str | None,
     ) -> SchedulerConfig:
-        """`base` plus the store, the bucket at `endpoint_url` and an instance prefix (validated, so fields count as set)."""
+        """`base` plus the store, the bucket at `endpoint_url` and an instance prefix (validated, so
+        fields count as set)."""
         return SchedulerConfig.model_validate(
             {
                 **base.model_dump(exclude_unset=True),
@@ -393,6 +398,32 @@ class TestWorkerChecks:
         async with InstanceManager.open(self._settings(tmp_path), work_dir=tmp_path / "work", vm_manager=MagicMock()):
             assert (tmp_path / "work").is_dir()
 
+    async def test_the_store_closes_after_the_loads_in_flight(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The open block ends (Scheduler exit closes the store) while a load still reads the
+        store: the block ends only once the load ended, never under it. The store is the seam:
+        its read waits until the block ends."""
+        self._qemu(monkeypatch, (11, 0, 0))
+        reading, block_ends = asyncio.Event(), asyncio.Event()
+        get = LocalInstanceStore.get
+
+        async def held_get(self: LocalInstanceStore, key: str, /, *, max_bytes: int) -> tuple[bytes, str] | None:
+            reading.set()
+            await block_ends.wait()
+            return await get(self, key, max_bytes=max_bytes)
+
+        async with InstanceManager.open(
+            self._settings(tmp_path), work_dir=tmp_path / "work", vm_manager=MagicMock()
+        ) as manager:
+            monkeypatch.setattr(LocalInstanceStore, "get", held_get)  # after the store probe
+            loading = asyncio.create_task(manager.load("gone", packages_image=no_packages))
+            await reading.wait()
+            asyncio.get_running_loop().call_soon(block_ends.set)  # once the block's end waits
+        assert loading.done()
+        with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_NOT_FOUND):
+            await loading
+
     @pytest.mark.parametrize(
         "case",
         [
@@ -539,9 +570,7 @@ class TestWorkerChecks:
         """QEMU runs as qemu-vm and this host cannot give it write access to the migration
         file (no setfacl): ConfigError HOST_DEPENDENCY (FIX_CONFIG) before QEMU is asked and
         before any store call; the save's files go."""
-        monkeypatch.setattr(
-            "exec_sandbox.instance.manager.grant_qemu_vm_private_file_access", AsyncMock(return_value=False)
-        )
+        monkeypatch.setattr("exec_sandbox.instance.manager.grant_qemu_vm_acl", AsyncMock(return_value=False))
         vm = await instance_env.new_vm(SparseImage(size=BLOCK), SparseImage(size=BLOCK), spec=PYTHON)
         vm.use_qemu_vm_user = True
         mark = len(instance_env.proxy.log)
@@ -565,9 +594,7 @@ class TestWorkerChecks:
         state = await Saver(instance_env, vm, manager=instance_env.manager, state=None).save()
         await instance_env.manager.drain()
         monkeypatch.setattr("exec_sandbox.instance.manager.probe_qemu_vm_user", AsyncMock(return_value=True))
-        monkeypatch.setattr(
-            "exec_sandbox.instance.manager.grant_qemu_vm_private_file_access", AsyncMock(return_value=False)
-        )
+        monkeypatch.setattr("exec_sandbox.instance.manager.grant_qemu_vm_acl", AsyncMock(return_value=False))
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc:
             await instance_env.load(state.instance_id, manager=instance_env.manager)
         assert exc.value.message == (

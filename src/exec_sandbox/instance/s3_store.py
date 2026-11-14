@@ -29,12 +29,13 @@ from aiobotocore.httpsession import AIOHTTPSession
 from botocore.exceptions import BotoCoreError, ClientError
 
 from exec_sandbox._imports import aws_session
+from exec_sandbox.aio_utils import gather_or_cancel
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.files.disk import pwrite_all
 from exec_sandbox.instance.store import Applied, InstanceStore, ListedObject, NotApplied, wrong_size
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Coroutine, Sequence
+    from collections.abc import AsyncGenerator, Sequence
     from pathlib import Path
 
     from aiobotocore.response import StreamingBody
@@ -199,7 +200,7 @@ class S3InstanceStore(InstanceStore):
             return {"PartNumber": number, "ETag": _etag_of(response.get("ETag"), "PUT", key)}
 
         try:
-            parts = await _gather_or_cancel(
+            parts = await gather_or_cancel(
                 [send(number, offset) for number, offset in enumerate(range(0, size, _PART_BYTES), start=1)]
             )
             response = await self._client.complete_multipart_upload(
@@ -293,7 +294,7 @@ class S3InstanceStore(InstanceStore):
                     raise _failure("GET", key, e) from e
 
         jobs.truncate(size)
-        await _gather_or_cancel([fetch(start, min(start + _PART_BYTES, size)) for start in range(0, size, _PART_BYTES)])
+        await gather_or_cancel([fetch(start, min(start + _PART_BYTES, size)) for start in range(0, size, _PART_BYTES)])
 
     async def _confirm_wrong_size(self, key: str, *, size: int, expected: int) -> NoReturn:
         try:
@@ -418,18 +419,6 @@ async def _receive(body: StreamingBody, jobs: _FileJobs, *, key: str, start: int
         raise _malformed("GET", key, what=f"body shorter than range {start}-{end - 1}")
 
 
-async def _gather_or_cancel[T](coros: Sequence[Coroutine[Any, Any, T]]) -> list[T]:
-    """Run all; on the first failure cancel the rest and raise that failure unwrapped."""
-    tasks = [asyncio.ensure_future(c) for c in coros]
-    try:
-        return await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
-
 class _FileJobs:
     """Blocking reads and writes on one fd, in worker threads.
 
@@ -514,8 +503,8 @@ def _failure_of(operation: str, key: str, *, status: int, code: str) -> ConfigEr
             code=ErrorCode.INSTANCE_CONFIG,
             instance_id=None,
             hint="Check the store bucket, region and endpoint, and give this worker s3:GetObject, s3:PutObject, "
-            "s3:DeleteObject and s3:ListBucket on the store prefix (without ListBucket, S3 answers a missing "
-            "key with 403).",
+            "s3:DeleteObject and s3:AbortMultipartUpload on the store prefix, and s3:ListBucket on the bucket "
+            "(without ListBucket, S3 answers a missing key with 403).",
             context=None,
         )
     return TransientError(

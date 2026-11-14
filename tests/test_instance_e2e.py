@@ -4,8 +4,10 @@ new -> exec -> save -> close -> reuse: the Python state and /home/user come back
 """
 
 import asyncio
+import errno
 import shutil
 import tempfile
+import threading
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterator
@@ -23,6 +25,7 @@ from exec_sandbox.exceptions import (
     RouteError,
     TransientError,
 )
+from exec_sandbox.instance import manager as instance_manager
 from exec_sandbox.instance.keyring import Keyring
 from exec_sandbox.models import Language
 from tests.conftest import skip_unless_hwaccel
@@ -53,7 +56,8 @@ def _config(base: SchedulerConfig, endpoint_url: str, prefix: str, keyring: str)
 
 @pytest.fixture
 def home_root(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """EXEC_SANDBOX_HOME_DISK_DIR of this test: each VmManager's folder, with its instances/ work folder, is under it."""
+    """EXEC_SANDBOX_HOME_DISK_DIR of this test: each VmManager's folder, with its instances/ work
+    folder, is under it."""
     root = Path(tempfile.mkdtemp(prefix="hd-"))  # short and 0700 (PrivateRunDir checks the root)
     monkeypatch.setenv("EXEC_SANDBOX_HOME_DISK_DIR", str(root))
     try:
@@ -128,6 +132,7 @@ class TestSaveAndReuse:
         async with await scheduler.reuse(first.instance_id) as vm:
             assert vm.instance == first
             assert vm.startup_timing.instance_load_ms is not None
+            assert vm.startup_timing.instance_load_ms > 0  # the download and rebuild of the saved state
             result = await vm.exec("x += 1; print(x, open('/home/user/note.txt').read())")
             assert result.stdout.strip() == "42 kept", result.stderr
             second = await vm.save()
@@ -238,6 +243,35 @@ class TestSaveFailures:
             assert not vm.closed
             assert vm.instance is None
             assert (await vm.save()).generation == 1
+
+    async def test_cancelled_save_stops_the_home_copy_first(
+        self, store: tuple[Scheduler, str, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A save cancelled while the VM is stopped and its home disk is copied: the copy stops
+        (at its next chunk) and the cancel comes out once it ended. A copy still running would
+        read the disk that the resumed guest writes, into the folder that the save removes.
+        The private seam of disk_full_once: the manager module's name for files.disk.clone_sparse."""
+        scheduler, _, _ = store
+        copying, ended = threading.Event(), threading.Event()
+
+        def stoppable_copy(_source: Path, target: Path, *, stop: threading.Event | None) -> bool:
+            target.write_bytes(b"partial")
+            copying.set()
+            assert stop is not None
+            stop.wait(timeout=30)
+            target.unlink()
+            ended.set()
+            raise InterruptedError(errno.EINTR, "The copy was stopped")
+
+        monkeypatch.setattr(instance_manager, "clone_sparse", stoppable_copy)
+        async with await scheduler.new(_PY) as vm:
+            await vm.exec("x = 1")
+            saving = asyncio.create_task(vm.save())
+            assert await asyncio.to_thread(copying.wait, 30)
+            saving.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await saving
+            assert ended.is_set()  # the copy ended before the cancel came out
 
     async def test_scheduler_exit_waits_for_a_save_in_flight(
         self, store: tuple[Scheduler, str, object], scheduler_config: SchedulerConfig, s3_proxy: S3Proxy
@@ -357,7 +391,8 @@ class TestLoadFailures:
     async def test_describe_reports_only_what_it_verified(
         self, store: tuple[Scheduler, str, object], s3_proxy: S3Proxy
     ) -> None:
-        """A forged head on one read: describe() never pairs its fields with verified=True."""
+        """A forged head on one read (generation 1 changed to 9): describe() raises
+        INSTANCE_INTEGRITY and never gives the forged fields as verified."""
         scheduler, _, _ = store
         async with await scheduler.new(_PY) as vm:
             ref = await vm.save()
@@ -510,7 +545,10 @@ class TestNotSavedWarning:
             assert not [w for w in caught if issubclass(w.category, InstanceNotSavedWarning)]
             async with await scheduler.reuse(ref.instance_id) as vm:
                 await vm.exec("x = 2")
-        assert [w for w in caught if issubclass(w.category, InstanceNotSavedWarning)]
+        assert [str(w.message) for w in caught if issubclass(w.category, InstanceNotSavedWarning)] == [
+            f"Session closed with changes since the last save of instance {ref.instance_id} (generation 1); "
+            "call save() to keep them."
+        ]
 
 
 class TestAssets:
@@ -597,17 +635,20 @@ class TestForcedId:
             assert (await vm.exec("print(x)")).stdout.strip() == "named"
 
     async def test_forced_id_that_exists_is_a_conflict(self, store: tuple[Scheduler, str, object]) -> None:
-        """A second new VM with the same id never overwrites the first: its first save conflicts."""
-        scheduler, _, _ = store
+        """A second new VM with the same id never overwrites the first: its first save conflicts,
+        and the body object it uploaded is deleted."""
+        scheduler, prefix, s3 = store
         async with await scheduler.new(_PY, instance_id="taken") as vm:
             await vm.exec("x = 'first'")
             await vm.save()
+        (first,) = _objects(s3, prefix, "taken")
         async with await scheduler.new(_PY, instance_id="taken") as vm:
             await vm.exec("x = 'second'")
             with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT) as exc:
                 await vm.save()
             assert exc.value.action == "VERIFY"
             assert vm.closed
+        assert _objects(s3, prefix, "taken") == [first]  # the loser's body is gone
         async with await scheduler.reuse("taken") as vm:
             assert (await vm.exec("print(x)")).stdout.strip() == "first"
             assert vm.instance is not None

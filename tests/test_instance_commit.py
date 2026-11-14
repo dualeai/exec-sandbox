@@ -17,8 +17,8 @@ from exec_sandbox.instance import head, ids, keyring
 from exec_sandbox.instance.commit import Base, Commit, commit_head
 from exec_sandbox.instance.models import RECENT_COMMITS, RecentCommit
 from exec_sandbox.instance.s3_store import S3InstanceStore
-from exec_sandbox.instance.store import InstanceStore, head_key
-from tests.instance_support import NO_VM_TIMEOUT, head_header
+from exec_sandbox.instance.store import InstanceStore
+from tests.instance_support import NO_VM_TIMEOUT, head_header, head_object
 from tests.s3_faults import After, Before, DropAfter, DropBefore, Edit, Fail, Request, Response, S3Proxy
 
 pytestmark = NO_VM_TIMEOUT
@@ -43,7 +43,7 @@ async def store(s3_proxy: S3Proxy) -> AsyncGenerator[InstanceStore]:
 
 def _head(chain: "_Chain") -> str:
     """Proxy key regex of the chain's head object."""
-    return f"^{head_key(chain.instance_id)}$"
+    return f"^{head_object(chain.instance_id)}$"
 
 
 def _body_is(commit: Commit) -> Callable[[Request], bool]:
@@ -114,7 +114,10 @@ class TestCommitHead:
         base = await _save(store, chain, chain.next(1), Base(etag=None, commit_id=None))
         second = chain.next(2)
         base = await _save(store, chain, second, base)
-        assert await store.get(head_key(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (second.data, base.etag)
+        assert await store.get(head_object(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (
+            second.data,
+            base.etag,
+        )
 
     async def test_two_savers_from_one_base_second_conflicts(self, store: InstanceStore) -> None:
         chain = _Chain()
@@ -126,7 +129,7 @@ class TestCommitHead:
         assert exc.value.action == "VERIFY"
         # What a caller compares with describe_instance().recent_commits
         assert exc.value.context == {"generation": 2, "commit_id": b.header.commit_id}
-        assert await store.get(head_key(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (a.data, etag)
+        assert await store.get(head_object(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (a.data, etag)
 
     async def test_lost_reply_resolves_to_success(self, store: InstanceStore, s3_proxy: S3Proxy) -> None:
         """The store applied the PUT but the answer was lost: the saver finds its own commit."""
@@ -135,7 +138,7 @@ class TestCommitHead:
         commit = chain.next(2)
         s3_proxy.add("PUT_IF", _head(chain), DropAfter(), times=None)
         etag = await commit_head(store, commit, base)
-        got = await store.get(head_key(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES)
+        got = await store.get(head_object(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES)
         assert got == (commit.data, etag)
         assert {e.status for e in s3_proxy.entries("PUT_IF", _head(chain))[1:]} == {0}  # no answer reached it
 
@@ -148,7 +151,7 @@ class TestCommitHead:
         _lost_until_read_back(s3_proxy, chain)
         etag = await commit_head(store, commit, base)
         _resent_once_after_read_back(s3_proxy, chain, since=mark)
-        assert await store.get(head_key(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (commit.data, etag)
+        assert await store.get(head_object(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (commit.data, etag)
 
     async def test_unchanged_head_after_resend_is_unknown(self, store: InstanceStore, s3_proxy: S3Proxy) -> None:
         chain = _Chain()
@@ -195,8 +198,8 @@ class TestCommitHead:
             resp.body = b"<Error><Code>PreconditionFailed</Code></Error>"
 
         s3_proxy.add("PUT_IF", _head(chain), Edit(response=refused))
-        assert await commit_head(store, mine, base) is not None
-        assert s3_proxy.bucket.read(head_key(chain.instance_id)) == mine.data
+        etag = await commit_head(store, mine, base)
+        assert await store.get(head_object(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (mine.data, etag)
 
     async def test_refused_write_under_a_foreign_head_is_a_conflict(self, store: InstanceStore) -> None:
         """Every write was refused and the head is another one: nothing of this save landed, so
@@ -250,7 +253,7 @@ class TestCommitHead:
     async def test_deleted_during_save(self, store: InstanceStore) -> None:
         chain = _Chain()
         base = await _save(store, chain, chain.next(1), Base(etag=None, commit_id=None))
-        await store.delete_many([head_key(chain.instance_id)])
+        await store.delete_many([head_object(chain.instance_id)])
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_NOT_FOUND) as exc:
             await commit_head(store, chain.next(2), base)
         assert exc.value.action == "RECREATE"
@@ -260,7 +263,7 @@ class TestCommitHead:
         commit = chain.next(1)
         s3_proxy.add("PUT_IF", _head(chain), DropAfter(), times=None)
         etag = await commit_head(store, commit, Base(etag=None, commit_id=None))
-        assert await store.get(head_key(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (commit.data, etag)
+        assert await store.get(head_object(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (commit.data, etag)
 
     async def test_first_save_lost_request_is_resent(self, store: InstanceStore, s3_proxy: S3Proxy) -> None:
         chain = _Chain()
@@ -268,7 +271,7 @@ class TestCommitHead:
         _lost_until_read_back(s3_proxy, chain)
         etag = await commit_head(store, commit, Base(etag=None, commit_id=None))
         _resent_once_after_read_back(s3_proxy, chain, since=0)
-        assert await store.get(head_key(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (commit.data, etag)
+        assert await store.get(head_object(chain.instance_id), max_bytes=head.MAX_HEAD_BYTES) == (commit.data, etag)
 
     async def test_first_save_still_absent_after_the_resend_is_unknown(
         self, store: InstanceStore, s3_proxy: S3Proxy
@@ -289,7 +292,7 @@ class TestCommitHead:
             ("PUT_IF", 0),
             ("GET", 404),
         ]
-        assert not s3_proxy.bucket.exists(head_key(chain.instance_id))
+        assert not s3_proxy.bucket.exists(head_object(chain.instance_id))
 
     async def test_store_error_on_the_resend_after_an_unanswered_write_is_unknown(
         self, store: InstanceStore, s3_proxy: S3Proxy
@@ -299,7 +302,7 @@ class TestCommitHead:
         that nothing of this save applied)."""
         chain = _Chain()
         base = await _save(store, chain, chain.next(1), Base(etag=None, commit_id=None))
-        before = s3_proxy.bucket.read(head_key(chain.instance_id))
+        before = s3_proxy.bucket.read(head_object(chain.instance_id))
         s3_proxy.add("PUT_IF", _head(chain), DropBefore())
         s3_proxy.add("PUT_IF", _head(chain), Fail(403, "AccessDenied"), skip=1)
         with pytest.raises(
@@ -309,7 +312,7 @@ class TestCommitHead:
         cause = exc.value.__cause__
         assert isinstance(cause, ConfigError)
         assert cause.code is ErrorCode.INSTANCE_CONFIG
-        assert s3_proxy.bucket.read(head_key(chain.instance_id)) == before
+        assert s3_proxy.bucket.read(head_object(chain.instance_id)) == before
 
     async def test_store_error_on_the_resend_after_refused_writes_is_raised(
         self, store: InstanceStore, s3_proxy: S3Proxy
@@ -318,7 +321,7 @@ class TestCommitHead:
         is raised as it is (no write of this save applied), never "unknown"."""
         chain = _Chain()
         base = await _save(store, chain, chain.next(1), Base(etag=None, commit_id=None))
-        before = s3_proxy.bucket.read(head_key(chain.instance_id))
+        before = s3_proxy.bucket.read(head_object(chain.instance_id))
         s3_proxy.add("PUT_IF", _head(chain), Fail(412, "PreconditionFailed"))
         s3_proxy.add("PUT_IF", _head(chain), Fail(403, "AccessDenied"), skip=1)
         with pytest.raises(
@@ -326,7 +329,7 @@ class TestCommitHead:
         ) as exc:
             await commit_head(store, chain.next(2), base)
         assert exc.value.action == "FIX_CONFIG"
-        assert s3_proxy.bucket.read(head_key(chain.instance_id)) == before
+        assert s3_proxy.bucket.read(head_object(chain.instance_id)) == before
 
     async def test_own_commit_superseded_before_read_back_returns_none(
         self, store: InstanceStore, s3_proxy: S3Proxy
@@ -372,9 +375,9 @@ class TestCommitHead:
         base = await _save(store, chain, chain.next(1), Base(etag=None, commit_id=None))
         mine = chain.next(2)
         forged = head.seal_head(header=mine.header, body=_Empty(), data_key=secrets.token_bytes(32))
-        await asyncio.to_thread(s3_proxy.bucket.write, head_key(chain.instance_id), forged)
+        await asyncio.to_thread(s3_proxy.bucket.write, head_object(chain.instance_id), forged)
         # My write gets no answer (it may have landed), so only the read-back can decide.
         s3_proxy.add("PUT_IF", _head(chain), DropAfter(), times=None)
         with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN):
             await commit_head(store, mine, base)
-        assert s3_proxy.bucket.read(head_key(chain.instance_id)) == forged
+        assert s3_proxy.bucket.read(head_object(chain.instance_id)) == forged

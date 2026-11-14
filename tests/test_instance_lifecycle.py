@@ -36,6 +36,7 @@ from exec_sandbox.exceptions import (
     ErrorCode,
     InstanceGoneError,
     InstanceNotSavedWarning,
+    InvalidInputError,
     OutcomeUnknownError,
     SessionClosedError,
     TransientError,
@@ -281,7 +282,7 @@ async def _close_quietly(forks: list[Fork]) -> None:
             await fork.session.close()
 
 
-# ----------------------------------------------------------------------------- 4: generations
+# ----------------------------------------------------------------------------- generations
 
 
 class TestGenerations:
@@ -321,7 +322,7 @@ class TestGenerations:
         assert env.work_files() == set()
 
 
-# ----------------------------------------------------------------------------- 5-6: one session, FIFO
+# ----------------------------------------------------------------------------- one session, FIFO
 
 
 class TestOneSession:
@@ -405,7 +406,7 @@ class TestOneSession:
         assert env.work_files() == set()
 
 
-# ----------------------------------------------------------------------------- 7-9: close, cancel, drain
+# ----------------------------------------------------------------------------- close, cancel, drain
 
 
 _PHASES = ["migrate", "body-put", "head-put"]
@@ -552,10 +553,57 @@ class TestCloseDuringSave:
 
 
 class TestWorkFileRemoval:
+    async def test_drain_waits_for_a_load_in_flight(self, lab: Lab) -> None:
+        """A load downloads when drain() starts (a reuse() while the Scheduler stops): drain()
+        returns only after the load ended, so the store clients and the work folder never go
+        under it."""
+        env = lab.env
+        instance_id = await lab.base(seed=17)
+        (key,) = env.bucket.body_keys(instance_id)
+        gate = env.proxy.add("GET", _exact(key), Hold())
+        loading = asyncio.create_task(env.load(instance_id, manager=env.manager))
+        await _within(gate.reached.wait())
+        try:
+            draining = asyncio.create_task(env.manager.drain())
+        finally:
+            gate.release()
+        await _within(draining)
+        assert loading.done()
+        await env.manager.release(loading.result())
+        assert env.work_files() == set()
+
+    async def test_stop_refuses_a_save_that_starts_after_it(self, lab: Lab) -> None:
+        """stop() (what Scheduler exit awaits) refuses a save that starts while it waits for a
+        load in flight: sessions that keep saving cannot hold the exit (drain() alone waits for
+        every call that starts). The load in flight still ends before stop() returns."""
+        env = lab.env
+        instance_id = await lab.base(seed=17)
+        fork = await lab.new(18, instance_id=None)
+        (key,) = env.bucket.body_keys(instance_id)
+        gate = env.proxy.add("GET", _exact(key), Hold())
+        loading = asyncio.create_task(env.load(instance_id, manager=env.manager))
+        await _within(gate.reached.wait())
+        stopping = asyncio.create_task(env.manager.stop())
+        try:
+            await asyncio.sleep(0)  # stop() began: it waits for the load
+            with pytest.raises(
+                InvalidInputError,
+                check=lambda e: e.code is ErrorCode.SCHEDULER_STATE,
+                match=r"^The scheduler is stopping: no save or load starts now$",
+            ):
+                await fork.session.save()
+        finally:
+            gate.release()
+        await _within(stopping)
+        assert loading.done()
+        await env.manager.release(loading.result())
+        await fork.session.close()
+
     async def test_drain_returns_when_only_ended_jobs_remain(self, lab: Lab) -> None:
         """A job that ended but whose discard callback has not run yet (a window a loaded
         host hits): drain() must return, not spin. White-box: no public call can hold
-        the set in that state. The old `while` loop never yields here (the test times out)."""
+        the set in that state. A drain() that loops without a yield never returns here (the test
+        times out)."""
         manager = lab.env.manager
         ended = asyncio.ensure_future(asyncio.sleep(0))
         await ended
@@ -677,7 +725,7 @@ class TestWorkFileRemoval:
         assert env.work_files() == files
 
 
-# ----------------------------------------------------------------------------- 10: disk full
+# ----------------------------------------------------------------------------- disk full
 
 
 class TestDiskFull:
@@ -847,11 +895,35 @@ class TestCleanupFailure:
                 for record in caplog.records
                 if record.getMessage() == "Instance work file not removed"
             }
-            assert logged >= {str(path) for path in kept}
+            assert logged == {str(path) for path in (*kept, folder)}  # each file, then the folder
             assert all(path.exists() for path in kept)
         finally:
             folder.chmod(0o700)
             shutil.rmtree(folder)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root looks into a folder it may not search")
+    async def test_close_logs_a_work_folder_it_cannot_look_at(self, lab: Lab, caplog: pytest.LogCaptureFixture) -> None:
+        """The work folder of a closing session cannot even be looked at (EACCES: no search
+        access to the folder above it): close still returns, and the folder is logged."""
+        env = lab.env
+        instance_id = await lab.base(seed=18)
+        fork = await lab.reuse(instance_id)
+        assert fork.state is not None
+        folder = fork.state.folder
+        await _within(env.manager.drain())
+        env.work_dir.chmod(0o600)
+        try:
+            with caplog.at_level(logging.WARNING, logger="exec_sandbox"):
+                await fork.session.close()
+        finally:
+            env.work_dir.chmod(0o700)
+        logged = [
+            record.path  # type: ignore[attr-defined]
+            for record in caplog.records
+            if record.getMessage() == "Instance work file not removed"
+        ]
+        assert logged == [str(folder)]
+        shutil.rmtree(folder)
 
     async def test_refused_save_keeps_its_error(self, lab: Lab, monkeypatch: pytest.MonkeyPatch) -> None:
         """The new files of a refused save cannot be removed (EIO): the caller still gets the
@@ -876,7 +948,7 @@ class TestCleanupFailure:
         await lab.check(instance_id, 2)
 
 
-# ----------------------------------------------------------------------------- 13-17: forks and delete
+# ----------------------------------------------------------------------------- forks and delete
 
 
 def _assert_loser(fork: Fork, error: BaseException, instance_id: str) -> None:

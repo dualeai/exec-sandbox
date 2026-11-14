@@ -2,6 +2,7 @@
 
 import contextlib
 import errno
+import io
 import json
 import os
 import random
@@ -9,7 +10,7 @@ import secrets
 import signal
 import time
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Buffer, Callable, Mapping
 from pathlib import Path
 from unittest.mock import patch
 
@@ -205,14 +206,43 @@ class TestChain:
         assert pack.stat().st_size < full.stat().st_size / 16
 
 
+class _DiskFullAtSecondWrite(io.BufferedWriter):
+    """The object file of a full disk: the first write reaches the file, the next one fails (ENOSPC)."""
+
+    writes = 0
+
+    def write(self, data: Buffer, /) -> int:
+        self.writes += 1
+        if self.writes > 1:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        written = super().write(data)
+        self.flush()
+        return written
+
+
 class TestWriteFailure:
-    def test_failed_write_leaves_no_object(self, tmp_path: Path) -> None:
-        """ENOSPC or a vanished stream mid-write: no partial object stays behind."""
-        ram = _stream(tmp_path / "ram", {0: b"x"})
-        streams = {0: (ram, None), 1: (tmp_path / "gone", None)}
-        with pytest.raises(FileNotFoundError):
-            write_object(tmp_path / "obj", data_key=_KEY, instance_id=_ID, commit_id=ids.new_id(), streams=streams)
-        assert not (tmp_path / "obj").exists()
+    @pytest.mark.parametrize("fault", ["vanished-stream", "disk-full"])
+    def test_failed_write_leaves_no_object(self, tmp_path: Path, fault: str) -> None:
+        """A stream gone before its turn, or ENOSPC after the first record reached the file:
+        the error goes to the caller and no partial object stays behind."""
+        ram = _stream(tmp_path / "ram", {0: b"x", 1: b"y"})
+        obj = tmp_path / "obj"
+        if fault == "vanished-stream":
+            streams = {0: (ram, None), 1: (tmp_path / "gone", None)}
+            with pytest.raises(FileNotFoundError):
+                write_object(obj, data_key=_KEY, instance_id=_ID, commit_id=ids.new_id(), streams=streams)
+        else:
+            seen: list[int] = []
+
+            def disk_full(fd: int, mode: str) -> _DiskFullAtSecondWrite:
+                assert mode == "wb"
+                seen.append(os.fstat(fd).st_ino)
+                return _DiskFullAtSecondWrite(io.FileIO(fd, "wb"))
+
+            with patch.object(os, "fdopen", disk_full), pytest.raises(OSError, check=lambda e: e.errno == errno.ENOSPC):
+                write_object(obj, data_key=_KEY, instance_id=_ID, commit_id=ids.new_id(), streams={0: (ram, None)})
+            assert len(seen) == 1  # the object file was made, then removed
+        assert not obj.exists()
 
 
 class TestTamper:

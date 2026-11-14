@@ -267,7 +267,7 @@ class LocalInstanceStore(InstanceStore):
         src_fd = os.open(src, os.O_RDONLY)  # a missing or unreadable source stays an OSError (a local file)
         try:
             with self._staging_file() as (staging, staged):
-                clone_sparse_fd(src_fd, staged, dst_dir_fd=staging)
+                clone_sparse_fd(src_fd, staged, dst_dir_fd=staging, stop=stop)
                 fd = os.open(staged, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=staging)
                 try:
                     os.fchmod(fd, 0o600)  # clonefile copies the mode of the source
@@ -291,9 +291,10 @@ class LocalInstanceStore(InstanceStore):
         return etag
 
     def _download(
-        self, _stop: threading.Event, *, key: str, parts: _Parts, dest: Path, max_bytes: int, expected_size: int | None
+        self, stop: threading.Event, *, key: str, parts: _Parts, dest: Path, max_bytes: int, expected_size: int | None
     ) -> bool:
-        """A cancel needs no stop point: the clone runs to its end, then `undo` removes `dest`."""
+        """A cancel stops a copy of the data at its next chunk (it removes `dest`); a clone,
+        one call, ends first, then `undo` removes `dest`."""
         try:
             fd = self._open_key(key, parts)
         except OSError as e:
@@ -307,7 +308,7 @@ class LocalInstanceStore(InstanceStore):
             if held.st_size > max_bytes:
                 raise wrong_size(key, held.st_size, expected=f"at most {max_bytes}")
             # A clone of the open file: an object file never changes in place, so this is one version.
-            clone_sparse_fd(fd, dest, dst_dir_fd=None)
+            clone_sparse_fd(fd, dest, dst_dir_fd=None, stop=stop)
             dest.chmod(0o600)
         except FileExistsError:
             raise  # `dest` is another file: keep it
@@ -424,7 +425,8 @@ class LocalInstanceStore(InstanceStore):
 
     @contextlib.contextmanager
     def _staging_file(self) -> Generator[tuple[int, str]]:
-        """The staging folder (open) and a new name in it. A file of that name is removed at exit (after a rename, there is none)."""
+        """The staging folder (open) and a new name in it. A file of that name is removed
+        at exit (after a rename, there is none)."""
         staging = _make_child(self._root_fd, _STAGING_NAME)
         name = f"{new_id()}.part"
         try:

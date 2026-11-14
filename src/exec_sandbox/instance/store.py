@@ -160,6 +160,7 @@ class InstanceStore(ABC):
         """Bytes of the object at `key`, or None when it does not exist."""
 
     async def exists(self, key: str, /) -> bool:
+        """True when an object is at `key` (one `size` call)."""
         return await self.size(key) is not None
 
     @abstractmethod

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
+import grp
 import hashlib
 import multiprocessing
 import os
@@ -190,20 +191,16 @@ class TestRaces:
             assert isinstance(base, Applied)
             etag = base.etag
 
-        async def write(n: int) -> bool:
+        async def write(n: int) -> Applied | NotApplied:
             data = f"writer-{n}".encode()
             if etag is None:
-                result = await store.put_if_absent(_HEAD, data=data)
-            else:
-                result = await store.put_if_match(_HEAD, data=data, etag=etag)
-            assert result == NotApplied(maybe_applied=False) or isinstance(result, Applied)
-            return isinstance(result, Applied)
+                return await store.put_if_absent(_HEAD, data=data)
+            return await store.put_if_match(_HEAD, data=data, etag=etag)
 
-        applied = await asyncio.gather(*(write(n) for n in range(20)))
-        assert applied.count(True) == 1
-        got = await store.get(_HEAD, max_bytes=_MAX)
-        assert got is not None
-        assert got[0] == f"writer-{applied.index(True)}".encode()
+        results = await asyncio.gather(*(write(n) for n in range(20)))
+        (winner,) = [n for n, result in enumerate(results) if isinstance(result, Applied)]
+        assert results[:winner] + results[winner + 1 :] == [NotApplied(maybe_applied=False)] * 19
+        assert await store.get(_HEAD, max_bytes=_MAX) == (f"writer-{winner}".encode(), results[winner].etag)
 
     async def test_readers_never_see_a_half_written_object(self, store: LocalInstanceStore, root: Path) -> None:
         await store.put_if_absent(_HEAD, data=_payload(0xFFFFFFFF))
@@ -234,15 +231,20 @@ class TestRaces:
 
 
 class TestCrashAndCancel:
-    async def test_killed_writer_frees_the_lock(self, store: LocalInstanceStore, root: Path) -> None:
+    async def test_killed_writer_frees_the_lock(
+        self, store: LocalInstanceStore, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A writer of another process holds the flock and is killed: the waiting write then applies."""
         ctx = multiprocessing.get_context("spawn")
         held = ctx.Event()
         holder = ctx.Process(target=_child_hold_lock, args=(str(root), held))
         holder.start()
         try:
             assert await asyncio.to_thread(held.wait, _WAIT)
+            asked = _signal_lock_requests(monkeypatch)
             write = asyncio.create_task(store.put_if_absent(_HEAD, data=b"after"))
-            done, _ = await asyncio.wait({write}, timeout=0.5)
+            assert await asyncio.to_thread(asked.wait, _WAIT)  # the write asked for the lock
+            done, _ = await asyncio.wait({write}, timeout=0.2)
             assert not done, "the write did not wait for the lock"
             assert holder.pid is not None
             os.kill(holder.pid, signal.SIGKILL)
@@ -284,13 +286,18 @@ class TestCrashAndCancel:
         assert (await store.get(_HEAD, max_bytes=_MAX) or (b"", ""))[0] == b"first"  # applied whole
         assert not _lock_is_held(root)
 
-    async def test_cancel_before_the_lock_applies_nothing(self, store: LocalInstanceStore, root: Path) -> None:
+    async def test_cancel_before_the_lock_applies_nothing(
+        self, store: LocalInstanceStore, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A conditional write cancelled while it waits for the flock: nothing is written, no
+        staging file stays."""
         fd = os.open(root / ".lock", os.O_RDWR)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)  # another writer holds the lock
+            asked = _signal_lock_requests(monkeypatch)
             write = asyncio.create_task(store.put_if_absent(_HEAD, data=b"never"))
-            done, _ = await asyncio.wait({write}, timeout=0.2)
-            assert not done
+            assert await asyncio.to_thread(asked.wait, _WAIT)  # the write waits for the lock
+            assert not write.done()
             write.cancel()
             await asyncio.sleep(0)  # one loop turn: the call takes the cancel and stops its job
         finally:
@@ -361,16 +368,31 @@ class TestCrashAndCancel:
         assert not list((root / ".tmp").iterdir())
         assert not _lock_is_held(root)
 
-    async def test_cancelled_download_leaves_no_file(self, store: LocalInstanceStore, tmp_path: Path) -> None:
+    async def test_cancelled_download_leaves_no_file(
+        self, store: LocalInstanceStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cancel comes while the copy job runs; the job ends after it (a clone has no stop
+        point): the file it made is removed."""
         (tmp_path / "src").write_bytes(os.urandom(1000))
         await store.upload("k", src=tmp_path / "src")
         dest = tmp_path / "dest"
+        started, go_on = threading.Event(), threading.Event()
+        clone = local_store.clone_sparse_fd
+
+        def held_clone(*args: Any, **kwargs: Any) -> bool:
+            started.set()
+            go_on.wait(_WAIT)
+            return clone(*args, **kwargs)
+
+        monkeypatch.setattr(local_store, "clone_sparse_fd", held_clone)
         task = asyncio.create_task(store.download("k", dest=dest, max_bytes=_MAX, expected_size=None))
-        await asyncio.sleep(0)  # the job starts
+        assert await asyncio.to_thread(started.wait, _WAIT)
         task.cancel()
+        go_on.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert not dest.exists()  # removed even when the job ended before the cancel reached it
+        assert not dest.exists()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["src", "store"]
 
 
 # ---------------------------------------------------------------- disk failures
@@ -582,8 +604,13 @@ class TestOpen:
     ) -> None:
         """Another user who can write a parent folder can put another folder in place of the root
         (OpenSSH StrictModes): every folder above the root must be writable only by root or this
-        user. Its group is not this user's private group here (that one passes)."""
-        monkeypatch.setattr("exec_sandbox.permission_utils._group_is_this_users", lambda _gid: False)
+        user. The group database lists another member in the folder's group here, so it is not
+        this user's private group (that one passes on Linux; macOS never reads the database)."""
+
+        def shared_group(gid: int) -> grp.struct_group:
+            return grp.struct_group(("shared", "x", gid, ["another-user"]))
+
+        monkeypatch.setattr(grp, "getgrgid", shared_group)
         shared = tmp_path / "shared"
         shared.mkdir()
         shared.chmod(mode)

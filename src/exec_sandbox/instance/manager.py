@@ -40,13 +40,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from exec_sandbox import __version__, constants
+from exec_sandbox import constants
 from exec_sandbox._imports import require_s3_instance_store
 from exec_sandbox._logging import get_logger
+from exec_sandbox._version import __version__
+from exec_sandbox.aio_utils import run_stoppable
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
     InstanceGoneError,
+    InvalidInputError,
     OutcomeUnknownError,
     SandboxError,
     TransientError,
@@ -83,10 +86,11 @@ from exec_sandbox.instance.store import (
     instance_prefix,
     probe,
 )
+from exec_sandbox.memory_snapshot_files import home_path_from_vmstate
 from exec_sandbox.migration_client import MigrationClient, migration_timeout
 from exec_sandbox.permission_utils import (
     get_expected_socket_uid,
-    grant_qemu_vm_private_file_access,
+    grant_qemu_vm_acl,
     probe_qemu_vm_user,
 )
 from exec_sandbox.platform_utils import HostArch, detect_host_arch, detect_host_x86_vendor
@@ -302,9 +306,12 @@ class InstanceManager(InstanceAdmin):
         self.work_dir = work_dir
         self.asset_dir = asset_dir
         self._vm_manager = vm_manager
-        self._saves = 0
-        self._no_saves = asyncio.Event()
-        self._no_saves.set()
+        self._calls = 0
+        """Saves and loads in flight (they use the store, the VM and the work folder)."""
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self._stopping = False
+        """stop() began: no save or load starts."""
         self._background: set[asyncio.Task[Any]] = set()
         """Head writes, which run on when their save is cancelled, and the work file
         removals of saves and loads, which run on after their call returns."""
@@ -319,7 +326,9 @@ class InstanceManager(InstanceAdmin):
         memory filesystem), store probe. Each raises ConfigError INSTANCE_CONFIG
         (FIX_CONFIG; MIGRATION_UNSUPPORTED for a QEMU below the floor), or
         TransientError INSTANCE_STORE_UNAVAILABLE when the store does not answer. A
-        store whose extra is not installed raises ConfigError EXTRA_MISSING."""
+        store whose extra is not installed raises ConfigError EXTRA_MISSING. When the
+        block ends, the saves, loads and background jobs still in flight end (drain)
+        before the store closes."""
         async with _open_store(settings) as (store, keyring):
             qemu = await probe_qemu_version()
             if qemu is None or qemu < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
@@ -348,13 +357,17 @@ class InstanceManager(InstanceAdmin):
                 "Instance store ready",
                 extra={"store": settings.instance_store, "key_ids": [key.id for key in keyring.keys]},
             )
-            yield cls(
+            manager = cls(
                 store=store,
                 keyring=keyring,
                 work_dir=work_dir,
                 asset_dir=settings.instance_asset_dir,
                 vm_manager=vm_manager,
             )
+            try:
+                yield manager
+            finally:
+                await manager.stop()  # the store closes once no call or background job uses it
 
     # ------------------------------------------------------------------ save
 
@@ -381,27 +394,48 @@ class InstanceManager(InstanceAdmin):
         needs no check: delete removes the head first, so its If-Match write fails.
         """
         instance_id = state.instance_id if state is not None else new_instance_id or ids.new_id()
-        self._saves += 1
-        self._no_saves.clear()
-        try:
-            with _named(instance_id):
-                return await self._save(vm, state, instance_id=instance_id)
-        finally:
-            self._saves -= 1
-            if not self._saves:
-                self._no_saves.set()
+        with self._in_flight(), _named(instance_id):
+            return await self._save(vm, state, instance_id=instance_id)
+
+    async def stop(self) -> None:
+        """Refuse new saves and loads (InvalidInputError SCHEDULER_STATE), then wait until
+        the calls and background jobs in flight end (drain). Shutdown calls it before the VMs,
+        the work folder and the store clients go: drain() alone waits on for as long as
+        sessions start new saves."""
+        self._stopping = True
+        await self.drain()
 
     async def drain(self) -> None:
-        """Wait until no save and no background job runs: a head write runs on after
-        its save is cancelled, and the work files of a save or a load (folders, body
-        objects, an asset's .part file) are removed in a worker thread after it
-        returns. Shutdown calls it before the VMs, the work folder and the store
-        clients go."""
-        await self._no_saves.wait()
-        # Only jobs that have not ended: a gather of ended jobs completes without a yield,
-        # so their discard callbacks never run and a `while self._background` loop spins.
-        while running := [job for job in self._background if not job.done()]:
-            await asyncio.gather(*running, return_exceptions=True)
+        """Wait until no save, no load and no background job runs: a head write runs on
+        after its save is cancelled, and the work files of a save or a load (folders, body
+        objects, an asset's .part file) are removed in a worker thread after it returns.
+        A call that starts meanwhile is waited for too. Shutdown calls it before the VMs,
+        the work folder and the store clients go."""
+        while not (self._idle.is_set() and all(job.done() for job in self._background)):
+            await self._idle.wait()
+            # Only jobs that have not ended: a gather of ended jobs completes without a yield,
+            # so their discard callbacks never run and a loop on `self._background` spins.
+            await asyncio.gather(*[job for job in self._background if not job.done()], return_exceptions=True)
+
+    @contextlib.contextmanager
+    def _in_flight(self) -> Generator[None]:
+        """A save or a load: drain() waits for it. Refused once stop() began."""
+        if self._stopping:
+            raise InvalidInputError(
+                "The scheduler is stopping: no save or load starts now",
+                code=ErrorCode.SCHEDULER_STATE,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
+        self._calls += 1
+        self._idle.clear()
+        try:
+            yield
+        finally:
+            self._calls -= 1
+            if not self._calls:
+                self._idle.set()
 
     def _in_background[T](self, job: Coroutine[Any, Any, T]) -> asyncio.Task[T]:
         """Run `job` on its own: it ends even when its caller is cancelled or returns
@@ -432,7 +466,8 @@ class InstanceManager(InstanceAdmin):
         obj: Path | None = None
         with _local_files(instance_id, step="saving"):
             folder = state.folder if state is not None else self._new_folder(instance_id)
-            vmstate, home = folder / f"{commit_id}.vmstate", folder / f"{commit_id}.home"
+            vmstate = folder / f"{commit_id}.vmstate"
+            home = home_path_from_vmstate(vmstate)  # where VmManager.restore_vm looks for it
             try:
                 await self._snapshot(vm, vmstate=vmstate, home=home)
                 facts = await self._host_facts(vm)
@@ -575,7 +610,7 @@ class InstanceManager(InstanceAdmin):
         """Migration file and a copy of the home disk, both of one stopped instant."""
         qemu_version = await probe_qemu_version()
         new_stream_file(vmstate)
-        if vm.use_qemu_vm_user and not await grant_qemu_vm_private_file_access(vmstate):
+        if vm.use_qemu_vm_user and not await grant_qemu_vm_acl([vmstate], perms="rw"):
             raise ConfigError(
                 "Could not give qemu-vm write access to the migration file (needs setfacl, package acl)",
                 code=ErrorCode.HOST_DEPENDENCY,
@@ -585,7 +620,10 @@ class InstanceManager(InstanceAdmin):
             )
 
         async def copy_home() -> None:  # the VM is stopped: the copy matches the saved RAM
-            await asyncio.to_thread(clone_sparse, vm.workdir.home_disk, home)
+            # A cancel resumes the VM (save_snapshot): the copy stops first (a copy of the data
+            # at its next chunk), so none runs on to read a disk the guest writes, into a folder
+            # the save removes
+            await run_stoppable(lambda stop: clone_sparse(vm.workdir.home_disk, home, stop=stop), undo=None)
 
         async with MigrationClient(vm.qmp_socket, get_expected_socket_uid(vm.use_qemu_vm_user)) as client:
             try:
@@ -690,7 +728,7 @@ class InstanceManager(InstanceAdmin):
         """
         previous_etag: str | None = None
         missing: str | None = None
-        with _named(instance_id):
+        with self._in_flight(), _named(instance_id):
             for _ in range(_LOAD_ATTEMPTS):
                 got = await self.store.get(head_key(instance_id), max_bytes=MAX_HEAD_BYTES)
                 if got is None:
@@ -765,7 +803,8 @@ class InstanceManager(InstanceAdmin):
         _VanishedError. On an error or a cancel, the downloads stop; load() then
         starts the removal of the folder with every file in it (drain() waits for it)."""
         instance_id = header.instance_id
-        vmstate, home = folder / f"{header.commit_id}.vmstate", folder / f"{header.commit_id}.home"
+        vmstate = folder / f"{header.commit_id}.vmstate"
+        home = home_path_from_vmstate(vmstate)  # where VmManager.restore_vm looks for it
         new_stream_file(vmstate)
         new_stream_file(home)
         objects = [folder / f"{entry.commit_id}.{_OBJECT_KIND[entry.kind]}" for entry in body.chain]
@@ -811,7 +850,7 @@ class InstanceManager(InstanceAdmin):
             raise
         finally:
             _close_after(applying, list(targets.values()))
-        if await probe_qemu_vm_user() and not await grant_qemu_vm_private_file_access(vmstate):
+        if await probe_qemu_vm_user() and not await grant_qemu_vm_acl([vmstate], perms="rw"):
             raise ConfigError(
                 "Could not give qemu-vm read access to the migration file (needs setfacl, package acl)",
                 code=ErrorCode.HOST_DEPENDENCY,
@@ -842,7 +881,7 @@ class InstanceManager(InstanceAdmin):
         bytes do not have."""
         key = asset_key(digest)
         if await self.store.size(key) != path.stat().st_size:  # missing or cut: (re)upload
-            if await file_hash(path) != digest:
+            if await file_hash(path, "sha256") != digest:
                 raise ConfigError(
                     f"Guest image {path} does not match its recorded digest {digest} (changed or damaged). "
                     "It was not stored.",
@@ -889,7 +928,7 @@ class InstanceManager(InstanceAdmin):
                 asset_key(digest), dest=part, max_bytes=_MAX_ASSET_BYTES, expected_size=None
             ):
                 problem = "not on this worker, not in the store"
-            elif await file_hash(part) != digest:
+            elif await file_hash(part, "sha256") != digest:
                 problem = "the store's copy does not match its digest"
             else:
                 part.replace(cached)
@@ -986,7 +1025,7 @@ def _remove_quietly(*paths: Path) -> None:
             logger.warning("Instance work file not removed", extra={"path": str(path), "error": str(error)})
 
     for path in paths:
-        if path.is_dir():
+        if os.path.isdir(path):  # noqa: PTH112 - never raises; Path.is_dir of Python 3.12 raises on EACCES or EIO
             shutil.rmtree(path, onexc=not_removed)
             continue
         try:

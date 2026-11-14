@@ -6,6 +6,7 @@ moto does not make a conditional PUT atomic, so two writers can both win.
 """
 
 import asyncio
+import dataclasses
 import hashlib
 import io
 import logging
@@ -153,8 +154,13 @@ async def _saves_while_busy(sessions: list[Session], busy: list[Session]) -> lis
 @pytest.mark.parametrize("count", [4, pytest.param(12, marks=pytest.mark.slow)], ids=["4", "12"])
 async def test_many_instances_save_at_once(instance_world: InstanceWorld, primed_l1_dir: Path, count: int) -> None:
     """`count` sessions (mixed languages) make their first saves at once, then their packs at
-    once, while other sessions run code. Each instance keeps its own state and store objects."""
-    world = instance_world
+    once, while other sessions run code. Each instance keeps its own state and store objects.
+    The CPU budget holds all the VMs: the CPU gate is not what this test checks. 12 + 2 VMs
+    need 14 x 1.25 = 17.5 CPU; the largest ratio (20) and no reserve give 20 CPU on a 1-CPU host."""
+    world = dataclasses.replace(
+        instance_world,
+        base=instance_world.base.model_copy(update={"cpu_overcommit_ratio": 20.0, "host_cpu_reserve_cores": 0.0}),
+    )
     languages = [list(Language)[i % len(Language)] for i in range(count)]
     async with world.scheduler(
         memory_snapshot_cache_dir=primed_l1_dir, warm_pool_size=0, disk_snapshot_cache_dir=None

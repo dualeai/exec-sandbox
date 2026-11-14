@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import http.client
 import os
 import random
 import re
+import socket
 from typing import TYPE_CHECKING
 
 import pytest
@@ -35,9 +37,11 @@ from exec_sandbox.instance.manager import MAX_CHAIN_PACKS
 from exec_sandbox.instance.models import ChainEntry, HeadBody
 from exec_sandbox.instance.pack import write_object
 from exec_sandbox.instance.s3_store import S3InstanceStore
-from exec_sandbox.instance.store import Applied, InstanceStore, NotApplied, body_key, head_key
+from exec_sandbox.instance.store import Applied, InstanceStore, NotApplied
 from tests.instance_support import (
     BLOCK,
+    GOLDEN_KEY,
+    GOLDEN_KEY_ID,
     NO_VM_TIMEOUT,
     PYTHON,
     FakeVm,
@@ -55,7 +59,6 @@ from tests.instance_support import (
     head_header,
     head_object,
     kinds,
-    new_keyring,
     random_block,
     worker_without_base_image,
 )
@@ -71,6 +74,7 @@ from tests.s3_faults import (
     Response,
     S3Proxy,
     Truncate,
+    moto_server,
 )
 
 if TYPE_CHECKING:
@@ -85,8 +89,8 @@ pytestmark = NO_VM_TIMEOUT
 _MAX = 1024 * 1024
 _REGION = "us-east-1"
 _PART = s3_store._PART_BYTES  # pyright: ignore[reportPrivateUsage]
-"""S3 part and ranged-GET size (a tuning value, from the code): a body object of at most one
-part loads with one GET; a larger one with a HEAD, then ranged GETs pinned to its ETag."""
+"""S3 part and ranged-GET size, read from the code (a tuning value: no setting gives it). A body
+object of at most one part loads with one GET; a larger one with a HEAD, then ranged GETs pinned to its ETag."""
 _POSITION = {"full": 0, "first": 1, "middle": 2, "last": 3}
 """Objects of a chain of one full copy and three packs."""
 
@@ -156,6 +160,25 @@ async def _reuse(env: InstanceEnv, instance_id: str, *, manager: InstanceManager
 # ----------------------------------------------------------------------------- the proxy itself
 
 
+def test_moto_server_binds_with_no_name_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The moto server starts and answers while every name lookup fails: a lookup of its
+    address at bind (http.server's getfqdn) blocked over 10 s on macOS runners."""
+
+    def no_lookup(*_args: object) -> None:
+        raise AssertionError("name lookup")
+
+    monkeypatch.setattr(socket, "getfqdn", no_lookup)
+    monkeypatch.setattr(socket, "gethostbyaddr", no_lookup)
+    with moto_server("127.0.0.1") as server:
+        assert server.server_name == "127.0.0.1"
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+        try:
+            connection.request("POST", "/moto-api/reset")
+            assert connection.getresponse().status == 200
+        finally:
+            connection.close()
+
+
 class TestProxy:
     """The fault proxy itself: each action does what the chain tests rely on."""
 
@@ -189,7 +212,9 @@ class TestProxy:
         ):
             await store.get("k", max_bytes=_MAX)
         assert (rule.hits, s3_proxy.count("GET", "^k$")) == (1, 1)
-        assert await store.get("k", max_bytes=_MAX) is not None
+        got = await store.get("k", max_bytes=_MAX)
+        assert got is not None
+        assert got[0] == b"x"
 
     async def test_drop_before_never_applies_drop_after_does(self, store: InstanceStore, s3_proxy: S3Proxy) -> None:
         """aiohttp sends an idempotent request (PUT too) once more after a dropped connection:
@@ -301,7 +326,7 @@ class TestProxy:
         assert current[1] == applied[0].etag
 
 
-# ----------------------------------------------------------------------------- 1-3: chain shape
+# ----------------------------------------------------------------------------- chain shape
 
 
 class TestChainShape:
@@ -382,7 +407,7 @@ class TestChainShape:
         await env.check_load(state.instance_id, generation=MAX_CHAIN_PACKS + 2, manager=env.manager, want=None)
 
 
-# ----------------------------------------------------------------------------- 4-8: rollover
+# ----------------------------------------------------------------------------- rollover
 
 
 class TestRollover:
@@ -390,13 +415,13 @@ class TestRollover:
         """A new newest key: the next save is a full copy under it, the old chain goes, and the old key
         alone can no longer read the instance (FIX_CONFIG, not damage)."""
         saver = await _chain(env, packs=1, seed=4, manager=env.manager)
-        new_key = new_keyring()
+        new_key = GOLDEN_KEY
         rotated = env.manager_for(f"{new_key},{env.keyring}")
         worker = await _reuse(env, saver.instance_id, manager=rotated)
         _small_change(worker.vm, 9)
         state = await worker.save()
         assert kinds(state) == ["full"]
-        assert state.header.key_id == Keyring.parse(new_key).latest.id
+        assert state.header.key_id == GOLDEN_KEY_ID
         assert env.bucket.body_keys(state.instance_id) == chain_keys(state)
         await env.check_load(state.instance_id, generation=3, manager=env.manager_for(new_key), want=None)
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.INSTANCE_KEY_MISSING) as exc:
@@ -444,14 +469,14 @@ class TestRollover:
         finally:
             await env.manager.release(loaded)
         assert env.proxy.entries("GET", _exact(old_pack), since=mark)[-1].status == 404
-        assert env.proxy.count("GET", _exact(head_key(state.instance_id)), since=mark) == 2
+        assert env.proxy.count("GET", _exact(head_object(state.instance_id)), since=mark) == 2
 
     async def test_rollover_unknown_outcome_keeps_old_chain(self, env: InstanceEnv) -> None:
         """No answer to the head write and no read-back: unknown outcome (VERIFY), and nothing is
         deleted, since the new head (which landed) needs the new full copy and the old head the old chain."""
         saver = await _chain(env, packs=1, seed=7, manager=env.manager)
         old = chain_keys(saver.state)  # type: ignore[arg-type]
-        head = _exact(head_key(saver.instance_id))
+        head = _exact(head_object(saver.instance_id))
         env.proxy.add("PUT_IF", head, DropAfter(), times=None)
         env.proxy.add("GET", head, Fail(503, "ServiceUnavailable"), times=None)
         _rewrite(saver.vm, 7)
@@ -488,7 +513,7 @@ class TestRollover:
         await env.check_load(saver.instance_id, generation=3, manager=env.manager, want=None)
 
 
-# ----------------------------------------------------------------------------- commit outcome (R1)
+# ----------------------------------------------------------------------------- commit outcome
 
 
 class TestCommitOutcome:
@@ -500,7 +525,7 @@ class TestCommitOutcome:
         this save's alone, so it is deleted."""
         saver = await _chain(env, packs=0, seed=71, manager=env.manager)
         a = await _reuse(env, saver.instance_id, manager=env.manager)
-        head = _exact(head_key(saver.instance_id))
+        head = _exact(head_object(saver.instance_id))
         if outcome == "conflict":
             b = await _reuse(env, saver.instance_id, manager=env.manager)
             _small_change(b.vm, 71)
@@ -519,7 +544,7 @@ class TestCommitOutcome:
         assert env.bucket.exists(uploaded) == (outcome == "unknown")
 
 
-# ----------------------------------------------------------------------------- 9-14: damage at load
+# ----------------------------------------------------------------------------- damage at load
 
 
 _IN_CHAIN_DAMAGE = [
@@ -604,7 +629,7 @@ class TestDamageAtLoad:
         await env.manager.drain()  # the failed load's folder goes in a worker thread
         assert env.work_files() == files
         if damage == "delete":
-            assert env.proxy.count("GET", _exact(head_key(saver.instance_id)), since=mark) == 2
+            assert env.proxy.count("GET", _exact(head_object(saver.instance_id)), since=mark) == 2
         if damage == "delete" or damage in _SIZE_DAMAGE:
             asked = {op: env.proxy.count(op, _exact(key), since=mark) for op in ("GET", "HEAD", "GET_RANGE")}
             assert asked == {"GET": 1, "HEAD": 1, "GET_RANGE": 0}
@@ -613,7 +638,7 @@ class TestDamageAtLoad:
     async def test_head_damage(self, env: InstanceEnv, damage: str) -> None:
         """A missing head is "not found"; a changed, cut, oversized or foreign head is damaged; no body is read."""
         saver = await _chain(env, packs=1, seed=10, manager=env.manager)
-        head = head_key(saver.instance_id)
+        head = head_object(saver.instance_id)
         match damage:
             case "delete":
                 env.bucket.delete(head)
@@ -625,7 +650,7 @@ class TestDamageAtLoad:
                 env.bucket.append(head, bytes(MAX_HEAD_BYTES))
             case "other-instance":
                 twin = await _chain(env, packs=0, seed=1010, manager=env.manager)
-                env.bucket.swap(head_key(twin.instance_id), head)
+                env.bucket.swap(head_object(twin.instance_id), head)
         mark = len(env.proxy.log)
         expected = ErrorCode.INSTANCE_NOT_FOUND if damage == "delete" else ErrorCode.INSTANCE_INTEGRITY
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is expected) as exc:
@@ -636,7 +661,7 @@ class TestDamageAtLoad:
     async def test_older_head_with_its_chain_loads_the_older_generation(self, env: InstanceEnv) -> None:
         """Accepted limit: an authentic older head put back while its chain is stored loads that generation."""
         saver = await _chain(env, packs=0, seed=101, manager=env.manager)
-        head = head_key(saver.instance_id)
+        head = head_object(saver.instance_id)
         older = env.bucket.read(head)
         _small_change(saver.vm, 3)
         await saver.save()
@@ -645,7 +670,7 @@ class TestDamageAtLoad:
 
     async def test_older_head_after_rollover_is_expired(self, env: InstanceEnv) -> None:
         saver = await _chain(env, packs=0, seed=102, manager=env.manager)
-        head = head_key(saver.instance_id)
+        head = head_object(saver.instance_id)
         older = env.bucket.read(head)
         _rewrite(saver.vm, 102)
         assert kinds(await saver.save()) == ["full"]  # the generation-1 chain is deleted
@@ -662,17 +687,17 @@ class TestDamageAtLoad:
         iid = saver.instance_id
         match damage:
             case "loser-orphan":
-                env.bucket.write(body_key(iid, ids.new_id(), "p"), os.urandom(500))
+                env.bucket.write(f"s/{iid}/b/{ids.new_id()}.p", os.urandom(500))
             case "leftovers":
-                env.bucket.write(body_key(iid, ids.new_id(), "f"), os.urandom(5000))
-                env.bucket.write(body_key(iid, ids.new_id(), "p"), os.urandom(500))
+                env.bucket.write(f"s/{iid}/b/{ids.new_id()}.f", os.urandom(5000))
+                env.bucket.write(f"s/{iid}/b/{ids.new_id()}.p", os.urandom(500))
             case "garbage-keys":
                 for name in ("garbage", "x.y.z", "sub/dir/k", f"{ids.new_id()}.q"):
                     env.bucket.write(f"s/{iid}/b/{name}", b"junk")
             case "other-instance":
                 other = ids.new_id()
-                env.bucket.write(head_key(other), b"not a head")
-                env.bucket.write(body_key(other, ids.new_id(), "f"), os.urandom(5000))
+                env.bucket.write(head_object(other), b"not a head")
+                env.bucket.write(f"s/{other}/b/{ids.new_id()}.f", os.urandom(5000))
         await env.check_load(iid, generation=2, manager=env.manager, want=None)
         _small_change(saver.vm, 12)
         state = await saver.save()
@@ -742,7 +767,7 @@ class TestDamageAtLoad:
             commit_id=commit_id,
             streams={0: (block, None), 2: (block, None)},
         )
-        etag = env.bucket.write(body_key(iid, commit_id, "p"), obj.read_bytes())
+        etag = env.bucket.write(f"s/{iid}/b/{commit_id}.p", obj.read_bytes())
         entry = ChainEntry(
             commit_id=commit_id,
             kind="pack",
@@ -759,7 +784,7 @@ class TestDamageAtLoad:
             data_key=state.data_key,
         )
         body = HeadBody(spec=state.body.spec, host=state.body.host, chain=(*state.body.chain, entry))
-        env.bucket.write(head_key(iid), seal_head(header=header, body=body, data_key=state.data_key))
+        env.bucket.write(head_object(iid), seal_head(header=header, body=body, data_key=state.data_key))
         with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
             await env.load(iid, manager=env.manager)
         assert (exc.value.action, exc.value.instance_id) == ("ROUTE", iid)
@@ -940,7 +965,7 @@ class TestDownloadAhead:
         assert env.work_files() == files
 
 
-# ----------------------------------------------------------------------------- 15-18: lineage at save
+# ----------------------------------------------------------------------------- lineage at save
 
 
 _REPAIRABLE = ["delete", "flip-record", "cut-1", "other-commit-same-size", "other-instance-same-size"]
@@ -1071,7 +1096,7 @@ class TestLineage:
     async def test_paginated_list_is_no_false_alarm(self, env: InstanceEnv) -> None:
         saver = await _chain(env, packs=1, seed=183, manager=env.manager)
         for _ in range(2):  # more objects under b/: four pages of one
-            env.bucket.write(body_key(saver.instance_id, ids.new_id(), "p"), b"orphan")
+            env.bucket.write(f"s/{saver.instance_id}/b/{ids.new_id()}.p", b"orphan")
 
         def one_per_page(req: Request) -> None:
             req.query["max-keys"] = "1"
@@ -1093,7 +1118,7 @@ class TestLineage:
         assert kinds(await saver.save()) == ["full", "pack", "pack"]
 
 
-# ----------------------------------------------------------------------------- 19-21: store answers at save
+# ----------------------------------------------------------------------------- store answers at save
 
 
 class TestStoreAnswersAtSave:
@@ -1233,8 +1258,10 @@ class TestErrorsNameTheInstance:
             env.proxy.add(op, "^s/", Fail(503, "ServiceUnavailable"), times=None)
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
             await saver.save()
-        assert exc.value.instance_id is not None
-        assert re.fullmatch(r"[0-9a-f]{32}", exc.value.instance_id)
+        (refused_key,) = {e.key for e in env.proxy.entries(("PUT", "MPU_CREATE"), "^s/")}
+        instance_id = refused_key.split("/")[1]  # s/<instance>/b/<commit>.f
+        assert re.fullmatch(r"[0-9a-f]{32}", instance_id)
+        assert exc.value.instance_id == instance_id
 
     @pytest.mark.parametrize(("call", "op"), [("describe", "GET"), ("delete", "HEAD")])
     async def test_admin_calls_name_the_id(self, env: InstanceEnv, call: str, op: str) -> None:

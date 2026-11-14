@@ -28,7 +28,7 @@ KEY_BYTES = 32
 
 _KEY_ID_LABEL = b"exec-sandbox/v1/key-id"
 _MIN_DISTINCT_BYTES = 16
-"""A random 32-byte key has fewer distinct bytes with probability < 1e-20."""
+"""A random 32-byte key has fewer distinct bytes with probability ~3e-17."""
 _PRINTABLE = range(0x20, 0x7F)
 """A random 32-byte key is all printable ASCII with probability ~2e-14: such a key is a password."""
 

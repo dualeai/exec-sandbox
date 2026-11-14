@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from cryptography.exceptions import InvalidTag
 
-from exec_sandbox import __version__
+from exec_sandbox._version import __version__
 from exec_sandbox.exceptions import RouteError, damaged_instance_data, host_mismatch
 from exec_sandbox.instance.ids import is_commit_id, is_instance_id
 

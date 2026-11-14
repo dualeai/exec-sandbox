@@ -11,14 +11,12 @@ that a Scheduler start does reach them.
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import random
-import secrets
 import sys
 import uuid
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -26,9 +24,7 @@ from click.testing import CliRunner
 from exec_sandbox import Scheduler, SchedulerConfig, __version__
 from exec_sandbox._imports import require_instance_admin
 from exec_sandbox.cli import cli
-from exec_sandbox.cli_keyring import open_local_keyring
 from exec_sandbox.exceptions import ConfigError, ErrorCode, InstanceGoneError, InvalidInputError
-from exec_sandbox.instance.keyring import KEY_BYTES, Keyring
 from exec_sandbox.instance.manager import InstanceManager, open_instance_admin
 from exec_sandbox.instance.models import HostFacts, InstanceInfo, RecentCommit
 from exec_sandbox.models import Language
@@ -37,14 +33,18 @@ from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.vm_spec import VmSpec
 from tests.instance_support import (
     BLOCK,
+    GOLDEN_KEY,
+    GOLDEN_KEY_ID,
     NO_VM_TIMEOUT,
     PYTHON,
     InstanceEnv,
     Saver,
     SparseImage,
+    new_keyring,
     random_block,
     seed_instance,
 )
+from tests.keyring_support import isolate_account
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -62,10 +62,6 @@ _HOST = HostFacts(
     packages_image=None,
     release=__version__,
 )
-
-
-def _key() -> str:
-    return base64.b64encode(secrets.token_bytes(KEY_BYTES)).decode()
 
 
 def _forbid_vm_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -90,14 +86,16 @@ def no_vm_path(monkeypatch: pytest.MonkeyPatch) -> None:
 def settings(request: pytest.FixtureRequest, tmp_path: Path) -> Settings:
     """Store settings of one test, with a fresh keyring: a local folder, or a fresh prefix of the moto bucket."""
     if request.param == "local":
-        return Settings(instance_store="local", instance_store_dir=tmp_path / "instances", instance_keyring=_key())
+        return Settings(
+            instance_store="local", instance_store_dir=tmp_path / "instances", instance_keyring=new_keyring()
+        )
     endpoint_url, _ = request.getfixturevalue("moto_s3_server")
     return Settings(
         instance_store="s3",
         s3_bucket="test-snapshots",
         s3_endpoint_url=endpoint_url,
         s3_instance_prefix=f"inst-{uuid.uuid4().hex}/",
-        instance_keyring=_key(),
+        instance_keyring=new_keyring(),
     )
 
 
@@ -116,7 +114,7 @@ async def test_describe_list_delete(settings: Settings, tmp_path: Path) -> None:
         await seed_instance(
             admin.store, tmp_path, instance_id="mine", keyring=_keyring(settings), spec=_SPEC, host=_HOST
         )
-        await seed_instance(admin.store, tmp_path, instance_id="other", keyring=_key(), spec=_SPEC, host=_HOST)
+        await seed_instance(admin.store, tmp_path, instance_id="other", keyring=new_keyring(), spec=_SPEC, host=_HOST)
         assert sorted([iid async for iid in admin.list_ids()]) == ["mine", "other"]
 
         mine = await admin.describe("mine")
@@ -145,7 +143,7 @@ async def test_list_skips_names_that_are_not_instance_ids(moto_s3_server: Any, t
         s3_bucket="test-snapshots",
         s3_endpoint_url=endpoint_url,
         s3_instance_prefix=prefix,
-        instance_keyring=_key(),
+        instance_keyring=new_keyring(),
     )
     async with open_instance_admin(settings) as admin:
         await seed_instance(
@@ -171,14 +169,15 @@ async def test_ids_that_are_not_instance_ids_are_refused(settings: Settings, tmp
 
 
 async def test_admin_reads_what_the_manager_saved(instance_env: InstanceEnv, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A real save (InstanceManager, fake VM): the admin's describe gives the facts of that save
-    (its commit, the newest key, the SHA-256 of the base image); its delete removes it."""
+    """A real save (InstanceManager, fake VM) with a keyring of two keys: the admin's describe
+    gives the facts of that save (its commit, the id of the newest key, the SHA-256 of the base
+    image); its delete removes it."""
+    keyring = f"{GOLDEN_KEY},{instance_env.keyring}"
     ram, home = SparseImage(size=4 * BLOCK), SparseImage(size=4 * BLOCK)
     ram.put(0, random_block(random.Random(1)))
     home.put(2, random_block(random.Random(2)))
-    saver = Saver(
-        instance_env, await instance_env.new_vm(ram, home, spec=PYTHON), manager=instance_env.manager, state=None
-    )
+    vm = await instance_env.new_vm(ram, home, spec=PYTHON)
+    saver = Saver(instance_env, vm, manager=instance_env.manager_for(keyring), state=None)
     saved = await saver.save()
     instance_id = saved.instance_id
     base_digest = hashlib.sha256(instance_env.base_image.read_bytes()).hexdigest()
@@ -188,7 +187,7 @@ async def test_admin_reads_what_the_manager_saved(instance_env: InstanceEnv, mon
         s3_bucket=proxy.bucket.name,
         s3_endpoint_url=proxy.endpoint_url,
         s3_instance_prefix=proxy.prefix,
-        instance_keyring=instance_env.keyring,
+        instance_keyring=keyring,
     )
     _forbid_vm_path(monkeypatch)
 
@@ -202,7 +201,7 @@ async def test_admin_reads_what_the_manager_saved(instance_env: InstanceEnv, mon
             VmSpec(language=Language.PYTHON),
         )
         assert info.recent_commits == (RecentCommit(generation=1, commit_id=saved.header.commit_id),)
-        assert info.key_id == Keyring.parse(instance_env.keyring).latest.id
+        assert info.key_id == GOLDEN_KEY_ID
         assert info.host is not None
         assert (info.host.base_image, info.host.packages_image, info.host.release) == (base_digest, None, __version__)
         assert await admin.delete(instance_id) is True
@@ -228,7 +227,7 @@ async def test_admin_reads_what_the_manager_saved(instance_env: InstanceEnv, mon
 async def test_bad_settings_refused_before_the_store_opens(tmp_path: Path, fields: dict[str, Any], match: str) -> None:
     """KEY is a fresh valid keyring. The local store's folder is never made."""
     root = tmp_path / "instances"
-    keyring = _key() if fields["instance_keyring"] == "KEY" else fields["instance_keyring"]
+    keyring = new_keyring() if fields["instance_keyring"] == "KEY" else fields["instance_keyring"]
     settings = Settings(**{**fields, "instance_keyring": keyring, "instance_store_dir": root})
     with pytest.raises(ConfigError, match=match, check=lambda e: e.code is ErrorCode.INSTANCE_CONFIG) as exc:
         async with open_instance_admin(settings):
@@ -240,7 +239,9 @@ async def test_bad_settings_refused_before_the_store_opens(tmp_path: Path, field
 async def test_the_vm_path_is_watched(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Control: with the same patches, a Scheduler start, InstanceManager.open and a VmManager fail.
     So the tests above prove that the admin path skips them."""
-    settings = Settings(instance_store="local", instance_store_dir=tmp_path / "instances", instance_keyring=_key())
+    settings = Settings(
+        instance_store="local", instance_store_dir=tmp_path / "instances", instance_keyring=new_keyring()
+    )
     _forbid_vm_path(monkeypatch)
     config = SchedulerConfig(
         instance_store="local", instance_store_dir=settings.instance_store_dir, instance_keyring=_keyring(settings)
@@ -274,14 +275,14 @@ def test_import_guard_names_the_extra(store: str, install: str) -> None:
 @pytest.mark.usefixtures("no_vm_path")
 def test_cli_commands_open_no_vm_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """`sbx instance list | describe | rm` on a local store in tmp_path. The key comes from
-    EXEC_SANDBOX_INSTANCE_KEYRING: the OS keyring fails the test if called. No image folder is made."""
-    root, assets, key = tmp_path / "instances", tmp_path / "assets", _key()
+    EXEC_SANDBOX_INSTANCE_KEYRING: the OS keyring (a dict behind the OS backend class) is never
+    read, and nothing is made under the account's home. No image folder is made."""
+    root, assets, key = tmp_path / "instances", tmp_path / "assets", new_keyring()
     monkeypatch.delenv("EXEC_SANDBOX_INSTANCE_STORE", raising=False)
     monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_STORE_DIR", str(root))
     monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", key)
     monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_ASSET_DIR", str(assets))
-    os_keyring: MagicMock = create_autospec(open_local_keyring, side_effect=AssertionError("OS keyring used"))
-    monkeypatch.setattr("exec_sandbox.cli_keyring.open_local_keyring", os_keyring)
+    account = isolate_account(monkeypatch, home=tmp_path / "account", key=new_keyring())
 
     async def seed() -> None:
         settings = Settings(instance_store="local", instance_store_dir=root, instance_keyring=key)
@@ -301,5 +302,5 @@ def test_cli_commands_open_no_vm_path(tmp_path: Path, monkeypatch: pytest.Monkey
     assert (removed.exit_code, removed.stdout) == (0, "my-vm\n"), removed.output
     assert runner.invoke(cli, ["instance", "list"]).stdout == ""
 
-    os_keyring.assert_not_called()
+    account.assert_untouched()
     assert not assets.exists()

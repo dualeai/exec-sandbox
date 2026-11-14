@@ -5,9 +5,9 @@ writes on one side, `upload` and `list_objects` on the other.
 """
 
 import asyncio
-import contextlib
 import os
 import stat
+import threading
 import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from exec_sandbox.exceptions import ErrorCode, InstanceGoneError
-from exec_sandbox.instance import s3_store
+from exec_sandbox.instance import local_store
 from exec_sandbox.instance.local_store import LocalInstanceStore
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import Applied, InstanceStore, ListedObject, NotApplied, probe
@@ -25,7 +25,8 @@ from tests.s3_faults import BUCKET
 pytestmark = NO_VM_TIMEOUT
 
 _MAX = 1024 * 1024
-_TWO_PARTS_AND_ONE = 2 * s3_store._PART_BYTES + 1  # pyright: ignore[reportPrivateUsage]
+_TWO_PARTS_AND_ONE = 2 * 8 * 1024 * 1024 + 1
+"""Two parts of the S3 store's multipart size (8 MiB) and one byte."""
 
 
 @pytest.fixture(params=["s3", "local"])
@@ -127,12 +128,32 @@ class TestSmallObjects:
         assert not (tmp_path / "dest").exists()
         assert await store.list_objects("a/") == []
 
-    async def test_cancelled_write_is_whole_or_absent(self, store: InstanceStore) -> None:
+    async def test_cancelled_write_is_whole_or_absent(
+        self, store: InstanceStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancel while the write runs: the call raises CancelledError, and the object is
+        whole or absent. The local write (a thread job, which can end before its await on
+        3.13+) is held in its write of the staging file until the cancel is sent; an S3 write
+        cannot end in one loop turn."""
         data = os.urandom(_MAX)
+        started, go_on = threading.Event(), threading.Event()
+        if isinstance(store, LocalInstanceStore):
+            write = local_store.pwrite_all
+
+            def held_write(fd: int, chunk: bytes, offset: int) -> None:
+                started.set()
+                go_on.wait(10)
+                write(fd, chunk, offset)
+
+            monkeypatch.setattr(local_store, "pwrite_all", held_write)
         task = asyncio.create_task(store.put_if_absent("s/a/head", data=data))
-        await asyncio.sleep(0)  # the write starts
+        if isinstance(store, LocalInstanceStore):
+            assert await asyncio.to_thread(started.wait, 10)
+        else:
+            await asyncio.sleep(0)  # the request is under way
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        go_on.set()
+        with pytest.raises(asyncio.CancelledError):
             await task
         got = await store.get("s/a/head", max_bytes=_MAX)
         assert got is None or got[0] == data

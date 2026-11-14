@@ -24,8 +24,8 @@ pytestmark = NO_VM_TIMEOUT
 
 _MAX = 1024 * 1024
 _PART = s3_store._PART_BYTES  # pyright: ignore[reportPrivateUsage]
-"""Multipart part and ranged-GET size of the S3 store (a tuning value, from the code): a larger
-object is a multipart upload and a download of several ranges (the round trip checks it)."""
+"""Multipart part and ranged-GET size of the S3 store, read from the code (a tuning value: no setting
+gives it). A larger object is a multipart upload and a download of several ranges (the round trip checks it)."""
 
 
 @pytest.fixture
@@ -127,14 +127,15 @@ class TestStreaming:
         self, proxied: tuple[InstanceStore, S3Proxy], tmp_path: Path, size: int, wire: tuple[int, int, int]
     ) -> None:
         """The bytes come back; the wire shows one PUT or a multipart upload, and one ranged GET
-        per part. `wire`: (single PUTs, multipart parts, ranged GETs)."""
+        per part. `wire`: (single PUTs, multipart parts, ranged GETs). The ETag the upload gives
+        is the one a LIST entry reports (the lineage check of a save compares the two)."""
         store, proxy = proxied
         puts, parts, ranges = wire
         src, dest = tmp_path / "src", tmp_path / "dest"
         src.write_bytes(os.urandom(size))
         etag = await store.upload("s/a/b/c.p", src=src)
-        assert etag
-        assert '"' not in etag  # the form a LIST entry has
+        assert [(o.key, o.size, o.etag) for o in await store.list_objects("s/a/b/")] == [("s/a/b/c.p", size, etag)]
+        assert re.fullmatch(r"[0-9a-f]{32}" + ("-3" if parts else ""), etag)  # MD5, or "<md5>-<parts>" (multipart)
         assert (proxy.count("PUT"), proxy.count("MPU_PART"), proxy.count("MPU_COMPLETE")) == (
             puts,
             parts,
@@ -614,7 +615,9 @@ class TestHeadWriteIsSentOnce:
         store, proxy = retrying
         proxy.bucket.write("k", b"x")
         proxy.add("GET", "^k$", Fail(503, "ServiceUnavailable"))  # once
-        assert await store.get("k", max_bytes=_MAX) is not None
+        got = await store.get("k", max_bytes=_MAX)
+        assert got is not None
+        assert got[0] == b"x"
         assert [e.status for e in proxy.entries("GET", "^k$")] == [503, 200]
 
     async def test_failed_head_put_is_not_retried_by_the_sdk(self, retrying: tuple[InstanceStore, S3Proxy]) -> None:

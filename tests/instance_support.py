@@ -430,6 +430,12 @@ def new_keyring() -> str:
     return base64.b64encode(secrets.token_bytes(32)).decode()
 
 
+GOLDEN_KEY = "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4CBgoM="
+"""A fixed keyring key: the 32 bytes 0x64..0x83 (kek_secret of tests/fixtures/instance/vectors.json)."""
+GOLDEN_KEY_ID = "a1bf818a0e68c84cd16af3146144aa0f72f423da16bc2c00aee963aaffb95fd5"
+"""Id of GOLDEN_KEY, HMAC-SHA256(key, "exec-sandbox/v1/key-id"), worked out once: the golden head names it."""
+
+
 def head_header(
     *, instance_id: str, generation: int, commit_id: str, older: tuple[RecentCommit, ...], kek: Key, data_key: bytes
 ) -> HeadHeader:
@@ -536,6 +542,8 @@ class InstanceEnv:
         self.asset_dir.mkdir(mode=0o700)
         self.vm_manager = FakeVmManager(base_image=base_image)
         self.keyring = new_keyring()
+        self.managers: list[InstanceManager] = []
+        """Every manager of this env (add_manager): drained at teardown, before the store closes."""
         self.manager = self.manager_for(self.keyring)
         self.vms: list[FakeVm] = []
         self.saved: dict[str, tuple[bytes, bytes]] = {}
@@ -553,19 +561,33 @@ class InstanceEnv:
             try:
                 yield env
             finally:
-                proxy.clear()
+                proxy.clear()  # held requests go on: no drain below waits on a rule
                 for vm in env.vms:
                     with contextlib.suppress(Exception):
                         await vm.qmp.stop()
+                # The background jobs of the managers (head writes, work file removals) end
+                # before the store closes, as at Scheduler shutdown (InstanceManager.drain)
+                for manager in env.managers:
+                    await manager.drain()
+
+    def add_manager(
+        self, *, keyring: str, work_dir: Path, asset_dir: Path, vm_manager: FakeVmManager
+    ) -> InstanceManager:
+        """Another worker on the same store, with this keyring, folders and VM manager."""
+        manager = InstanceManager(
+            store=self.store,
+            keyring=Keyring.parse(keyring),
+            work_dir=work_dir,
+            asset_dir=asset_dir,
+            vm_manager=vm_manager,  # type: ignore[arg-type]
+        )
+        self.managers.append(manager)
+        return manager
 
     def manager_for(self, keyring: str) -> InstanceManager:
         """Another worker on the same store and folders, with this keyring."""
-        return InstanceManager(
-            store=self.store,
-            keyring=Keyring.parse(keyring),
-            work_dir=self.work_dir,
-            asset_dir=self.asset_dir,
-            vm_manager=self.vm_manager,  # type: ignore[arg-type]
+        return self.add_manager(
+            keyring=keyring, work_dir=self.work_dir, asset_dir=self.asset_dir, vm_manager=self.vm_manager
         )
 
     async def new_vm(self, ram: SparseImage, home: SparseImage, *, spec: VmSpec) -> FakeVm:
@@ -644,12 +666,8 @@ def worker_without_base_image(env: InstanceEnv, *, root: Path) -> InstanceManage
     work_dir, asset_dir = root / "work", root / "assets"
     work_dir.mkdir(mode=0o700, parents=True)
     asset_dir.mkdir(mode=0o700)
-    return InstanceManager(
-        store=env.store,
-        keyring=Keyring.parse(env.keyring),
-        work_dir=work_dir,
-        asset_dir=asset_dir,
-        vm_manager=FakeVmManager(base_image=None),  # type: ignore[arg-type]
+    return env.add_manager(
+        keyring=env.keyring, work_dir=work_dir, asset_dir=asset_dir, vm_manager=FakeVmManager(base_image=None)
     )
 
 

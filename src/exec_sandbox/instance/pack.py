@@ -93,7 +93,8 @@ def write_object(
             index_offset = out.tell()
             nonce = os.urandom(NONCE_BYTES)
             plain = _INDEX.dump_json(index)
-            sealed = nonce + AESGCM(data_key).encrypt(nonce, plain, _index_aad(instance_id, commit_id))
+            index_aad = codec.object_index_aad(instance_id=instance_id, commit_id=commit_id)
+            sealed = nonce + AESGCM(data_key).encrypt(nonce, plain, index_aad)
             out.write(sealed)
             out.write(index_offset.to_bytes(8, "big") + len(sealed).to_bytes(4, "big") + PACK_MAGIC)
             return out.tell()
@@ -142,10 +143,9 @@ def apply_object(
             )
         f.seek(index_offset)
         sealed = f.read(index_len)
+        index_aad = codec.object_index_aad(instance_id=instance_id, commit_id=commit_id)
         try:
-            plain = AESGCM(data_key).decrypt(
-                sealed[:NONCE_BYTES], sealed[NONCE_BYTES:], _index_aad(instance_id, commit_id)
-            )
+            plain = AESGCM(data_key).decrypt(sealed[:NONCE_BYTES], sealed[NONCE_BYTES:], index_aad)
         except InvalidTag:
             raise damaged_instance_data(
                 f"Instance {instance_id}: object index failed authentication.", instance_id=instance_id
@@ -298,7 +298,3 @@ def _data_blocks(fd: int) -> set[int]:
     except OSError:
         blocks.update(range(offset // BLOCK_BYTES, (size - 1) // BLOCK_BYTES + 1))
     return blocks
-
-
-def _index_aad(instance_id: str, commit_id: str) -> bytes:
-    return codec.object_index_aad(instance_id=instance_id, commit_id=commit_id)
