@@ -1,7 +1,8 @@
 """Tests for MemorySnapshotManager (L1 memory snapshot cache).
 
-De-mocked: uses real Settings + real VmManager (not started) instead of
-MagicMock. Only system probes (QEMU binary / CPU features) remain mocked.
+The manager runs with real Settings and a real VmManager (not started). Stand-ins replace
+the host probes (QEMU version, accelerator, CPU), the save VM (VmManager.ephemeral_vm),
+the migration (MigrationClient) and setfacl (grant_qemu_vm_acl): no QEMU starts.
 
 Includes:
 - Normal case tests for all public APIs
@@ -16,10 +17,10 @@ import contextlib
 import errno
 import fcntl
 import gc
-import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import sys
@@ -47,14 +48,8 @@ from exec_sandbox.exceptions import (
 from exec_sandbox.files.disk import pwrite_all
 from exec_sandbox.files.locks import CacheEntry, EntryLease
 from exec_sandbox.guest_agent_protocol import WarmReplAckMessage
-from exec_sandbox.images import image_digest
-from exec_sandbox.memory_snapshot_manager import (
-    MemorySnapshotManager,
-    _open_live_ram_dir,
-    _publish_ram,
-    _vmstate_digest,
-    remove_dead_live_ram_dirs,
-)
+from exec_sandbox.memory_snapshot_files import open_live_ram_dir, remove_dead_live_ram_dirs
+from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager, _publish_ram, _vmstate_digest
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import get_arch_name
 from exec_sandbox.private_run_dir import PrivateRunDir, new_folder_name
@@ -63,6 +58,17 @@ from tests.conftest import asyncio_with
 from tests.test_files_locks import evictable, leased_here, leased_in_child
 
 _BLOCK = 64 * 1024
+
+_VMSTATE = b"vmstate"
+"""The vmstate of the entries the tests make by hand (7 bytes)."""
+
+_VMSTATE_DIGEST = "daf7866fe199125e85d29fcb1e7186ea601aa195d28570c8f6d0c11dceeef5c9"
+"""The L1 digest of _VMSTATE, worked out from its definition: SHA-256 of the size
+(7, 8 bytes big-endian), then of its one non-zero 64 KiB block: offset 0 (8 bytes
+big-endian) and the 7 bytes. A check that computes another digest misses these entries."""
+
+_KEY = re.compile(r"l1-python-v\d+\.\d+-[0-9a-f]{64}")
+"""An L1 key of a Python spec: l1-{language}-v{major.minor}-{full SHA-256 hex digest}."""
 
 
 @pytest.fixture
@@ -77,7 +83,7 @@ def live_ram_root(tmp_path: Path) -> Generator[Path]:
     unless the test asks (`in_memory`): with no such folder the RAM stays in the cache
     folder. No test writes to the host's /dev/shm, and every test sees the same host."""
     root = tmp_path / "shm"
-    with patch("exec_sandbox.memory_snapshot_manager._LIVE_RAM_ROOT", root):
+    with patch("exec_sandbox.memory_snapshot_files._LIVE_RAM_ROOT", root):
         yield root
 
 
@@ -94,7 +100,7 @@ def in_memory(live_ram_root: Path) -> Generator[Path]:
         kept.append(real_open(root, name=name))
         return kept[-1]
 
-    with patch("exec_sandbox.memory_snapshot_manager.PrivateRunDir.open", open_and_keep):
+    with patch("exec_sandbox.memory_snapshot_files.PrivateRunDir.open", open_and_keep):
         yield live_ram_root
     for folder in kept:
         folder.close()
@@ -433,13 +439,9 @@ class TestComputeCacheKey:
         assert key_nonet != key_net
 
     async def test_key_format(self, manager: MemorySnapshotManager) -> None:
-        """Key format: l1-{language}-v{major.minor}-{hash}."""
+        """Key format: l1-{language}-v{major.minor}-{full SHA-256 hex digest}."""
         key = await self._compute_key(manager, language=Language.PYTHON)
-        assert key.startswith("l1-python-v")
-        # Hash part is a fixed-length SHA-256 fingerprint
-        parts = key.split("-", 3)
-        assert len(parts) == 4  # l1, python, v0.0, hash
-        assert len(parts[3]) == 64  # full SHA-256 hex digest
+        assert _KEY.fullmatch(key), key
 
     async def test_package_order_insensitive(self, manager: MemorySnapshotManager) -> None:
         """Package order should not affect cache key (sorted internally)."""
@@ -450,7 +452,7 @@ class TestComputeCacheKey:
     async def test_none_qemu_version(self, manager: MemorySnapshotManager) -> None:
         """An unknown QEMU version gives a stable key of its own."""
         key = await self._compute_key(manager, qemu_version=None)
-        assert key.startswith("l1-python-v")
+        assert _KEY.fullmatch(key), key
         assert key == await self._compute_key(manager, qemu_version=None)
         assert key != await self._compute_key(manager, qemu_version=(9, 2, 0))
 
@@ -489,6 +491,29 @@ class TestVmstateDigest:
         finally:
             os.close(fd)
         return ranges
+
+    @pytest.mark.parametrize(
+        ("writes", "size", "digest"),
+        [
+            # SHA-256 of the size (7), then of offset 0 and the 7 bytes: _VMSTATE_DIGEST
+            pytest.param({0: _VMSTATE}, 7, _VMSTATE_DIGEST, id="one-block"),
+            # SHA-256 of the size (1) only: a zero block is not hashed
+            pytest.param(
+                {0: b"\x00"}, 1, "cd2662154e6d76b2b2b92e70c0cac3ccf534f9b74eb5b89819ec509083d00a50", id="zero-block"
+            ),
+            # SHA-256 of the size (4 blocks), then of offset 65536 and that whole block ("x" at 4464)
+            pytest.param(
+                {70_000: b"x"},
+                4 * 64 * 1024,
+                "1dc0d2fecb7719f54f91c162c0923575148ea635f0cc5d112081a69b928ea7f9",
+                id="sparse",
+            ),
+        ],
+    )
+    def test_golden_vectors(self, tmp_path: Path, writes: dict[int, bytes], size: int, digest: str) -> None:
+        """The digest of a file, worked out from its definition (sizes and offsets as 8 bytes
+        big-endian)."""
+        assert _vmstate_digest(self._sparse(tmp_path / "vmstate", writes, size=size)) == digest
 
     def test_hole_layout_does_not_change_it(self, tmp_path: Path) -> None:
         """The same bytes in two hole layouts (zeros written into a hole of one): same digest."""
@@ -545,35 +570,24 @@ class TestVmstateDigest:
 class TestCheckCache:
     """Tests for check_cache (L1 cache lookups)."""
 
-    async def _populate_cache(
-        self,
-        manager: MemorySnapshotManager,
-        language: Language = Language.PYTHON,
-        packages: list[str] | None = None,
-        memory_mb: int = 512,
-        data: bytes = b"fake vmstate " * 100,
-    ) -> Path:
-        """Helper to populate cache with fake data (requires mock_system_probes fixture)."""
+    async def _populate_cache(self, manager: MemorySnapshotManager, *, empty: bool) -> Path:
+        """An entry of the Python spec (requires mock_system_probes fixture): _VMSTATE with
+        its digest, or an empty vmstate with no digest."""
         key = await manager.compute_cache_key(
-            VmSpec(language=language, packages=tuple(packages or []), memory_mb=memory_mb), l2_path=None
+            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
         )
         vmstate = manager.cache_dir / f"{key}.vmstate"
         meta = manager.cache_dir / f"{key}.vmstate.meta"
-        vmstate.write_bytes(data)
+        vmstate.write_bytes(b"" if empty else _VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
-        # Include SHA-256 so integrity check passes
-        vmstate_sha256 = _vmstate_digest(vmstate) if data else None
-        meta_obj: dict[str, Any] = {"test": True}
-        if vmstate_sha256:
-            meta_obj["vmstate_sha256"] = vmstate_sha256
-        meta.write_text(json.dumps(meta_obj))
+        meta.write_text(json.dumps({"test": True} if empty else {"test": True, "vmstate_sha256": _VMSTATE_DIGEST}))
         return vmstate
 
     async def test_zero_size_cleaned_up(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """Zero-size vmstate is cleaned up and returns miss."""
-        vmstate = await self._populate_cache(manager, data=b"")
+        vmstate = await self._populate_cache(manager, empty=True)
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is None
         assert not vmstate.exists()
@@ -582,7 +596,7 @@ class TestCheckCache:
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """Invalid metadata causes cleanup and returns miss."""
-        vmstate = await self._populate_cache(manager)
+        vmstate = await self._populate_cache(manager, empty=False)
         # Corrupt metadata
         meta = vmstate.parent / f"{vmstate.name[: -len('.vmstate')]}.vmstate.meta"
         meta.write_text("not json {{{")
@@ -596,7 +610,7 @@ class TestCheckCache:
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """A vmstate without its metadata is a miss, and the check does not remove it."""
-        vmstate = await self._populate_cache(manager)
+        vmstate = await self._populate_cache(manager, empty=False)
         # Delete metadata only
         meta = vmstate.parent / f"{vmstate.name[: -len('.vmstate')]}.vmstate.meta"
         meta.unlink()
@@ -619,7 +633,6 @@ class TestCheckCache:
         meta.write_text(json.dumps({"test": True}))  # No vmstate_sha256 field
 
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is not None
         assert result == vmstate
 
 
@@ -669,8 +682,8 @@ class TestHomeDiskEntry:
         key = await manager.compute_cache_key(spec, l2_path=None)
         vmstate = manager.cache_dir / f"{key}.vmstate"
         meta = manager.cache_dir / f"{key}.vmstate.meta"
-        vmstate.write_bytes(b"vmstate")
-        meta.write_text(json.dumps({"vmstate_sha256": _vmstate_digest(vmstate)}))
+        vmstate.write_bytes(_VMSTATE)
+        meta.write_text(json.dumps({"vmstate_sha256": _VMSTATE_DIGEST}))
 
         assert await manager.check_cache(key) is None
         assert not vmstate.exists()
@@ -682,7 +695,7 @@ class TestHomeDiskEntry:
         """An entry that fails its integrity check takes its large sidecars with it (eviction
         lists only *.vmstate), in a worker thread (the .ram file is the RAM size); the miss
         returns once they are gone. No save of a key starts while its vmstate exists
-        (_save_lock): the vmstate goes last, so a removal never deletes the sidecars of a
+        (CacheEntry.try_saving): the vmstate goes last, so a removal never deletes the sidecars of a
         new save of that key."""
         key = await manager.compute_cache_key(VmSpec(language=Language.PYTHON, memory_mb=512), l2_path=None)
         files = [manager.cache_dir / f"{key}{ext}" for ext in (".vmstate", ".vmstate.meta", ".ram", ".home")]
@@ -712,10 +725,10 @@ class TestHomeDiskEntry:
         spec = VmSpec(language=Language.PYTHON, memory_mb=512)
         key = await manager.compute_cache_key(spec, l2_path=None)
         vmstate = manager.cache_dir / f"{key}.vmstate"
-        vmstate.write_bytes(b"device state")
+        vmstate.write_bytes(_VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")
         (manager.cache_dir / f"{key}.vmstate.meta").write_text(
-            json.dumps({"vmstate_sha256": _vmstate_digest(vmstate), "use_template": True})
+            json.dumps({"vmstate_sha256": _VMSTATE_DIGEST, "use_template": True})
         )
 
         assert await manager.check_cache(key) is None
@@ -741,8 +754,8 @@ class TestRestore:
         """A valid L1 entry of _SPEC (no L2 layer): its key and every file of it."""
         key = await manager.compute_cache_key(TestRestore._SPEC, l2_path=None)
         files = [manager.cache_dir / f"{key}{ext}" for ext in (".vmstate", ".vmstate.meta", ".ram", ".home")]
-        files[0].write_bytes(b"vmstate")
-        files[1].write_text(json.dumps({"vmstate_sha256": _vmstate_digest(files[0])}))
+        files[0].write_bytes(_VMSTATE)
+        files[1].write_text(json.dumps({"vmstate_sha256": _VMSTATE_DIGEST}))
         files[2].write_bytes(b"ram")
         files[3].write_bytes(b"home")
         return key, files
@@ -1323,20 +1336,22 @@ class TestTemplateRamInMemory:
         """A cancel while the RAM file is made, or while a failed save's entry is removed:
         the fd on the RAM file and its folder in memory are gone once the task has ended (an
         open fd keeps up to the guest RAM in tmpfs until the process ends). The cancel must
-        come while a worker-thread job runs: the test holds the private step of that job."""
+        come while a worker-thread job runs: the test holds the private step of that job until
+        the task has the cancel."""
         key = await manager.compute_cache_key(self._SPEC, l2_path=None)
         loop = asyncio.get_running_loop()
         in_job = asyncio.Event()
+        release = threading.Event()
         made: list[int] = []
         real_new_live_ram = msm._new_live_ram
-        real_open_live_ram_dir = msm._open_live_ram_dir
+        real_open_live_ram_dir = msm.open_live_ram_dir
         real_remove_entry = manager._remove_entry
 
         def open_live_ram_dir(*, size: int) -> Any:
             live_dir = real_open_live_ram_dir(size=size)
             if where == "making-it":  # the cancel comes before the RAM file and its fd are made
                 loop.call_soon_threadsafe(in_job.set)
-                time.sleep(0.1)
+                release.wait(5)
             return live_dir
 
         def new_live_ram(*args: Any, **kwargs: Any) -> Any:
@@ -1347,7 +1362,7 @@ class TestTemplateRamInMemory:
         def remove_entry(path: Path) -> None:
             if where == "removing-the-entry":
                 loop.call_soon_threadsafe(in_job.set)
-                time.sleep(0.1)
+                release.wait(5)
             real_remove_entry(path)
 
         @contextlib.asynccontextmanager
@@ -1356,7 +1371,7 @@ class TestTemplateRamInMemory:
             yield MagicMock()  # pragma: no cover
 
         with (
-            patch.object(msm, "_open_live_ram_dir", open_live_ram_dir),
+            patch.object(msm, "open_live_ram_dir", open_live_ram_dir),
             patch.object(msm, "_new_live_ram", new_live_ram),
             patch.object(manager, "_remove_entry", remove_entry),
             patch.object(manager.vm_manager, "ephemeral_vm", boot_fails),
@@ -1365,8 +1380,11 @@ class TestTemplateRamInMemory:
             assert task is not None
             await in_job.wait()
             task.cancel()
+            await asyncio.sleep(0)  # the task takes the cancel while the job still runs
+            release.set()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        assert task.cancelled()
         with pytest.raises(OSError, match="Bad file descriptor"):
             os.fstat(made[0])
         assert _live_folders(live_ram_root) == []
@@ -1378,19 +1396,20 @@ class TestTemplateRamInMemory:
         """A cancel while the RAM is copied to the cache (a stop, the end of asyncio.run): the
         copy ends before the fd is closed. Else the job read on through a closed fd, whose
         number the next open takes: another file's data in the template. The test holds the
-        private copy step to put the cancel in it."""
+        private copy step until the cancel came."""
         key = await manager.compute_cache_key(self._SPEC, l2_path=None)
         home_disk = tmp_path / "home.img"
         home_disk.write_bytes(b"home")
         loop = asyncio.get_running_loop()
         in_job = asyncio.Event()
+        release = threading.Event()
         same_file: list[bool] = []
         real_publish_ram = msm._publish_ram
 
         def publish_ram(stop: threading.Event, *, src_fd: int, dst: Path) -> None:
             inode = os.fstat(src_fd).st_ino
             loop.call_soon_threadsafe(in_job.set)
-            time.sleep(0.1)  # the cancel comes while the copy runs
+            release.wait(5)  # the cancel comes while the copy runs
             try:
                 same_file.append(os.fstat(src_fd).st_ino == inode)
             except OSError:
@@ -1423,6 +1442,9 @@ class TestTemplateRamInMemory:
             assert task is not None
             await in_job.wait()
             task.cancel()
+            done, _ = await asyncio.wait([task], timeout=0.1)  # a bound: the task cannot end first
+            assert not done  # the cancelled save waits for the copy
+            release.set()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         assert same_file == [True]
@@ -1435,24 +1457,28 @@ class TestTemplateRamInMemory:
     ) -> None:
         """A cancel during the copy of a large RAM (GBs: seconds) ends it at its next 64 KiB
         block, not at its end; the fd closes only after the copy has stopped. Here 200
-        blocks at 10 ms each: 2 s for the whole copy. The test slows the block writes and
-        wraps the private copy step to see the fd at its end."""
+        blocks: the write of the first one waits until the cancel has set the job's stop
+        event. The test wraps the private copy step to get that event and to see the fd at
+        its end."""
         key = await manager.compute_cache_key(self._SPEC, l2_path=None)
         home_disk = tmp_path / "home.img"
         home_disk.write_bytes(b"home")
         loop = asyncio.get_running_loop()
         copying = asyncio.Event()
+        stops: list[threading.Event] = []
         written: list[int] = []
         fd_open_at_end: list[bool] = []
         real_publish_ram = msm._publish_ram
 
-        def slow_pwrite_all(fd: int, data: bytes, offset: int) -> None:
+        def held_pwrite_all(fd: int, data: bytes, offset: int) -> None:
             written.append(offset)
-            loop.call_soon_threadsafe(copying.set)
-            time.sleep(0.01)
+            if len(written) == 1:  # the cancel comes while the first block is written
+                loop.call_soon_threadsafe(copying.set)
+                stops[0].wait(5)
             pwrite_all(fd, data, offset)
 
         def publish_ram(stop: threading.Event, *, src_fd: int, dst: Path) -> None:
+            stops.append(stop)
             real_publish_ram(stop, src_fd=src_fd, dst=dst)
             fd_open_at_end.append(os.fstat(src_fd).st_size > 0)
 
@@ -1473,7 +1499,7 @@ class TestTemplateRamInMemory:
             path.write_bytes(b"device state")
 
         with (
-            patch.object(msm, "pwrite_all", slow_pwrite_all),
+            patch.object(msm, "pwrite_all", held_pwrite_all),
             patch.object(msm, "_publish_ram", publish_ram),
             patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm),
             patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client,
@@ -1486,14 +1512,11 @@ class TestTemplateRamInMemory:
             task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
             assert task is not None
             await copying.wait()
-            cancelled_at = time.monotonic()
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-            ended_s = time.monotonic() - cancelled_at
         assert task.cancelled()
-        assert len(written) < 20, len(written)  # stopped within a block or two, not after 200
-        assert ended_s < 0.5, ended_s
+        assert written == [0]  # stopped after the block in progress, not after 200
         assert fd_open_at_end == [True]  # the copy's end came before the fd's close
         assert _live_folders(live_ram_root) == []
         assert await manager.check_cache(key) is None  # the partial copy is gone
@@ -1676,7 +1699,7 @@ class TestTemplateRamInMemory:
         dead = user_root / "vmm-dead"
         dead.mkdir()
         (dead / ".lock").touch()
-        with caplog.at_level("WARNING", logger="exec_sandbox.memory_snapshot_manager"):
+        with caplog.at_level("WARNING", logger="exec_sandbox.memory_snapshot_files"):
             remove_dead_live_ram_dirs()
         assert dead.exists()
         assert [r.getMessage() for r in caplog.records] == ["RAM folders of stopped L1 saves stay in /dev/shm"]
@@ -1706,11 +1729,31 @@ class TestTemplateRamInMemory:
         self, live_ram_root: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Less free space in memory than the RAM (a container's 64 MB /dev/shm): None, and
-        nothing is made in memory. Private level: a VmSpec cannot ask for more RAM than the
+        nothing is made in memory. Function level: a VmSpec cannot ask for more RAM than the
         free space of the test folder."""
-        assert _open_live_ram_dir(size=1 << 62) is None  # more than any free space
+        assert open_live_ram_dir(size=1 << 62) is None  # more than any free space
         assert _live_folders(live_ram_root) == []
-        assert "/dev/shm is too small" in caplog.text
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+            "L1 template RAM goes to the cache folder: /dev/shm is too small, the save VM runs slower"
+        ]
+
+    @pytest.mark.usefixtures("in_memory")
+    async def test_ram_stays_in_the_cache_when_memory_cannot_be_used(
+        self, manager: MemorySnapshotManager, live_ram_root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """/dev/shm cannot be used (its sweep gets an OSError: no access, an I/O error): the save
+        goes on with its RAM in the cache folder, and leaves no folder in memory."""
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+
+        def sweep_fails(_root: Path) -> None:
+            raise OSError(errno.EACCES, os.strerror(errno.EACCES))
+
+        vms = _SaveVms(gate=_open_gate(), fail=False)
+        with vms.of(manager), patch("exec_sandbox.memory_snapshot_files.remove_dead_folders", sweep_fails):
+            await _save(manager, self._SPEC)
+        assert vms.mem_paths == [manager.cache_dir / f"{key}.ram"]
+        assert _live_folders(live_ram_root) == []
+        assert "L1 template RAM goes to the cache folder" in caplog.text
 
     @pytest.mark.usefixtures("in_memory")
     async def test_ram_stays_in_the_cache_when_another_user_can_change_the_root(
@@ -1856,6 +1899,36 @@ class TestStop:
         assert [task is not None and task.done() for task in tasks] == [True, True]
         await manager.stop()  # nothing in flight
 
+    async def test_stop_waits_for_a_save_scheduled_while_it_waits(self, manager: MemorySnapshotManager) -> None:
+        """A save scheduled while stop() waits (the cold boot of a new() that the Scheduler's
+        stop did not stop) is waited for too: stop() returns once no save is in flight."""
+        gates = {language: asyncio.Event() for language in (Language.PYTHON, Language.JAVASCRIPT)}
+        booted = {language: asyncio.Event() for language in gates}
+
+        @contextlib.asynccontextmanager
+        async def ephemeral_vm(spec: VmSpec, **_kwargs: object) -> AsyncIterator[MagicMock]:
+            booted[spec.language].set()
+            await gates[spec.language].wait()
+            vm = MagicMock()
+            vm.channel.send_request = AsyncMock(return_value=MagicMock(status="error"))  # no entry
+            yield vm
+
+        with patch.object(manager.vm_manager, "ephemeral_vm", ephemeral_vm):
+            first = await _schedule_save(manager, VmSpec(language=Language.PYTHON, memory_mb=512))
+            await booted[Language.PYTHON].wait()
+            stop = asyncio.create_task(manager.stop())
+            await asyncio.sleep(0)  # stop() waits for the first save
+            second = await _schedule_save(manager, VmSpec(language=Language.JAVASCRIPT, memory_mb=512))
+            await booted[Language.JAVASCRIPT].wait()
+            gates[Language.PYTHON].set()
+            assert first is not None
+            await first
+            gates[Language.JAVASCRIPT].set()
+            await stop
+
+        assert second is not None
+        assert second.done()
+
     async def test_stop_returns_after_a_cancelled_save(self, manager: MemorySnapshotManager) -> None:
         """A save task cancelled in flight: stop() returns, and does not raise its CancelledError."""
         vms = _SaveVms(gate=asyncio.Event(), fail=False)
@@ -1901,9 +1974,9 @@ class TestScheduleBackgroundSave:
         key = await manager.compute_cache_key(self._SPEC, l2_path=None)
         vmstate = manager.cache_dir / f"{key}.vmstate"
         meta = manager.cache_dir / f"{key}.vmstate.meta"
-        vmstate.write_bytes(b"fake " * 100)
+        vmstate.write_bytes(_VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
-        meta.write_text(json.dumps({"test": True, "vmstate_sha256": _vmstate_digest(vmstate)}))
+        meta.write_text(json.dumps({"test": True, "vmstate_sha256": _VMSTATE_DIGEST}))
         vms = _SaveVms(gate=_open_gate(), fail=False)
 
         with vms.of(manager):
@@ -1997,8 +2070,8 @@ class TestComputeCacheKeyEdgeCases:
     async def test_unicode_package_names(self, manager: MemorySnapshotManager) -> None:
         """Unicode package names produce valid, stable cache keys."""
         key = await self._compute_key(manager, packages=["日本語", "пакет", "αβγ"])
-        assert key.startswith("l1-python-v")
-        assert len(key.split("-", 3)[3]) == 64  # full SHA-256 hex digest
+        assert _KEY.fullmatch(key), key
+        assert key == await self._compute_key(manager, packages=["日本語", "пакет", "αβγ"])
 
     async def test_empty_string_package(self, manager: MemorySnapshotManager) -> None:
         """An empty-string package is a distinct input: the length-prefixed encoding keeps it apart from []."""
@@ -2010,18 +2083,20 @@ class TestComputeCacheKeyEdgeCases:
         """Large package list (1000 packages) still produces a fixed-length fingerprint."""
         packages = [f"pkg-{i}" for i in range(1000)]
         key = await self._compute_key(manager, packages=packages)
-        parts = key.split("-", 3)
-        assert len(parts[3]) == 64  # full SHA-256 hex digest
+        assert _KEY.fullmatch(key), key
 
-    async def test_special_chars_in_packages(self, manager: MemorySnapshotManager) -> None:
-        """Special characters in package names (pipes, commas, newlines)."""
-        key = await self._compute_key(manager, packages=["pkg|bar", "pkg,baz", "pkg\nnl"])
-        assert key.startswith("l1-python-v")
+    @pytest.mark.parametrize("separator", ["|", ",", "\n"], ids=["pipe", "comma", "newline"])
+    async def test_special_chars_in_packages(self, manager: MemorySnapshotManager, separator: str) -> None:
+        """A pipe, a comma or a newline in a package name is part of the name, never a
+        separator: the key is valid, and not the key of the name split there."""
+        joined = await self._compute_key(manager, packages=[f"bar{separator}pkg"])
+        assert _KEY.fullmatch(joined), joined
+        assert joined != await self._compute_key(manager, packages=["bar", "pkg"])
 
     async def test_memory_very_large(self, manager: MemorySnapshotManager) -> None:
         """Very large memory_mb (64GB) produces valid key."""
         key = await self._compute_key(manager, memory_mb=65536)
-        assert key.startswith("l1-python-v")
+        assert _KEY.fullmatch(key), key
 
     async def test_different_cpu_cores_different_key(self, manager: MemorySnapshotManager) -> None:
         """Different cpu_cores produce different keys."""
@@ -2054,29 +2129,20 @@ class TestCheckCacheEdgeCases:
     """Edge cases and corruption scenarios for check_cache."""
 
     async def _populate(
-        self,
-        manager: MemorySnapshotManager,
-        *,
-        language: Language = Language.PYTHON,
-        packages: list[str] | None = None,
-        memory_mb: int = 512,
-        data: bytes = b"vmstate data " * 100,
-        meta_dict: dict[str, Any] | None = None,
+        self, manager: MemorySnapshotManager, *, data: bytes = _VMSTATE, meta_dict: dict[str, Any] | None = None
     ) -> tuple[Path, Path]:
-        """Create cache entry. Returns (vmstate_path, meta_path)."""
+        """Create an entry of the Python spec: the vmstate `data`, and `meta_dict` as its
+        metadata (default: the digest of _VMSTATE). Returns (vmstate_path, meta_path)."""
         key = await manager.compute_cache_key(
-            VmSpec(language=language, packages=tuple(packages or []), memory_mb=memory_mb), l2_path=None
+            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
         )
         vmstate = manager.cache_dir / f"{key}.vmstate"
         meta = manager.cache_dir / f"{key}.vmstate.meta"
         vmstate.write_bytes(data)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
-        if meta_dict is None:
-            sha = _vmstate_digest(vmstate) if data else None
-            meta_dict = {"test": True}
-            if sha:
-                meta_dict["vmstate_sha256"] = sha
-        meta.write_text(json.dumps(meta_dict))
+        meta.write_text(
+            json.dumps({"test": True, "vmstate_sha256": _VMSTATE_DIGEST} if meta_dict is None else meta_dict)
+        )
         return vmstate, meta
 
     async def test_meta_exists_vmstate_missing(
@@ -2091,75 +2157,94 @@ class TestCheckCacheEdgeCases:
     async def test_metadata_is_json_array(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Metadata is valid JSON but not a dict (array) → typed parse rejects → miss."""
-        _vmstate, meta = await self._populate(manager)
+        """Metadata is valid JSON but not a dict (array) → typed parse rejects → miss, entry removed."""
+        vmstate, meta = await self._populate(manager)
         meta.write_text("[1, 2, 3]")
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        # SnapshotMetadata.from_json rejects non-dict JSON → cache miss + cleanup
         assert result is None
+        assert not vmstate.exists()
+        assert not meta.exists()
 
     async def test_metadata_is_json_string(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Metadata is valid JSON but a bare string → typed parse rejects → miss."""
-        _vmstate, meta = await self._populate(manager)
+        """Metadata is valid JSON but a bare string → typed parse rejects → miss, entry removed."""
+        vmstate, meta = await self._populate(manager)
         meta.write_text('"just a string"')
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is None
+        assert not vmstate.exists()
 
     async def test_metadata_sha256_is_not_string(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Metadata has vmstate_sha256 as int → coerced to str, SHA-256 mismatch → miss."""
-        _vmstate, _meta = await self._populate(manager, meta_dict={"vmstate_sha256": 12345})
+        """Metadata has vmstate_sha256 as int → coerced to str, SHA-256 mismatch → miss, entry removed."""
+        vmstate, _meta = await self._populate(manager, meta_dict={"vmstate_sha256": 12345})
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        # SnapshotMetadata.from_json coerces 12345 to "12345" which won't match actual hash
         assert result is None
+        assert not vmstate.exists()
 
     async def test_metadata_sha256_empty_string(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """Metadata has vmstate_sha256 = "" → falsy, SHA-256 check skipped, still hits."""
-        _vmstate, _meta = await self._populate(manager, meta_dict={"vmstate_sha256": ""})
+        vmstate, _meta = await self._populate(manager, data=b"not the digest's bytes", meta_dict={"vmstate_sha256": ""})
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is not None
+        assert result == vmstate
 
     async def test_1_byte_vmstate(self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]) -> None:
-        """Minimal valid vmstate (1 byte) — non-zero, should be a cache hit."""
-        vmstate, _meta = await self._populate(manager, data=b"\x00")
+        """Minimal valid vmstate (1 byte, a zero byte): its size is not zero, so it is a cache hit.
+        Its digest is SHA-256 of the size alone (1, 8 bytes big-endian): no non-zero block."""
+        vmstate, _meta = await self._populate(
+            manager,
+            data=b"\x00",
+            meta_dict={"vmstate_sha256": "cd2662154e6d76b2b2b92e70c0cac3ccf534f9b74eb5b89819ec509083d00a50"},
+        )
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result == vmstate
 
     async def test_large_vmstate_sha256_check(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
+        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any], tmp_path: Path
     ) -> None:
-        """SHA-256 check on ~10MB vmstate completes correctly."""
-        data = os.urandom(10 * 1024 * 1024)
-        vmstate, _meta = await self._populate(manager, data=data)
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result == vmstate
+        """A ~10 MB vmstate (160 blocks) that a save published is a hit: the save and the check
+        compute one digest. A byte changed in its last block is a miss, and the entry goes."""
+        spec = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+        data = bytes(range(1, 256)) * (10 * 1024 * 1024 // 255)  # no zero byte
+
+        async def write_large_vmstate(path: Path, **_kwargs: object) -> None:
+            path.write_bytes(data)
+
+        with _template_save(manager, vm=_save_vm(home_disk=home_disk, qemu_vm=False), migrate=write_large_vmstate):
+            await _save(manager, spec)
+        vmstate = manager.cache_dir / f"{await manager.compute_cache_key(spec, l2_path=None)}.vmstate"
+        assert await _check_spec(manager, spec) == vmstate
+
+        with vmstate.open("r+b") as f:
+            f.seek(-1, os.SEEK_END)
+            f.write(b"\x00")  # was 0xff
+        assert await _check_spec(manager, spec) is None
+        assert not vmstate.exists()
 
     async def test_concurrent_check_cache_same_key(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """Multiple concurrent check_cache calls for same key all return same path."""
-        await self._populate(manager)
+        vmstate, _meta = await self._populate(manager)
         results = await asyncio.gather(
             *[_check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)) for _ in range(20)]
         )
-        paths = {str(r) for r in results}
-        assert len(paths) == 1  # All return same path
-        assert all(r is not None for r in results)
+        assert results == [vmstate] * 20
 
     async def test_sha256_partial_corruption(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """Flip one byte in vmstate → SHA-256 mismatch → cleaned up."""
-        data = b"correct data " * 100
-        vmstate, meta = await self._populate(manager, data=data)
+        vmstate, meta = await self._populate(manager)
         # Flip one byte
-        corrupted = bytearray(data)
-        corrupted[50] ^= 0xFF
+        corrupted = bytearray(_VMSTATE)
+        corrupted[3] ^= 0xFF
         vmstate.write_bytes(bytes(corrupted))
 
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
@@ -2189,8 +2274,7 @@ class TestSaveResults:
 
     async def test_saved_entry_is_a_hit(self, manager: MemorySnapshotManager, save_vm: MagicMock) -> None:
         """The entry the save publishes passes check_cache: the save writes the digest the
-        check computes. (The other tests build their entries with _vmstate_digest, so
-        they cannot see a save that writes another digest.) The entry has its home disk."""
+        check computes. The entry has its home disk."""
         key = await manager.compute_cache_key(self._SPEC, l2_path=None)
         with _template_save(manager, vm=save_vm, migrate=_write_vmstate):
             await _save(manager, self._SPEC)
@@ -2438,78 +2522,6 @@ class TestEvictOldestSnapshotEdgeCases:
 
 
 # ============================================================================
-# Torture Tests — image_digest Edge Cases
-# ============================================================================
-
-
-class TestImageHashEdgeCases:
-    """Edge cases for content-digest image identity."""
-
-    def test_empty_file(self, tmp_path: Path) -> None:
-        """An empty file has a digest (it exists)."""
-
-        f = tmp_path / "empty"
-        f.write_bytes(b"")
-        assert image_digest(f) == hashlib.sha256(b"").hexdigest()
-
-    def test_same_content_different_mtime_same_hash(self, tmp_path: Path) -> None:
-        """A rewrite with identical bytes keeps the identity (mtime is not identity)."""
-
-        f = tmp_path / "test"
-        f.write_bytes(b"data")
-        h1 = image_digest(f)
-        f.write_bytes(b"data")
-        st = f.stat()
-        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # a new stamp
-        assert image_digest(f) == h1
-
-    def test_different_content_same_stat_different_hash(self, tmp_path: Path) -> None:
-        """New bytes with the old mtime and size are re-hashed (stamp includes inode)."""
-
-        f = tmp_path / "test"
-        f.write_bytes(b"aaaa")
-        stat1 = f.stat()
-        h1 = image_digest(f)
-
-        # Replace the file (new inode) with different bytes but the same mtime and size
-        replacement = tmp_path / "replacement"
-        replacement.write_bytes(b"bbbb")
-        os.utime(replacement, ns=(stat1.st_atime_ns, stat1.st_mtime_ns))
-        replacement.replace(f)
-        assert h1 == hashlib.sha256(b"aaaa").hexdigest()
-        assert image_digest(f) == hashlib.sha256(b"bbbb").hexdigest()
-
-    def test_sidecar_written(self, tmp_path: Path) -> None:
-        """The digest is cached in a <file>.sha256 sidecar keyed by inode, mtime and size."""
-        f = tmp_path / "image.qcow2"
-        f.write_bytes(b"image-bytes")
-        digest = image_digest(f)
-        sidecar = tmp_path / "image.qcow2.sha256"
-        assert sidecar.read_text().split()[1] == digest == hashlib.sha256(b"image-bytes").hexdigest()
-
-    def test_sidecar_has_no_group_or_other_access(self, tmp_path: Path) -> None:
-        """Under `sg qemu-vm` and umask 002, open() made the sidecar 0664 of group qemu-vm: a
-        QEMU as qemu-vm could give a base image or an L2 layer a wrong digest, and so the
-        cache keys built on it. It is 0600, also where a killed process with this pid left
-        its temp file (here 0666)."""
-
-        f = tmp_path / "image.qcow2"
-        f.write_bytes(b"image-bytes")
-        stale = tmp_path / f"image.qcow2.sha256.{os.getpid()}.tmp"
-        stale.write_text("old")
-        stale.chmod(0o666)
-        old = os.umask(0o002)
-        try:
-            digest = image_digest(f)
-        finally:
-            os.umask(old)
-        sidecar = tmp_path / "image.qcow2.sha256"
-        assert sidecar.read_text().split()[1] == digest
-        assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
-        assert not stale.exists()
-
-
-# ============================================================================
 # Torture Tests — Full Integration Cycles (mock-based)
 # ============================================================================
 
@@ -2518,23 +2530,15 @@ class TestIntegrationCycles:
     """Full save → check → evict → check cycles with mock MigrationClient."""
 
     async def _populate(
-        self,
-        manager: MemorySnapshotManager,
-        language: Language = Language.PYTHON,
-        packages: list[str] | None = None,
-        memory_mb: int = 512,
-        data: bytes = b"vmstate " * 100,
+        self, manager: MemorySnapshotManager, language: Language = Language.PYTHON
     ) -> tuple[Path, Path]:
-        """Create cache entry with valid SHA-256."""
-        key = await manager.compute_cache_key(
-            VmSpec(language=language, packages=tuple(packages or []), memory_mb=memory_mb), l2_path=None
-        )
+        """Create cache entry with valid SHA-256 (_VMSTATE and its digest)."""
+        key = await manager.compute_cache_key(VmSpec(language=language, packages=(), memory_mb=512), l2_path=None)
         vmstate = manager.cache_dir / f"{key}.vmstate"
         meta = manager.cache_dir / f"{key}.vmstate.meta"
-        vmstate.write_bytes(data)
+        vmstate.write_bytes(_VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
-        sha = _vmstate_digest(vmstate)
-        meta.write_text(json.dumps({"test": True, "vmstate_sha256": sha}))
+        meta.write_text(json.dumps({"test": True, "vmstate_sha256": _VMSTATE_DIGEST}))
         return vmstate, meta
 
     async def test_miss_populate_hit_cycle(
@@ -2561,8 +2565,8 @@ class TestIntegrationCycles:
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """Multiple cache entries for different languages are independent."""
-        py_vmstate, _ = await self._populate(manager, language=Language.PYTHON, data=b"py " * 100)
-        js_vmstate, _ = await self._populate(manager, language=Language.JAVASCRIPT, data=b"js " * 100)
+        py_vmstate, _ = await self._populate(manager, language=Language.PYTHON)
+        js_vmstate, _ = await self._populate(manager, language=Language.JAVASCRIPT)
 
         assert await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512)) == py_vmstate
         assert (
@@ -2613,15 +2617,13 @@ class TestIntegrationCycles:
         key = await mgr1.compute_cache_key(VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None)
         vmstate = mgr1.cache_dir / f"{key}.vmstate"
         meta = mgr1.cache_dir / f"{key}.vmstate.meta"
-        data = b"persistent " * 100
-        vmstate.write_bytes(data)
+        vmstate.write_bytes(_VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
-        meta.write_text(json.dumps({"vmstate_sha256": _vmstate_digest(vmstate)}))
+        meta.write_text(json.dumps({"vmstate_sha256": _VMSTATE_DIGEST}))
 
         # Check with second manager
         mgr2 = MemorySnapshotManager(settings, vm_manager)
         result = await _check_spec(mgr2, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is not None
         assert result == vmstate
 
 

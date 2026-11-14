@@ -29,7 +29,6 @@ import sys
 import time
 import uuid
 from dataclasses import asdict
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Final, cast
 
 import psutil
@@ -43,16 +42,17 @@ else:
 import logging
 
 from tenacity import (
-    AsyncRetrying,
     before_sleep_log,
     retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
 )
 
-from exec_sandbox import __version__, constants
+from exec_sandbox import constants
 from exec_sandbox._imports import aioboto3_session
 from exec_sandbox._logging import get_logger
+from exec_sandbox._version import __version__
+from exec_sandbox.aio_utils import AsyncRetrying, run_stoppable, run_to_end
 from exec_sandbox.base_cache_manager import BaseCacheManager
 from exec_sandbox.exceptions import (
     ConfigError,
@@ -73,7 +73,6 @@ from exec_sandbox.guest_channel import consume_stream
 from exec_sandbox.hash_utils import fingerprint
 from exec_sandbox.images import key_part
 from exec_sandbox.migration_client import MigrationClient
-from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import get_expected_socket_uid
 from exec_sandbox.qemu_vm import guest_error_to_exception
 from exec_sandbox.resource_cleanup import cleanup_process
@@ -82,6 +81,10 @@ from exec_sandbox.subprocess_utils import communicate_managed_process
 from exec_sandbox.vm_spec import VmSpec
 
 if TYPE_CHECKING:
+    import threading
+    from pathlib import Path
+
+    from exec_sandbox.models import Language
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.vm_manager import VmManager
 
@@ -262,6 +265,10 @@ class DiskSnapshotManager(BaseCacheManager):
         Args:
             settings: Application settings with cache configuration
             vm_manager: VmManager for VM operations
+
+        Raises:
+            ConfigError: SETTING_INVALID: the cache folder cannot be made, or is not private
+            TransientError: LOCAL_DISK: a host error on the cache folder (disk full, I/O error)
         """
         super().__init__(settings.disk_snapshot_cache_dir, setting="disk_snapshot_cache_dir")
         self.settings = settings
@@ -277,11 +284,26 @@ class DiskSnapshotManager(BaseCacheManager):
         # Limit concurrent S3 uploads to prevent network saturation and memory exhaustion
         # S3 PutObject is atomic - aborted uploads leave no partial blobs
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_s3_uploads)
+        self._stopping = False
+        """stop() began: no upload starts."""
 
     async def start(self) -> None:
         """Delete .part files left by a killed process. One worker-thread job: the
         listing has no size limit and each part can be GBs."""
         await asyncio.to_thread(self._remove_stale_parts)
+
+    async def stop(self) -> None:
+        """Wait for the L3 uploads in flight at most L3_UPLOAD_STOP_GRACE_SECONDS, then cancel
+        the ones left and wait until each ended; no upload starts once stop() began. An upload
+        is a cache fill: a store that does not answer (minutes of botocore retries) does not
+        hold the exit. An interrupted upload leaves no object (S3 writes an object whole) and
+        its compressed file is removed."""
+        self._stopping = True
+        if self._background_tasks:  # only uploads: _schedule_upload is the one tracker
+            await asyncio.wait(list(self._background_tasks), timeout=constants.L3_UPLOAD_STOP_GRACE_SECONDS)
+        for task in self._background_tasks:
+            task.cancel()
+        await super().stop()
 
     def _remove_stale_parts(self) -> None:
         """Delete .part files left by a killed process (name holds the writer's pid)."""
@@ -298,10 +320,8 @@ class DiskSnapshotManager(BaseCacheManager):
         language: Language,
         packages: list[str],
     ) -> EntryLease | None:
-        """Check L2 cache without creating snapshot.
-
-        Use this for warm pool: creating L2 cache for base images (no packages)
-        is pointless - would boot VM just to shut it down. Check-only instead.
+        """Check L2 cache without creating snapshot (Scheduler.reuse: a saved instance's
+        L2 layer, used when its digest matches).
 
         Args:
             language: Programming language
@@ -379,6 +399,8 @@ class DiskSnapshotManager(BaseCacheManager):
                 SETTING_INVALID (no write access to the build files, a read-only disk, a cache
                 folder that cannot be made again), ASSET_NOT_FOUND (the base image is missing)
             InternalError: INTERNAL: unclassified creation failure
+            SandboxError: an error of the build VM's start (VmManager.create_vm: VM_BOOT_TIMEOUT,
+                GVPROXY_FAILED, CAPACITY, CAPACITY_NEVER_FITS, ...), raised as it is
         """
         cache_key = await asyncio.to_thread(self._compute_cache_key, language, packages)
 
@@ -414,7 +436,13 @@ class DiskSnapshotManager(BaseCacheManager):
             # Cache miss: Create new snapshot
             logger.debug("Cache miss, creating snapshot", extra={"cache_key": cache_key})
             snapshot_path = await self._create_snapshot(
-                language, packages, cache_key=cache_key, tenant_id=tenant_id, task_id=task_id, memory_mb=memory_mb
+                language,
+                packages,
+                cache_key=cache_key,
+                tenant_id=tenant_id,
+                task_id=task_id,
+                memory_mb=memory_mb,
+                enospc_retried=False,
             )
             lease = await self._lease_built(snapshot_path, cache_key=cache_key, language=language, packages=packages)
 
@@ -432,8 +460,10 @@ class DiskSnapshotManager(BaseCacheManager):
         too, so the image is there).
 
         Raises:
-            TransientError: LOCAL_DISK: the image is gone all the same (removed by hand)
-            ConfigError: SETTING_INVALID: the lease's lock file cannot be made
+            TransientError: LOCAL_DISK: the image is gone all the same (removed by hand), or
+                another error of the lease's lock file (_file_error)
+            ConfigError: SETTING_INVALID: the lease's lock file cannot be made (no access, a
+                read-only disk)
         """
         try:
             lease = await CacheEntry(snapshot_path).lease()
@@ -553,7 +583,7 @@ class DiskSnapshotManager(BaseCacheManager):
         tenant_id: str,
         task_id: str,
         memory_mb: int,
-        _enospc_retried: bool = False,
+        enospc_retried: bool,
     ) -> Path:
         """Create new qcow2 snapshot with packages installed.
 
@@ -587,6 +617,8 @@ class DiskSnapshotManager(BaseCacheManager):
             ConfigError: HOST_DEPENDENCY (qemu-img missing or not executable),
                 SETTING_INVALID (no write access to the build files, a read-only disk)
             InternalError: INTERNAL: any other failure
+            SandboxError: an error of the build VM's start (VmManager.create_vm: VM_BOOT_TIMEOUT,
+                GVPROXY_FAILED, CAPACITY, CAPACITY_NEVER_FITS, ...), raised as it is
         """
         start_time = asyncio.get_running_loop().time()
         snapshot_path = self._cache_path(cache_key)
@@ -637,7 +669,7 @@ class DiskSnapshotManager(BaseCacheManager):
 
                 # Step 3-5: Boot VM, install packages, shutdown — ephemeral_vm handles lifecycle
                 build_spec = VmSpec(
-                    language=Language(language),
+                    language=language,
                     memory_mb=effective_memory_mb,
                     allow_network=True,
                     allowed_domains=tuple(package_domains) if package_domains is not None else None,
@@ -655,28 +687,22 @@ class DiskSnapshotManager(BaseCacheManager):
                 ) as vm:
                     # Install packages with death monitoring (asyncio.wait)
                     death_task = asyncio.create_task(self._monitor_vm_death(vm, cache_key))
-                    install_task = asyncio.create_task(self._install_packages(vm, Language(language), packages))
-
+                    install_task = asyncio.create_task(self._install_packages(vm, language, packages))
                     try:
-                        done, pending = await asyncio.wait(
-                            {death_task, install_task},
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-
-                        for task in pending:
-                            task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await task
-
-                        await done.pop()  # Propagate the VM death or the install exception, if any
-
-                    except Exception:
-                        for task in [death_task, install_task]:
-                            if not task.done():
-                                task.cancel()
-                                with contextlib.suppress(asyncio.CancelledError):
-                                    await task
-                        raise
+                        await asyncio.wait((death_task, install_task), return_when=asyncio.FIRST_COMPLETED)
+                    finally:
+                        # Neither task outlives the build, also on a cancel: both cancelled (no
+                        # effect on one that ended), then waited for
+                        death_task.cancel()
+                        install_task.cancel()
+                        await asyncio.wait((death_task, install_task))
+                    # The VM's death when it ended (an install error is then its effect), else
+                    # the install's outcome. Both errors are read: asyncio logs an unread one.
+                    install_error = None if install_task.cancelled() else install_task.exception()
+                    if not death_task.cancelled():
+                        death_task.result()  # raises: the watch ends only on the VM's death
+                    if install_error is not None:
+                        raise install_error
 
                     # Shutdown QEMU process cleanly: QMP quit first, so QEMU closes the layer and
                     # exits 0 whatever wraps it. A signal alone does not do it: an `unshare --fork`
@@ -691,7 +717,9 @@ class DiskSnapshotManager(BaseCacheManager):
                                 MigrationClient(vm.qmp_socket, get_expected_socket_uid(vm.use_qemu_vm_user)) as client,
                             ):
                                 await client.quit()
-                    await cleanup_process(vm.process, "QEMU", cache_key, term_timeout=5.0, kill_first=False)
+                    await cleanup_process(
+                        vm.process, "QEMU", cache_key, term_timeout=5.0, kill_timeout=2.0, kill_first=False
+                    )
 
                     # Verify QEMU exited cleanly. Only a clean exit closes the layer: SIGKILL (-9),
                     # from the escalation after term_timeout or from a destroy that a Scheduler
@@ -740,7 +768,7 @@ class DiskSnapshotManager(BaseCacheManager):
             except OSError as e:
                 if isinstance(e, TimeoutError):  # an OSError in Python, not a disk error: unexpected here
                     raise build_failed(e) from e
-                if e.errno != errno.ENOSPC or _enospc_retried:
+                if e.errno != errno.ENOSPC or enospc_retried:
                     raise _file_error(e, cache_key=cache_key, language=language, packages=packages) from e
                 try:
                     await self.evict_oldest()
@@ -776,7 +804,7 @@ class DiskSnapshotManager(BaseCacheManager):
                 tenant_id=tenant_id,
                 task_id=task_id,
                 memory_mb=memory_mb,
-                _enospc_retried=True,
+                enospc_retried=True,
             )
 
         # Record snapshot creation duration
@@ -851,7 +879,7 @@ class DiskSnapshotManager(BaseCacheManager):
     async def _monitor_vm_death(self, vm: QemuVM, cache_key: str) -> None:
         """Monitor VM process for unexpected death during snapshot creation."""
         returncode = await vm.process.wait()
-        diag = await vm.collect_diagnostics()
+        diag = vm.collect_diagnostics()
         logger.error(
             "VM died during snapshot creation",
             extra={**asdict(diag), "cache_key": cache_key},
@@ -942,6 +970,8 @@ class DiskSnapshotManager(BaseCacheManager):
                             request,
                             timeout=hard_timeout,
                             vm_id=vm.vm_id,
+                            on_stdout=None,
+                            on_stderr=None,
                             on_error=_handle_install_error,
                         )
 
@@ -1098,6 +1128,9 @@ class DiskSnapshotManager(BaseCacheManager):
         """Upload the snapshot `lease` holds to S3 in a background task. The task holds its own
         share of the lease until it ends (also when cancelled before it starts): no eviction
         removes the image while the task waits for its turn or reads it."""
+        if self._stopping:
+            logger.info("S3 upload skipped: the manager is stopping", extra={"cache_key": cache_key})
+            return
         share = lease.share()
         task = asyncio.create_task(self._upload_to_s3(cache_key, share.path))
         task.add_done_callback(lambda _t: share.release())
@@ -1126,16 +1159,17 @@ class DiskSnapshotManager(BaseCacheManager):
                 # Compress with zstd (level 3 for speed, run in thread pool to avoid blocking)
                 chunk_size = 64 * 1024  # 64KB chunks for streaming
 
-                def _compress() -> str:
+                def _compress(stop: threading.Event) -> str:
                     # Digest from the same read as the compressed bytes: the metadata always
-                    # matches the object.
+                    # matches the object. A stop (the upload is cancelled) ends the job at its
+                    # next chunk and removes the partial file; its "" is never used.
                     compressor = zstd.ZstdCompressor(level=3)
                     hasher = hashlib.sha256()
                     with (
-                        Path(snapshot_path).open("rb") as src,
+                        snapshot_path.open("rb") as src,
                         create_file(compressed_path, mode=0o600, dir_fd=None) as dst,
                     ):
-                        while True:
+                        while not stop.is_set():
                             chunk = src.read(chunk_size)
                             if not chunk:
                                 break
@@ -1143,13 +1177,19 @@ class DiskSnapshotManager(BaseCacheManager):
                             compressed = compressor.compress(chunk)
                             if compressed:
                                 dst.write(compressed)
-                        # Flush remaining data
-                        final = compressor.flush()
-                        if final:
-                            dst.write(final)
+                        if not stop.is_set():
+                            # Flush remaining data
+                            final = compressor.flush()
+                            if final:
+                                dst.write(final)
+                    if stop.is_set():
+                        compressed_path.unlink(missing_ok=True)
+                        return ""
                     return hasher.hexdigest()
 
-                snapshot_sha256 = await asyncio.to_thread(_compress)
+                snapshot_sha256 = await run_stoppable(
+                    _compress, undo=lambda _digest: compressed_path.unlink(missing_ok=True)
+                )
 
                 async with await self._get_s3_client() as s3:  # type: ignore[union-attr]
                     # Upload compressed qcow2; the digest of the uncompressed
@@ -1168,6 +1208,9 @@ class DiskSnapshotManager(BaseCacheManager):
                 # Cleanup compressed file (up to GBs)
                 await asyncio.to_thread(compressed_path.unlink)
 
+            except asyncio.CancelledError:  # stop(): the compressed file goes, also on a second cancel
+                await run_to_end(lambda: compressed_path.unlink(missing_ok=True))
+                raise
             except Exception as e:  # noqa: BLE001 - Fire-and-forget S3 upload
                 # Silent failure (L2 cache still works)
                 # Catch all exceptions including botocore.exceptions.ClientError

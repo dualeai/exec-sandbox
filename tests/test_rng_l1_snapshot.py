@@ -1,4 +1,4 @@
-"""Regression test: L1 snapshot restore must produce unique RNG output per VM.
+"""L1 snapshot restore must produce unique RNG output per VM.
 
 QEMU migration replays exact CPU+RAM+device state, including the kernel CRNG.
 Without the guest-agent's RNDRESEEDCRNG ioctl (called before every command

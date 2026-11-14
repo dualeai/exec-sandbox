@@ -14,13 +14,12 @@ from collections import deque
 from typing import TYPE_CHECKING, ClassVar
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.files.disk import allocated_bytes, file_stamp
 from exec_sandbox.files.locks import CacheEntry
-from exec_sandbox.permission_utils import make_owned_dir
+from exec_sandbox.permission_utils import make_cache_dir
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import Callable
     from pathlib import Path
 
     from exec_sandbox.files.locks import EntryLease
@@ -79,7 +78,6 @@ class BaseCacheManager:
     Provides:
     - Cache directory initialization
     - Background task lifecycle (track, stop, await)
-    - File-based flock for cross-process deduplication (files.locks.CacheEntry)
     - Leases on entries (files.locks.EntryLease): eviction skips an entry a VM runs on
     - Eviction of the entry with the oldest access time (on ENOSPC, and for admission's
       home disk space: EvictionOrder, one listing per pass); removal of a broken entry
@@ -104,7 +102,8 @@ class BaseCacheManager:
         """Make the cache folder (_make_cache_dir); *setting* names its config field.
 
         Raises:
-            ConfigError: SETTING_INVALID: the folder cannot be made
+            ConfigError: SETTING_INVALID: the folder cannot be made, or is not private
+            TransientError: LOCAL_DISK: a host error (disk full, quota, I/O error)
         """
         # One spelling for every path of the cache (symlinks resolved): the paths of its entries
         # compare equal (`held`); files.locks keys its locks by the folder's inode
@@ -116,25 +115,17 @@ class BaseCacheManager:
     def _make_cache_dir(self) -> None:
         """Make the cache folder if it is not there: at start, then before each build or save
         lock, so a folder removed at run time (a tmp cleaner) is made again. Raises ConfigError
-        SETTING_INVALID when it cannot be made (no access, a read-only disk, a file in its place)."""
-        try:
-            make_owned_dir(
-                self.cache_dir, setting=self._setting
-            )  # 0700 whatever the umask and group (sg qemu-vm, umask 002)
-        except OSError as e:
-            raise ConfigError(
-                f"Cache folder {self.cache_dir} cannot be made: {e.strerror or type(e).__name__}",
-                code=ErrorCode.SETTING_INVALID,
-                context={"cache_dir": str(self.cache_dir), "errno": e.errno},
-                hint=f"Set {self._setting} to a folder this user can write, on a writable disk.",
-                instance_id=None,
-            ) from e
+        SETTING_INVALID when it cannot be made (no access, a read-only disk, a file in its path
+        or in its place, a symlink loop) or is not private, TransientError LOCAL_DISK on a host
+        error (make_cache_dir)."""
+        # 0700 whatever the umask and group (sg qemu-vm, umask 002)
+        make_cache_dir(self.cache_dir, setting=self._setting)
 
     def _track_task(self, task: asyncio.Task[None], *, name: str) -> None:
         """Register a background task with lifecycle logging.
 
-        Tasks are tracked to prevent GC and awaited on stop().
-        Completion and failure are logged for observability.
+        Tasks are tracked to prevent GC and awaited on stop(); each leaves the registry when
+        it ends (its done callback). Completion and failure are logged for observability.
         """
         self._background_tasks[task] = name
         logger.info("Background task started", extra={"task_name": name, "in_flight": len(self._background_tasks)})
@@ -157,23 +148,6 @@ class BaseCacheManager:
         """Return the primary cache file path for *key*."""
         return self.cache_dir / f"{key}{self._cache_ext}"
 
-    @contextlib.asynccontextmanager
-    async def _save_lock(self, key: str) -> AsyncGenerator[bool]:
-        """File-based exclusive lock for snapshot save. Cross-process safe.
-
-        Acquires non-blocking flock on {key}{ext}.lock, then checks whether
-        {key}{ext} already exists and is non-empty (detects if a concurrent
-        process completed the save before us).
-
-        Yields True if caller should proceed with save (lock acquired, file absent).
-        Yields False if another process completed the save first.
-        Raises BlockingIOError if lock is held by another process/task, ConfigError
-        SETTING_INVALID if the cache folder cannot be made again.
-        """
-        self._make_cache_dir()
-        with CacheEntry(self._cache_path(key)).try_saving() as should_proceed:
-            yield should_proceed
-
     def _entry_files(self, path: Path) -> list[Path]:
         """Every file of the entry whose primary file is `path`: its sidecars, then `path`."""
         stem = path.name[: -len(self._cache_ext)]
@@ -190,8 +164,9 @@ class BaseCacheManager:
 
     def _remove_entry(self, path: Path) -> None:
         """Delete every file of one cache entry: its sidecars, then the primary file `path`.
-        Last, because no save of the key starts while the primary file exists (_save_lock):
-        a removal in a worker thread never deletes the files of a new save of the same key.
+        Last, because no save of the key starts while the primary file exists
+        (CacheEntry.try_saving): a removal in a worker thread never deletes the files of a new
+        save of the same key.
 
         Blocking (an L1 .ram file is the RAM size, an L2 image up to GBs): async callers
         use asyncio.to_thread.
@@ -301,12 +276,12 @@ class BaseCacheManager:
         return True
 
     async def stop(self) -> None:
-        """Wait for all background tasks to finish, then clear."""
-        if self._background_tasks:
+        """Wait until no background task is in flight, also one started while stop() waits (a
+        cold boot or a build of a call in flight). Each task leaves the registry when it ends."""
+        while self._background_tasks:
             task_names = list(self._background_tasks.values())
             logger.info(
                 "Waiting for background tasks",
                 extra={"count": len(task_names), "tasks": task_names},
             )
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            self._background_tasks.clear()

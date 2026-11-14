@@ -4,12 +4,12 @@ Captures full VM state (CPU + RAM + device state) after REPL warm-up and
 package import. On restore, the VM resumes at the exact instruction — ~50-60 ms
 regardless of packages.
 
-Cache structure:
+Cache structure (the names next to the vmstate: memory_snapshot_files):
     {cache_dir}/{key}.vmstate       # QEMU migration stream (sparse: ~140MB apparent, ~3MB on disk)
     {cache_dir}/{key}.vmstate.meta  # JSON metadata sidecar
     {cache_dir}/{key}.vmstate.lock  # flock for cross-process deduplication of saves
     {cache_dir}/{key}.vmstate.use.lock  # record lock (fcntl) each restored VM holds shared (no eviction)
-    {cache_dir}/{key}.ram           # guest RAM of a template (memory-backend-file; see _open_live_ram_dir)
+    {cache_dir}/{key}.ram           # guest RAM of a template (memory-backend-file; see open_live_ram_dir)
     {cache_dir}/{key}.home          # home disk at the save point (cloned per restore)
 
 Cache key includes ALL parameters that affect VM state:
@@ -28,16 +28,14 @@ import contextlib
 import errno
 import functools
 import hashlib
-import json
 import os
 import time
 import weakref
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Final, cast
+from typing import TYPE_CHECKING, ClassVar, Final
 
-from exec_sandbox import __version__, constants
+from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox._version import __version__
 from exec_sandbox.aio_utils import run_stoppable, run_to_end
 from exec_sandbox.base_cache_manager import BaseCacheManager
 from exec_sandbox.exceptions import ConfigError, ErrorCode, InternalError, SandboxError
@@ -54,19 +52,27 @@ from exec_sandbox.files.locks import CacheEntry, EntryLease
 from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
 from exec_sandbox.hash_utils import fingerprint
 from exec_sandbox.images import key_part
+from exec_sandbox.memory_snapshot_files import (
+    SnapshotMetadata,
+    home_path_from_vmstate,
+    meta_path_from_vmstate,
+    open_live_ram_dir,
+    ram_path_from_vmstate,
+)
 from exec_sandbox.migration_client import MigrationClient, migration_timeout, rejected_by_qemu
 from exec_sandbox.permission_utils import get_expected_socket_uid, grant_qemu_vm_acl, probe_qemu_as_qemu_vm
 from exec_sandbox.platform_utils import detect_host_arch
-from exec_sandbox.private_run_dir import PrivateRunDir, new_folder_name, remove_dead_folders
 from exec_sandbox.qemu_cmd import guest_cpu_model
 from exec_sandbox.system_probes import detect_accel_type, probe_qemu_version
 
 if TYPE_CHECKING:
     import threading
     from collections.abc import Iterator
+    from pathlib import Path
 
     from exec_sandbox.admission import ResourceReservation
     from exec_sandbox.models import ExposedPort
+    from exec_sandbox.private_run_dir import PrivateRunDir
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.settings import Settings
     from exec_sandbox.vm_manager import VmManager
@@ -77,9 +83,6 @@ logger = get_logger(__name__)
 
 _BLOCK = 64 * 1024
 _ZERO_BLOCK = bytes(_BLOCK)
-
-_LIVE_RAM_ROOT: Final = Path("/dev/shm")  # noqa: S108 - only a folder of this user under it (PrivateRunDir checks it)
-"""The memory file system (tmpfs) of Linux where a template save VM keeps its RAM file."""
 
 _PUBLISH_FLUSH_BYTES: Final = 32 * 1024 * 1024
 """_publish_ram writes the RAM through to the disk after each this many bytes."""
@@ -136,66 +139,6 @@ def _new_entry_file(path: Path, *, size: int) -> None:
     create_sparse(path, size)
 
 
-def _live_ram_root() -> Path:
-    """The folder of this user in /dev/shm: the RAM folders of its template save VMs are in it."""
-    return _LIVE_RAM_ROOT / f"exec-sandbox-{os.geteuid()}"
-
-
-def remove_dead_live_ram_dirs() -> None:
-    """Remove the RAM folders of template save VMs whose process died (a crash, SIGKILL):
-    each holds up to a whole guest RAM in memory, until the next template save of this user
-    would remove it. VmManager.start runs it, after it killed the VMs of dead processes.
-    Sync (a listing): async callers use asyncio.to_thread. With no /dev/shm folder
-    (macOS) there is nothing to remove."""
-    try:
-        remove_dead_folders(_live_ram_root())  # checks the root before it removes anything in it
-    except ConfigError as e:
-        logger.warning("RAM folders of stopped L1 saves stay in /dev/shm", extra={"error": str(e)})
-
-
-def _open_live_ram_dir(*, size: int) -> PrivateRunDir | None:
-    """A new folder in memory for the RAM file of a template save VM (`size` bytes), or
-    None: the VM then maps its RAM file in the cache folder.
-
-    On a disk, each page the guest writes is dirty page cache that writeback writes again
-    and again, and the kernel stalls the vCPUs meanwhile (balance_dirty_pages, waits for
-    writeback). Measured on EBS: a Python save VM wrote 131 MB/s for 10-15 s, and its save
-    took 12-17 s, not 1 s. In memory (tmpfs) its RAM is shared memory, charged to the VM's
-    memory cgroup as anonymous RAM is; _publish_ram writes it to the cache once.
-
-    /dev/shm is the folder of POSIX shared memory: a memory filesystem wherever the host
-    keeps the convention, whatever its type (what the host mounts there is its choice; a
-    disk there is as slow as the cache folder, never wrong). None when there is no such
-    folder (macOS: a POSIX shared memory object has no path QEMU can open; there the save
-    takes 0.6 s with the file on the disk), when /dev/shm/exec-sandbox-<uid> is not a private folder of this
-    user (anyone can make it first), or when /dev/shm has less than `size` bytes free (a
-    container's /dev/shm is 64 MB by default). The folders of dead processes go first:
-    their RAM files would hold memory until a reboot. Sync: metadata calls.
-    """
-    if not _LIVE_RAM_ROOT.is_dir():
-        return None
-    root = _live_ram_root()
-    try:
-        live_dir = PrivateRunDir.open(root, name=new_folder_name())  # checks the root before the sweep
-    except ConfigError as e:
-        logger.warning("L1 template RAM goes to the cache folder, the save VM runs slower", extra={"error": str(e)})
-        return None
-    try:
-        remove_dead_folders(root)
-        st = os.statvfs(_LIVE_RAM_ROOT)
-    except BaseException:
-        live_dir.close()
-        raise
-    if st.f_bavail * st.f_frsize < size:
-        live_dir.close()
-        logger.warning(
-            "L1 template RAM goes to the cache folder: /dev/shm is too small, the save VM runs slower",
-            extra={"free_mb": st.f_bavail * st.f_frsize // (1024 * 1024), "needed_mb": size // (1024 * 1024)},
-        )
-        return None
-    return live_dir
-
-
 class _LiveRam:
     """The RAM file of a template save VM (_new_live_ram): `path`, in `folder` in memory,
     with `fd` open on it for _publish_ram; else {key}.ram itself (no folder, no fd).
@@ -216,9 +159,9 @@ class _LiveRam:
 
 def _new_live_ram(ram_path: Path, *, size: int, owner: list[_LiveRam]) -> _LiveRam:
     """A new RAM file of `size` bytes for a template save VM (_new_entry_file), in the folder
-    from _open_live_ram_dir, else at `ram_path`. Put in `owner` as soon as it is made, so a
+    from open_live_ram_dir, else at `ram_path`. Put in `owner` as soon as it is made, so a
     caller whose await was cancelled (run_to_end waits for this job) still closes it. Sync."""
-    live_dir = _open_live_ram_dir(size=size)
+    live_dir = open_live_ram_dir(size=size)
     live_ram = ram_path if live_dir is None else live_dir.path / ram_path.name
     try:
         _new_entry_file(live_ram, size=size)
@@ -286,35 +229,6 @@ async def _grant_entry_files(paths: list[Path], *, perms: str, key: str) -> None
         )
 
 
-@dataclass(frozen=True)
-class SnapshotMetadata:
-    """The JSON sidecar of an L1 vmstate: what a check of the entry and a restore read. The
-    cache key holds what the entry was made from (compute_cache_key)."""
-
-    vmstate_sha256: str
-    """_vmstate_digest of the vmstate; empty: not checked."""
-    use_template: bool
-    """The guest RAM is the {key}.ram template (memory-backend-file), not in the vmstate."""
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self))
-
-    @classmethod
-    def from_json(cls, text: str) -> SnapshotMetadata | None:
-        """Parse JSON text into SnapshotMetadata, or None when it is not a JSON object."""
-        try:
-            parsed = json.loads(text)
-        except ValueError:  # json.JSONDecodeError too
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        fields = cast("dict[str, object]", parsed)
-        return cls(
-            vmstate_sha256=str(fields.get("vmstate_sha256", "")),
-            use_template=bool(fields.get("use_template", False)),
-        )
-
-
 class MemorySnapshotManager(BaseCacheManager):
     """L1 memory snapshot cache. Manages vmstate files + metadata sidecars.
 
@@ -327,6 +241,12 @@ class MemorySnapshotManager(BaseCacheManager):
     _sidecar_exts: ClassVar[tuple[str, ...]] = (".vmstate.meta", ".ram", ".home")
 
     def __init__(self, settings: Settings, vm_manager: VmManager):
+        """Make the cache folder (memory_snapshot_cache_dir).
+
+        Raises:
+            ConfigError: SETTING_INVALID: the cache folder cannot be made, or is not private
+            TransientError: LOCAL_DISK: a host error on the cache folder (disk full, I/O error)
+        """
         super().__init__(settings.memory_snapshot_cache_dir, setting="memory_snapshot_cache_dir")
         self.settings = settings
         self.vm_manager = vm_manager
@@ -338,29 +258,7 @@ class MemorySnapshotManager(BaseCacheManager):
     def _cache_paths(self, key: str) -> tuple[Path, Path]:
         """Return (vmstate_path, meta_path) for a given cache key."""
         vmstate_path = self._cache_path(key)
-        return (vmstate_path, vmstate_path.with_suffix(".vmstate.meta"))
-
-    @staticmethod
-    def ram_path_from_vmstate(vmstate_path: Path) -> Path:
-        """Derive RAM template file path from vmstate path.
-
-        The RAM file is a sibling of the vmstate with ``.ram`` extension.
-        Used by vm_manager to pass mem_path to build_qemu_cmd for COW restore.
-        """
-        # vmstate_path = /cache/l1-python-v1.2-abcd1234.vmstate
-        # ram_path     = /cache/l1-python-v1.2-abcd1234.ram
-        return vmstate_path.with_suffix(".ram")
-
-    @staticmethod
-    def home_path_from_vmstate(vmstate_path: Path) -> Path:
-        """Home disk of an L1 entry: sibling of the vmstate with ``.home`` extension.
-
-        A restored VM resumes with a page cache that refers to these blocks, so
-        it gets a clone of this disk, never a blank one. VmManager.restore_vm
-        also uses it to find a saved instance's home disk: InstanceManager names
-        its files <commit>.vmstate and <commit>.home to match.
-        """
-        return vmstate_path.with_suffix(".home")
+        return (vmstate_path, meta_path_from_vmstate(vmstate_path))
 
     async def compute_cache_key(self, spec: VmSpec, *, l2_path: Path | None) -> str:
         """Compute L1 cache key. Includes ALL parameters that affect VM state.
@@ -468,9 +366,9 @@ class MemorySnapshotManager(BaseCacheManager):
                     return "L1 cache vmstate integrity check failed"
             except OSError:
                 return "L1 cache vmstate unreadable during integrity check"
-        if meta.use_template and not self.ram_path_from_vmstate(vmstate_path).exists():
+        if meta.use_template and not ram_path_from_vmstate(vmstate_path).exists():
             return "L1 cache RAM template missing"
-        if not self.home_path_from_vmstate(vmstate_path).exists():
+        if not home_path_from_vmstate(vmstate_path).exists():
             return "L1 cache home disk missing"
         return None
 
@@ -541,7 +439,7 @@ class MemorySnapshotManager(BaseCacheManager):
 
             # The vmstate has no RAM (x-ignore-shared): without its template it is no entry. In
             # memory, its pages are there through the fd even when the file is gone (logind).
-            ram_path = self.ram_path_from_vmstate(vmstate_path)
+            ram_path = ram_path_from_vmstate(vmstate_path)
             if live_ram_fd is not None:
                 # A cancel stops the copy at its next block and waits for its end: the caller
                 # then closes the fd, whose number the next open takes (a job still running
@@ -552,9 +450,9 @@ class MemorySnapshotManager(BaseCacheManager):
 
             # Home disk at the save point (the VM is stopped): a restored VM's
             # page cache refers to these blocks.
-            home_path = self.home_path_from_vmstate(vmstate_path)
+            home_path = home_path_from_vmstate(vmstate_path)
             home_path.unlink(missing_ok=True)
-            await asyncio.to_thread(clone_sparse, vm.workdir.home_disk, home_path)
+            await run_stoppable(lambda stop: clone_sparse(vm.workdir.home_disk, home_path, stop=stop), undo=None)
 
             # Digest of the vmstate (SHA-256 of its size and non-zero blocks); check_cache
             # verifies it before each restore.
@@ -736,7 +634,10 @@ class MemorySnapshotManager(BaseCacheManager):
             try:
                 # Acquire file lock for entire save lifecycle (VM boot + warm + save).
                 # Prevents duplicate work: concurrent callers skip on BlockingIOError.
-                async with self._save_lock(key) as should_save:
+                # False: another process saved the entry meanwhile. The folder is made
+                # again first (a tmp cleaner may have removed it).
+                self._make_cache_dir()
+                with CacheEntry(self._cache_path(key)).try_saving() as should_save:
                     if not should_save:
                         logger.debug("L1 background save skipped (already exists)", extra={"key": key})
                         return
@@ -745,7 +646,7 @@ class MemorySnapshotManager(BaseCacheManager):
                     # memory-backend-file,share=on so QEMU writes guest RAM to this file.
                     # After migration with x-ignore-shared, the vmstate contains only
                     # device state; the RAM file is the template. The file is in memory
-                    # when the host can (_open_live_ram_dir), else {key}.ram itself. The
+                    # when the host can (open_live_ram_dir), else {key}.ram itself. The
                     # host makes it (sparse, the RAM size: QEMU opens it O_RDWR and keeps
                     # its size), so qemu-vm needs no write access to its folder.
                     vmstate_path, meta_path = self._cache_paths(key)
@@ -755,7 +656,7 @@ class MemorySnapshotManager(BaseCacheManager):
                         live_ram = await run_to_end(
                             functools.partial(
                                 _new_live_ram,
-                                self.ram_path_from_vmstate(vmstate_path),
+                                ram_path_from_vmstate(vmstate_path),
                                 size=template_spec.memory_mb * 1024 * 1024,
                                 owner=live_rams,
                             )
@@ -848,7 +749,3 @@ class MemorySnapshotManager(BaseCacheManager):
         finally:
             for live_ram in live_rams:
                 live_ram.close()
-
-    async def wait_saves(self) -> None:
-        """Wait until the background saves in flight now have ended (their errors are logged, not raised)."""
-        await asyncio.gather(*list(self._in_flight_saves.values()), return_exceptions=True)
