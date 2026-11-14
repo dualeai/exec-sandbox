@@ -14,12 +14,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple, TypedDict, Unpack, cast
 from unittest.mock import AsyncMock
-from uuid import uuid4
 
 import boto3
 import pytest
 from _pytest.runner import runtestprotocol
-from moto.server import ThreadedMotoServer
 
 from exec_sandbox import subprocess_utils
 from exec_sandbox._logging import LIBRARY_LOGGER_NAME
@@ -42,9 +40,10 @@ from exec_sandbox.platform_utils import (
 )
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.settings import Settings
-from exec_sandbox.system_probes import check_hwaccel_available, check_tsc_deadline, probe_cache
+from exec_sandbox.system_probes import check_tsc_deadline, detect_accel_type, probe_cache
 from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.vm_spec import VmSpec
+from exec_sandbox.vm_types import AccelType
 
 logger = logging.getLogger(__name__)
 
@@ -131,9 +130,7 @@ _QEMU_RETRYABLE_PROPERTY = "qemu_retryable_code"
 
 
 @pytest.hookimpl(wrapper=True)
-def pytest_runtest_makereport(
-    item: pytest.Item, call: pytest.CallInfo[None]
-) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+def pytest_runtest_makereport(call: pytest.CallInfo[None]) -> Generator[None, pytest.TestReport, pytest.TestReport]:
     """Mark a report that failed with a retryable QEMU error code (read by _is_retryable_qemu_crash)."""
     report = yield
     error = call.excinfo.value if call.excinfo is not None else None
@@ -206,7 +203,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
 # ============================================================================
 
 # Probed once at import time; used for skip markers and timeout scaling.
-_hwaccel_available: bool = asyncio.run(check_hwaccel_available())
+_hwaccel_available: bool = asyncio.run(detect_accel_type()) is not AccelType.TCG
 
 # Central test-execution timeout (seconds).
 # TCG software emulation under ``pytest -n auto`` contention can inflate
@@ -234,7 +231,7 @@ async def _fast_virt_available() -> bool:
     memory-heavy work 50-100x slower than bare metal. macOS has no nested virt;
     arm64 Linux KVM (GIC timer) is not affected.
     """
-    if not await check_hwaccel_available():
+    if not _hwaccel_available:
         return False
     host_os, host_arch = detect_host_os(), detect_host_arch()
     if host_os == HostOS.LINUX and host_arch == HostArch.X86_64:
@@ -378,7 +375,7 @@ async def dual_scheduler(
 
     hwaccel gets ``_TIMEOUT_HWACCEL``; emulation gets ``_TIMEOUT_TCG``.
     The emulation budget is higher because parallel TCG VMs on CI runners
-    starve each other — trivial code that takes <1s locally consumed the
+    starve each other — trivial code that takes <1s locally can use the
     full hwaccel budget on a loaded macOS arm64 runner (cold-boot fallback
     + TCG + ``pytest -n auto`` contention).
     """
@@ -497,29 +494,23 @@ async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
 
 @pytest.fixture
 async def make_snapshot_manager(make_vm_manager):  # type: ignore[no-untyped-def]
-    """Factory to create (DiskSnapshotManager, Settings) with optional Settings overrides.
-
-    Consolidates the repeated pattern of creating settings + vm_manager +
-    DiskSnapshotManager with consistent kwargs and automatic cache dir creation.
-    Settings are created once (inside make_vm_manager) and reused, avoiding
-    the kwargs-passed-twice problem.
+    """Factory to create (DiskSnapshotManager, Settings) on a started VmManager (make_vm_manager).
+    The manager makes its cache folder. Each is stopped at teardown (its background tasks
+    awaited), before its VmManager, as Scheduler does.
 
     Usage:
         async def test_something(make_snapshot_manager, tmp_path):
-            snapshot_manager, settings = await make_snapshot_manager(
-                disk_snapshot_cache_dir=tmp_path / "cache",
-                s3_bucket=None,
-            )
+            snapshot_manager, settings = await make_snapshot_manager(disk_snapshot_cache_dir=tmp_path / "cache")
     """
+    async with AsyncExitStack() as stack:
 
-    async def _make(**overrides: Any) -> tuple[DiskSnapshotManager, Any]:
-        vm_manager = await make_vm_manager(**overrides)
-        settings = vm_manager.settings
-        if settings.disk_snapshot_cache_dir:
-            settings.disk_snapshot_cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        return DiskSnapshotManager(settings, vm_manager), settings
+        async def _make(**overrides: Any) -> tuple[DiskSnapshotManager, Settings]:
+            vm_manager = await make_vm_manager(**overrides)
+            manager = DiskSnapshotManager(vm_manager.settings, vm_manager)
+            stack.push_async_callback(manager.stop)
+            return manager, vm_manager.settings
 
-    return _make
+        yield _make
 
 
 # ============================================================================
@@ -584,29 +575,12 @@ def make_destroy_mock(kind: str = "confirmed") -> AsyncMock:
     return AsyncMock(side_effect=destroy)
 
 
-def random_test_id() -> str:
-    """Generate a unique random identifier for test isolation.
-
-    Returns the full 32-char hex of a UUID4.  Callers add their own prefix
-    (e.g. ``f"task-{random_test_id()}"``).
-    """
-    return uuid4().hex
-
-
 async def create_test_qcow2(path: Path, size: str = "1M") -> None:
-    """Create a minimal valid qcow2 file via qemu-img."""
-    proc = await asyncio.create_subprocess_exec(
-        "qemu-img",
-        "create",
-        "-f",
-        "qcow2",
-        str(path),
-        size,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    """Create a minimal valid qcow2 file via qemu-img. A cancelled call ends qemu-img too."""
+    returncode, _stdout, stderr = await subprocess_utils.communicate_managed_process(
+        ["qemu-img", "create", "-f", "qcow2", str(path), size], process_name="qemu-img", context_id=path.name
     )
-    await proc.communicate()
-    assert proc.returncode == 0, f"qemu-img create failed for {path}"
+    assert returncode == 0, f"qemu-img create failed for {path}: {stderr.decode(errors='replace')}"
 
 
 # ============================================================================
@@ -656,8 +630,8 @@ def _reset_probe_caches() -> Iterator[None]:
         probe_cache.reset,
         permission_probe_cache.reset,
         get_qemu_vm_uid.cache_clear,
-        subprocess_utils._runnable.clear,
-    )  # pyright: ignore[reportPrivateUsage]
+        subprocess_utils._runnable.clear,  # pyright: ignore[reportPrivateUsage]
+    )
     for reset in resets:
         reset()
     yield
@@ -739,10 +713,9 @@ def worker_moto_server() -> Iterator[MotoWorker]:
     """One moto S3 server for each xdist worker. Tests use `moto_s3_server` (or `s3_proxy`).
 
     A server per test costs 0.5 s to stop (werkzeug polls its stop flag twice a second).
-    It listens on and is reached at 127.0.0.1, never 0.0.0.0: the HTTP server looks up the
-    name of its bind address (for 0.0.0.0, the host name: an mDNS query on macOS runners,
-    whose names end in .local), and macOS sends a connect to 0.0.0.0 to its first address,
-    which may not be loopback. No SDK retry.
+    It listens on and is reached at 127.0.0.1, never 0.0.0.0: macOS sends a connect to
+    0.0.0.0 to its first address, which may not be loopback. It binds with no name lookup
+    (s3_faults.MotoServer). No SDK retry.
 
     moto finds the service of each request by listing its own package folder (about 180
     stat calls, under its dispatch lock): here it lists the folder once.
@@ -751,14 +724,13 @@ def worker_moto_server() -> Iterator[MotoWorker]:
     from moto import backends
     from moto.server import DomainDispatcherApplication, create_backend_app
 
+    from tests.s3_faults import moto_server
+
     modules = tuple(backends.list_of_moto_modules())
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(backends, "list_of_moto_modules", lambda: modules)
-        server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-        server.start()
-        try:
-            _, port = server.get_host_and_port()
-            endpoint_url = f"http://127.0.0.1:{port}"
+        with moto_server("127.0.0.1") as server:
+            endpoint_url = f"http://127.0.0.1:{server.server_port}"
             s3_sync = boto3.client(
                 "s3",
                 region_name="us-east-1",
@@ -768,8 +740,6 @@ def worker_moto_server() -> Iterator[MotoWorker]:
                 config=Config(retries={"total_max_attempts": 1}),
             )
             yield MotoWorker(endpoint_url=endpoint_url, s3=s3_sync, app=DomainDispatcherApplication(create_backend_app))
-        finally:
-            server.stop()
 
 
 @pytest.fixture
@@ -789,22 +759,28 @@ def moto_s3_server(fake_aws_env, worker_moto_server: MotoWorker) -> tuple[str, A
 
 
 def l1_hit(vm_manager: Any, tmp_path: Path) -> MemorySnapshotManager:
-    """A real L1 manager (its restore() runs) whose lookup, and the check restore() runs,
-    find an entry in tmp_path at its current version."""
+    """A real L1 manager (its check_cache() and restore() run) whose lookup, and the check
+    restore() runs, find an entry in tmp_path at its current version.
+
+    Two seams are replaced: compute_cache_key (it hashes the boot images, which a unit test does
+    not have) and the private entry check (_check_entry, under check_cache and restore): a valid
+    entry needs a saved VM (vmstate digest, RAM template, home disk), and no public call makes one
+    without QEMU."""
     memory = MemorySnapshotManager(Settings(memory_snapshot_cache_dir=tmp_path), vm_manager)
     vmstate = tmp_path / "cached.vmstate"
     vmstate.write_bytes(b"vmstate")
     memory.compute_cache_key = AsyncMock(return_value="cached")  # type: ignore[method-assign]
-    memory.check_cache = AsyncMock(return_value=vmstate)  # type: ignore[method-assign]
     memory._check_entry = AsyncMock(return_value=(vmstate, file_stamp(vmstate.stat())))  # type: ignore[method-assign]
     return memory
 
 
 async def wait_l1_saves(scheduler: Scheduler) -> None:
-    """Until the scheduler's background L1 saves in flight have ended (the next new() can hit L1)."""
-    manager = scheduler._memory_snapshot_manager  # pyright: ignore[reportPrivateUsage]  # the one seam
+    """Until the scheduler's background L1 saves have ended (the next new() can hit L1): the L1
+    manager's stop waits for them and leaves it usable. Scheduler has no public handle on its L1
+    manager: the private attribute is the one seam."""
+    manager = scheduler._memory_snapshot_manager  # pyright: ignore[reportPrivateUsage]
     assert manager is not None
-    await manager.wait_saves()
+    await manager.stop()
 
 
 @pytest.fixture
@@ -828,8 +804,6 @@ async def s3_proxy(moto_s3_server, worker_moto_server: MotoWorker) -> AsyncGener
 def host_accelerator():
     """This host's accelerator (AccelType), probed once for each xdist worker. The autouse
     probe-cache reset would make every save and load of a test probe it again (two process spawns)."""
-    from exec_sandbox.system_probes import detect_accel_type
-
     return asyncio.run(detect_accel_type())
 
 

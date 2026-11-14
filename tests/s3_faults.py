@@ -16,6 +16,8 @@ a real store lets only one win.
 
 `Bucket` reads and writes moto directly, never through the proxy: what the
 bucket expiry rule, an operator or another bucket writer does.
+
+`moto_server` serves moto's S3 API over HTTP for the clients that need an endpoint.
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ import contextlib
 import html
 import io
 import re
+import socketserver
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -32,11 +36,13 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import quote, urlencode
 
 from aiohttp import web
+from moto.moto_server.werkzeug_app import DomainDispatcherApplication, MotoRequestHandler, create_backend_app
 from multidict import CIMultiDict, MultiDict
+from werkzeug.serving import ThreadedWSGIServer
 from werkzeug.test import EnvironBuilder, run_wsgi_app
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Iterator
     from wsgiref.types import WSGIApplication, WSGIEnvironment
 
     from werkzeug.datastructures import Headers
@@ -65,6 +71,30 @@ _HOP_HEADERS = frozenset(
 )
 _DROPPED_RESPONSE_HEADERS = _HOP_HEADERS | {"server", "date"}
 _MAX_BODY = 256 * 1024 * 1024
+
+
+class MotoServer(ThreadedWSGIServer):
+    """The HTTP server of moto.server.ThreadedMotoServer, bound with no name lookup:
+    http.server looks up the name of the bind address (socket.getfqdn), which can block for
+    more than 10 s on each xdist worker of the macOS runners. The server name is the address."""
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+@contextlib.contextmanager
+def moto_server(host: str) -> Iterator[MotoServer]:
+    """moto's S3 API on `host` and a free port, served by a thread until the block ends."""
+    server = MotoServer(host, 0, DomainDispatcherApplication(create_backend_app), handler=MotoRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, name="moto-server", daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
 
 
 class LogEntry(NamedTuple):
@@ -235,11 +265,11 @@ class S3Proxy:
             app.router.add_route("*", "/{tail:.*}", proxy._handle)
             runner = web.AppRunner(app, access_log=None, handle_signals=False)
             await runner.setup()
-            site = web.TCPSite(runner, "127.0.0.1", 0)
-            await site.start()
-            host, port = runner.addresses[0][:2]
-            proxy.endpoint_url = f"http://{host}:{port}"
             try:
+                site = web.TCPSite(runner, "127.0.0.1", 0)
+                await site.start()
+                host, port = runner.addresses[0][:2]
+                proxy.endpoint_url = f"http://{host}:{port}"
                 yield proxy
             finally:
                 for rule in proxy.rules:

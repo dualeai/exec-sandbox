@@ -417,6 +417,8 @@ def test_no_test_patches_asyncio_or_time_for_the_whole_process() -> None:
     ],
 )
 def test_the_scan_judges_each_form(source: str, caught: bool) -> None:
+    """Each form that replaces a shared function or loop method is caught; a patch of the
+    module's own name, of another module or of a spawn is not."""
     assert bool(_found(source)) is caught
 
 
