@@ -16,7 +16,7 @@ from importlib.abc import MetaPathFinder
 
 class _Missing(MetaPathFinder):
     def find_spec(self, name, path=None, target=None):
-        if name.split(".")[0] == {missing!r}:
+        if name == {missing!r} or name.startswith({missing!r} + "."):
             raise ModuleNotFoundError(f"No module named {{name!r}}", name=name)
         return None
 
@@ -28,7 +28,7 @@ cli_main()
 
 
 def _sbx_without(missing: str, *args: str, home: Path) -> subprocess.CompletedProcess[str]:
-    """`sbx ARGS` in a new interpreter where `missing` (and its submodules) cannot be imported.
+    """`sbx ARGS` in a new interpreter where the module `missing` (and its submodules) cannot be imported.
     No EXEC_SANDBOX_* variable reaches it, the keyring package may only use its fail backend,
     and HOME and XDG_DATA_HOME are `home`: the user folders (the local store's default
     folder among them) resolve under it, never under the developer's home."""
@@ -74,8 +74,9 @@ def test_os_keyring_step_names_the_missing_extra(missing: str, tmp_path: Path) -
 
 
 def test_other_missing_module_keeps_its_error(tmp_path: Path) -> None:
-    """termios (standard library, imported by the CLI only) is not in the cli extra: no install hint."""
-    done = _sbx_without("termios", "--version", home=tmp_path)
+    """A module that is not in the cli extra fails the CLI import: its error stays, with no
+    install hint (exec_sandbox.cli itself stands in: the package imports, cli_main runs)."""
+    done = _sbx_without("exec_sandbox.cli", "--version", home=tmp_path)
     assert done.returncode == 1
-    assert "ModuleNotFoundError: No module named 'termios'" in done.stderr
+    assert "ModuleNotFoundError: No module named 'exec_sandbox.cli'" in done.stderr
     assert "exec-sandbox[cli]" not in done.stderr

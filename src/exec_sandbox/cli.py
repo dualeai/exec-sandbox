@@ -24,8 +24,6 @@ import logging
 import os
 import signal
 import sys
-import termios
-import threading
 import time
 import warnings
 from dataclasses import dataclass
@@ -73,30 +71,12 @@ from exec_sandbox.process_registry import force_kill_all, get_tracked_count
 from exec_sandbox.settings import Settings
 
 
-def _create_terminal_monitor(stop_event: threading.Event) -> None:
-    """Background thread to keep ISIG enabled so Ctrl+C generates SIGINT."""
-    try:
-        tty_fd = sys.stdin.fileno()
-        while not stop_event.is_set():
-            try:
-                attrs = termios.tcgetattr(tty_fd)
-                lflag = attrs[3]
-                if not (lflag & termios.ISIG):
-                    # ISIG was disabled - re-enable it
-                    attrs[3] = lflag | termios.ISIG
-                    termios.tcsetattr(tty_fd, termios.TCSANOW, attrs)
-            except (OSError, termios.error):
-                pass  # Terminal not available or error reading settings
-            stop_event.wait(0.1)  # Check every 100ms
-    except (OSError, ValueError):
-        pass  # Thread cleanup, stdin closed, or invalid fd
-
-
 def _run_with_interrupt_handling(coro: Any) -> Any:
     """Run coroutine with proper Ctrl+C handling.
 
-    Does NOT use asyncio.run() because it overrides signal handlers.
-    Spawns a background thread to keep terminal ISIG enabled.
+    Does NOT use asyncio.run() because it overrides signal handlers. No child holds the
+    terminal: every spawn of the package sets stdin (/dev/null, or a pipe of its own;
+    test_every_spawn_site_sets_stdin), so no child changes its modes and Ctrl+C stays SIGINT.
 
     - First Ctrl+C: Cancels main task, cleanup (__aexit__) runs
     - Second Ctrl+C: Force kill all child process groups immediately
@@ -104,7 +84,6 @@ def _run_with_interrupt_handling(coro: Any) -> Any:
     interrupt_count = [0]
     main_task: asyncio.Task[Any] | None = None
     loop: asyncio.AbstractEventLoop | None = None
-    stop_monitor = threading.Event()
 
     def handle_sigint(_signum: int, _frame: Any) -> None:
         interrupt_count[0] += 1
@@ -114,15 +93,13 @@ def _run_with_interrupt_handling(coro: Any) -> Any:
                 click.echo(f"\nForce killing {count} VM process(es)...", err=True)
                 force_kill_all()
             sys.exit(130)
-        click.echo("\nInterrupted. Shutting down (Ctrl+C again to force)...", err=True)
+        click.echo("\nInterrupted. Stopping the VMs (press Ctrl+C again to stop them at once)...", err=True)
         if main_task is not None and not main_task.done():
             main_task.cancel()
         if loop is not None:
             loop.call_soon_threadsafe(lambda: None)
 
     original_handler = signal.signal(signal.SIGINT, handle_sigint)
-    monitor_thread = threading.Thread(target=_create_terminal_monitor, args=(stop_monitor,), daemon=True)
-    monitor_thread.start()
 
     try:
         loop = asyncio.new_event_loop()
@@ -137,7 +114,6 @@ def _run_with_interrupt_handling(coro: Any) -> Any:
     except KeyboardInterrupt:
         sys.exit(130)
     finally:
-        stop_monitor.set()
         signal.signal(signal.SIGINT, original_handler)
 
 
@@ -303,7 +279,7 @@ def parse_upload_spec(spec: str) -> tuple[str, str]:
     local, sep, guest = spec.partition(":")
     if not sep or not guest:
         raise click.BadParameter(
-            f"Invalid upload format: '{spec}'. Use LOCAL:GUEST format (e.g. ./data.csv:data.csv).",
+            f"Invalid upload format: '{spec}'. Use LOCAL:GUEST (for example ./data.csv:data.csv).",
             param_hint="'--upload'",
         )
     if not local:
@@ -350,7 +326,7 @@ def parse_download_spec(spec: str) -> tuple[str, str]:
         local = Path(guest).name
     if not local:
         raise click.BadParameter(
-            f"Empty local path in: '{spec}'. Use GUEST:LOCAL format (e.g. output.csv:./out.csv).",
+            f"Empty local path in: '{spec}'. Use GUEST:LOCAL (for example output.csv:./out.csv).",
             param_hint="'--download'",
         )
     # Expand ~ since shell can't do it inside colon-separated args
@@ -358,7 +334,7 @@ def parse_download_spec(spec: str) -> tuple[str, str]:
     local = os.path.expanduser(local)  # noqa: PTH111
     if Path(local).is_dir():
         raise click.BadParameter(
-            f"Local path is a directory, not a file: '{local}'. Specify a full file path (e.g. ~/results/output.csv).",
+            f"Local path is a folder, not a file: '{local}'. Give a file path (for example ~/results/output.csv).",
             param_hint="'--download'",
         )
     return (guest, local)
@@ -459,11 +435,15 @@ def format_multi_result_json(results: list[MultiSourceResult]) -> str:
 _MULTI_RESULTS = TypeAdapter(list[MultiSourceResult])
 
 
-def truncate_source(source: str, max_len: int = 40) -> str:
+_LABEL_CHARS = 40
+"""Longest source label shown: a longer one keeps its first 37 characters, then "..."."""
+
+
+def truncate_source(source: str) -> str:
     """Truncate source label for display."""
-    if len(source) <= max_len:
+    if len(source) <= _LABEL_CHARS:
         return source
-    return source[: max_len - 3] + "..."
+    return source[: _LABEL_CHARS - 3] + "..."
 
 
 def _resolve_source(src: str, language_override: str | None) -> SourceInput:
@@ -482,21 +462,20 @@ def _resolve_source(src: str, language_override: str | None) -> SourceInput:
     if src == "-":
         # Read from stdin
         if sys.stdin.isatty():
-            raise click.UsageError("No input provided. Pipe code to stdin or use -c flag.")
+            raise click.UsageError("No code on stdin. Pipe code to stdin, or use the -c option.")
         code = sys.stdin.read()
         label = "<stdin>"
+    # A file when one is at that path, else inline code. os.path.isfile is False for
+    # text that cannot be a path (too long, a NUL byte); Path.exists raises
+    elif os.path.isfile(src):  # noqa: PTH113
+        code = Path(src).read_text()
+        label = src
     else:
-        # Check if it's a file, otherwise treat as inline code
-        path = Path(src)
-        if path.exists() and path.is_file():
-            code = path.read_text()
-            label = src
-        else:
-            code = src
-            label = truncate_source(src)
+        code = src
+        label = truncate_source(src)
 
     if not code.strip():
-        raise click.UsageError(f"Empty code provided for source: {label}")
+        raise click.UsageError(f"No code in source: {label}")
 
     # Resolve language (override > auto-detect > python default)
     resolved_language = language_override.lower() if language_override else detect_language(src) or "python"
@@ -638,9 +617,8 @@ _SPEC_OPTIONS: dict[str, tuple[str, str]] = {
 
 _ACTION_ADVICE: dict[ErrorAction, str] = {
     ErrorAction.RETRY: "Run the same command again later.",
-    ErrorAction.VERIFY: "It is not known what this run did: the code may have run, or the save may have "
-    "landed (or another save won). Check before you run again; for an instance, read the generation "
-    "with 'sbx instance describe {id}'.",
+    ErrorAction.VERIFY: "Check before you run again: the code may have run, or the save may be "
+    "stored. For an instance, read the generation with 'sbx instance describe {id}'.",
     ErrorAction.RESTART: "Run the command again.",
     ErrorAction.FIX_INPUT: "Correct the command, then run again.",
     ErrorAction.FIX_CONFIG: "Correct the settings, then run again.",
@@ -664,13 +642,13 @@ _CODE_ADVICE: dict[ErrorCode, list[str]] = {
     ErrorCode.ASSET_DOWNLOAD: [_PREFETCH_ADVICE],
     ErrorCode.ASSET_NOT_FOUND: [_PREFETCH_ADVICE],
     ErrorCode.PACKAGE_NOT_ALLOWED: [
-        "Only packages from the top 10,000 PyPI/npm packages are allowed for security reasons.",
-        "Check spelling of package name",
-        "Use --no-validation to bypass (not recommended)",
+        "Only the top 10,000 packages of PyPI or npm are allowed.",
+        "Check the spelling of the package name.",
+        "To skip this check, use --no-validation.",
     ],
     ErrorCode.VM_BOOT_TIMEOUT: [
-        "The VM failed to start before code could run: boot timeouts are often transient (CPU contention).",
-        "Check system load and available resources",
+        "The VM did not start in time, so the code did not run. A boot timeout often comes from CPU contention and passes.",
+        "Check the system load and the free resources.",
     ],
 }
 """Extra advice for some codes, printed before the action's advice."""
@@ -726,7 +704,7 @@ def _instance_store(settings: Settings) -> tuple[InstanceStoreKind, SecretStr | 
     service, username = cli_keyring.KEYRING_SERVICE, cli_keyring.KEYRING_USERNAME
 
     # The lock must be shared by every process of this account (one keyring entry per account)
-    local = cli_keyring.open_local_keyring(data_dir=get_account_dir(kind=UserDir.DATA, app_name="exec-sandbox"))
+    local = cli_keyring.open_local_keyring(data_dir=get_account_dir(kind=UserDir.DATA))
     if local.created:
         click.echo(
             click.style(
@@ -1046,6 +1024,7 @@ async def run_multiple(
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
+        debug: Enable boot log streaming to stderr
 
     Returns:
         Exit code to return from CLI (the _report_error one when the scheduler fails)
@@ -1244,7 +1223,13 @@ does not boot in time; 125 for other errors; 130 after Ctrl+C.
     type=click.Choice(["python", "javascript", "raw"], case_sensitive=False),
     help="Language of the code (default: from the file extension, else python)",
 )
-@click.option("-t", "--timeout", default=30, show_default=True, help="Timeout in seconds (1-300)")
+@click.option(
+    "-t",
+    "--timeout",
+    default=constants.DEFAULT_TIMEOUT_SECONDS,
+    show_default=True,
+    help=f"Timeout in seconds (1-{constants.MAX_TIMEOUT_SECONDS})",
+)
 @click.option("-e", "--env", "env_vars", multiple=True, help="Environment variable KEY=VALUE (repeatable)")
 @click.option(
     "-m", "--memory", default=constants.DEFAULT_MEMORY_MB, show_default=True, help="Memory in MB (128 or more)"
@@ -1280,7 +1265,7 @@ does not boot in time; 125 for other errors; 130 after Ctrl+C.
     "--download",
     "download_files",
     multiple=True,
-    help="Download file GUEST:LOCAL, or GUEST to ./basename(GUEST) (repeatable)",
+    help="Download file GUEST:LOCAL, or GUEST to ./<file name> (repeatable)",
 )
 @click.option(
     "--instance",
@@ -1326,7 +1311,7 @@ def run_command(
 ) -> NoReturn:
     """Run code in an isolated VM.
 
-    SOURCES can be one or more of (several run at the same time, each in its own VM):
+    SOURCES is one or more of these (several sources run at the same time, each in its own VM):
 
     \b
       - Inline code:  sbx run 'print("hello")'
@@ -1359,30 +1344,17 @@ def run_command(
         raise click.UsageError("Stdin marker '-' can only be used once.")
 
     if not all_sources:
-        raise click.UsageError("No code provided. Provide SOURCES argument or use -c flag.")
+        raise click.UsageError("No code given. Give SOURCES, or use the -c option.")
 
     # Without network access, the domain list has nothing to allow
     if allowed_domains and not network:
         raise click.UsageError("--allow-domain requires --network.")
 
-    # Parse environment variables
+    # Parse environment variables, port mappings and file I/O specs
     try:
         parsed_env_vars = parse_env_vars(env_vars)
-    except click.BadParameter as exc:
-        raise click.UsageError(str(exc)) from exc
-
-    # Parse port mappings
-    try:
         parsed_ports = parse_port_mappings(expose_ports) if expose_ports else None
-    except click.BadParameter as exc:
-        raise click.UsageError(str(exc)) from exc
-
-    # Parse file I/O specs
-    try:
         parsed_uploads = tuple(parse_upload_spec(spec) for spec in upload_files)
-    except click.BadParameter as exc:
-        raise click.UsageError(str(exc)) from exc
-    try:
         parsed_downloads = tuple(parse_download_spec(spec) for spec in download_files)
     except click.BadParameter as exc:
         raise click.UsageError(str(exc)) from exc
@@ -1466,14 +1438,14 @@ async def _instance_admin(action: Callable[[InstanceAdmin], Awaitable[int]]) -> 
 def instance_group() -> None:
     """List, describe and remove saved instances.
 
-    'sbx run --instance ID' makes and saves them. The store is the same: a
-    folder on this host (EXEC_SANDBOX_INSTANCE_STORE_DIR, else the user's
+    These commands start no VM. They use the store of 'sbx run --instance ID':
+    a folder on this host (EXEC_SANDBOX_INSTANCE_STORE_DIR, else the user's
     data folder) with its key in EXEC_SANDBOX_INSTANCE_KEYRING, else in the
     OS keyring; or S3 with EXEC_SANDBOX_INSTANCE_STORE=s3 and
-    EXEC_SANDBOX_INSTANCE_KEYRING. These commands start no VM.
+    EXEC_SANDBOX_INSTANCE_KEYRING.
 
-    Exit codes: 2 for invalid settings, a bad id, or a FIX_INPUT or FIX_CONFIG
-    error; 125 for the other errors.
+    Exit codes: 0 on success; 2 for invalid settings, a bad id, or a FIX_INPUT
+    or FIX_CONFIG error; 125 for the other errors; 130 after Ctrl+C.
     """
 
 
@@ -1524,10 +1496,10 @@ def instance_describe_command(*, instance_id: str) -> NoReturn:
 def instance_rm_command(*, instance_ids: tuple[str, ...]) -> NoReturn:
     """Remove saved instances.
 
-    Prints each id it removed. An id with no instance is not an error (the
-    objects left under that id are removed too): the exit code is 0 when all
-    the instances are gone. The ids are removed in order; the first error
-    stops the command.
+    Removes the ids in order and prints each id it removed; the first error
+    stops the command. An id with no instance is not an error (the objects
+    left under that id are removed too): the exit code is 0 when all the
+    instances are gone.
     """
     configure_logging()
 
@@ -1558,9 +1530,11 @@ def instance_rm_command(*, instance_ids: tuple[str, ...]) -> NoReturn:
 def prefetch_command(arch: str | None, quiet: bool) -> NoReturn:
     """Download the VM assets before use, for offline hosts.
 
-    Downloads all the assets of one architecture (kernel, initramfs,
-    gvproxy-wrapper for this OS, base images) to the cache folder. Exit code 1
-    when a download fails.
+    Downloads the kernel, the initramfs and the base images of one
+    architecture to the download cache, except the files already there.
+    gvproxy-wrapper (for this OS) goes there only when no images folder
+    (EXEC_SANDBOX_IMAGES_DIR, a local build) holds it. Exit code 1 when a
+    download fails.
 
     Dockerfile example:
 
@@ -1600,7 +1574,7 @@ def _display_prefetch_result(result: PrefetchResult, quiet: bool) -> None:
 
 
 # ============================================================================
-# Entry Point with Backward Compatibility
+# Entry Point
 # ============================================================================
 
 # Known subcommands and flags that should NOT trigger implicit 'run'
@@ -1608,17 +1582,15 @@ _KNOWN_SUBCOMMANDS = {"instance", "prefetch", "run", "--help", "-h", "--version"
 
 
 def main() -> NoReturn:
-    """Entry point with backward compatibility.
+    """Entry point of `sbx`.
 
-    For backward compatibility, if the first argument is not a known subcommand
-    or flag, we automatically insert 'run' so that:
+    When the first argument is not a known subcommand or flag, 'run' goes
+    before it:
 
         sbx 'print(1)'  ->  sbx run 'print(1)'
-
-    This preserves the original CLI behavior while supporting new subcommands.
     """
     if len(sys.argv) > 1 and sys.argv[1] not in _KNOWN_SUBCOMMANDS:
-        # Insert 'run' as the subcommand for backward compatibility
+        # Implicit 'run' subcommand
         sys.argv.insert(1, "run")
     cli()
     # cli() will sys.exit() via subcommands, but for bare 'sbx' (help display),

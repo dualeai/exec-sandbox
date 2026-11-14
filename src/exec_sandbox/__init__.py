@@ -43,7 +43,7 @@ For the "local" instance store (and the sbx command line):
 # ---------------------------------------------------------------------------
 # exec-sandbox is deeply POSIX-specific: Unix domain sockets (AF_UNIX),
 # signals (SIGKILL/SIGTERM/SIGSTOP), cgroups v2, /proc, fcntl file locking,
-# termios, os.getuid(), unshare namespaces, and QEMU with KVM (Linux) or
+# os.getuid(), unshare namespaces, and QEMU with KVM (Linux) or
 # HVF (macOS) acceleration.  None of these are available on Windows.
 #
 # We detect the platform via psutil (see platform_utils.detect_host_os) and
@@ -68,11 +68,8 @@ if detect_host_os() == HostOS.UNKNOWN:
     from exec_sandbox.exceptions import ConfigError, ErrorCode
 
     raise ConfigError(
-        "exec-sandbox requires Linux or macOS. "
-        f"Detected platform '{platform.system()}' is not supported because "
-        "exec-sandbox relies on QEMU with KVM/HVF acceleration, Unix domain sockets, "
-        "and POSIX process management (signals, cgroups, overlayfs). "
-        "Consider running inside WSL2 on Windows.",
+        f"exec-sandbox runs on Linux or macOS, not on '{platform.system()}' (it needs QEMU with "
+        "KVM or HVF, Unix sockets and POSIX processes). On Windows, run it in WSL2.",
         code=ErrorCode.PLATFORM_UNSUPPORTED,
         context={"platform": platform.system()},
         hint=None,

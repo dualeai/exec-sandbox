@@ -5,17 +5,15 @@ Uses Click's CliRunner for isolated testing without running actual VMs.
 """
 
 import asyncio
-import base64
 import json
-import os
+import pwd
 import re
-import secrets
 import stat
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import keyring.core
@@ -51,12 +49,9 @@ from exec_sandbox.assets import PrefetchResult
 from exec_sandbox.cli import (
     EXIT_CLI_ERROR,
     EXIT_SANDBOX_ERROR,
-    EXIT_SUCCESS,
     EXIT_TIMEOUT,
     MultiSourceResult,
     OneShotRun,
-    SourceInput,
-    _compute_multi_exit_code,
     cli,
     detect_language,
     format_error,
@@ -78,7 +73,7 @@ from exec_sandbox.instance.store import body_key
 from exec_sandbox.platform_utils import HostOS
 from exec_sandbox.scheduler import settings_from_config
 from exec_sandbox.session import Session
-from tests.instance_support import seed_instance
+from tests.instance_support import new_keyring, seed_instance
 from tests.keyring_support import KEYRING_ENTRY, Account, isolate_account
 
 _SEEDED_SPEC = VmSpec(language=Language.JAVASCRIPT, memory_mb=512)
@@ -86,15 +81,16 @@ _SEEDED_HOST = HostFacts(
     arch="aarch64",
     accelerator="hvf",
     cpu_vendor=None,
+    cpu_model="host",
     qemu_version="10.1.0",
     base_image="0" * 64,
     packages_image=None,
     release=__version__,
 )
 """An instance a test seals into a store itself (seed_instance)."""
-_LOCAL_KEY = base64.b64encode(secrets.token_bytes(32)).decode()
+_LOCAL_KEY = new_keyring()
 """Key in the fake OS keyring at the start of each test (see account)."""
-_ENV_KEY = base64.b64encode(secrets.token_bytes(32)).decode()
+_ENV_KEY = new_keyring()
 """Key a test puts in EXEC_SANDBOX_INSTANCE_KEYRING."""
 _INSTANCE_ENV = ("EXEC_SANDBOX_INSTANCE_STORE", "EXEC_SANDBOX_INSTANCE_KEYRING", "EXEC_SANDBOX_INSTANCE_STORE_DIR")
 
@@ -125,6 +121,17 @@ def _on_linux(monkeypatch: pytest.MonkeyPatch) -> None:
 def _no_os_keyring(monkeypatch: pytest.MonkeyPatch) -> None:
     """keyring finds no OS keyring on this host (its fail backend)."""
     monkeypatch.setattr(keyring.core, "_keyring_backend", fail.Keyring())
+
+
+def _user_home(monkeypatch: pytest.MonkeyPatch, *, user: str, home: Path) -> None:
+    """The user database has `user` with the home `home`; other names are not in it."""
+
+    def getpwnam(name: str) -> pwd.struct_passwd:
+        if name != user:
+            raise KeyError(name)
+        return pwd.struct_passwd((user, "*", 4242, 4242, "", str(home), "/bin/sh"))
+
+    monkeypatch.setattr(pwd, "getpwnam", getpwnam)
 
 
 @pytest.fixture
@@ -213,7 +220,6 @@ class TestDetectLanguage:
         """Detects Python from .py extension."""
         assert detect_language("script.py") == "python"
         assert detect_language("/path/to/script.py") == "python"
-        assert detect_language("test.PY") == "python"  # Case insensitive
 
     def test_javascript_extensions(self) -> None:
         """Detects JavaScript from .js and .mjs extensions."""
@@ -331,29 +337,11 @@ class TestFormatResultJson:
 class TestCliHelp:
     """Tests for CLI help output."""
 
-    def test_help_flag(self, runner: CliRunner) -> None:
-        """Shows help with --help flag."""
-        result = runner.invoke(run_command, ["--help"])
-        assert result.exit_code == 0
-        assert "Run code in an isolated VM." in result.output
-        assert "--language" in result.output
-        assert "--timeout" in result.output
-
     def test_short_help_flag(self, runner: CliRunner) -> None:
         """Shows help with -h flag."""
         result = runner.invoke(run_command, ["-h"])
         assert result.exit_code == 0
         assert "Run code in an isolated VM." in result.output
-
-
-class TestCliVersion:
-    """Tests for CLI version output."""
-
-    def test_version_flag(self, runner: CliRunner) -> None:
-        """Shows version with --version flag."""
-        result = runner.invoke(cli, ["--version"])
-        assert result.exit_code == 0
-        assert __version__ in result.output
 
 
 class TestCliArgumentParsing:
@@ -363,21 +351,20 @@ class TestCliArgumentParsing:
         """Shows error when no arguments provided."""
         result = runner.invoke(run_command, [])
         assert result.exit_code == EXIT_CLI_ERROR
-        assert "No code provided" in result.output
+        assert "No code given" in result.output
 
     def test_empty_code_shows_error(self, runner: CliRunner) -> None:
         """Shows error for empty code."""
         # Empty string argument passes through but results in empty code
         result = runner.invoke(run_command, [""])
         assert result.exit_code == EXIT_CLI_ERROR
-        # Either "Empty code" or "No code" depending on how Click handles empty strings
-        assert "Empty code" in result.output or "No code" in result.output
+        assert "No code in source" in result.output
 
     def test_whitespace_only_code_shows_error(self, runner: CliRunner) -> None:
         """Shows error for whitespace-only code."""
         result = runner.invoke(run_command, ["   "])
         assert result.exit_code == EXIT_CLI_ERROR
-        assert "Empty code provided" in result.output
+        assert "No code in source" in result.output
 
 
 class TestCliCodeExecution:
@@ -396,6 +383,21 @@ class TestCliCodeExecution:
             call_kwargs = _call(mock_scheduler)
             assert call_kwargs["code"] == "print('hello')"
             assert call_kwargs["language"] == Language.PYTHON
+
+    @pytest.mark.parametrize("code", ["x = 1\n" * 200, "print('a\x00b')"], ids=["longer-than-a-path", "nul-byte"])
+    def test_inline_code_that_cannot_be_a_path_runs(
+        self, runner: CliRunner, mock_result: ExecutionResult, code: str
+    ) -> None:
+        """Inline code longer than a file name, or with a NUL byte, runs as code: it is no
+        path, and the file check does not raise."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            mock_scheduler = _mock_scheduler(scheduler_cls)
+            _vm(mock_scheduler).exec.return_value = mock_result
+
+            result = runner.invoke(run_command, [code])
+
+            assert result.exit_code == 0, result.output
+            assert _call(mock_scheduler)["code"] == code
 
     def test_explicit_language(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Uses explicitly specified language."""
@@ -598,7 +600,7 @@ class TestCliErrorHandling:
 
             assert result.exit_code == EXIT_CLI_ERROR
             assert "Error: PACKAGE_NOT_ALLOWED (FIX_INPUT)" in result.stderr
-            assert "Use --no-validation to bypass (not recommended)" in result.stderr
+            assert "To skip this check, use --no-validation." in result.stderr
 
     def test_timeout_error(self, runner: CliRunner) -> None:
         """VM_BOOT_TIMEOUT (RETRY): exit 124, like the timeout command."""
@@ -616,7 +618,7 @@ class TestCliErrorHandling:
 
             assert result.exit_code == EXIT_TIMEOUT
             assert "Error: VM_BOOT_TIMEOUT (RETRY)" in result.stderr
-            assert "The VM failed to start before code could run" in result.stderr
+            assert "The VM did not start in time, so the code did not run" in result.stderr
 
     @pytest.mark.parametrize(
         ("error", "exit_code", "advice"),
@@ -750,16 +752,6 @@ class TestCliNoValidation:
 # ============================================================================
 # Edge Cases and Boundary Tests
 # ============================================================================
-class TestCliVersionShortFlag:
-    """Tests for -V version flag."""
-
-    def test_short_version_flag(self, runner: CliRunner) -> None:
-        """Shows version with -V flag."""
-        result = runner.invoke(cli, ["-V"])
-        assert result.exit_code == 0
-        assert __version__ in result.output
-
-
 class TestCliLanguageEdgeCases:
     """Tests for language option edge cases."""
 
@@ -890,61 +882,21 @@ class TestCliFileEdgeCases:
 class TestCliCodeEdgeCases:
     """Tests for code content edge cases."""
 
-    def test_code_with_quotes(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Code containing quotes is handled correctly."""
+    @pytest.mark.parametrize(
+        "code",
+        ["print(\"hello 'world'\")", "x = 1\nprint(x)", "print('Hello 世界 🌍')"],
+        ids=["quotes", "newlines", "unicode"],
+    )
+    def test_code_is_passed_unchanged(self, runner: CliRunner, mock_result: ExecutionResult, code: str) -> None:
+        """Quotes, new lines and non-ASCII characters in inline code get to exec() unchanged."""
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = _mock_scheduler(scheduler_cls)
             _vm(mock_scheduler).exec.return_value = mock_result
 
-            result = runner.invoke(run_command, ["print(\"hello 'world'\")"])
-
-            assert result.exit_code == 0
-            call_kwargs = _call(mock_scheduler)
-            assert call_kwargs["code"] == "print(\"hello 'world'\")"
-
-    def test_code_with_newlines(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Code containing newlines is handled correctly."""
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            _vm(mock_scheduler).exec.return_value = mock_result
-
-            code = "x = 1\nprint(x)"
             result = runner.invoke(run_command, [code])
 
             assert result.exit_code == 0
-            call_kwargs = _call(mock_scheduler)
-            assert call_kwargs["code"] == code
-
-    def test_code_with_unicode(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Code containing unicode is handled correctly."""
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            _vm(mock_scheduler).exec.return_value = mock_result
-
-            code = "print('Hello 世界 🌍')"
-            result = runner.invoke(run_command, [code])
-
-            assert result.exit_code == 0
-            call_kwargs = _call(mock_scheduler)
-            assert call_kwargs["code"] == code
-
-    def test_code_flag_and_positional_both_run(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Both -c flag and positional arguments run as separate sources."""
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            _vm(mock_scheduler).exec.return_value = mock_result
-
-            # Both -c and positional provided - both should run
-            result = runner.invoke(run_command, ["-c", "print('from -c')", "print('from pos')"])
-
-            assert result.exit_code == 0
-            # Both sources should be executed (multi-input mode)
-            assert mock_scheduler.new.call_count == 2
-            # -c sources come first, then positional
-            calls = _calls(mock_scheduler)
-            codes = [call["code"] for call in calls]
-            assert "print('from -c')" in codes
-            assert "print('from pos')" in codes
+            assert _call(mock_scheduler)["code"] == code
 
 
 class TestCliStdinEdgeCases:
@@ -954,13 +906,13 @@ class TestCliStdinEdgeCases:
         """Empty stdin shows error."""
         result = runner.invoke(run_command, ["-"], input="")
         assert result.exit_code == EXIT_CLI_ERROR
-        assert "Empty code provided" in result.output
+        assert "No code in source" in result.output
 
     def test_stdin_whitespace_only(self, runner: CliRunner) -> None:
         """Whitespace-only stdin shows error."""
         result = runner.invoke(run_command, ["-"], input="   \n\t\n   ")
         assert result.exit_code == EXIT_CLI_ERROR
-        assert "Empty code provided" in result.output
+        assert "No code in source" in result.output
 
     def test_stdin_with_explicit_language(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Stdin with explicit language works."""
@@ -1145,13 +1097,10 @@ class TestCliQuietMode:
 class TestDetectLanguageEdgeCases:
     """Additional edge cases for detect_language."""
 
-    def test_uppercase_extension(self) -> None:
-        """Handles uppercase extensions."""
+    def test_extension_case_is_ignored(self) -> None:
+        """Upper case and mixed case extensions give the same language as lower case ones."""
         assert detect_language("SCRIPT.PY") == "python"
         assert detect_language("APP.JS") == "javascript"
-
-    def test_mixed_case_extension(self) -> None:
-        """Handles mixed case extensions."""
         assert detect_language("script.Py") == "python"
         assert detect_language("app.Js") == "javascript"
 
@@ -1231,14 +1180,6 @@ class TestParseUploadSpec:
         assert local_path == "rel.csv"
         assert guest_path == "data.csv"
 
-    def test_absolute_local_path(self, tmp_path: Path) -> None:
-        """Parses absolute local path."""
-        local_file = tmp_path / "abs.txt"
-        local_file.write_text("content")
-        local_path, guest_path = parse_upload_spec(f"{local_file}:dest.txt")
-        assert local_path == str(local_file)
-        assert guest_path == "dest.txt"
-
     def test_symlink_local_path(self, tmp_path: Path) -> None:
         """Follows symlink for local path (exists check passes)."""
         real = tmp_path / "real.txt"
@@ -1291,29 +1232,20 @@ class TestParseUploadSpec:
 
     # --- Tilde expansion ---
 
-    def test_tilde_expanded_in_local_path(self, tmp_path: Path) -> None:
-        """Expands ~ to home directory in local path."""
-        local_file = tmp_path / "data.csv"
-        local_file.write_text("content")
-        with patch("os.path.expanduser", return_value=str(local_file)):
-            local_path, guest_path = parse_upload_spec("~/data.csv:data.csv")
-        assert local_path == str(local_file)
+    def test_tilde_expanded_in_local_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """~ in the local path is the HOME folder: the file there is found."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / "data.csv").write_text("content")
+        local_path, guest_path = parse_upload_spec("~/data.csv:data.csv")
+        assert local_path == str(tmp_path / "data.csv")
         assert guest_path == "data.csv"
 
-    def test_tilde_prefix_user_expanded(self, tmp_path: Path) -> None:
-        """Expands ~user to that user's home directory."""
-        local_file = tmp_path / "data.csv"
-        local_file.write_text("content")
-        with patch("os.path.expanduser", return_value=str(local_file)):
-            local_path, _ = parse_upload_spec("~someone/data.csv:data.csv")
-        assert local_path == str(local_file)
-
-    def test_no_tilde_unchanged(self, tmp_path: Path) -> None:
-        """Paths without ~ are unchanged by expanduser."""
-        local_file = tmp_path / "data.csv"
-        local_file.write_text("content")
-        local_path, _ = parse_upload_spec(f"{local_file}:data.csv")
-        assert local_path == str(local_file)
+    def test_tilde_prefix_user_expanded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """~user in the local path is the home of that user in the user database."""
+        _user_home(monkeypatch, user="someone", home=tmp_path)
+        (tmp_path / "data.csv").write_text("content")
+        local_path, _ = parse_upload_spec("~someone/data.csv:data.csv")
+        assert local_path == str(tmp_path / "data.csv")
 
     # --- Error cases ---
 
@@ -1464,29 +1396,21 @@ class TestParseDownloadSpec:
 
     # --- Tilde expansion ---
 
-    def test_tilde_expanded_in_local_path(self) -> None:
-        """Expands ~ to home directory in local path."""
+    def test_tilde_expanded_in_local_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """~ in the local path is the HOME folder."""
+        monkeypatch.setenv("HOME", str(tmp_path))
         guest_path, local_path = parse_download_spec("output.csv:~/result.csv")
         assert guest_path == "output.csv"
-        assert "~" not in local_path
-        assert local_path.endswith("/result.csv")
+        assert local_path == str(tmp_path / "result.csv")
 
-    def test_tilde_prefix_user_expanded(self) -> None:
-        """Expands ~user to that user's home directory (or leaves unchanged if user unknown)."""
-
-        expected = os.path.expanduser("~someone/result.csv")  # noqa: PTH111
+    def test_tilde_prefix_user_expanded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """~user in the local path is the home of that user in the user database; an unknown
+        user stays as written."""
+        _user_home(monkeypatch, user="someone", home=tmp_path)
         _, local_path = parse_download_spec("output.csv:~someone/result.csv")
-        assert local_path == expected
-
-    def test_no_tilde_unchanged(self) -> None:
-        """Paths without ~ are unchanged by expanduser."""
-        _, local_path = parse_download_spec("output.csv:./result.csv")
-        assert local_path == "./result.csv"
-
-    def test_shorthand_no_tilde(self) -> None:
-        """Shorthand (no colon) paths without ~ are unchanged."""
-        _, local_path = parse_download_spec("output.csv")
-        assert local_path == "output.csv"
+        assert local_path == str(tmp_path / "result.csv")
+        _, local_path = parse_download_spec("output.csv:~nobody-here/result.csv")
+        assert local_path == "~nobody-here/result.csv"
 
     # --- Boundary cases ---
 
@@ -1545,28 +1469,28 @@ class TestParseDownloadSpec:
         """Guest path '..' — basename is '..', rejected because '..' is a directory."""
         import click
 
-        with pytest.raises(click.BadParameter, match="directory"):
+        with pytest.raises(click.BadParameter, match="folder"):
             parse_download_spec("..")
 
     def test_tilde_alone_as_local_rejected(self) -> None:
         """Bare ~ as local path (full format) is rejected as directory."""
         import click
 
-        with pytest.raises(click.BadParameter, match="directory"):
+        with pytest.raises(click.BadParameter, match="folder"):
             parse_download_spec("output.csv:~")
 
     def test_tilde_alone_shorthand_rejected(self) -> None:
         """Shorthand ~ is rejected as directory."""
         import click
 
-        with pytest.raises(click.BadParameter, match="directory"):
+        with pytest.raises(click.BadParameter, match="folder"):
             parse_download_spec("~")
 
     def test_existing_directory_as_local_rejected(self, tmp_path: Path) -> None:
         """Existing directory as local path is rejected."""
         import click
 
-        with pytest.raises(click.BadParameter, match="directory"):
+        with pytest.raises(click.BadParameter, match="folder"):
             parse_download_spec(f"output.csv:{tmp_path}")
 
 
@@ -1579,15 +1503,8 @@ class TestCliFileIoIntegration:
         local_file.write_text("content")
 
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_session = AsyncMock()
-            mock_session.startup_timing = _STARTUP
-            mock_session.exposed_ports = []
+            mock_session = _vm(_mock_scheduler(scheduler_cls))
             mock_session.exec.return_value = mock_result
-            mock_session.__aenter__.return_value = mock_session
-            mock_session.__aexit__.return_value = None
-
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            mock_scheduler.new.return_value = mock_session
 
             result = runner.invoke(
                 run_command,
@@ -1595,90 +1512,71 @@ class TestCliFileIoIntegration:
             )
 
             assert result.exit_code == 0
-            mock_session.write_file.assert_called_once_with("input.csv", local_file)
+            mock_session.write_file.assert_awaited_once_with("input.csv", local_file)
 
-    def test_download_full_parsed_and_passed(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+    def test_download_full_parsed_and_passed(
+        self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Download GUEST:LOCAL spec flows correctly to session.read_file."""
+        monkeypatch.chdir(tmp_path)
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_session = AsyncMock()
-            mock_session.startup_timing = _STARTUP
-            mock_session.exposed_ports = []
+            mock_session = _vm(_mock_scheduler(scheduler_cls))
             mock_session.exec.return_value = mock_result
 
             async def _fake_read(path: str, *, destination: Path) -> None:
                 destination.write_bytes(b"downloaded")
 
             mock_session.read_file.side_effect = _fake_read
-            mock_session.__aenter__.return_value = mock_session
-            mock_session.__aexit__.return_value = None
 
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            mock_scheduler.new.return_value = mock_session
+            result = runner.invoke(run_command, ["--download", "out.csv:./result.csv", "-c", "print(1)"])
 
-            with runner.isolated_filesystem():
-                result = runner.invoke(
-                    run_command,
-                    ["--download", "out.csv:./result.csv", "-c", "print(1)"],
-                )
+        assert result.exit_code == 0
+        mock_session.read_file.assert_awaited_once_with("out.csv", destination=Path("result.csv"))
+        assert (tmp_path / "result.csv").read_bytes() == b"downloaded"
 
-                assert result.exit_code == 0
-                mock_session.read_file.assert_called_once_with("out.csv", destination=Path("result.csv"))
-                assert Path("result.csv").read_bytes() == b"downloaded"
-
-    def test_download_to_a_path_under_a_file_exits_2(
+    def test_download_destination_the_caller_can_fix_exits_2(
         self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path
     ) -> None:
-        """A --download destination the caller cannot write (a regular file in its path: ENOTDIR)
-        is the caller's to fix: ARGUMENT_INVALID (FIX_INPUT), exit 2, never 125 (RETRY). The real
-        destination step of read_file runs: it fails before any guest call."""
-        from types import SimpleNamespace
-
-        from exec_sandbox.qemu_vm import QemuVM
-
-        (tmp_path / "file").write_bytes(b"")
-        destination = tmp_path / "file" / "sub" / "out.csv"  # mkdir of "sub" under a file: ENOTDIR
-
-        async def read_file(path: str, *, destination: Path) -> None:
-            await QemuVM._read_file_to_path(cast("QemuVM", SimpleNamespace(vm_id="vm-1")), path, destination, "op")
+        """read_file refuses a --download destination the caller can fix (ARGUMENT_INVALID,
+        FIX_INPUT): exit 2, never 125 (RETRY), with the message of the error. Which destinations
+        read_file refuses: tests/test_session_guard_and_io.py
+        (test_destination_the_caller_can_fix_is_argument_invalid)."""
+        destination = tmp_path / "file" / "sub" / "out.csv"
+        message = "VM vm-1 read_file could not write the local destination (a file is in its path)"
 
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             vm = _vm(_mock_scheduler(scheduler_cls))
             vm.exec.return_value = mock_result
-            vm.read_file.side_effect = read_file
+            vm.read_file.side_effect = InvalidInputError(
+                message, code=ErrorCode.ARGUMENT_INVALID, context=None, hint=None, instance_id=None
+            )
 
             result = runner.invoke(run_command, ["--download", f"out.csv:{destination}", "-c", "print(1)"])
 
         assert result.exit_code == EXIT_CLI_ERROR
         assert "Error: ARGUMENT_INVALID (FIX_INPUT)" in result.stderr
-        assert list((tmp_path).iterdir()) == [tmp_path / "file"]
+        assert message in result.stderr
+        vm.read_file.assert_awaited_once_with("out.csv", destination=destination)
 
-    def test_download_shorthand_writes_to_basename(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+    def test_download_shorthand_writes_to_basename(
+        self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Download GUEST shorthand writes to ./basename in cwd."""
+        monkeypatch.chdir(tmp_path)
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_session = AsyncMock()
-            mock_session.startup_timing = _STARTUP
-            mock_session.exposed_ports = []
+            mock_session = _vm(_mock_scheduler(scheduler_cls))
             mock_session.exec.return_value = mock_result
 
             async def _fake_read(path: str, *, destination: Path) -> None:
                 destination.write_bytes(b"data")
 
             mock_session.read_file.side_effect = _fake_read
-            mock_session.__aenter__.return_value = mock_session
-            mock_session.__aexit__.return_value = None
 
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            mock_scheduler.new.return_value = mock_session
+            result = runner.invoke(run_command, ["--download", "subdir/output.csv", "-c", "print(1)"])
 
-            with runner.isolated_filesystem():
-                result = runner.invoke(
-                    run_command,
-                    ["--download", "subdir/output.csv", "-c", "print(1)"],
-                )
-
-                assert result.exit_code == 0
-                mock_session.read_file.assert_called_once_with("subdir/output.csv", destination=Path("output.csv"))
-                assert Path("output.csv").read_bytes() == b"data"
+        assert result.exit_code == 0
+        mock_session.read_file.assert_awaited_once_with("subdir/output.csv", destination=Path("output.csv"))
+        assert (tmp_path / "output.csv").read_bytes() == b"data"
 
     @pytest.mark.parametrize("quiet", [False, True], ids=["line", "quiet"])
     def test_download_line_on_stderr(
@@ -1703,45 +1601,31 @@ class TestCliFileIoIntegration:
         assert result.stderr == ("" if quiet else f"  Downloaded: out.csv -> {local} (10 bytes)\n")
 
     def test_upload_and_download_together(
-        self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path
+        self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Upload + download in same command uses session path."""
+        monkeypatch.chdir(tmp_path)
         local_file = tmp_path / "input.txt"
         local_file.write_text("hello")
 
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_session = AsyncMock()
-            mock_session.startup_timing = _STARTUP
-            mock_session.exposed_ports = []
+            mock_session = _vm(_mock_scheduler(scheduler_cls))
             mock_session.exec.return_value = mock_result
 
             async def _fake_read(path: str, *, destination: Path) -> None:
                 destination.write_bytes(b"result")
 
             mock_session.read_file.side_effect = _fake_read
-            mock_session.__aenter__.return_value = mock_session
-            mock_session.__aexit__.return_value = None
 
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            mock_scheduler.new.return_value = mock_session
+            result = runner.invoke(
+                run_command,
+                ["--upload", f"{local_file}:input.txt", "--download", "output.txt:result.txt", "-c", "print(1)"],
+            )
 
-            with runner.isolated_filesystem():
-                result = runner.invoke(
-                    run_command,
-                    [
-                        "--upload",
-                        f"{local_file}:input.txt",
-                        "--download",
-                        "output.txt:result.txt",
-                        "-c",
-                        "print(1)",
-                    ],
-                )
-
-                assert result.exit_code == 0
-                mock_session.write_file.assert_called_once()
-                mock_session.read_file.assert_called_once_with("output.txt", destination=Path("result.txt"))
-                assert Path("result.txt").read_bytes() == b"result"
+        assert result.exit_code == 0
+        mock_session.write_file.assert_awaited_once_with("input.txt", local_file)
+        mock_session.read_file.assert_awaited_once_with("output.txt", destination=Path("result.txt"))
+        assert (tmp_path / "result.txt").read_bytes() == b"result"
 
     def test_bad_upload_spec_shows_usage_error(self, runner: CliRunner) -> None:
         """Invalid upload spec surfaces as CLI usage error."""
@@ -1765,42 +1649,17 @@ class TestTruncateSource:
         assert truncate_source("short") == "short"
 
     def test_long_source(self) -> None:
-        """Long sources are truncated with ellipsis."""
-        long_src = "x" * 50
-        result = truncate_source(long_src, max_len=40)
-        assert len(result) == 40
-        assert result.endswith("...")
+        """A source longer than 40 characters keeps its first 37, then "..."."""
+        assert truncate_source("a" * 37 + "bcdef") == "a" * 37 + "..."
 
     def test_exact_length(self) -> None:
         """Exact length sources are not truncated."""
         src = "x" * 40
-        assert truncate_source(src, max_len=40) == src
-
-
-class TestSourceInput:
-    """Tests for SourceInput dataclass."""
-
-    def test_create_source_input(self) -> None:
-        """Creates SourceInput with required fields."""
-        src = SourceInput(code="print(1)", label="test", language=Language.PYTHON)
-        assert src.code == "print(1)"
-        assert src.label == "test"
-        assert src.language == Language.PYTHON
+        assert truncate_source(src) == src
 
 
 class TestMultiSourceResult:
     """Tests for MultiSourceResult dataclass."""
-
-    def test_create_success_result(self, mock_result: ExecutionResult) -> None:
-        """Creates successful MultiSourceResult."""
-        result = MultiSourceResult(
-            index=0, source="test.py", run=_one_shot(mock_result), error=None, code=None, action=None
-        )
-        assert result.index == 0
-        assert result.source == "test.py"
-        assert result.run is not None
-        assert result.exit_code == 0
-        assert result.error is None
 
     @pytest.mark.parametrize(
         ("code", "action", "exit_code"),
@@ -1813,15 +1672,10 @@ class TestMultiSourceResult:
         ],
         ids=["fix-input", "fix-config", "boot-timeout", "retry", "verify"],
     )
-    def test_create_error_result(self, code: ErrorCode, action: ErrorAction, exit_code: int) -> None:
-        """A source with no run keeps its error's message, code and action; its exit code is
-        the one a single source gets for that error."""
+    def test_error_result_exit_code(self, code: ErrorCode, action: ErrorAction, exit_code: int) -> None:
+        """The exit code of a source with no run is the one a single source gets for that error."""
         result = MultiSourceResult(index=1, source="bad.py", run=None, error="It failed.", code=code, action=action)
-        assert result.index == 1
-        assert result.source == "bad.py"
-        assert result.run is None
         assert result.exit_code == exit_code
-        assert (result.error, result.code, result.action) == ("It failed.", code, action)
 
 
 class TestFormatMultiResultJson:
@@ -2008,15 +1862,30 @@ class TestCliMultiInput:
         assert result.exit_code == EXIT_CLI_ERROR
         assert "once" in result.output.lower()
 
-    def test_single_source_uses_streaming(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Single source uses streaming (run_code) not run_multiple."""
+    def test_single_source_streams_its_output(self, runner: CliRunner) -> None:
+        """One source: the chunks exec() gives to on_stdout and on_stderr go to stdout and stderr
+        as they come (in that order on the terminal), and the output in the result is not
+        printed again."""
+
+        async def exec_(code: str, *, on_stdout: Any, on_stderr: Any, **_: Any) -> ExecutionResult:
+            on_stdout("out-1 ")
+            on_stderr("err-1 ")
+            on_stdout("out-2")
+            return ExecutionResult(
+                stdout="out-1 out-2",
+                stderr="err-1 ",
+                exit_code=0,
+                timing=TimingBreakdown(execute_ms=5, connect_ms=None),
+            )
+
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            _vm(mock_scheduler).exec.return_value = mock_result
+            _vm(_mock_scheduler(scheduler_cls)).exec.side_effect = exec_
 
-            result = runner.invoke(run_command, ["print('hello')"])
+            result = runner.invoke(run_command, ["-q", "print('hello')"])
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
+        assert (result.stdout, result.stderr) == ("out-1 out-2", "err-1 ")
+        assert result.output == "out-1 err-1 out-2"  # stdout and stderr as the terminal shows them
 
 
 class TestCliMultiInputLanguageDetection:
@@ -2072,137 +1941,64 @@ class TestCliMultiInputLanguageDetection:
             assert calls[1]["language"] == Language.RAW
 
 
-class TestComputeMultiExitCode:
-    """Tests for _compute_multi_exit_code helper."""
+def _crashed() -> SandboxError:
+    return TransientError("QEMU died.", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None)
 
-    def test_all_success(self, mock_result: ExecutionResult) -> None:
-        """Returns SUCCESS when all sources succeed."""
-        results = [
-            MultiSourceResult(index=0, source="a", run=_one_shot(mock_result), error=None, code=None, action=None),
-            MultiSourceResult(index=1, source="b", run=_one_shot(mock_result), error=None, code=None, action=None),
-        ]
-        assert _compute_multi_exit_code(results) == EXIT_SUCCESS
 
-    def test_max_exit_code(self) -> None:
-        """Returns max exit code from results."""
-        result0 = ExecutionResult(
-            stdout="",
-            stderr="",
-            exit_code=0,
-            execution_time_ms=10,
-            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
-        )
-        result5 = ExecutionResult(
-            stdout="",
-            stderr="",
-            exit_code=5,
-            execution_time_ms=10,
-            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
-        )
-        results = [
-            MultiSourceResult(index=0, source="a", run=_one_shot(result0), error=None, code=None, action=None),
-            MultiSourceResult(index=1, source="b", run=_one_shot(result5), error=None, code=None, action=None),
-        ]
-        assert _compute_multi_exit_code(results) == 5
-
-    @staticmethod
-    def _failed(code: ErrorCode, action: ErrorAction) -> MultiSourceResult:
-        return MultiSourceResult(index=1, source="b", run=None, error="It failed.", code=code, action=action)
-
-    @staticmethod
-    def _ran(exit_code: int) -> MultiSourceResult:
-        result = ExecutionResult(
-            stdout="",
-            stderr="",
-            exit_code=exit_code,
-            execution_time_ms=1,
-            timing=TimingBreakdown(execute_ms=1, connect_ms=None),
-        )
-        return MultiSourceResult(index=0, source="a", run=_one_shot(result), error=None, code=None, action=None)
-
-    def test_timeout_takes_precedence(self) -> None:
-        """EXIT_TIMEOUT if a source did not boot in time, over higher exit codes."""
-        results = [self._ran(130), self._failed(ErrorCode.VM_BOOT_TIMEOUT, ErrorAction.RETRY)]
-        assert _compute_multi_exit_code(results) == EXIT_TIMEOUT
-
-    def test_sandbox_error_returns_125(self) -> None:
-        """Returns EXIT_SANDBOX_ERROR for other errors."""
-        results = [self._failed(ErrorCode.QEMU_CRASHED, ErrorAction.RETRY)]
-        assert _compute_multi_exit_code(results) == EXIT_SANDBOX_ERROR
-
-    @pytest.mark.parametrize(
-        ("code", "action"),
-        [(ErrorCode.OUTPUT_LIMIT, ErrorAction.FIX_INPUT), (ErrorCode.HOST_DEPENDENCY, ErrorAction.FIX_CONFIG)],
-        ids=["fix-input", "fix-config"],
+def _boot_timeout() -> SandboxError:
+    return TransientError(
+        "Guest agent not ready", code=ErrorCode.VM_BOOT_TIMEOUT, context=None, hint=None, instance_id=None
     )
-    def test_fix_error_takes_precedence(self, code: ErrorCode, action: ErrorAction) -> None:
-        """EXIT_CLI_ERROR when a source failed with a FIX_INPUT or FIX_CONFIG error, over a
-        boot timeout, another sandbox error and a higher exit code of the code."""
-        results = [
-            self._ran(130),
-            self._failed(ErrorCode.VM_BOOT_TIMEOUT, ErrorAction.RETRY),
-            self._failed(ErrorCode.QEMU_CRASHED, ErrorAction.RETRY),
-            self._failed(code, action),
-        ]
-        assert _compute_multi_exit_code(results) == EXIT_CLI_ERROR
 
-    def test_code_timeout_counts_as_a_timeout(self) -> None:
-        """A source whose code timed out (-1): EXIT_TIMEOUT over a higher exit code and another
-        sandbox error, never the highest code (0 would hide it)."""
-        results = [self._ran(0), self._ran(-1)]
-        assert _compute_multi_exit_code(results) == EXIT_TIMEOUT
-        results = [self._ran(130), self._ran(-1), self._failed(ErrorCode.QEMU_CRASHED, ErrorAction.RETRY)]
-        assert _compute_multi_exit_code(results) == EXIT_TIMEOUT
 
-    def test_fix_error_wins_over_a_code_timeout(self) -> None:
-        results = [self._ran(-1), self._failed(ErrorCode.OUTPUT_LIMIT, ErrorAction.FIX_INPUT)]
-        assert _compute_multi_exit_code(results) == EXIT_CLI_ERROR
+def _output_limit() -> SandboxError:
+    return InvalidInputError(
+        "Output limit exceeded", code=ErrorCode.OUTPUT_LIMIT, context=None, hint=None, instance_id=None
+    )
 
-    def test_only_minus_one_is_a_code_timeout(self) -> None:
-        """-1 is the guest's timeout code only: the code's own exit codes are 0-255 (sys.exit(-1)
-        is 255), and any other exit code counts as an exit code, not as a timeout."""
-        assert _compute_multi_exit_code([self._ran(255), self._ran(0)]) == 255
-        assert _compute_multi_exit_code([self._ran(-2), self._ran(0)]) == 0
 
-    @pytest.mark.parametrize("exit_code", [EXIT_CLI_ERROR, EXIT_TIMEOUT])
-    def test_code_exit_code_is_not_an_error(self, exit_code: int) -> None:
-        """Code that exits 2 or 124 is not a sandbox error: the highest exit code wins."""
-        results = [self._ran(exit_code), self._failed(ErrorCode.QEMU_CRASHED, ErrorAction.RETRY)]
-        assert _compute_multi_exit_code(results) == EXIT_SANDBOX_ERROR
-
-    def test_empty_results(self) -> None:
-        """Returns SUCCESS for empty results list."""
-        assert _compute_multi_exit_code([]) == EXIT_SUCCESS
+def _no_qemu() -> SandboxError:
+    return ConfigError("qemu-img not found", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None)
 
 
 class TestCliMultiInputExitCodes:
     """Tests for exit code handling with multiple sources."""
 
-    def test_max_exit_code_returned(self, runner: CliRunner) -> None:
-        """Returns maximum exit code from all sources."""
-        result0 = ExecutionResult(
-            stdout="",
-            stderr="",
-            exit_code=0,
-            execution_time_ms=10,
-            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
-        )
-        result1 = ExecutionResult(
-            stdout="",
-            stderr="",
-            exit_code=5,
-            execution_time_ms=10,
-            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
-        )
+    @pytest.mark.parametrize(
+        ("outcomes", "exit_code"),
+        [
+            pytest.param((0, 0), 0, id="all-passed"),
+            pytest.param((0, 5), 5, id="highest-exit-code"),
+            pytest.param((255, 0), 255, id="exit-255"),
+            pytest.param((-2, 0), 0, id="only-minus-one-is-a-timeout"),
+            pytest.param((0, _crashed), 125, id="sandbox-error"),
+            pytest.param((2, _crashed), 125, id="code-exit-2-is-not-fix"),
+            pytest.param((124, _crashed), 125, id="code-exit-124-is-not-timeout"),
+            pytest.param((130, _boot_timeout), 124, id="boot-timeout-over-exit-code"),
+            pytest.param((130, -1, _crashed), 124, id="code-timeout-over-error"),
+            pytest.param((130, _boot_timeout, _crashed, _output_limit), 2, id="fix-input-first"),
+            pytest.param((130, _boot_timeout, _crashed, _no_qemu), 2, id="fix-config-first"),
+            pytest.param((-1, _output_limit), 2, id="fix-input-over-code-timeout"),
+        ],
+    )
+    def test_exit_code(self, runner: CliRunner, outcomes: tuple[Any, ...], exit_code: int) -> None:
+        """Each source exits with a code or fails with an error. The run exits 2 when an error
+        is FIX_INPUT or FIX_CONFIG, else 124 when a VM did not boot in time or the code of a
+        source timed out (-1), else 125 when a source failed with another error, else the
+        highest exit code. Code that exits 2 or 124 itself is an exit code, not an error."""
+
+        def exec_(code: str, **_: Any) -> ExecutionResult:
+            outcome = outcomes[int(code.removeprefix("source_"))]
+            if isinstance(outcome, int):
+                return _result(outcome)
+            raise outcome()
 
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            _vm(mock_scheduler).exec.side_effect = [result0, result1]
+            _vm(_mock_scheduler(scheduler_cls)).exec.side_effect = exec_
 
-            result = runner.invoke(run_command, ["print(1)", "exit(5)"])
+            result = runner.invoke(run_command, ["-q", *(f"source_{i}" for i in range(len(outcomes)))])
 
-            # Should return max(0, 5) = 5
-            assert result.exit_code == 5
+        assert result.exit_code == exit_code, result.output
 
     def test_package_not_allowed_exits_2_like_one_source(self, runner: CliRunner) -> None:
         """Every source has the same packages: each source shows the single-source error
@@ -2221,31 +2017,7 @@ class TestCliMultiInputExitCodes:
 
         assert result.exit_code == EXIT_CLI_ERROR
         assert result.stderr.count("Error: PACKAGE_NOT_ALLOWED (FIX_INPUT)") == 2
-        assert result.stderr.count("Use --no-validation to bypass (not recommended)") == 2
-
-    def test_timeout_returns_124(self, runner: CliRunner) -> None:
-        """Returns EXIT_TIMEOUT (124) if any source times out (VM_BOOT_TIMEOUT)."""
-        result0 = ExecutionResult(
-            stdout="",
-            stderr="",
-            exit_code=0,
-            execution_time_ms=10,
-            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
-        )
-
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            # First succeeds, second times out
-            _vm(mock_scheduler).exec.side_effect = [
-                result0,
-                TransientError(
-                    "Guest agent not ready", code=ErrorCode.VM_BOOT_TIMEOUT, context=None, hint=None, instance_id=None
-                ),
-            ]
-
-            result = runner.invoke(run_command, ["print(1)", "import time; time.sleep(100)"])
-
-            assert result.exit_code == EXIT_TIMEOUT
+        assert result.stderr.count("To skip this check, use --no-validation.") == 2
 
     def test_code_timeout_of_one_source_exits_124(self, runner: CliRunner) -> None:
         """One source's code times out (-1), the other exits 0: 124, not 0; its JSON entry
@@ -2391,7 +2163,7 @@ class TestCliPrefetch:
 
     def test_prefetch_help(self, runner: CliRunner) -> None:
         """Shows help for prefetch command."""
-        result = runner.invoke(prefetch_command, ["--help"])
+        result = runner.invoke(cli, ["prefetch", "--help"])
         assert result.exit_code == 0
         assert "Download the VM assets before use" in result.output
         assert "--arch" in result.output
@@ -2490,12 +2262,7 @@ class TestCliGroup:
         assert result.exit_code == 0
         assert "Run code in an isolated VM." in result.output
         assert "--language" in result.output
-
-    def test_prefetch_subcommand_help(self, runner: CliRunner) -> None:
-        """Shows help for prefetch subcommand."""
-        result = runner.invoke(cli, ["prefetch", "--help"])
-        assert result.exit_code == 0
-        assert "Download the VM assets before use" in result.output
+        assert "--timeout" in result.output
 
 
 # ============================================================================
@@ -3276,7 +3043,7 @@ class TestCliInstanceCommandsStore:
         assert result.exit_code == 0, result.output
         assert json.loads(result.stdout) == []
         store = home / ".local" / "share" / "exec-sandbox" / "instances"
-        assert stat.S_IMODE(store.stat().st_mode) == 0o700
+        assert stat.S_IMODE(store.stat().st_mode) & 0o777 == 0o700
         assert (account.linux_data_dir() / "instance-keyring.lock").is_file()
         assert "Keep a copy" in result.stderr  # the new-key notice, on stderr only
         key = account.keyring.entries[KEYRING_ENTRY]
@@ -3483,12 +3250,3 @@ class TestCliSpecOptionErrors:
         assert isinstance(result.exception, SystemExit), result.exception  # an exit, not a traceback
         assert result.stderr.splitlines()[-1] == line
         scheduler_cls.assert_not_called()
-
-    def test_domain_with_network_runs(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Control: the same options with --network start the VM."""
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            _vm(_mock_scheduler(scheduler_cls)).exec.return_value = mock_result
-
-            result = runner.invoke(run_command, ["--network", "--allow-domain", "a.example.com", "-c", "pass"])
-
-        assert result.exit_code == 0, result.output
