@@ -1675,9 +1675,9 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
             pytest.param(
                 HostOS.LINUX,
                 AccelType.TCG,
-                "iothread,id=iothread0-test-vm-platform-io,thread-pool-min=0,thread-pool-max=8",
-                True,
-                id="linux-tcg-dedicated-iothread",
+                "main-loop,id=main-loop0,thread-pool-min=0,thread-pool-max=8",
+                False,
+                id="linux-tcg-main-loop",
             ),
             pytest.param(
                 HostOS.LINUX,
@@ -1698,7 +1698,8 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
         expected_object: str,
         expect_device_iothread: bool,
     ) -> None:
-        """macOS (HVF and TCG) uses the capped main-loop pool; Linux (KVM and TCG) keeps the IOThread."""
+        """Linux KVM keeps the IOThread; without KVM (HVF, TCG on macOS or Linux) block I/O uses the
+        capped main-loop pool: with the IOThread, a disk request could stall for good."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
         with _qemu_cmd_mocks(host_os=host_os, accel_type=accel_type, io_uring=False):

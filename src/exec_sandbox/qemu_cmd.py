@@ -604,16 +604,21 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         )
 
     # IOThread — offloads block I/O completion (pread, qcow2 decompress) to a
-    # dedicated AioContext. Keep it on Linux (KVM and TCG), where ioeventfd or
-    # main-loop offload provides a measured benefit. macOS has no eventfd, and
-    # with the IOThread a disk request can stall for good: QEMU sits idle (IOThread
-    # in g_poll, workers waiting, vCPU halted) while the guest waits for it. HVF
-    # showed post-boot read stalls; TCG stalled about 1 cold VM in 100 under load
-    # (home disk mkfs/mount at boot, or a REPL page-in), 0 in 736 on the main loop,
-    # at the same speed (paired rounds). Route macOS block I/O through the main
-    # loop. Keep the same aio=threads pool cap in both configurations so
-    # the platform conditional changes AioContext placement, not concurrency.
-    use_dedicated_iothread = not is_macos
+    # dedicated AioContext. KVM only. Without KVM, with the IOThread a disk request
+    # can stall for good: QEMU sits idle (IOThread in g_poll, workers waiting, vCPU
+    # halted) while the guest waits for it, here a page fault in filemap_fault for
+    # the whole exec timeout.
+    # - macOS (no eventfd): HVF showed post-boot read stalls; TCG stalled about 1
+    #   cold VM in 100 under load (home disk mkfs/mount at boot, or a REPL
+    #   page-in), 0 in 736 on the main loop, at the same speed (paired rounds).
+    # - Linux TCG (the CI arm64 runners): VMs that read /usr and run uv stalled with
+    #   the IOThread 6 in 1000 on a Graviton4 host and 16 in 1000 in a container
+    #   (aio=io_uring; aio=threads too), on the main loop 0 in 1000 on each; p50
+    #   2.44 s against 2.32 s on the Graviton4 host in that read-heavy test.
+    # Route that block I/O through the main loop. Keep the same aio=threads pool cap
+    # in both configurations so the choice changes AioContext placement, not
+    # concurrency.
+    use_dedicated_iothread = accel_type == AccelType.KVM
     iothread_id = f"iothread0-{vm_id}"
     # Cap I/O thread pool to 8 (QEMU default is 64).  With single-queue
     # virtio-blk on qcow2, 8 is sufficient.  When aio=io_uring is active
@@ -671,8 +676,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # iothread-vq-mapping (QEMU 9.0) only pays off with many vCPUs and an
     # I/O-bound guest saturating a single iothread. Our VMs have 1-2 vCPUs, a
     # read-only page-cache-hot EROFS base and a tiny no-flush overlay — never
-    # iothread-CPU-bound. macOS routes block I/O to the main loop (above) and TCG has
-    # at most one thread per vCPU, so extra queues buy nothing here.
+    # iothread-CPU-bound. Without KVM, block I/O runs on the main loop (above),
+    # so extra queues buy nothing here.
     qs = constants.VIRTIO_QUEUE_SIZE
     qemu_args.extend(
         [

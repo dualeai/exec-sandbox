@@ -88,7 +88,7 @@ def pytest_configure(config: pytest.Config) -> None:
 #      → Causes SIGABRT (exit code -6). This is a host-side issue, not a test bug.
 #
 # Root cause: With TCG, each QEMU process uses ~5-11 threads at
-# steady state (main loop, vCPU, call_rcu, iothread, signal handler), plus the
+# steady state (main loop, vCPU, call_rcu, signal handler), plus the
 # I/O worker threads (QEMU util/thread-pool.c, aio=threads; qemu_cmd caps the
 # pool at 8 per AioContext, QEMU's default is 64). When many VMs boot
 # simultaneously (pytest -n auto with 4 workers), these transient spikes can
