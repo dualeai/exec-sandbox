@@ -13,7 +13,7 @@ Architecture:
         stopped) → `quit` (or `cont` to keep running)
 - Restore: QEMU started with `-incoming defer` →
         `migrate-incoming file:/path` (exit-on-error=false) → poll → `cont`
-- Strict: success only on an observed "completed"; no legacy fallback.
+- Strict: success only on an observed "completed"; no fallback to another format.
 
 Usage:
     async with MigrationClient(qmp_socket_path, expected_uid) as client:
@@ -45,7 +45,7 @@ from exec_sandbox.exceptions import (
     SandboxError,
     TransientError,
 )
-from exec_sandbox.qmp_client import QmpClient
+from exec_sandbox.qmp_client import QMP_BUFFER_LIMIT, QmpClient
 from exec_sandbox.socket_auth import connect_and_verify
 from exec_sandbox.system_probes import probe_direct_io
 
@@ -110,8 +110,7 @@ def migration_timeout(memory_mb: float) -> float:
 class MigrationClient:
     """QMP client for QEMU migration (save/restore memory snapshots).
 
-    Connection lifecycle is protected by an asyncio lock (connect/close).
-    _execute() is NOT concurrency-safe: callers must not issue commands
+    One user at a time (an `async with` block): callers must not issue commands
     concurrently on the same client (the QMP protocol is sequential).
     Pattern: connect_and_verify(), then a QmpClient (start: QMP handshake;
     execute: id-matched commands, events skipped).
@@ -122,9 +121,7 @@ class MigrationClient:
     """
 
     __slots__ = (
-        "_connected",
         "_expected_uid",
-        "_lock",
         "_qmp",
         "_qmp_socket",
     )
@@ -132,9 +129,7 @@ class MigrationClient:
     def __init__(self, qmp_socket: Path, expected_uid: int) -> None:
         self._qmp_socket = qmp_socket
         self._expected_uid = expected_uid
-        self._qmp: QmpClient | None = None
-        self._connected = False
-        self._lock = asyncio.Lock()
+        self._qmp: QmpClient | None = None  # set once the handshake ends
 
     async def connect(self, *, timeout: float) -> None:
         """Connect to QMP socket and complete handshake.
@@ -142,44 +137,32 @@ class MigrationClient:
         Raises:
             TransientError: MIGRATION_FAILED: connection, peer authentication or handshake failed
         """
-        async with self._lock:
-            if self._connected:
-                return
-
-            try:
-                reader, writer = await connect_and_verify(
-                    str(self._qmp_socket),
-                    self._expected_uid,
-                    timeout=timeout,
-                )
-                self._qmp = QmpClient(
-                    reader, writer, error_factory=lambda message: _failed(message, context=None), id_prefix="migration"
-                )
-                await self._qmp.start(timeout=timeout)
-                self._connected = True
-                logger.debug("QMP connection established (migration)")
-
-            except BaseException as error:  # Every failed handshake owns socket cleanup.
-                # Runs to its end; a cancel that comes meanwhile is raised after it (it wins
-                # over the handshake error)
-                await await_cancellation_safe(self._cleanup())
-                if isinstance(error, asyncio.CancelledError | SandboxError):
-                    raise
-                # CommunicationError: SocketAuthError, internal; the guest channel wraps it the same way.
-                if isinstance(error, OSError | TimeoutError | json.JSONDecodeError | CommunicationError):
-                    raise _failed(f"QMP connection failed: {error}", context=None) from error
+        qmp: QmpClient | None = None
+        try:
+            reader, writer = await connect_and_verify(
+                str(self._qmp_socket), self._expected_uid, timeout=timeout, buffer_limit=QMP_BUFFER_LIMIT
+            )
+            qmp = QmpClient(
+                reader, writer, error_factory=lambda message: _failed(message, context=None), id_prefix="migration"
+            )
+            await qmp.start(timeout=timeout)
+        except BaseException as error:  # Every failed handshake owns socket cleanup.
+            # Runs to its end; a cancel that comes meanwhile is raised after it (it wins
+            # over the handshake error)
+            if qmp is not None:
+                await await_cancellation_safe(qmp.close())
+            if isinstance(error, asyncio.CancelledError | SandboxError):
                 raise
+            # CommunicationError: SocketAuthError, internal; the guest channel wraps it the same way.
+            if isinstance(error, OSError | TimeoutError | json.JSONDecodeError | CommunicationError):
+                raise _failed(f"QMP connection failed: {error}", context=None) from error
+            raise
+        self._qmp = qmp
+        logger.debug("QMP connection established (migration)")
 
     async def close(self) -> None:
         """Close the QMP connection."""
-        async with self._lock:
-            await self._cleanup()
-
-    async def _cleanup(self) -> None:
-        """Internal cleanup (must hold lock)."""
-        qmp = self._qmp
-        self._qmp = None
-        self._connected = False
+        qmp, self._qmp = self._qmp, None
         if qmp is not None:
             await qmp.close()
 
@@ -194,10 +177,11 @@ class MigrationClient:
         that QEMU refuses comes back with its ``error`` key, not raised.
 
         Raises:
-            TransientError: MIGRATION_FAILED: not connected, no response within `timeout`,
-                a line that is not JSON, EOF, or too many skipped messages
+            TransientError: MIGRATION_FAILED: not connected, the connection failed (reset,
+                broken pipe), no response within `timeout`, a line that is not JSON, EOF, or
+                too many skipped messages
         """
-        if not self._connected or self._qmp is None:
+        if self._qmp is None:
             raise _failed("Not connected to QMP", context=None)
 
         # Tag each command with a unique id and match it on the response. The
@@ -207,7 +191,7 @@ class MigrationClient:
         logger.debug("QMP command: %s args=%s", command, arguments)
         try:
             return await self._qmp.execute(command, arguments=arguments, timeout=timeout, on_event=None)
-        except (TimeoutError, json.JSONDecodeError) as e:
+        except (OSError, json.JSONDecodeError) as e:  # OSError: TimeoutError, a reset or broken pipe
             raise _failed(f"QMP {command} failed: {e!r}", context=None) from e
 
     async def _set_capabilities(
@@ -227,8 +211,8 @@ class MigrationClient:
 
         Both sender (save) and receiver (restore) MUST set the same
         capabilities, otherwise QEMU rejects with "received capability is off".
-        There is no legacy fallback: a QEMU below the floor, or one that refuses
-        a capability, raises ConfigError MIGRATION_UNSUPPORTED.
+        There is no fallback to another format: a QEMU below the floor, or one that
+        refuses a capability, raises ConfigError MIGRATION_UNSUPPORTED.
 
         NOTE (design constraints, verified QEMU 11.0):
         - mapped-ram does not work with multifd-compression (seekable-fd
@@ -324,9 +308,9 @@ class MigrationClient:
         still stopped (e.g. copy a disk that must match the saved RAM). Then QEMU
         quits, or, with keep_running=True, the VM resumes (cont) and can be saved
         again later.
-        On a failure after `stop`, the VM resumes, best effort: QEMU can refuse
-        `cont` (for example while the migration finalizes), so the VM can stay
-        paused. A SandboxError raised there gets context["vm_resumed"] (True when
+        On a failure after `stop` (a cancel of the caller too), the VM resumes,
+        best effort: QEMU can refuse `cont` (for example while the migration
+        finalizes), so the VM can stay paused. A SandboxError raised there gets context["vm_resumed"] (True when
         `cont` succeeded). Keep the VM only then; replace it after any other
         failed save.
 
@@ -337,8 +321,9 @@ class MigrationClient:
 
         Raises:
             ConfigError: MIGRATION_UNSUPPORTED: QEMU below the floor or capability refused
-            TransientError: MIGRATION_FAILED: save failed, or `cont` failed after a save
-                with keep_running=True
+            TransientError: MIGRATION_FAILED: save failed (a QMP connection that fails
+                before `stop` too: the VM runs on, context vm_resumed), or `cont` failed after
+                a save with keep_running=True
             Any error that `while_paused` raises (the VM resumes first, best effort; when
                 it does not resume, TransientError MIGRATION_FAILED replaces the error).
         """
@@ -360,23 +345,29 @@ class MigrationClient:
         # without pausing the vCPU) is not used. It is KVM-only (needs userfaultfd
         # write-protect) so excluded on HVF, and we snapshot idle sessions where a
         # brief stop is cheap and full-fidelity capture wants a quiescent VM anyway.
-        resp = await self._execute("stop", arguments=None, timeout=_QMP_TIMEOUT)
-        if "error" in resp:  # QEMU refused to stop: the VM runs on
-            raise _failed(f"stop command failed: {resp['error']}", context={"vm_resumed": True})
-
         try:
-            resp = await self._execute("migrate", arguments={"uri": f"file:{vmstate_path}"}, timeout=_QMP_TIMEOUT)
-            if "error" in resp:
-                raise _failed(f"migrate command failed: {resp['error']}", context=None)
-            await self._poll_migration(timeout, lambda message: _failed(message, context=None))
-            if while_paused is not None:
-                await while_paused()
-        except Exception as e:
-            resumed = await self._resume_after_failed_save()
-            if not resumed:  # the VM may stay paused, whatever failed: the caller must replace it
-                raise _failed(f"Save failed and the VM did not resume: {e}", context={"vm_resumed": False}) from e
-            if isinstance(e, SandboxError):
-                e.context["vm_resumed"] = True  # the VM runs on: a caller may keep it
+            resp = await self._execute("stop", arguments=None, timeout=_QMP_TIMEOUT)
+            if "error" in resp:  # QEMU refused to stop: the VM runs on
+                raise _failed(f"stop command failed: {resp['error']}", context={"vm_resumed": True})
+
+            try:
+                resp = await self._execute("migrate", arguments={"uri": f"file:{vmstate_path}"}, timeout=_QMP_TIMEOUT)
+                if "error" in resp:
+                    raise _failed(f"migrate command failed: {resp['error']}", context=None)
+                await self._poll_migration(timeout, lambda message: _failed(message, context=None))
+                if while_paused is not None:
+                    await while_paused()
+            except Exception as e:
+                resumed = await self._resume_after_failed_save()
+                if not resumed:  # the VM may stay paused, whatever failed: the caller must replace it
+                    raise _failed(f"Save failed and the VM did not resume: {e}", context={"vm_resumed": False}) from e
+                if isinstance(e, SandboxError):
+                    e.context["vm_resumed"] = True  # the VM runs on: a caller may keep it
+                raise
+        except asyncio.CancelledError:
+            # A cancel of the caller, the stop sent or not: the VM resumes first (best effort,
+            # as after a failure), as a caller that keeps it (a session) runs later calls on it
+            await await_cancellation_safe(self._resume_after_failed_save())
             raise
 
         if keep_running:
@@ -432,8 +423,8 @@ class MigrationClient:
         Raises:
             RouteError: MIGRATION_REJECTED: QEMU refused the saved state
             ConfigError: MIGRATION_UNSUPPORTED: QEMU below the floor or capability refused
-            TransientError: MIGRATION_FAILED: QMP failure, timeout, or QEMU could not open
-                the file (migrate-incoming refused)
+            TransientError: MIGRATION_FAILED: QMP failure (a reset or broken connection
+                too), timeout, or QEMU could not open the file (migrate-incoming refused)
         """
         await self._set_capabilities(qemu_version, use_template=use_template)
 
@@ -465,14 +456,14 @@ class MigrationClient:
     ) -> None:
         """Poll query-migrate until completed/failed, with a pause that doubles from
         _POLL_FIRST_SECONDS to MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS: an L1 restore loads
-        its device state in a few ms, and a fixed 5 ms pause added up to 5 ms to it.
+        its device state in a few ms, and a fixed 5 ms pause would add up to 5 ms to it.
 
         Raises:
             SandboxError: failure(message) when the migration reached
                 failed/cancelled/failing (with QEMU's error-desc)
             TransientError: MIGRATION_FAILED: query-migrate failed or timed out
         """
-        delay = min(_POLL_FIRST_SECONDS, constants.MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS)
+        delay = _POLL_FIRST_SECONDS
         try:
             async with asyncio.timeout(timeout):
                 while True:

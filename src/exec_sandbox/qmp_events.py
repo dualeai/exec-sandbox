@@ -180,8 +180,7 @@ class QmpEventWatch:
                 try:
                     verify_socket_peer(writer.get_extra_info("socket"), self._expected_uid, str(self._path))
                     await client.start(timeout=math.inf)
-                    self._sample()  # the reference of this connection's first event
-                    connected_at = time.monotonic()
+                    connected_at = self._sample()  # the reference of this connection's first event
                     self._client = client
                     await self._on_connect(self)
                     while line := await client.reader.readline():

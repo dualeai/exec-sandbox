@@ -82,6 +82,16 @@ def isolated_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("exec_sandbox.process_registry._process_groups", set())
 
 
+async def _image_info(path: Path) -> dict[str, Any]:
+    """qemu-img info of `path` (JSON): the image as QEMU reads it."""
+    proc = await asyncio.create_subprocess_exec(
+        "qemu-img", "info", "-U", "--output=json", str(path), stdout=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await proc.communicate()
+    assert proc.returncode == 0, path
+    return json.loads(stdout)
+
+
 def _qcow2_header(size: int) -> bytes:
     """The first 32 bytes of a qcow2 v3 image of `size` bytes (magic, version, size at 24)."""
     return b"QFI\xfb" + (3).to_bytes(4, "big") + bytes(16) + size.to_bytes(8, "big")
@@ -635,16 +645,7 @@ class TestQemuStorageDaemonIntegration:
         overlay = tmp_path / "backing-test.qcow2"
         await started_daemon.create_overlay(base_image, overlay)
 
-        # Verify backing file using qemu-img info
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "info",
-            "--output=json",
-            str(overlay),
-            stdout=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        info = json.loads(stdout)
+        info = await _image_info(overlay)
 
         assert info["backing-filename"] == str(base_image.absolute())
         assert info["backing-filename-format"] == "qcow2"
@@ -652,51 +653,39 @@ class TestQemuStorageDaemonIntegration:
     async def test_overlay_has_qcow2_format(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
     ) -> None:
-        """Created overlay is valid qcow2 format, with the options of every overlay
-        (qemu-img create -o lazy_refcounts=on,extended_l2=on,cluster_size=128k)."""
+        """Created overlay is valid qcow2 format, with the size of its base and the options of
+        every overlay (qemu-img create -o lazy_refcounts=on,extended_l2=on,cluster_size=128k)."""
         overlay = tmp_path / "format-test.qcow2"
         await started_daemon.create_overlay(base_image, overlay)
 
-        # Verify format using qemu-img info
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "info",
-            "--output=json",
-            str(overlay),
-            stdout=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        info = json.loads(stdout)
+        info = await _image_info(overlay)
 
-        assert info.get("format") == "qcow2"
-        virtual_size = info.get("virtual-size")
-        assert isinstance(virtual_size, int)
-        assert virtual_size > 0
+        assert info["format"] == "qcow2"
+        assert info["virtual-size"] == (await _image_info(base_image))["virtual-size"]
         assert info["cluster-size"] == 128 * 1024
         options = info["format-specific"]["data"]
         assert (options["lazy-refcounts"], options["extended-l2"]) == (True, True)
 
     # --- Job flow integration ---
 
-    async def test_sequential_overlays_complete(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """Sequential overlays all complete on one daemon."""
-        for i in range(10):
-            overlay = tmp_path / f"seq-{i}.qcow2"
-            await started_daemon.create_overlay(base_image, overlay)
-            assert overlay.exists()
-
-    async def test_concurrent_overlays_no_stale_events(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """20 concurrent overlays (more than the pool's creation limit; QMP commands take
-        turns) all complete."""
+    async def test_concurrent_overlays_all_complete(self, started_daemon: QemuStorageDaemon, tmp_path: Path) -> None:
+        """20 overlays at once, each of its own base image (more than the pool's creation
+        limit; each goes through QMP, whose commands take turns), all complete: each has the
+        size of its base and that base as its backing file."""
+        bases = [tmp_path / f"base-{i}.qcow2" for i in range(20)]
+        for i, base in enumerate(bases):
+            proc = await asyncio.create_subprocess_exec(
+                "qemu-img", "create", "-q", "-f", "qcow2", str(base), f"{i + 1}M"
+            )
+            assert await proc.wait() == 0
         overlays = [tmp_path / f"many-{i}.qcow2" for i in range(20)]
-        tasks = [started_daemon.create_overlay(base_image, o) for o in overlays]
-        await asyncio.gather(*tasks)
 
-        assert all(o.exists() for o in overlays)
+        await asyncio.gather(*(started_daemon.create_overlay(b, o) for b, o in zip(bases, overlays, strict=True)))
+
+        infos = [await _image_info(overlay) for overlay in overlays]
+        assert [(info["virtual-size"], info["backing-filename"]) for info in infos] == [
+            ((i + 1) * 1024 * 1024, str(base)) for i, base in enumerate(bases)
+        ]
 
     async def test_overlay_after_failed_overlay_succeeds(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
@@ -841,7 +830,8 @@ class TestOverlayTemplates:
 
     @staticmethod
     def _counted(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-        """The QMP commands that the daemons send from now on (a slotted class: patched on it)."""
+        """The QMP commands that the daemons send from now on: a spy on _execute, the one way
+        out of every command (no public path counts them; a slotted class: patched on it)."""
         sent: list[str] = []
         execute = QemuStorageDaemon._execute  # pyright: ignore[reportPrivateUsage]
 
@@ -882,33 +872,42 @@ class TestOverlayTemplates:
         assert len({overlay.read_bytes() for overlay in overlays}) == 1
 
     async def test_a_template_gone_makes_the_overlay_through_qmp(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, short_tmp_dir: Path, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A template removed meanwhile (a temp folder cleaner): the overlay is made through QMP."""
-        first = tmp_path / "first.qcow2"
-        await started_daemon.create_overlay(base_image, first)
-        template_dir = started_daemon._template_dir  # pyright: ignore[reportPrivateUsage]
-        assert template_dir is not None
-        for template in template_dir.iterdir():
-            template.unlink()
-        sent = self._counted(monkeypatch)
+        """A template removed meanwhile (a temp folder cleaner): the overlay is made through QMP.
+        The daemon's temp folder is one of this test: its template folder is the one there."""
+        monkeypatch.setattr(tempfile, "tempdir", str(short_tmp_dir))
+        daemon = QemuStorageDaemon()
+        await daemon.start()
+        try:
+            first = tmp_path / "first.qcow2"
+            await daemon.create_overlay(base_image, first)
+            (template_dir,) = short_tmp_dir.glob("qsd-*.templates")
+            for template in template_dir.iterdir():
+                template.unlink()
+            sent = self._counted(monkeypatch)
 
-        await started_daemon.create_overlay(base_image, tmp_path / "second.qcow2")
+            await daemon.create_overlay(base_image, tmp_path / "second.qcow2")
+        finally:
+            await daemon.stop()
 
         assert "blockdev-add" in sent
         assert (tmp_path / "second.qcow2").read_bytes() == first.read_bytes()
 
-    async def test_stop_removes_the_template_folder(self, base_image: Path, tmp_path: Path) -> None:
+    async def test_stop_removes_the_template_folder(
+        self, short_tmp_dir: Path, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The template folder in the temp folder holds the template; stop() removes it."""
+        monkeypatch.setattr(tempfile, "tempdir", str(short_tmp_dir))
         daemon = QemuStorageDaemon()
         await daemon.start()
         try:
             await daemon.create_overlay(base_image, tmp_path / "overlay.qcow2")
-            template_dir = daemon._template_dir  # pyright: ignore[reportPrivateUsage]
-            assert template_dir is not None
-            assert any(template_dir.iterdir())
+            (template_dir,) = short_tmp_dir.glob("qsd-*.templates")
+            assert len(list(template_dir.iterdir())) == 1
         finally:
             await daemon.stop()
-        assert not template_dir.exists()
+        assert list(short_tmp_dir.glob("qsd-*.templates")) == []
 
     @staticmethod
     async def _template_clone_held(
@@ -984,7 +983,7 @@ class TestOverlayTemplates:
         a stand-in that waits on an event."""
         qmp_entered, qmp_done = asyncio.Event(), asyncio.Event()
 
-        async def slow_qmp(_self: QemuStorageDaemon, _base: Path, overlay_path: Path, _identity: object) -> None:
+        async def slow_qmp(_self: QemuStorageDaemon, _base: Path, overlay_path: Path) -> None:
             qmp_entered.set()
             await qmp_done.wait()
             overlay_path.write_bytes(b"overlay")
@@ -1171,9 +1170,7 @@ class TestQemuStorageDaemonErrors:
         nonexistent = tmp_path / "does-not-exist.qcow2"
         overlay = tmp_path / "overlay.qcow2"
 
-        with pytest.raises(
-            TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="Failed to read the header"
-        ):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="Failed to stat"):
             await started_daemon.create_overlay(nonexistent, overlay)
 
         # Overlay should not exist
@@ -1203,42 +1200,35 @@ class TestQemuStorageDaemonErrors:
         ):
             await started_daemon.create_overlay(fake_base, overlay)
 
-    async def test_create_overlay_with_unicode_path(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
+    @pytest.mark.parametrize("folder", ["тест-日本語-🔥", "path with spaces"], ids=["unicode", "spaces"])
+    async def test_create_overlay_with_unusual_path(
+        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path, folder: str
     ) -> None:
-        """create_overlay works with unicode characters in path."""
-        # Unicode path with various scripts
-        unicode_dir = tmp_path / "тест-日本語-🔥"
-        unicode_dir.mkdir()
-        overlay = unicode_dir / "overlay-émoji-中文.qcow2"
+        """An overlay path with unicode characters or spaces (QMP takes it as a JSON string):
+        the overlay is made there, backed by its base."""
+        (tmp_path / folder).mkdir()
+        overlay = tmp_path / folder / f"overlay {folder}.qcow2"
 
         await started_daemon.create_overlay(base_image, overlay)
-        assert overlay.exists()
 
-    async def test_create_overlay_with_spaces_in_path(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """create_overlay works with spaces in path."""
-        space_dir = tmp_path / "path with spaces"
-        space_dir.mkdir()
-        overlay = space_dir / "overlay file.qcow2"
-
-        await started_daemon.create_overlay(base_image, overlay)
-        assert overlay.exists()
+        assert (await _image_info(overlay))["backing-filename"] == str(base_image)
 
     async def test_create_overlay_symlink_base_image(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
     ) -> None:
-        """create_overlay works when base image is a symlink."""
-        # Create symlink to base image
+        """A base image given as a symlink: the overlay keeps the symlink path as its backing
+        file, and QEMU opens the chain through it."""
         symlink = tmp_path / "base-link.qcow2"
         symlink.symlink_to(base_image)
 
         overlay = tmp_path / "overlay.qcow2"
         await started_daemon.create_overlay(symlink, overlay)
 
-        assert overlay.exists()
-        assert overlay.stat().st_size > 0
+        info = await _image_info(overlay)
+        assert (info["backing-filename"], info["virtual-size"]) == (
+            str(symlink),
+            (await _image_info(base_image))["virtual-size"],
+        )
 
 
 _KILLED_OWNER = """

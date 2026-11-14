@@ -14,6 +14,7 @@ from typing import Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled
+from exec_sandbox.exceptions import ErrorCode, TransientError
 from exec_sandbox.permission_utils import sudo_rm
 
 logger = get_logger(__name__)
@@ -58,7 +59,7 @@ class VmWorkingDirectory:
         "_home_dir",
         "_path",
         "_retry_task",
-        "_use_qemu_vm_user",
+        "use_qemu_vm_user",
         "vm_id",
     )
 
@@ -73,7 +74,8 @@ class VmWorkingDirectory:
         """
         self.vm_id = vm_id
         self._path = path
-        self._use_qemu_vm_user = False
+        # Files owned by qemu-vm (set by VmManager): cleanup needs sudo
+        self.use_qemu_vm_user = False
         self._cleaned_up = False
         self._cleanup_task: asyncio.Task[bool] | None = None
         self._retry_task: asyncio.Task[None] | None = None
@@ -92,6 +94,10 @@ class VmWorkingDirectory:
 
         Returns:
             VmWorkingDirectory instance with directory created
+
+        Raises:
+            TransientError: LOCAL_DISK, mkdtemp failed (a full disk, no inodes or file
+                handles: this host's state, it can pass)
         """
         # Create directory in thread pool (blocking I/O)
         # mkdtemp creates with mode 0700 by default (secure)
@@ -126,6 +132,14 @@ class VmWorkingDirectory:
             elif not creation_task.cancelled():
                 creation_task.exception()
             raise
+        except OSError as e:
+            raise TransientError(
+                f"Could not make the VM working folder: {e.strerror or type(e).__name__}",
+                code=ErrorCode.LOCAL_DISK,
+                context={"vm_id": vm_id, "folder": tempfile.gettempdir()},
+                hint=None,
+                instance_id=None,
+            ) from e
 
         logger.debug(
             "Created VM working directory",
@@ -177,16 +191,6 @@ class VmWorkingDirectory:
     def gvproxy_socket(self) -> Path:
         """Path to gvproxy network socket."""
         return self._path / "gvproxy.sock"
-
-    @property
-    def use_qemu_vm_user(self) -> bool:
-        """Whether files are owned by qemu-vm user (requires sudo for cleanup)."""
-        return self._use_qemu_vm_user
-
-    @use_qemu_vm_user.setter
-    def use_qemu_vm_user(self, value: bool) -> None:
-        """Set qemu-vm user ownership flag."""
-        self._use_qemu_vm_user = value
 
     async def cleanup(self) -> bool:
         """Remove the home disk, then the working directory and all its contents.
@@ -274,7 +278,7 @@ class VmWorkingDirectory:
             return True
 
         try:
-            if self._use_qemu_vm_user:
+            if self.use_qemu_vm_user:
                 # Files owned by qemu-vm user, need sudo
                 if not await sudo_rm(self._path):
                     logger.error(
@@ -330,13 +334,8 @@ async def _retry_workdir_cleanup(workdir: VmWorkingDirectory) -> None:
 
 
 async def drain_workdir_cleanup_tasks() -> None:
-    """Wait until every module-owned abandoned-directory retry is finished."""
-    while True:
-        tasks = tuple(task for task in _WORKDIR_CLEANUP_TASKS if not task.done())
-        if not tasks:
-            _WORKDIR_CLEANUP_TASKS.difference_update(task for task in _WORKDIR_CLEANUP_TASKS if task.done())
-            if not _WORKDIR_CLEANUP_TASKS:
-                return
-            await asyncio.sleep(0)
-            continue
+    """Wait until every module-owned abandoned-directory retry is finished (also the ones
+    that start meanwhile)."""
+    while tasks := tuple(_WORKDIR_CLEANUP_TASKS):
         await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+        _WORKDIR_CLEANUP_TASKS.difference_update(tasks)

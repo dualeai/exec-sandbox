@@ -76,7 +76,20 @@ async def _command(workdir: VmWorkingDirectory, tmp_path: Path, *, sandbox: bool
             stack.enter_context(patch(f"exec_sandbox.qemu_cmd.{name}", return_value=value))
         stack.enter_context(patch("exec_sandbox.qemu_cmd.detect_accel_type", AsyncMock(return_value=AccelType.TCG)))
         return await build_qemu_cmd(
-            settings, detect_host_arch(), "qemu-binary", workdir, VmSpec(language=Language.PYTHON)
+            settings,
+            detect_host_arch(),
+            "qemu-binary",
+            workdir,
+            VmSpec(language=Language.PYTHON),
+            expose_ports=None,
+            direct_write=False,
+            debug_boot=False,
+            snapshot_drive=None,
+            defer_incoming=False,
+            qmp_fd=None,
+            guest_port_fds=None,
+            mem_path=None,
+            mem_path_share=False,
         )
 
 
@@ -167,16 +180,31 @@ class TestHostDiskFull:
         assert len(home) == 1
         assert "werror=enospc" in home[0].split(",")
 
+    @pytest.mark.parametrize(
+        ("version", "monitor"),
+        [
+            ("11.1.3", ["-object", "monitor-qmp,id=mon-qmpev0,chardev=qmpev0"]),  # 11.1 deprecates -mon
+            ("11.0.0", ["-mon", "chardev=qmpev0,mode=control"]),
+        ],
+    )
     async def test_events_have_their_own_monitor(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workdir: VmWorkingDirectory
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        workdir: VmWorkingDirectory,
+        version: str,
+        monitor: list[str],
     ) -> None:
-        """The control monitor serves one client at a time (saves, diagnostics): events get a second one."""
-        monkeypatch.setenv(_VARIABLE, str(_fake_qemu(tmp_path / "qemu" / _NAME, version="11.1.3", accelerator="kvm")))
+        """The control monitor serves one client at a time (saves, diagnostics): events get a
+        second one, a monitor-qmp object from QEMU 11.1 (which warns on -mon), -mon before."""
+        monkeypatch.setenv(_VARIABLE, str(_fake_qemu(tmp_path / "qemu" / _NAME, version=version, accelerator="kvm")))
         cmd = await _command(workdir, tmp_path, sandbox=False, unshare=False)
 
         chardev = f"socket,id=qmpev0,path={workdir.qmp_events_socket},server=on,wait=off"
-        assert cmd[cmd.index(chardev) - 1] == "-chardev"
-        assert [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-mon"] == ["chardev=qmpev0,mode=control"]
+        at = cmd.index(chardev)
+        assert cmd[at - 1] == "-chardev"
+        assert cmd[at + 1 : at + 3] == monitor
+        assert "-mon" not in cmd[at + 3 :] and "monitor-qmp" not in " ".join(cmd[at + 3 :])
 
 
 class TestGuestPorts:
@@ -193,10 +221,8 @@ class TestGuestPorts:
             next(o for o in port if o.startswith("name=")): next(o for o in port if o.startswith("id="))
             for port in ports
         }
-        assert ids == {
-            "name=org.dualeai.cmd": f"id={constants.GUEST_PORT_IDS[0]}",
-            "name=org.dualeai.event": f"id={constants.GUEST_PORT_IDS[1]}",
-        }
+        assert ids == {"name=org.dualeai.cmd": "id=guest-cmd", "name=org.dualeai.event": "id=guest-event"}
+        assert set(constants.GUEST_PORT_IDS) == {"guest-cmd", "guest-event"}  # the ids the event watch knows
 
 
 class TestSandbox:

@@ -61,19 +61,23 @@ class TestStart:
     @pytest.mark.parametrize(
         ("sends", "message"),
         [
-            pytest.param(b"", "closed before the greeting", id="eof"),
-            pytest.param(b'{"return": {}, "id": "qmp-capabilities"}\n', "greeting expected", id="no-greeting"),
+            pytest.param(b"", "QMP connection closed before the greeting", id="eof"),
+            pytest.param(
+                b'{"return": {}, "id": "qmp-capabilities"}\n',
+                """QMP greeting expected, got b'{"return": {}, "id": "qmp-capabilities"}\\n'""",
+                id="no-greeting",
+            ),
             pytest.param(
                 b'{"QMP": {}}\n{"error": {"class": "GenericError"}, "id": "qmp-capabilities"}\n',
-                "capabilities failed",
+                "QMP capabilities failed: {'class': 'GenericError'}",
                 id="capabilities-error",
             ),
         ],
     )
     async def test_failures_use_the_error_factory(self, sends: bytes, message: str) -> None:
         result, _ = await _run(sends, lambda client: client.start(timeout=5))
-        assert isinstance(result, ConnectionResetError)
-        assert message in str(result)
+        assert type(result) is ConnectionResetError
+        assert str(result) == message
 
 
 class TestExecute:
@@ -105,7 +109,7 @@ class TestExecute:
             lambda client: client.execute("query-block", arguments=None, timeout=5, on_event=on_event),
         )
         assert result == {"return": {}, "id": "q-1"}
-        assert len(acted) == 100
+        assert acted == [_EVENT] * 100
 
     async def test_a_line_that_is_no_object_is_skipped(self) -> None:
         """A JSON line that is not an object is skipped (counted), not a TypeError that would
@@ -121,8 +125,8 @@ class TestExecute:
             _EVENT * 100 + b'{"return": {}, "id": "q-1"}\n',
             lambda client: client.execute("query-block", arguments=None, timeout=5, on_event=None),
         )
-        assert isinstance(result, ConnectionResetError)
-        assert "Too many QMP messages" in str(result)
+        assert type(result) is ConnectionResetError
+        assert str(result) == "Too many QMP messages without a matching command response"
 
 
 async def test_connect_closes_a_connection_that_fails_to_start(short_tmp_dir: Path) -> None:

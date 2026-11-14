@@ -13,8 +13,8 @@ command N+1. execute writes one identified command and consumes *its* matching r
 giving the events to the caller or skipping them, and discarding any stale reply carrying a
 different ``id``. The whole read loop is bounded by a single ``asyncio.timeout``.
 
-qemu_storage_daemon.py keeps its own id-matched loop: it also buffers the job events with
-status "concluded" that its _wait_for_job reads.
+qemu_storage_daemon.py keeps its own id-matched loop: it skips the job events, and its
+_wait_for_job polls query-jobs.
 """
 
 from __future__ import annotations
@@ -38,6 +38,9 @@ logger = get_logger(__name__)
 # has no deadline. Events given to on_event are acted on, not skipped: they do not
 # count (QEMU sends one BLOCK_IO_ERROR per failed request, with no rate limit).
 _MAX_SKIPPED_MESSAGES = 64
+
+QMP_BUFFER_LIMIT = 16 * 1024 * 1024
+"""StreamReader buffer limit of a QMP connection: readuntil() fails on a longer line."""
 
 
 class QmpClient:
@@ -72,8 +75,15 @@ class QmpClient:
         id_prefix: str,
     ) -> AsyncGenerator[Self]:
         """A started client on the socket at `path` (its peer is checked: connect_and_verify),
-        closed when the block ends. `timeout` bounds the connect, then each step of start."""
-        reader, writer = await connect_and_verify(path=str(path), expected_uid=expected_uid, timeout=timeout)
+        closed when the block ends. `timeout` bounds the connect, then each step of start.
+
+        Raises:
+            What connect_and_verify raises (SocketAuthError, TimeoutError, OSError), then
+            what start raises.
+        """
+        reader, writer = await connect_and_verify(
+            path=str(path), expected_uid=expected_uid, timeout=timeout, buffer_limit=QMP_BUFFER_LIMIT
+        )
         client = cls(reader, writer, error_factory=error_factory, id_prefix=id_prefix)
         try:
             await client.start(timeout=timeout)
@@ -98,6 +108,7 @@ class QmpClient:
                 capabilities error.
             TimeoutError: No greeting, or no capabilities return, within `timeout`.
             ValueError: A line that is not JSON.
+            OSError: The connection failed (reset, broken pipe).
         """
         async with asyncio.timeout(timeout):
             line = await self._reader.readline()
@@ -129,6 +140,7 @@ class QmpClient:
             Exception: ``error_factory(...)`` on EOF or too many skipped messages.
             TimeoutError: no response within `timeout`.
             ValueError: A line that is not JSON.
+            OSError: The connection failed (reset, broken pipe).
         """
         self._sequence += 1
         return await self._exchange(

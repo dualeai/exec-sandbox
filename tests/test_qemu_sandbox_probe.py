@@ -2,8 +2,10 @@
 
 The fake QEMU is a real process (one sh script per module: macOS checks each new
 executable on its first run, ~0.1 s), so the probe runs its real subprocess and pipe
-handling; only the binary path and the host OS are pinned. Its behaviour comes from
-a mode file next to it.
+handling. The binary comes from EXEC_SANDBOX_QEMU_BIN_X86 / _ARM, the variables VMs read;
+the host OS is pinned to Linux. Its behaviour comes from a mode file next to it. The bound
+of the greeting wait has no setting: the tests that need it short or long patch the
+private constant.
 """
 
 import asyncio
@@ -49,12 +51,17 @@ def fake_qemu(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return script
 
 
-async def _probe(binary: Path, mode: str | None = None) -> bool:
+async def _probe(binary: Path, mode: str | None = None, *, path: Path | None = None) -> bool:
+    """probe_qemu_sandbox_support on Linux with `binary` as the QEMU of both arches; `path`
+    replaces PATH (where the bare name is found when `binary` is not a file)."""
     if mode is not None:
         (binary.parent / "mode").write_text(mode)
+    env = {"EXEC_SANDBOX_QEMU_BIN_X86": str(binary), "EXEC_SANDBOX_QEMU_BIN_ARM": str(binary)}
+    if path is not None:
+        env["PATH"] = str(path)
     with (
+        patch.dict(os.environ, env),
         patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
-        patch("exec_sandbox.system_probes._probed_qemu_binary", return_value=str(binary)),
     ):
         return await probe_qemu_sandbox_support()
 
@@ -110,15 +117,19 @@ async def test_stderr_never_blocks_the_greeting(fake_qemu: Path) -> None:
 
 
 async def test_binary_that_cannot_run_is_not_supported(tmp_path: Path) -> None:
-    missing = tmp_path / "absent"
+    """No file at the setting and no qemu-system on PATH, or a file without the execute bit:
+    not supported."""
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
     not_executable = tmp_path / "qemu-system-plain-file"
     not_executable.write_text("#!/bin/sh\nexit 0\n")
 
-    assert await _probe(missing) is False
+    assert await _probe(tmp_path / "absent", path=empty_path) is False
     assert await _probe(not_executable) is False
 
 
 async def test_macos_spawns_nothing() -> None:
+    """macOS has no seccomp: not supported, and no QEMU starts."""
     with (
         patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.MACOS),
         patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as spawn,
@@ -128,6 +139,7 @@ async def test_macos_spawns_nothing() -> None:
 
 
 async def test_result_is_cached(fake_qemu: Path) -> None:
+    """The first answer stays: a second probe starts no QEMU."""
     runs = fake_qemu.parent / "runs"
     runs.unlink(missing_ok=True)
 

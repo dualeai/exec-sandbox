@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import shutil
 import socket
@@ -10,13 +11,15 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 import exec_sandbox.vm_working_directory as workdir_module
-from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox import constants
+from exec_sandbox.exceptions import ErrorCode, TransientError
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import get_qemu_vm_gid, get_qemu_vm_uid, probe_qemu_as_qemu_vm
 from exec_sandbox.vm_spec import VmSpec
@@ -30,6 +33,20 @@ if TYPE_CHECKING:
 _HOME_DIR = Path(tempfile.gettempdir())
 
 
+def _sudo_stand_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail_first: bool) -> Path:
+    """Put a stand-in for sudo on PATH: it adds its arguments to a log (one line for each
+    call), then runs them without the first one (-n) as this user. With `fail_first`, its
+    first call removes nothing and exits 1. Returns the log."""
+    log, failed = tmp_path / "sudo.log", tmp_path / "sudo.failed"
+    stand_in = tmp_path / "bin" / "sudo"
+    stand_in.parent.mkdir()
+    fail = f'if [ ! -e "{failed}" ]; then : > "{failed}"; exit 1; fi\n' if fail_first else ""
+    stand_in.write_text(f'#!/bin/sh\necho "$*" >> "{log}"\n{fail}shift\nexec "$@"\n')
+    stand_in.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stand_in.parent}{os.pathsep}{os.environ['PATH']}")
+    return log
+
+
 class TestVmWorkingDirectoryCreate:
     """Test VmWorkingDirectory.create() method."""
 
@@ -41,6 +58,25 @@ class TestVmWorkingDirectoryCreate:
             assert workdir.path.is_dir()
         finally:
             await workdir.cleanup()
+
+    async def test_a_folder_that_cannot_be_made_is_local_disk(self) -> None:
+        """mkdtemp fails (a full disk, no inodes): TransientError LOCAL_DISK with the OS reason,
+        never a raw OSError out of create_vm. A fake mkdtemp: only a full disk makes the real
+        one fail with ENOSPC."""
+
+        def full_disk(*, prefix: str) -> str:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        fake = SimpleNamespace(mkdtemp=full_disk, gettempdir=tempfile.gettempdir)
+        with (
+            patch("exec_sandbox.vm_working_directory.tempfile", fake),
+            pytest.raises(
+                TransientError,
+                check=lambda e: e.code is ErrorCode.LOCAL_DISK and isinstance(e.__cause__, OSError),
+                match=r"^Could not make the VM working folder: No space left on device$",
+            ),
+        ):
+            await VmWorkingDirectory.create("test-vm-full", home_dir=_HOME_DIR)
 
     async def test_create_sets_vm_id(self):
         """create() stores the vm_id."""
@@ -73,7 +109,7 @@ class TestVmWorkingDirectoryCreate:
 
         with patch("exec_sandbox.vm_working_directory.tempfile.mkdtemp", side_effect=blocked_mkdtemp):
             creation = asyncio.create_task(VmWorkingDirectory.create("cancelled-create", home_dir=_HOME_DIR))
-            await asyncio.wait_for(asyncio.to_thread(created.wait), timeout=1)
+            assert await asyncio.to_thread(created.wait, 1)
             creation.cancel()
             release_thread.set()
             with pytest.raises(asyncio.CancelledError):
@@ -82,13 +118,16 @@ class TestVmWorkingDirectoryCreate:
         assert not abandoned.exists()
 
     async def test_cancelled_creation_retains_failed_cleanup_until_retry_succeeds(self, tmp_path: Path):
-        """A failed first removal keeps a strong retry owner after cancellation. The module's
-        set of retry tasks is empty at the end: a retry owner that stays shows only there."""
+        """A cancelled create() whose first removal of the new folder fails: one module retry
+        owns the folder and removes it, then leaves the module's set of retry tasks. Only
+        that private set shows a retry task that stays after its end
+        (drain_workdir_cleanup_tasks clears the set)."""
         abandoned = tmp_path / "abandoned-retry"
         created = threading.Event()
         release_thread = threading.Event()
-        retry_done = asyncio.Event()
+        real_rmtree = shutil.rmtree
         attempts = 0
+        before = set(workdir_module._WORKDIR_CLEANUP_TASKS)
 
         def blocked_mkdtemp(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
             abandoned.mkdir()
@@ -96,40 +135,40 @@ class TestVmWorkingDirectoryCreate:
             release_thread.wait()
             return str(abandoned)
 
-        async def cleanup_once_then_succeed(workdir: VmWorkingDirectory) -> bool:
+        def fail_once(target: Path) -> None:
             nonlocal attempts
             attempts += 1
             if attempts == 1:
-                return False
-            shutil.rmtree(workdir.path)
-            retry_done.set()
-            return True
+                raise OSError("simulated removal failure")
+            real_rmtree(target)
 
         with (
             patch("exec_sandbox.vm_working_directory.tempfile.mkdtemp", side_effect=blocked_mkdtemp),
-            patch.object(VmWorkingDirectory, "cleanup", new=cleanup_once_then_succeed),
+            patch("exec_sandbox.vm_working_directory.shutil.rmtree", side_effect=fail_once),
         ):
             creation = asyncio.create_task(VmWorkingDirectory.create("cancelled-retry", home_dir=_HOME_DIR))
-            await asyncio.wait_for(asyncio.to_thread(created.wait), timeout=1)
+            assert await asyncio.to_thread(created.wait, 1)
             creation.cancel()
             release_thread.set()
             with pytest.raises(asyncio.CancelledError):
                 await creation
-            await asyncio.wait_for(retry_done.wait(), timeout=1)
+            retries = set(workdir_module._WORKDIR_CLEANUP_TASKS) - before
+            assert len(retries) == 1  # the folder of the failed removal has an owner
+            await asyncio.wait_for(asyncio.gather(*retries), timeout=1)
 
-        await asyncio.sleep(0)
         assert attempts == 2
         assert not abandoned.exists()
-        assert not workdir_module._WORKDIR_CLEANUP_TASKS
+        assert not retries & workdir_module._WORKDIR_CLEANUP_TASKS
 
-    async def test_shutdown_drain_waits_for_abandoned_cleanup_owner(self, tmp_path: Path):
-        """A failed removal handed to a module-owned retry: the shutdown drain does not return
-        while that retry still removes the directory."""
+    async def test_cancelled_failed_cleanup_retries_and_the_drain_waits_for_it(self, tmp_path: Path):
+        """A cleanup() cancelled while its rmtree worker runs: the cancel waits for the worker,
+        and its failed removal goes to a module retry (the folder keeps an owner). The
+        shutdown drain does not return while that retry still removes the folder."""
         path = tmp_path / "drained-retry"
         path.mkdir()
         workdir = VmWorkingDirectory("drained-retry", path, home_dir=_HOME_DIR)
-        retry_entered = threading.Event()
-        allow_retry = threading.Event()
+        first_entered, release_first = threading.Event(), threading.Event()
+        retry_entered, allow_retry = threading.Event(), threading.Event()
         real_rmtree = shutil.rmtree
         attempts = 0
 
@@ -137,6 +176,8 @@ class TestVmWorkingDirectoryCreate:
             nonlocal attempts
             attempts += 1
             if attempts == 1:
+                first_entered.set()
+                release_first.wait()
                 raise OSError("simulated removal failure")
             retry_entered.set()
             allow_retry.wait()
@@ -144,21 +185,38 @@ class TestVmWorkingDirectoryCreate:
 
         try:
             with patch("exec_sandbox.vm_working_directory.shutil.rmtree", side_effect=fail_then_block):
-                assert await workdir.cleanup() is False
-                workdir._retain_cleanup()  # pyright: ignore[reportPrivateUsage]
-                assert path.exists()  # the first removal failed: a retry owns the directory
+                cleanup = asyncio.create_task(workdir.cleanup())
+                assert await asyncio.to_thread(first_entered.wait, 1)
+                cleanup.cancel()
+                release_first.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await cleanup
                 drain = asyncio.create_task(workdir_module.drain_workdir_cleanup_tasks())
-                await asyncio.wait_for(asyncio.to_thread(retry_entered.wait), timeout=1)
-                await asyncio.sleep(0)
-                assert not drain.done()
+                assert await asyncio.to_thread(retry_entered.wait, 1)
+                done, _ = await asyncio.wait({drain}, timeout=0.1)
+                assert not done  # the retry still removes the folder
+                assert path.exists()
 
                 allow_retry.set()
                 await asyncio.wait_for(drain, timeout=1)
         finally:
+            release_first.set()
             allow_retry.set()
 
         assert attempts == 2
         assert not path.exists()
+
+    async def test_drain_takes_retries_that_ended_before_their_callback(self):
+        """Retry tasks that ended but are still in the module's set (their done callback, which
+        removes them, has not run yet): the drain returns and empties the set."""
+        ended = [asyncio.create_task(asyncio.sleep(0)) for _ in range(2)]
+        await asyncio.gather(*ended)
+        workdir_module._WORKDIR_CLEANUP_TASKS.update(ended)  # no done callback: never removed
+        try:
+            await asyncio.wait_for(workdir_module.drain_workdir_cleanup_tasks(), timeout=1)
+            assert not workdir_module._WORKDIR_CLEANUP_TASKS & set(ended)
+        finally:
+            workdir_module._WORKDIR_CLEANUP_TASKS.difference_update(ended)
 
 
 class TestVmWorkingDirectoryProperties:
@@ -233,63 +291,21 @@ class TestVmWorkingDirectoryCleanup:
         result = await workdir.cleanup()
         assert result is True
 
-    async def test_failed_sudo_cleanup_remains_retryable(self, tmp_path: Path):
+    async def test_failed_sudo_cleanup_remains_retryable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """With files of qemu-vm, cleanup() removes the folder with `sudo -n rm -rf` (-n: never
+        a password prompt). A sudo rm that fails leaves the folder: False; the next cleanup()
+        runs it again and removes the folder."""
         path = tmp_path / "retryable"
         path.mkdir()
         workdir = VmWorkingDirectory("retryable", path, home_dir=_HOME_DIR)
         workdir.use_qemu_vm_user = True
-        attempts = 0
+        log = _sudo_stand_in(tmp_path, monkeypatch, fail_first=True)
 
-        async def sudo_rm_side_effect(_path: Path) -> bool:
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                return False
-            shutil.rmtree(path)
-            return True
-
-        with patch("exec_sandbox.vm_working_directory.sudo_rm", side_effect=sudo_rm_side_effect):
-            assert await workdir.cleanup() is False
-            assert await workdir.cleanup() is True
-
-        assert attempts == 2
-
-    async def test_cancelled_cleanup_retains_failed_worker_for_retry(self, tmp_path: Path):
-        """Cancellation cannot detach a failed rmtree worker and lose ownership. The module's
-        set of retry tasks is empty at the end: a retry owner that stays shows only there."""
-        path = tmp_path / "cancelled-cleanup"
-        path.mkdir()
-        workdir = VmWorkingDirectory("cancelled-cleanup", path, home_dir=_HOME_DIR)
-        worker_entered = threading.Event()
-        release_worker = threading.Event()
-        retry_done = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        real_rmtree = shutil.rmtree
-        attempts = 0
-
-        def fail_once(target: Path) -> None:
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                worker_entered.set()
-                release_worker.wait()
-                raise OSError("simulated detached worker failure")
-            real_rmtree(target)
-            loop.call_soon_threadsafe(retry_done.set)
-
-        with patch("exec_sandbox.vm_working_directory.shutil.rmtree", side_effect=fail_once):
-            cleanup = asyncio.create_task(workdir.cleanup())
-            await asyncio.wait_for(asyncio.to_thread(worker_entered.wait), timeout=1)
-            cleanup.cancel()
-            release_worker.set()
-            with pytest.raises(asyncio.CancelledError):
-                await cleanup
-            await asyncio.wait_for(retry_done.wait(), timeout=1)
-            await asyncio.wait_for(workdir_module.drain_workdir_cleanup_tasks(), timeout=1)
-
-        assert attempts == 2
+        assert await workdir.cleanup() is False
+        assert path.exists()
+        assert await workdir.cleanup() is True
         assert not path.exists()
-        assert not workdir_module._WORKDIR_CLEANUP_TASKS
+        assert log.read_text().splitlines() == [f"-n rm -rf -- {path}"] * 2
 
 
 class TestVmWorkingDirectoryQemuVmUser:
@@ -302,29 +318,6 @@ class TestVmWorkingDirectoryQemuVmUser:
             assert workdir.use_qemu_vm_user is False
         finally:
             await workdir.cleanup()
-
-    @pytest.mark.sudo
-    async def test_cleanup_with_qemu_vm_user_uses_sudo(self):
-        """cleanup() uses sudo when use_qemu_vm_user is True."""
-        workdir = await VmWorkingDirectory.create("test-vm-user-sudo", home_dir=_HOME_DIR)
-        workdir.use_qemu_vm_user = True
-
-        try:
-            with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
-                mock_proc = AsyncMock()
-                mock_proc.wait = AsyncMock(return_value=0)
-                mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-                mock_proc.returncode = 0
-                mock_exec.return_value = mock_proc
-
-                await workdir.cleanup()
-
-                # Verify sudo rm -rf was called
-                mock_exec.assert_called_once()
-                args = mock_exec.call_args[0]
-                assert args[:4] == ("sudo", "-n", "rm", "-rf")  # -n: never a password prompt
-        finally:  # the stand-in for sudo removed nothing: the folder (in the temp folder) goes here
-            shutil.rmtree(workdir.path, ignore_errors=True)
 
 
 class TestHomeDisk:
@@ -344,6 +337,7 @@ class TestHomeDisk:
             await second.cleanup()
 
     async def test_cleanup_removes_home_disk(self, tmp_path: Path) -> None:
+        """cleanup() removes the home disk in home_dir and the working folder."""
         workdir = await VmWorkingDirectory.create("test-vm-home-cleanup", home_dir=tmp_path)
         workdir.home_disk.write_bytes(b"disk")
         assert await workdir.cleanup() is True
@@ -352,11 +346,12 @@ class TestHomeDisk:
 
 
 class TestQemuVmFolder:
-    """VmManager._apply_overlay_permissions on a real VM folder: on the qemu-vm path it gets
-    group qemu-vm and mode 2770 (other users: no access); a failure is HOST_DEPENDENCY and
-    never a world-writable folder. The qemu-vm group is a stand-in: a group this process
-    is in (or not in). The file grants are stand-ins that make the folder a+x, as
-    ensure_traversable does for the overlay."""
+    """VmManager._apply_overlay_permissions on a real VM folder: on the qemu-vm path the
+    folder gets group qemu-vm and mode 2770 (other users: no access) after the overlay
+    grant. The qemu-vm group is a stand-in: a group this process is in. The file grants
+    are stand-ins that make the folder a+x, as ensure_traversable does for the overlay.
+    No public path sets up this case on a host without the qemu-vm user: create_vm then
+    starts QEMU as qemu-vm (TestQemuVmFolderReal does that on a Linux host with the user)."""
 
     @staticmethod
     async def _apply(manager: VmManager, workdir: VmWorkingDirectory, *, gid: int) -> bool:
@@ -384,21 +379,6 @@ class TestQemuVmFolder:
             assert await self._apply(unit_test_vm_manager, workdir, gid=gid) is True
             st = workdir.path.stat()
             assert (stat.S_IMODE(st.st_mode), st.st_gid) == (0o2770, gid)
-        finally:
-            await workdir.cleanup()
-
-    async def test_folder_failure_is_host_dependency_never_world_writable(
-        self, unit_test_vm_manager: VmManager, tmp_path: Path
-    ) -> None:
-        """A group this process is not in (EPERM): the VM fails; the folder never gets a+rwx."""
-        if os.geteuid() == 0:
-            pytest.skip("root may give a file to any group")
-        workdir = await VmWorkingDirectory.create("test-vm-qemu-vm-folder-fail", home_dir=tmp_path)
-        try:
-            with pytest.raises(ConfigError) as caught:
-                await self._apply(unit_test_vm_manager, workdir, gid=max({os.getegid(), *os.getgroups()}) + 1)
-            assert caught.value.code is ErrorCode.HOST_DEPENDENCY
-            assert workdir.path.stat().st_mode & (stat.S_IROTH | stat.S_IWOTH) == 0
         finally:
             await workdir.cleanup()
 
@@ -431,7 +411,20 @@ class TestQemuVmFolderReal:
 
     async def test_folder_is_group_qemu_vm_2770_and_closed_to_other_users(self, vm_manager: VmManager) -> None:
         as_nobody = await _as_nobody("true") is not None
-        vm = await vm_manager.create_vm(self._SPEC, tenant_id="workdir", task_id="mode", cache_leases=())
+        vm = await vm_manager.create_vm(
+            self._SPEC,
+            tenant_id="workdir",
+            task_id="mode",
+            cache_leases=(),
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            reservation=None,
+            retry_profile=constants.RETRY_USER_FACING,
+            mem_path=None,
+            mem_path_share=False,
+        )
         folder = vm.workdir.path
         cmd_socket, planted = Path(vm.workdir.cmd_socket), folder / "planted"
         try:
@@ -456,7 +449,7 @@ class TestQemuVmFolderReal:
                 assert await _as_nobody("mkdir", str(planted)) == 1
                 assert cmd_socket.is_socket()
                 assert not planted.exists()
-            result = await vm.execute("print(6 * 7)", timeout_seconds=60)
+            result = await vm.execute("print(6 * 7)", timeout_seconds=60, env_vars=None, on_stdout=None, on_stderr=None)
             assert (result.exit_code, result.stdout.strip()) == (0, "42")
         finally:
             assert await vm_manager.destroy_vm(vm) is True

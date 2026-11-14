@@ -109,8 +109,7 @@ async def test_connect_waits_as_long_as_qemu_runs(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr("exec_sandbox.qmp_events.wait_for_socket", wait_for_socket)
     await _watch(exit_code, path=_NOWHERE, on_event=_no_event, on_connect=AsyncMock())._run()  # pyright: ignore[reportPrivateUsage]
-    assert len(waits) == 1
-    assert waits[0]["timeout"] == math.inf
+    assert [wait["timeout"] for wait in waits] == [math.inf]
 
 
 async def test_repeated_failures_back_off(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -205,6 +204,8 @@ async def test_stop_ends_the_watch_and_returns_a_caller_cancel(monkeypatch: pyte
     """stop cancels the watch and waits for its end; a cancel of the caller meanwhile is
     returned, so the owner finishes its own end first."""
     waiting = asyncio.Event()
+    closing = asyncio.Event()  # the watch got the cancel of stop
+    closes = asyncio.Event()  # the socket close ends
     closed: list[bool] = []
 
     async def wait_for_socket(_path: Path, **_kwargs: Any) -> None:
@@ -212,7 +213,8 @@ async def test_stop_ends_the_watch_and_returns_a_caller_cancel(monkeypatch: pyte
         try:
             await asyncio.Event().wait()
         finally:
-            await asyncio.sleep(0.05)  # the socket close takes a moment
+            closing.set()
+            await closes.wait()
             closed.append(True)
 
     monkeypatch.setattr("exec_sandbox.qmp_events.wait_for_socket", wait_for_socket)
@@ -220,8 +222,9 @@ async def test_stop_ends_the_watch_and_returns_a_caller_cancel(monkeypatch: pyte
     watch.start()
     await waiting.wait()
     stopping = asyncio.create_task(watch.stop())
-    await asyncio.sleep(0.01)
+    await closing.wait()
     stopping.cancel()  # the caller is cancelled while the watch closes
+    closes.set()
     cancellation = await stopping
     assert isinstance(cancellation, asyncio.CancelledError)
     assert closed == [True]  # stop returned after the watch closed its socket

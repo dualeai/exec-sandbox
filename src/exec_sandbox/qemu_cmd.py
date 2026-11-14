@@ -55,6 +55,14 @@ _X86_CPU_FLAGS = (
 _X86_KVM_PV_FLAGS = "+kvm-pv-ipi,+kvm-pv-tlb-flush,+kvm-pv-sched-yield,+kvm-poll-control,+kvm-asyncpf-int"
 
 
+def _qmp_monitor(chardev: str, *, qemu_version: tuple[int, int, int] | None) -> list[str]:
+    """Arguments of a QMP monitor on `chardev`: the monitor-qmp object from QEMU 11.1, which
+    deprecates `-mon` (a warning at each start), else `-mon`."""
+    if qemu_version is not None and qemu_version >= (11, 1, 0):
+        return ["-object", f"monitor-qmp,id=mon-{chardev},chardev={chardev}"]
+    return ["-mon", f"chardev={chardev},mode=control"]
+
+
 def _x86_cpu(accel_type: AccelType, *, tsc_deadline: bool) -> str:
     """-cpu value for x86 guests (the fixed model above). tsc-deadline follows the pit/pic/rtc=off machine choice."""
     parts = [_X86_CPU_FLAGS]
@@ -111,15 +119,15 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     workdir: VmWorkingDirectory,
     spec: VmSpec,
     *,
-    expose_ports: list[ExposedPort] | None = None,
-    direct_write: bool = False,
-    debug_boot: bool = False,
-    snapshot_drive: str | None = None,
-    defer_incoming: bool = False,
-    qmp_fd: int | None = None,
-    guest_port_fds: tuple[int, int] | None = None,
-    mem_path: str | None = None,
-    mem_path_share: bool = False,
+    expose_ports: list[ExposedPort] | None,
+    direct_write: bool,
+    debug_boot: bool,
+    snapshot_drive: str | None,
+    defer_incoming: bool,
+    qmp_fd: int | None,
+    guest_port_fds: tuple[int, int] | None,
+    mem_path: str | None,
+    mem_path_share: bool,
 ) -> list[str]:
     """Build QEMU command for microVM execution.
 
@@ -147,22 +155,28 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             migration stream via QMP.
         qmp_fd: File descriptor of a pre-created listening socket for QMP
             (socket activation pattern). When set, uses ``-chardev socket,fd=N,...``
-            + ``-mon chardev=qmp0,mode=control`` instead of ``-qmp`` shorthand
-            (which does not support ``fd=``). None (default) uses the
+            + a QMP monitor on it (``-object monitor-qmp``; ``-mon`` before QEMU 11.1) instead of the ``-qmp`` shorthand
+            (which does not support ``fd=``). None uses the
             path-based ``-qmp`` syntax (QEMU makes the socket).
         guest_port_fds: File descriptors of pre-created listening sockets for the
-            cmd and event ports (socket activation, as qmp_fd). None (default):
+            cmd and event ports (socket activation, as qmp_fd). None:
             QEMU makes the sockets at their paths.
         mem_path: Path to file-backed RAM for VM Templating (COW sharing).
             Template save uses share=on (QEMU writes RAM to file).
             Template restore uses share=off (MAP_PRIVATE = COW from file).
-            None (default) uses anonymous memory (memory-backend-ram).
+            None uses anonymous memory (memory-backend-ram).
         mem_path_share: When True, memory-backend-file uses share=on (template
             save). When False, uses share=off,readonly=on,rom=off (clone restore,
             MAP_PRIVATE COW). Only meaningful when mem_path is set.
 
     Returns:
         QEMU command as list of strings
+
+    Raises:
+        ConfigError: HOST_DEPENDENCY: this host cannot run the QEMU binary
+            (probe_qemu_runnable), or ARM64 TCG with a QEMU below 9.0.4
+        TransientError: QEMU_CRASHED: the QEMU probe exec hit a process, memory or
+            file-handle limit (qemu_unrunnable_error)
     """
     # Determine QEMU binary, machine type, and kernel based on architecture
     is_macos = detect_host_os() == HostOS.MACOS
@@ -182,7 +196,16 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Build accelerator string for QEMU
     if accel_type == AccelType.HVF:
-        accel = "hvf"
+        # ARM64, QEMU 11.1+: QEMU's own GIC, not Apple's (kernel-irqchip, on by default for
+        # virt-11.1). With Apple's GIC the guest's WFI waits inside hv_vcpu_run, and a vCPU
+        # kick (hv_vcpus_exit) that lands while the vCPU returns for an MMIO exit is lost: the
+        # HVF loop (hvf_arch_vcpu_exec) re-enters the guest without checking for a stop, and
+        # pause_all_vcpus waits with no timeout. QMP stop, quit and SIGTERM then hung for 10 s
+        # or more (6 of 6 trials of a stop loop; 0 in 12000 stops with QEMU's GIC, the only
+        # mode before 11.1). Cost per idle VM: about 25 context switches/s against 10-16 with
+        # Apple's GIC (the guest's timer interrupts exit to QEMU); no exec latency change.
+        own_gic = arch == HostArch.AARCH64 and qemu_version is not None and qemu_version >= (11, 1, 0)
+        accel = "hvf,kernel-irqchip=off" if own_gic else "hvf"
     elif accel_type == AccelType.KVM:
         accel = "kvm"
     else:
@@ -320,7 +343,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     machine_type += ",memory-backend=mem0"
 
     # Auto-discover kernel and initramfs based on architecture
-    # Note: existence validated by validate_kernel_initramfs (VmManager.start and create_vm)
+    # Note: existence validated by validate_kernel_initramfs (VmManager.start, and
+    # VmManager._setup_vm_infra at each create and restore)
     # Prefer uncompressed vmlinux for PVH direct boot (x86_64 only, ~50ms faster)
     # QEMU auto-detects PVH ELF note and skips kernel decompression
     images = GuestImages.from_settings(settings, arch=arch)
@@ -359,10 +383,17 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         qemu_args.extend(["-nodefaults", "-no-user-config"])
 
     # Console: ARM64 uses PL011 UART (ttyAMA0), x86 uses virtio-console (hvc0).
-    # hvc0 is NOT reliable on ARM64 — virtio-serial isn't ready when the kernel
-    # opens /dev/console, causing init to crash.
+    # hvc0 is NOT reliable on ARM64 as /dev/console — virtio-serial isn't ready when
+    # the kernel opens /dev/console, causing init to crash.
     # See: https://blog.memzero.de/toying-with-virtio/
-    console_params = "console=ttyAMA0 loglevel=1" if arch == HostArch.AARCH64 else "console=hvc0 loglevel=1"
+    # The PL011 has no backend (-serial none below), so a debug boot on ARM64 also
+    # names hvc0 first: the kernel prints there once hvc0 registers (about 30 ms in;
+    # the earlier lines are not replayed), and the last console= (ttyAMA0) stays
+    # /dev/console.
+    if arch == HostArch.AARCH64:
+        console_params = ("console=hvc0 " if debug_boot else "") + "console=ttyAMA0 loglevel=1"
+    else:
+        console_params = "console=hvc0 loglevel=1"
 
     qemu_args.extend(
         [
@@ -484,7 +515,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # protecting a co-resident tenant (there is only one tenant per VM).
             # This accepts residual risk to the trusted guest-agent and guest
             # kernel from untrusted guest code.
-            # nokaslr is deliberately omitted: the x86 base config currently has
+            # nokaslr is deliberately omitted: the x86 base config has
             # CONFIG_RANDOMIZE_BASE=y, although this cmdline guard does not prove
             # runtime randomization on the direct-vmlinux PVH boot path. The arm64
             # base has CONFIG_RANDOMIZE_BASE=n; with mitigations=off its KPTI also
@@ -766,7 +797,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # =============================================================
     # Virtio-serial provides guest agent communication channels (cmd/event ports).
     # All paths use virtio-console (hvc0) with ISA serial disabled:
-    #   - virtconsole device created for hvc0 (kernel console)
+    #   - virtconsole device created for hvc0 (the kernel console on x86; tiny-init
+    #     writes to hvc0 first on both architectures)
     #   - 3 ports: virtconsole (nr=0) + cmd (nr=1) + event (nr=2)
     #   - ISA serial disabled via isa-serial=off in machine type
     #
@@ -918,8 +950,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             [
                 "-chardev",
                 f"socket,id=qmp0,fd={qmp_fd},server=on,wait=off",
-                "-mon",
-                "chardev=qmp0,mode=control",
+                *_qmp_monitor("qmp0", qemu_version=qemu_version),
             ]
         )
     else:
@@ -933,8 +964,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         [
             "-chardev",
             f"socket,id=qmpev0,path={workdir.qmp_events_socket},server=on,wait=off",
-            "-mon",
-            "chardev=qmpev0,mode=control",
+            *_qmp_monitor("qmpev0", qemu_version=qemu_version),
         ]
     )
 

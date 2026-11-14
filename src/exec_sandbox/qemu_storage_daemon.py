@@ -89,7 +89,7 @@ def _pid_namespace() -> int:
 _INSTALL_HINT: Final = "Install QEMU (it ships qemu-storage-daemon)."
 
 # qcow2 options of every overlay (qemu-img create -o lazy_refcounts=on,extended_l2=on,cluster_size=128k):
-# lazy refcounts for faster writes (metadata stays crash-consistent through fsync), extended L2
+# lazy refcounts for faster writes (after a host crash QEMU rebuilds the refcounts at the next open), extended L2
 # entries for sub-cluster allocation of small writes, 128 KiB clusters to balance metadata size
 # and I/O.
 _OVERLAY_QCOW2_OPTIONS: Final[dict[str, Any]] = {"cluster-size": 131072, "lazy-refcounts": True, "extended-l2": True}
@@ -109,15 +109,15 @@ _JOB_POLL_MAX_SECONDS: Final = 0.05
 
 
 def _file_identity(image_path: Path) -> tuple[Path, int, int, int, int]:
-    """The path and the version of the file at it (device, inode, mtime, size).
+    """The path and the version of the file at it (device, inode, mtime, size): one stat.
 
     Raises:
-        TransientError: OVERLAY_FAILED if the file cannot be read
+        TransientError: OVERLAY_FAILED if the stat fails (missing file, no access)
     """
     try:
         st = image_path.stat()
     except OSError as e:
-        raise _overlay_failed(f"Failed to read the header of {image_path}: {e.strerror or e}", context=None) from e
+        raise _overlay_failed(f"Failed to stat {image_path}: {e.strerror or e}", context=None) from e
     return image_path, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size
 
 
@@ -126,7 +126,7 @@ def _clone_overlay(src: Path, dst: Path) -> bool:
     is no APFS clone; the daemon makes 0666 minus the umask). False when it cannot: a
     partial `dst` is removed, one that was there is left (blocking)."""
     try:
-        clone_sparse(src, dst)
+        clone_sparse(src, dst, stop=None)  # an overlay: a reflink clone, or a copy of KBs
     except FileExistsError:
         return False
     except OSError:
@@ -191,7 +191,6 @@ class QemuStorageDaemon:
         "_template_dir",
         "_template_writes",
         "_templates",
-        "_virtual_sizes",
         "_writer",
     )
 
@@ -208,9 +207,6 @@ class QemuStorageDaemon:
         # start() made, instead of finding nothing to stop
         self._lifecycle_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task[None] | None = None
-        # Base image virtual sizes, read once per file version (a worker thread: images can be on a
-        # network disk); keyed by _file_identity, so an image rebuilt in place is read again
-        self._virtual_sizes: dict[tuple[Path, int, int, int, int], int] = {}
         # The template of each base image version (keyed by _file_identity), made by start():
         # None when the folder could not be made (each overlay through QMP). The future gives
         # the template once its first overlay is made, or None (the next creation tries again).
@@ -231,8 +227,10 @@ class QemuStorageDaemon:
         Idempotent: Does nothing if already started.
 
         Raises:
-            TransientError: OVERLAY_FAILED if daemon fails to start or connect
-            ConfigError: HOST_DEPENDENCY if the qemu-storage-daemon binary is missing or cannot run
+            TransientError: OVERLAY_FAILED if daemon fails to start or connect (also a fork that
+                hits a process, memory or file-handle limit: spawn_error)
+            ConfigError: HOST_DEPENDENCY if the qemu-storage-daemon binary is missing or cannot
+                run, or this process may not connect to its socket
         """
         async with self._lifecycle_lock:
             await self._start()
@@ -255,15 +253,14 @@ class QemuStorageDaemon:
             logger.debug("Orphan reaper failed (non-critical)", exc_info=True)
 
         # The temp folder: a short path, under the Unix socket path limit (104-108 bytes)
-        self._socket_path = (
-            Path(tempfile.gettempdir()) / f"qsd-{_pid_namespace()}-{os.getpid()}-{secrets.token_hex(8)}.sock"
-        )
+        socket_path = Path(tempfile.gettempdir()) / f"qsd-{_pid_namespace()}-{os.getpid()}-{secrets.token_hex(8)}.sock"
+        self._socket_path = socket_path
 
         # Start daemon process
         cmd = [
             _BINARY,
             "--chardev",
-            f"socket,path={self._socket_path},server=on,wait=off,id=qmp0",
+            f"socket,path={socket_path},server=on,wait=off,id=qmp0",
             "--monitor",
             "chardev=qmp0",
         ]
@@ -280,24 +277,21 @@ class QemuStorageDaemon:
             spawned = True
 
             # Wait for socket and connect (single step to avoid TOCTOU)
-            await self._wait_and_connect_qmp()
+            await self._wait_and_connect_qmp(socket_path)
             self._started = True
 
             logger.info(
                 "QEMU storage daemon started",
-                extra={"socket": str(self._socket_path), "pid": self._process.pid},
+                extra={"socket": str(socket_path), "pid": self._process.pid},
             )
 
         except BaseException as e:
             # Publish process cleanup before another await; connection cleanup
-            # may itself be interrupted by repeated caller cancellation.
+            # may itself be interrupted by repeated caller cancellation (the
+            # globally-retained cleanup owner then keeps retrying).
             cleanup_task = self._ensure_cleanup_task()
-            try:
-                await self._cleanup_connection()
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
-                # The globally-retained cleanup owner keeps retrying.
-                raise
+            await self._cleanup_connection()
+            await asyncio.shield(cleanup_task)
             if isinstance(e, asyncio.CancelledError | ConfigError):  # ConfigError: exec_failed_error
                 raise
             if isinstance(e, OSError) and not spawned:
@@ -420,21 +414,21 @@ class QemuStorageDaemon:
         identity = await asyncio.to_thread(_file_identity, base_image)
         template_dir = self._template_dir
         if template_dir is None:
-            await self._create_with_qmp(base_image, overlay_path, identity)
+            await self._create_with_qmp(base_image, overlay_path)
             return
 
         made = self._templates.get(identity)
         if made is not None:
             template = await asyncio.shield(made)  # its first overlay may still be in the making
             if template is None or not await asyncio.to_thread(_clone_overlay, template, overlay_path):
-                await self._create_with_qmp(base_image, overlay_path, identity)
+                await self._create_with_qmp(base_image, overlay_path)
             return
 
         made = asyncio.get_running_loop().create_future()
         self._templates[identity] = made
         template = None
         try:
-            await self._create_with_qmp(base_image, overlay_path, identity)
+            await self._create_with_qmp(base_image, overlay_path)
             # stop() began meanwhile: its removal of the folder must not race a clone
             if self._template_dir is not template_dir:
                 return
@@ -449,11 +443,9 @@ class QemuStorageDaemon:
             if template is None and self._templates.get(identity) is made:
                 del self._templates[identity]
 
-    async def _create_with_qmp(
-        self, base_image: Path, overlay_path: Path, identity: tuple[Path, int, int, int, int]
-    ) -> None:
-        """Create qcow2 overlay with backing file via QMP (`base_image` absolute, `identity`
-        its _file_identity).
+    async def _create_with_qmp(self, base_image: Path, overlay_path: Path) -> None:
+        """Create qcow2 overlay with backing file via QMP (`base_image` absolute; its virtual
+        size read in a worker thread: images can be on a network disk).
 
         Uses 3-step approach required by qemu-storage-daemon:
         1. blockdev-create with file driver (creates empty file)
@@ -476,10 +468,7 @@ class QemuStorageDaemon:
         node_name = f"node-{uid}"
         qcow2_job_id = f"qcow2-{uid}"
 
-        virtual_size = self._virtual_sizes.get(identity)
-        if virtual_size is None:
-            virtual_size = await asyncio.to_thread(_qcow2_virtual_size, base_image)
-            self._virtual_sizes[identity] = virtual_size
+        virtual_size = await asyncio.to_thread(_qcow2_virtual_size, base_image)
 
         try:
             # Step 1: Create empty file
@@ -528,19 +517,21 @@ class QemuStorageDaemon:
             with contextlib.suppress(TransientError):
                 await self._execute("blockdev-del", {"node-name": node_name})
 
-    async def _wait_and_connect_qmp(self) -> None:
+    async def _wait_and_connect_qmp(self, socket_path: Path) -> None:
         """Wait for daemon socket and establish QMP connection in one step.
 
-        Uses keep_connection=True to reuse the socket from the readiness probe,
-        eliminating the TOCTOU gap between probe-close and real connect that
-        caused ConnectionRefusedError on single-client QMP chardev sockets
-        under CI load.
+        Uses keep_connection=True to reuse the socket from the readiness probe: no
+        gap between the probe's close and a second connect, which a single-client
+        QMP chardev socket can refuse (ConnectionRefusedError, seen under CI load).
 
         Raises:
-            TransientError: OVERLAY_FAILED if socket doesn't appear or handshake fails
+            TransientError: OVERLAY_FAILED if socket doesn't appear, the daemon exits, or
+                qmp_capabilities fails
+            ConfigError: HOST_DEPENDENCY: the launch exited 126 or 127 (exec_failed_error), or
+                this process may not connect to the socket (wait_for_socket)
+            TimeoutError, ValueError: no greeting in time, or one that is not JSON (start()
+                raises them as OVERLAY_FAILED)
         """
-        if not self._socket_path:
-            raise _overlay_failed("No socket path configured", context=None)
 
         def _check_process_alive() -> None:
             if self._process and (returncode := self._process.returncode) is not None:
@@ -554,7 +545,7 @@ class QemuStorageDaemon:
 
         try:
             self._reader, self._writer = await wait_for_socket(
-                self._socket_path,
+                socket_path,
                 timeout=startup_timeout,
                 abort_check=_check_process_alive,
                 keep_connection=True,
@@ -587,9 +578,6 @@ class QemuStorageDaemon:
         Raises:
             TransientError: OVERLAY_FAILED if command fails or not connected
         """
-        if self._writer is None or self._reader is None:
-            raise _overlay_failed("Not connected to QMP", context=None)
-
         self._request_seq += 1
         request_id = f"qsd-{self._request_seq}"
 
@@ -839,8 +827,6 @@ class QemuStorageDaemon:
             try:
                 if await self._cleanup_process():
                     break
-            except asyncio.CancelledError:
-                raise
             except Exception:
                 logger.exception("QEMU storage daemon cleanup attempt failed")
             await asyncio.sleep(delay)
