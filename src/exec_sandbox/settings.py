@@ -32,13 +32,7 @@ class Settings(QemuBinaries):
     Example: EXEC_SANDBOX_FORCE_EMULATION=true
     """
 
-    model_config = SettingsConfigDict(
-        env_prefix="EXEC_SANDBOX_",
-        env_nested_delimiter="__",
-        extra="ignore",
-    )
-
-    # QEMU binaries: QemuBinaries
+    # From QemuBinaries: the QEMU binaries and model_config (EXEC_SANDBOX_ prefix)
     kernel_path: Path = Path("/images/kernels")
     base_images_dir: Path = Path("/images")  # qcow2 base images
     # Where a base image that base_images_dir lacks is downloaded (the scheduler: the asset

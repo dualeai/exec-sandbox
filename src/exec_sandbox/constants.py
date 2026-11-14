@@ -112,8 +112,8 @@ RETRY_BACKGROUND: Final[RetryProfile] = RetryProfile(
     retry_min_seconds=VM_BOOT_RETRY_MIN_SECONDS,
     retry_max_seconds=VM_BOOT_RETRY_MAX_SECONDS,
 )
-"""Retry profile for background/disposable VMs (warm pool, snapshot creation, L1 saves).
-Fewer retries and shorter timeout — these VMs are sacrificial."""
+"""Retry profile for background VMs (warm pool, snapshot creation, L1 saves).
+Fewer attempts and a shorter boot timeout: no user request waits on these boots."""
 
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent."""
@@ -161,13 +161,13 @@ Zram readiness is terminal before the guest listener starts, so it can never
 delay a request. Network readiness gates only the first execution and usually
 resolves in well under a second; a pathologically slow (multi-second) setup on
 that first execution may trip this watchdog. The VM is then discarded and the
-caller sees OutcomeUnknownError (after dispatch) or a boot
-timeout (before dispatch) — never a wrong result. That rare case is accepted
+caller sees OutcomeUnknownError (after dispatch) or TransientError
+GUEST_UNAVAILABLE (before dispatch) — never a wrong result. That rare case is accepted
 instead of delaying hung-guest detection by 8s on every execution. The
 package-install path, which is always a first op on a network VM, adds its
 own gate allowance (see disk_snapshot_manager).
-This is a hard infrastructure backstop; user-code timeout semantics are
-unchanged."""
+This is a hard infrastructure backstop; it does not change the timeout of the
+user's code (exit_code -1 at timeout_seconds)."""
 
 SNAPSHOT_CREATION_MIN_MEMORY_MB: Final[int] = 320
 """Minimum guest memory for snapshot creation VMs (package installation).
@@ -184,10 +184,17 @@ PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 300
 
 Sent to the guest agent via InstallPackagesRequest.timeout field.
 The guest enforces this as the tokio::time::timeout for the package manager process.
-Also used host-side to compute hard_timeout (+ EXECUTION_TIMEOUT_MARGIN_SECONDS + 8s first-op network gate allowance, see disk_snapshot_manager)."""
+Also used host-side to compute hard_timeout (+ EXECUTION_TIMEOUT_MARGIN_SECONDS + 8s
+first-op network gate allowance, see disk_snapshot_manager)."""
 
 PACKAGE_INSTALL_MAX_RETRIES: Final[int] = 3
 """Maximum retry attempts for transient network errors during package install."""
+
+L3_UPLOAD_STOP_GRACE_SECONDS: Final[float] = 30.0
+"""How long DiskSnapshotManager.stop() (Scheduler exit) waits for the L3 uploads in flight
+before it cancels them. An upload saves another host the build (a package install of
+minutes); its compression and PUT of a few hundred MB take seconds. The bound keeps a store
+that does not answer (botocore retries: minutes) from holding the exit."""
 
 PACKAGE_INSTALL_RETRY_MIN_SECONDS: Final[float] = 1.0
 """Minimum backoff between package install retries (1s base).
@@ -204,7 +211,8 @@ Longer than VM boot retry (2s) to allow transient DNS/routing issues to resolve.
 # ============================================================================
 
 MAX_CODE_SIZE: Final[int] = 1024 * 1024  # 1 MiB
-"""Maximum size in bytes for code input."""
+"""Maximum size of the code of one exec(): the guest counts bytes; the host check
+(Session.exec, guest_agent_protocol) counts characters."""
 
 MAX_ENV_VARS: Final[int] = 100
 """Maximum number of environment variables allowed."""
@@ -250,7 +258,8 @@ HOST_WRITE_BATCH_FRAMES: Final[int] = 16
 until sent, with the partly sent frame of the batch before."""
 
 MAX_FILE_PATH_LENGTH: Final[int] = 4096
-"""Maximum relative file path length in bytes (POSIX PATH_MAX).
+"""Maximum relative file path length (POSIX PATH_MAX): the guest counts bytes; the
+host check (guest_agent_protocol, QemuVM.write_file) counts characters.
 
 Individual filename components are limited to 255 bytes (NAME_MAX) by the
 guest agent's validate_file_path(). This constant covers the full relative path.
@@ -291,7 +300,8 @@ context holds the whole ring buffer)."""
 CONSOLE_RING_LINES: Final[int] = 500
 """In-memory ring buffer size (lines) for QEMU console output.
 
-Kernel loglevel=7 can emit 300-600 lines before init starts.
+With a boot log (on_boot_log: kernel loglevel=7), the kernel can emit 300-600
+lines before init starts.
 500 keeps the diagnostic tail intact for boot failure analysis."""
 
 # ============================================================================
@@ -327,7 +337,8 @@ are enough, with no measurable wall-time difference in cold-start benchmarks
 # ============================================================================
 
 WARM_POOL_REPLENISH_CONCURRENCY_RATIO: Final[float] = 0.5
-"""Max concurrent replenish boots as ratio of pool_size (50% = 2-3 concurrent for pool_size=5)."""
+"""Max concurrent replenish boots per language, as a ratio of the pool size, rounded down
+(at least 1): 2 concurrent boots for pool_size=5."""
 
 WARM_POOL_TENANT_ID: Final[str] = "warm-pool"
 """Placeholder tenant ID for warm pool VMs."""
@@ -364,7 +375,8 @@ MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS: Final[float] = 10.0
 """Timeout for individual QMP commands during migration."""
 
 MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS: Final[float] = 0.005
-"""Interval between query-migrate polls (5ms)."""
+"""Longest interval between query-migrate polls (5 ms): the polls start at 1 ms
+and the interval doubles up to this value (migration_client)."""
 
 MEMORY_SNAPSHOT_QMP_SOCKET_TIMEOUT_SECONDS: Final[float] = 5.0
 """Timeout waiting for QMP socket to appear during L1 restore (sudo path only).
@@ -384,25 +396,20 @@ MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (11, 0, 0)
 Floor is 11.0: it is the first release where mapped-ram coexists with
 x-ignore-shared without a null-deref ("Bad address") crash, letting the template
 and full-RAM paths share ONE unified capability list (no version fork). The
-QEMU pin in versions.lock is above this floor, so it is free. Below the floor,
+QEMU pin in versions.lock (the QEMU that CI builds) is above this floor. Below the floor,
 save and restore raise ConfigError MIGRATION_UNSUPPORTED (no legacy fallback). Changing
 capabilities requires bumping MEMORY_SNAPSHOT_FORMAT_VERSION."""
 
-MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 5
-"""Migration format version. Bump when changing QMP capabilities or migration
-protocol to invalidate stale L1 cache entries. History:
-  v1: Plain streaming format (no mapped-ram)
-  v2: mapped-ram + multifd (QEMU >= 9.0)
-  v3: x-ignore-shared VM templating — device-state-only vmstate + separate
-      RAM file for COW sharing across VMs (QEMU >= 9.0)
-  v4: unified capability list — template path now also enables mapped-ram +
-      multifd alongside x-ignore-shared (QEMU >= 11.0 fixes the coexistence
-      crash), removing the version-forked branch.
-  v5: L2 snapshot drive (hd1) opened read-only outside the L2 build — the
-      virtio-blk device now carries VIRTIO_BLK_F_RO, which v4 templates lack;
-      x-ignore-shared state always sent explicitly; no legacy streaming saves;
-      no virtio-balloon; home disk drive (hd2, serial=home) with a .home file
-      per entry.
+MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 6
+"""Migration format version, part of the L1 cache key (memory_snapshot_manager). Bump
+it when the QMP capabilities, the migration protocol or the guest devices change, so
+that no L1 entry of another format is restored.
+
+Version 6: one capability list (mapped-ram + multifd, and x-ignore-shared always set
+with an explicit state: on for templates); no virtio-balloon; the L2 snapshot drive
+(hd1) read-only outside the L2 build (its virtio-blk device carries VIRTIO_BLK_F_RO);
+a home disk drive (hd2, serial=home), with a .home file per entry; on ARM64 HVF with
+QEMU 11.1+, QEMU's own GIC (kernel-irqchip=off: qemu_cmd), not Apple's.
 
 NOTE: the migration stream layout is QEMU-version- AND parameter-specific — a
 QEMU upgrade or a change to multifd-channels / direct-io (both baked into the
@@ -502,18 +509,15 @@ are bursty and mostly idle (avg memory utilization 18-22%).  At the optimal CPU=
 CPU is the binding constraint (~24 concurrent slots), so memory overcommit only
 affects the theoretical budget ceiling, not actual concurrency or RSS.
 
-The 5.0x default was determined by RBF surrogate optimization (thin-plate spline,
-16 samples) over a 4x4 latency-frontier sweep (250 VMs per combo) on a 16-vCPU /
-32GB EC2 instance with KVM + KSM (scripts/benchmark_optimizer.py):
+The 5.0x default comes from the 4x4 sweep of scripts/benchmark_optimizer.py (250 VMs
+per combo, ranked by 10^6 / geomean of the admission, setup and exec p95) on a 16-vCPU /
+32 GB KVM host (EC2, Xeon 6975P). At CPU=2x the memory ratio changed the results by 7%
+or less, within the spread of one run:
 
-  Predicted optimal: CPU_OC=2.0, MEM_OC=4.6 (efficiency=2227.9)
-  Best sampled:      CPU_OC=2.0, MEM_OC=5.0 (efficiency=2223.3)
-  → Grid already covers the optimum
+  CPU=2x MEM=5x:   58.7 VMs/s, admit_p95=3.6s, setup_p95=282ms, exec_p95=132ms, RSS=4.8%
+  CPU=2x MEM=1.5x: 58.8 VMs/s, admit_p95=3.6s, setup_p95=269ms, exec_p95=129ms, RSS=5.2%
 
-CPU=2x MEM=5x achieves latency efficiency=2223 (10^6 / geomean of admission,
-setup, exec p95) with admit_p95=3025ms, setup_p95=160ms, exec_p95=188ms at
-3.4% RSS.  13/16 grid combos achieved 100% success (250 VMs each); CPU=12x
-combos degraded under extreme contention (13-100% success, 37-49% RSS).
+README "Concurrent throughput" has the whole table.
 
 Not to be confused with DEFAULT_VM_MEMORY_OVERHEAD_MB which is a per-VM additive
 constant for QEMU/gvproxy process memory."""
@@ -524,18 +528,15 @@ DEFAULT_CPU_OVERCOMMIT_RATIO: Final[float] = 2.0
 budget = (host_cpus - reserve_cores) * overcommit_ratio
 
 AI workloads average 11-17% CPU utilization, so 2x overcommit is safe while
-keeping exec latency low.  The 2x default was confirmed by RBF surrogate
-optimization (thin-plate spline, 16 samples) over a 4x4 latency-frontier sweep
-(250 VMs per combo) on a 16-vCPU / 32GB EC2 instance with KVM + KSM
-(scripts/benchmark_optimizer.py):
+keeping exec latency low. The 2x default comes from the same 4x4 sweep as
+DEFAULT_MEMORY_OVERCOMMIT_RATIO (scripts/benchmark_optimizer.py, 250 VMs per combo,
+16-vCPU / 32 GB KVM host): CPU=2x gave the best results with every memory ratio.
+Beyond 2x, throughput falls and setup and exec p95 grow (MEM=5x, then 1.5x for 12x):
 
-  Predicted optimal: CPU_OC=2.0, MEM_OC=4.6
-
-Beyond 2x, setup and exec p95 degrade sharply under sustained load (250 VMs):
-  CPU=2x: setup_p95=160ms, exec_p95=188ms, RSS=3.4%
-  CPU=4x: setup_p95=719ms, exec_p95=336ms, RSS=5.9%
-  CPU=8x: setup_p95=768ms, exec_p95=783ms, RSS=12.4%
-  CPU=12x: setup_p95=31s, exec_p95=38s, RSS=36.9% (system collapse)
+  CPU=2x:  58.7 VMs/s, setup_p95=282ms, exec_p95=132ms, RSS=4.8%
+  CPU=4x:  55.9 VMs/s, setup_p95=627ms, exec_p95=279ms, RSS=9.8%
+  CPU=8x:  50.3 VMs/s, setup_p95=1.4s,  exec_p95=662ms, RSS=21.8%
+  CPU=12x: 36.4 VMs/s, setup_p95=2.8s,  exec_p95=2.9s,  RSS=56.5%
 
 Not to be confused with DEFAULT_VM_CPU_OVERHEAD_CORES which is a per-VM additive
 constant for QEMU/gvproxy process CPU."""
@@ -600,8 +601,8 @@ Measured breakdown:
   - Haltpoll idle overhead (KVM)            : ~5-10% of a core
   - Combined total                          : ~13-33% of a core
 
-0.25 provides ~60% headroom above observed peak (matching memory margin philosophy).
-The gvproxy share applies only when gvproxy runs in the cgroup (network on); without
+0.25 lies inside the measured range: like DEFAULT_VM_MEMORY_OVERHEAD_MB, it is a
+tight value, not the worst case. The gvproxy share applies only when gvproxy runs in the cgroup (network on); without
 it the overhead is ~5-10% of a core, but every VM gets 0.25 (one value is simpler)."""
 
 DEFAULT_TCG_TB_CACHE_SIZE_MB: Final[int] = 128

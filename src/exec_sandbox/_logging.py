@@ -79,12 +79,16 @@ class _NonBlockingHandler(logging.handlers.QueueHandler):
     Records are enqueued via put_nowait() into a bounded FIFO.  A
     QueueListener daemon thread drains them to _StderrHandler.  When
     the queue is full, records are silently dropped (backpressure).
+    close() stops the thread once (logging.shutdown at exit closes the
+    handler again); after it, records are dropped.
     """
 
     def __init__(self) -> None:
         q: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=_QUEUE_CAPACITY)
         super().__init__(q)
-        self._listener = logging.handlers.QueueListener(q, _StderrHandler(), respect_handler_level=False)
+        self._listener: logging.handlers.QueueListener | None = logging.handlers.QueueListener(
+            q, _StderrHandler(), respect_handler_level=False
+        )
         self._listener.start()
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
@@ -92,11 +96,16 @@ class _NonBlockingHandler(logging.handlers.QueueHandler):
         return record
 
     def enqueue(self, record: logging.LogRecord) -> None:
+        if self._listener is None:  # closed: no thread drains the queue
+            return
         with contextlib.suppress(queue.Full):
             self.queue.put_nowait(record)
 
     def close(self) -> None:
-        self._listener.stop()
+        # QueueListener.stop() fails on a second call before Python 3.13
+        listener, self._listener = self._listener, None
+        if listener is not None:
+            listener.stop()
         super().close()
 
 

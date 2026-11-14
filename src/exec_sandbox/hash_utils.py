@@ -48,7 +48,7 @@ def fingerprint(*parts: str) -> str:
 # =============================================================================
 
 
-async def file_hash(path: Path, algorithm: str = "sha256") -> str:
+async def file_hash(path: Path, algorithm: str) -> str:
     """Compute cryptographic hash of a file asynchronously.
 
     One worker-thread job (hashlib.file_digest): neither the reads nor the
@@ -85,6 +85,7 @@ def parse_hash_spec(hash_spec: str) -> tuple[str, str]:
         >>> parse_hash_spec("sha256:abc123")
         ("sha256", "abc123")
     """
-    if ":" not in hash_spec:
+    algorithm, sep, digest = hash_spec.partition(":")
+    if not sep:
         raise ValueError(f"Invalid hash spec (missing ':'): {hash_spec}")
-    return tuple(hash_spec.split(":", 1))  # type: ignore[return-value]
+    return algorithm, digest

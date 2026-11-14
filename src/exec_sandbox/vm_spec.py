@@ -1,8 +1,9 @@
 """VmSpec: what a VM is made of.
 
 One frozen object holds everything that shapes the guest: the L1 memory
-snapshot cache is keyed on it, and a saved instance stores it, so a load makes
-the same VM again. Values of one launch only (vm id, work paths, host ports
+snapshot cache key holds the fields that change the guest state (the domain
+list and the port numbers stay on the host side, so they are not in it), and a
+saved instance stores it, so a load makes the same VM again. Values of one launch only (vm id, work paths, host ports
 picked at launch, timeouts) are not part of it.
 """
 
@@ -86,6 +87,17 @@ class VmSpec(BaseModel):
             items = cast("Sequence[object]", value)
             return tuple(PortMapping(internal=p) if isinstance(p, int) else p for p in items)
         return value
+
+    @field_validator("expose_ports")
+    @classmethod
+    def _check_host_ports(cls, ports: tuple[PortMapping, ...]) -> tuple[PortMapping, ...]:
+        # gvproxy takes the forwards as one JSON object keyed by host port and protocol: a
+        # host port given twice would keep one forward and drop the other with no error
+        given = [(p.external, p.protocol) for p in ports if p.external is not None]
+        twice = sorted({key for key in given if given.count(key) > 1})
+        if twice:
+            raise ValueError(f"Host port given twice: {', '.join(f'{port}/{protocol}' for port, protocol in twice)}")
+        return ports
 
     @property
     def has_network_device(self) -> bool:

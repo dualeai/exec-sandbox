@@ -9,8 +9,18 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from pydantic.fields import FieldInfo
 
 from exec_sandbox.config import SchedulerConfig
+from exec_sandbox.settings import Settings
+
+
+def _refused(**fields: object) -> list[tuple[tuple[int | str, ...], str]]:
+    """The field and the error type of each error that SchedulerConfig(**fields) raises."""
+    with pytest.raises(ValidationError) as exc:
+        SchedulerConfig(**fields)
+    return [(error["loc"], error["type"]) for error in exc.value.errors()]
+
 
 # ============================================================================
 # Config Validation
@@ -21,7 +31,8 @@ class TestSchedulerConfigValidation:
     """Tests for SchedulerConfig field validation."""
 
     def test_defaults(self) -> None:
-        """SchedulerConfig has sensible defaults (the cache folders: TestSchedulerConfigCacheDir)."""
+        """No warm pool, a 30 s timeout, no S3, package validation on (the cache folders:
+        TestSchedulerConfigCacheDir)."""
         config = SchedulerConfig()
         assert config.warm_pool_size == 0
         assert config.default_timeout_seconds == 30
@@ -42,8 +53,7 @@ class TestSchedulerConfigValidation:
         assert config.warm_pool_size == 100
 
         # Invalid: negative
-        with pytest.raises(ValidationError):
-            SchedulerConfig(warm_pool_size=-1)
+        assert _refused(warm_pool_size=-1) == [(("warm_pool_size",), "greater_than_equal")]
 
     def test_default_timeout_seconds_range(self) -> None:
         """default_timeout_seconds must be 1-300."""
@@ -55,18 +65,31 @@ class TestSchedulerConfigValidation:
         config = SchedulerConfig(default_timeout_seconds=300)
         assert config.default_timeout_seconds == 300
 
-        # Invalid: 0
-        with pytest.raises(ValidationError):
-            SchedulerConfig(default_timeout_seconds=0)
-
-        # Invalid: > 300
-        with pytest.raises(ValidationError):
-            SchedulerConfig(default_timeout_seconds=301)
+        # Invalid: 0, and > 300
+        assert _refused(default_timeout_seconds=0) == [(("default_timeout_seconds",), "greater_than_equal")]
+        assert _refused(default_timeout_seconds=301) == [(("default_timeout_seconds",), "less_than_equal")]
 
     def test_extra_fields_forbidden(self) -> None:
         """SchedulerConfig rejects unknown fields."""
-        with pytest.raises(ValidationError):
-            SchedulerConfig(unknown_field="value")  # type: ignore[call-arg]
+        assert _refused(unknown_field="value") == [(("unknown_field",), "extra_forbidden")]
+
+
+class TestSchedulerConfigMatchesSettings:
+    """The Scheduler passes each field that SchedulerConfig and Settings share, when set in code,
+    to Settings, which reads the EXEC_SANDBOX_* variables for the others (settings_from_config)."""
+
+    def test_shared_fields_have_one_type_bounds_and_default(self) -> None:
+        """A value that SchedulerConfig accepts, Settings accepts too (else the Scheduler start
+        would blame a variable), and a field left unset means the same in both."""
+        shared = SchedulerConfig.model_fields.keys() & Settings.model_fields.keys()
+
+        def shape(field: FieldInfo) -> tuple[object, ...]:
+            return (field.annotation, field.metadata, field.get_default(call_default_factory=True))
+
+        config_fields, settings_fields = SchedulerConfig.model_fields, Settings.model_fields
+        assert {name: shape(config_fields[name]) for name in shared} == {
+            name: shape(settings_fields[name]) for name in shared
+        }
 
 
 # ============================================================================

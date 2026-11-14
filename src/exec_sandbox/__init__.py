@@ -76,14 +76,8 @@ if detect_host_os() == HostOS.UNKNOWN:
         instance_id=None,
     )
 
-from importlib.metadata import PackageNotFoundError, version
-
-try:
-    __version__ = version("exec-sandbox")
-except PackageNotFoundError:
-    __version__ = "0.0.0.dev0"
-
 from exec_sandbox._logging import configure_logging
+from exec_sandbox._version import __version__ as __version__
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
     ConfigError,

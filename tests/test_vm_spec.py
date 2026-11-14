@@ -38,11 +38,35 @@ class TestVmSpec:
         spec = VmSpec(language=Language.PYTHON, expose_ports=[8080, PortMapping(internal=9000, external=3000)])
         assert spec.expose_ports == (PortMapping(internal=8080), PortMapping(internal=9000, external=3000))
 
+    def test_a_host_port_given_twice_is_refused(self) -> None:
+        """gvproxy keys its forwards by host port and protocol: a second forward on the same
+        host port would replace the first with no error."""
+        ports = [
+            PortMapping(internal=80, external=3000),
+            PortMapping(internal=81, external=3000),
+            PortMapping(internal=82, external=3001, protocol="udp"),
+            PortMapping(internal=83, external=3001, protocol="udp"),
+        ]
+        with pytest.raises(ValidationError, match=r"Host port given twice: 3000/tcp, 3001/udp"):
+            VmSpec(language=Language.PYTHON, expose_ports=ports)
+
+    def test_one_host_port_per_protocol_and_shared_guest_ports_are_accepted(self) -> None:
+        """TCP and UDP on the same host port are two forwards; a guest port on two host ports
+        too; dynamic host ports (None) are picked apart by the OS."""
+        ports = (
+            PortMapping(internal=80, external=3000),
+            PortMapping(internal=80, external=3000, protocol="udp"),
+            PortMapping(internal=80, external=3001),
+            PortMapping(internal=81),
+            PortMapping(internal=81),
+        )
+        assert VmSpec(language=Language.PYTHON, expose_ports=ports).expose_ports == ports
+
     def test_frozen_and_hashable(self) -> None:
         """A catalogue of specs can be dict keys; a spec never changes after creation."""
         spec = VmSpec(language=Language.PYTHON, expose_ports=[8080])
         assert hash(spec) == hash(VmSpec(language="python", expose_ports=[8080]))
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError, match="Instance is frozen"):
             spec.memory_mb = 1024  # type: ignore[misc]
 
     def test_domains_are_kept_as_the_network_filter_compares_them(self) -> None:
@@ -63,23 +87,25 @@ class TestVmSpec:
         assert VmSpec.model_validate_json(spec.model_dump_json()) == spec
 
     @pytest.mark.parametrize(
-        "fields",
+        ("fields", "error_type"),
         [
-            pytest.param({"memory_mb": 127}, id="memory-below-min"),
-            pytest.param({"disk_mb": 127}, id="disk-below-min"),
-            pytest.param({"cpu_cores": 0}, id="no-cpu"),
-            pytest.param({"expose_ports": list(range(1, 12))}, id="too-many-ports"),
-            pytest.param({"expose_ports": None}, id="ports-not-a-sequence"),
-            pytest.param({"language": "cobol"}, id="unknown-language"),
-            pytest.param({"memroy_mb": 256}, id="typo-field"),
-            pytest.param({"allowed_domains": ["pypi.org", "bad..domain"]}, id="domain-empty-label"),
-            pytest.param({"allowed_domains": ["example.123"]}, id="domain-numeric-tld"),
-            pytest.param({"allowed_domains": ["(a|b)*.com"]}, id="domain-regex"),
+            pytest.param({"memory_mb": 127}, "greater_than_equal", id="memory-below-min"),
+            pytest.param({"disk_mb": 127}, "greater_than_equal", id="disk-below-min"),
+            pytest.param({"cpu_cores": 0}, "greater_than_equal", id="no-cpu"),
+            pytest.param({"expose_ports": list(range(1, 12))}, "too_long", id="too-many-ports"),
+            pytest.param({"expose_ports": None}, "tuple_type", id="ports-not-a-sequence"),
+            pytest.param({"language": "cobol"}, "enum", id="unknown-language"),
+            pytest.param({"memroy_mb": 256}, "extra_forbidden", id="typo-field"),
+            pytest.param({"allowed_domains": ["pypi.org", "bad..domain"]}, "value_error", id="domain-empty-label"),
+            pytest.param({"allowed_domains": ["example.123"]}, "value_error", id="domain-numeric-tld"),
+            pytest.param({"allowed_domains": ["(a|b)*.com"]}, "value_error", id="domain-regex"),
         ],
     )
-    def test_invalid(self, fields: dict[str, object]) -> None:
-        with pytest.raises(ValidationError):
+    def test_invalid(self, fields: dict[str, object], error_type: str) -> None:
+        """One error, on the field given, for the rule that field breaks."""
+        with pytest.raises(ValidationError) as exc:
             VmSpec.model_validate({"language": "python", **fields})
+        assert [(error["loc"], error["type"]) for error in exc.value.errors()] == [(tuple(fields), error_type)]
 
     @pytest.mark.parametrize("memory_mb", [128, 65536])
     def test_memory_bounds_accept(self, memory_mb: int) -> None:

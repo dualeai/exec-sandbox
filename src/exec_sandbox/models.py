@@ -76,7 +76,7 @@ class StartupTiming(BaseModel):
     time (ExecutionResult.timing.execute_ms).
 
     Phases do not overlap: total_ms = admission_ms + setup_ms + boot_ms
-    (+ instance_load_ms after reuse(), + small unmeasured gaps). A warm pool hit
+    (+ instance_load_ms after reuse()); setup_ms is the rest of total_ms. A warm pool hit
     has admission_ms = boot_ms = 0; an L1 restore has boot_ms = 0 and
     l1_restore_ms set; reuse() has boot_ms = 0 and setup_ms = the restore of the
     saved state.
@@ -94,7 +94,8 @@ class StartupTiming(BaseModel):
     total_ms: int = Field(description="The whole new() or reuse() call (exec() calls not included)")
     admission_ms: int = Field(description="Wait for a resource slot (0 for warm pool hits)")
     setup_ms: int = Field(
-        description="Cache lookup, overlay, cgroup (after reuse(): the restore of the saved state); excludes admission and boot"
+        description="Cache lookup, overlay, cgroup (after reuse(): the restore of the saved state); "
+        "excludes admission and boot"
     )
     boot_ms: int = Field(description="QEMU start + kernel + guest agent (0 for warm pool, L1 and reuse())")
     warm_pool_hit: bool = Field(description="The VM came from the warm pool")

@@ -181,17 +181,24 @@ class TestHelpers:
         assert error.found == {"arch": "x86_64", "accelerator": "kvm"}
 
     def test_no_instance_store(self) -> None:
+        """The hint names both ways to set a store: the settings and their variables."""
         error = exceptions.no_instance_store(instance_id="abc")
         assert type(error) is ConfigError
         assert error.code is ErrorCode.INSTANCE_CONFIG
         assert error.instance_id == "abc"
-        assert error.hint is not None
+        assert str(error) == "Saved instances need an instance store, and none is configured."
+        assert error.hint == (
+            "Set instance_store and instance_keyring "
+            "(or EXEC_SANDBOX_INSTANCE_STORE and EXEC_SANDBOX_INSTANCE_KEYRING)."
+        )
 
     def test_damaged_instance_data(self) -> None:
-        error = exceptions.damaged_instance_data("broken", instance_id=None)
+        """The caller's message, and a hint that tells to start again with a new instance."""
+        error = exceptions.damaged_instance_data("broken", instance_id="abc")
         assert type(error) is InstanceGoneError
         assert error.code is ErrorCode.INSTANCE_INTEGRITY
-        assert str(error) == "broken"
+        assert (str(error), error.instance_id) == ("broken", "abc")
+        assert error.hint == "The stored data was changed, damaged or truncated. Start again with a new instance."
 
     @pytest.mark.parametrize(
         ("err", "cls", "code", "hint"),
@@ -199,12 +206,22 @@ class TestHelpers:
             (errno.EAGAIN, TransientError, ErrorCode.GVPROXY_FAILED, None),
             (errno.ENOMEM, TransientError, ErrorCode.GVPROXY_FAILED, None),
             (errno.EMFILE, TransientError, ErrorCode.GVPROXY_FAILED, None),
+            (errno.ENFILE, TransientError, ErrorCode.GVPROXY_FAILED, None),
             (errno.ENOENT, ConfigError, ErrorCode.HOST_DEPENDENCY, "Install it."),
             (errno.EACCES, ConfigError, ErrorCode.HOST_DEPENDENCY, "Install it."),
             (errno.ENOEXEC, ConfigError, ErrorCode.HOST_DEPENDENCY, "Install it."),
             (errno.EPERM, ConfigError, ErrorCode.HOST_DEPENDENCY, "Install it."),
         ],
-        ids=["process-limit", "no-memory", "no-file-handles", "missing", "no-exec-bit", "other-arch", "other"],
+        ids=[
+            "process-limit",
+            "no-memory",
+            "no-file-handles",
+            "no-system-file-handles",
+            "missing",
+            "no-exec-bit",
+            "other-arch",
+            "other",
+        ],
     )
     def test_spawn_error_by_errno(self, err: int, cls: type[SandboxError], code: ErrorCode, hint: str | None) -> None:
         """A process or memory limit can pass (the site's TransientError, no install hint);

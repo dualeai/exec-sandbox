@@ -506,10 +506,6 @@ class SocketAuthError(CommunicationError):
     The Unix socket server does not run as the expected user. Causes: QEMU
     stopped and another process bound the socket path, a race during socket
     creation, or a process that tries to take over the socket.
-
-    Attributes:
-        expected_uid: Expected user ID
-        actual_uid: Actual user ID from peer credentials
     """
 
     def __init__(
@@ -522,8 +518,6 @@ class SocketAuthError(CommunicationError):
     ) -> None:
         # A new dict: the caller's context stays as it was
         super().__init__(message, context={**(context or {}), "expected_uid": expected_uid, "actual_uid": actual_uid})
-        self.expected_uid = expected_uid
-        self.actual_uid = actual_uid
 
 
 class InstanceNotSavedWarning(UserWarning):

@@ -132,7 +132,8 @@ class SchedulerConfig(BaseModel):
     # S3: one bucket for the L3 snapshot cache and for the "s3" instance store, each under its prefix
     s3_bucket: str | None = Field(
         default=None,
-        description='S3 bucket of the L3 snapshot cache and the "s3" instance store (None turns the L3 snapshot cache off)',
+        description='S3 bucket of the L3 snapshot cache and the "s3" instance store '
+        "(None turns the L3 snapshot cache off)",
     )
     s3_region: str = Field(
         default="us-east-1",
