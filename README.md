@@ -206,6 +206,8 @@ async with Scheduler(config) as scheduler:
         await session.save()  # generation 2
 ```
 
+`save()` keeps the VM running: the session goes on after the save.
+
 ### Keys
 
 Make a key with `python3 -c "import base64, secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())"`. The keyring is a comma-separated list of keys, newest first: the first key encrypts new saves, the others only open older instances. Keep the keyring in your secret store, and give every worker the same keyring. Keep every key that saved an instance: without it, `reuse()` raises `ConfigError` (`INSTANCE_KEY_MISSING`). To change keys: [Key rotation](#key-rotation).
@@ -213,6 +215,23 @@ Make a key with `python3 -c "import base64, secrets; print(base64.b64encode(secr
 ### Instance ids
 
 To choose the id, pass it to `new()`: `scheduler.new(spec, instance_id="user-42")`. An id has 1 to 64 lowercase letters, digits, `.`, `_` or `-`, and starts with a letter or digit. If the id exists, the first `save()` fails with `INSTANCE_CONFLICT`. Without an id, the first save makes a random one (`ref.instance_id`).
+
+### Save under a new id
+
+`session.save(instance_id="run-17")` saves the VM as generation 1 of a new instance, then the session saves to that instance (`session.instance`). The instance the session had stays as its last save left it. An id that exists raises `INSTANCE_CONFLICT`, and nothing is overwritten. The session's own id gives a plain save.
+
+To start many sessions from one save, call `reuse()` of the same instance in each, and give each session its own id at its first save:
+
+```python
+children = [await scheduler.reuse(checkpoint.instance_id) for _ in range(3)]
+for n, child in enumerate(children):
+    await child.exec(f"attempt({n})")
+    await child.save(instance_id=f"attempt-{n}")  # the checkpoint stays as it was
+```
+
+### Random values in copies
+
+Each VM that starts from the same save gets new values from its first `exec()`: the kernel random source (`os.urandom`, `/dev/urandom`), Python `ssl` and the module functions of `random`, the random functions of the JavaScript `crypto` and `node:crypto`, `Math.random` (also in the `node:vm` contexts that the code makes), the keys of the `Sync` functions of `node:crypto` (such as `generateKeyPairSync`), and bash `$RANDOM`. Python `random` gets a new seed at each `reuse()`: to repeat a seeded run, call `random.seed()` after the load. These keep the state of the save in each copy: values made before the save, programs that run since before the save, `random.Random()` objects and NumPy generators. In Bun, these can give the same values in each copy: the keys, primes and signatures of the functions that take a callback or return a promise (such as `generateKeyPair`, `generatePrime` and `crypto.subtle`), TLS and `fetch`, and Workers. To get other values in each copy, make keys with the `Sync` functions, and seed the other generators in the copy.
 
 ### Choose a store
 
@@ -263,9 +282,9 @@ async with instance_admin(SchedulerConfig(instance_store="s3", s3_bucket="my-buc
 
 ### Rules for save and reuse
 
-- **One writer.** `save()` fails, and closes its session, if another save of the instance was stored since this session loaded or last saved it. If two requests can reach one instance at the same time, use your own lock.
+- **One writer.** `save()` fails with `INSTANCE_CONFLICT` if another save of the instance was stored since this session loaded or last saved it. The session stays open: save it under a new id to keep its work, or close it. If two requests can reach one instance at the same time, use your own lock.
 - **Network.** A reused instance reaches the domains its last save allowed (`describe_instance(id).egress_domains`; empty: all), also after a release that changes the default list of `allowed_domains=None`.
-- **`close()` never saves.** After an `exec()` or `write_file()` with no later save, `close()` warns with `InstanceNotSavedWarning`. The idle timeout closes the session with no save and no warning: save before a long pause.
+- **`close()` never saves.** After an `exec()` or `write_file()` with no later save, `close()` warns with `InstanceNotSavedWarning` (not after another save of the instance won: no plain save of that session can store its work). The idle timeout closes the session with no save (it logs a warning in the cases where `close()` warns): save before a long pause.
 - **Host kind.** An instance loads only on a worker with the same CPU architecture, accelerator (`kvm`, `hvf` or `tcg`), CPU vendor (x86) and guest CPU model, and a QEMU that has the saved machine type (for example `virt-11.1`) and accepts the saved state. The release of the worker must run the saved devices (`describe_instance(id).host.device_layout`). Other workers raise `RouteError`; its `required` field gives the values (empty for the devices: load it on a worker of another release).
 - **After `reuse()`.** The network connections that were open at the save are closed.
 
@@ -275,9 +294,9 @@ async with instance_admin(SchedulerConfig(instance_store="s3", s3_bucket="my-buc
 |------------------|-------|---------|
 | `RETRY` (`TransientError`) | `INSTANCE_STORE_UNAVAILABLE`, `LOCAL_DISK` | Call again later. A failed save stored nothing. |
 | `ROUTE` (`RouteError`) | `INSTANCE_HOST_MISMATCH` | Use a worker that satisfies `required` ([Upgrades](#upgrades)). Keep the instance. |
-| `RECREATE` (`InstanceGoneError`) | `INSTANCE_NOT_FOUND`, `INSTANCE_EXPIRED`, `INSTANCE_INTEGRITY` | Start a new instance. To use the same id again, call `delete_instance(id)` first. |
-| `VERIFY` (`OutcomeUnknownError`) | `INSTANCE_SAVE_OUTCOME_UNKNOWN` | The session is closed. The save was stored if `describe_instance(id).recent_commits` has `error.context["commit_id"]`: check before you do the work again. |
-| `VERIFY` (`OutcomeUnknownError`) | `INSTANCE_CONFLICT` | The session is closed and this save was not stored: `reuse()` the instance (it has the other save), then do the work again. For the first save of `new(instance_id=...)`, the id is taken: use another id. |
+| `RECREATE` (`InstanceGoneError`) | `INSTANCE_NOT_FOUND`, `INSTANCE_EXPIRED`, `INSTANCE_INTEGRITY` | Start a new instance. To use the same id again, call `delete_instance(id)` first. A save that raises `INSTANCE_NOT_FOUND` keeps its session open: save it under a new id to keep its work. |
+| `VERIFY` (`OutcomeUnknownError`) | `INSTANCE_SAVE_OUTCOME_UNKNOWN` | The session stays open. The save was stored if `describe_instance(id).recent_commits` has `error.context["commit_id"]`: check before you do the work again. A retry of the same save (the same `instance_id`) never stores a second copy. |
+| `VERIFY` (`OutcomeUnknownError`) | `INSTANCE_CONFLICT` | This save was not stored, and the session stays open. If an earlier save of the session had an unknown outcome, look for its `commit_id` in `describe_instance(id).recent_commits` first: it may be the save that is stored. Else another save holds the instance: save this session under a new id to keep its work, or `reuse()` the instance (it has the other save) and do the work again. For a new id, or the first save of `new(instance_id=...)`, the id is taken: use another id. |
 | `FIX_CONFIG` (`ConfigError`) | `INSTANCE_CONFIG`, `INSTANCE_KEY_MISSING`, `MIGRATION_UNSUPPORTED`, `IMAGE_DAMAGED` | `INSTANCE_CONFIG`: fix the bucket, store folder, permissions or keyring, or use a store with conditional writes. `INSTANCE_KEY_MISSING`: add the named key; keep the instance. `MIGRATION_UNSUPPORTED`: upgrade QEMU to 11.0+. `IMAGE_DAMAGED`: download or rebuild the images. |
 | `FIX_INPUT` (`InvalidInputError`) | `INSTANCE_INVALID_ID` | Fix the id ([Instance ids](#instance-ids)). |
 
@@ -434,14 +453,14 @@ except SandboxError as e:  # The other actions
 | `GVPROXY_FAILED` | `TransientError` | gvproxy did not start or become ready. |
 | `CAPACITY` | `TransientError` | No resources became free within the admission timeout. |
 | `GUEST_UNAVAILABLE` | `TransientError` | The guest could not take the call or start the code. The code did not run. |
-| `GUEST_SILENT_AFTER_RESTORE` | `TransientError` | The guest did not answer after a memory snapshot restore. |
+| `GUEST_SILENT_AFTER_RESTORE` | `TransientError` | The guest did not answer after a memory snapshot restore, or could not reseed its kernel random source. |
 | `LOCAL_DISK` | `TransientError` | A local file is missing (a path that you gave: `ARGUMENT_INVALID`), or the host cannot read or write it now (disk full, quota, I/O error, file handle or memory limit), or the host disk has no room for a home disk. |
 | `PACKAGE_DOWNLOAD` | `TransientError` | The package manager could not download (network error or timeout). |
 | `MIGRATION_FAILED` | `TransientError` | QEMU did not save or load the VM state. |
 | `ASSET_DOWNLOAD` | `TransientError` | A VM image download failed after its retries. |
 | `INSTANCE_STORE_UNAVAILABLE` | `TransientError` | The instance store failed, answered badly, or kept changing. |
 | `GUEST_OUTCOME_UNKNOWN` | `OutcomeUnknownError` | The transport was lost after the call reached the guest. The code may have run. |
-| `INSTANCE_CONFLICT` | `OutcomeUnknownError` | Another save was stored first, or the id given to `new()` is taken. This save was not stored. |
+| `INSTANCE_CONFLICT` | `OutcomeUnknownError` | Another save was stored first, or the id of a first save is taken. This save was not stored; the session stays open. |
 | `INSTANCE_SAVE_OUTCOME_UNKNOWN` | `OutcomeUnknownError` | The store did not confirm the save, and a read-back could not tell. |
 | `SESSION_CLOSED` | `SessionClosedError` | The session is closed. |
 | `CODE_INVALID` | `InvalidInputError` | The code is empty, only spaces, holds null bytes, or is too large. |
@@ -767,7 +786,7 @@ The docstring of each method (`help(Scheduler.new)`) lists its errors.
 | `write_file(path, content, *, make_executable=False)` | Write a file from bytes, a local `Path` or an `IO[bytes]` stream ([Files](#files)) |
 | `read_file(path, *, destination)` | Read a file to a local `Path` or an `IO[bytes]` stream |
 | `list_files(path="")` | List a folder; returns `FileInfo` entries (`name`, `is_dir`, `size` in bytes, 0 for folders) |
-| `save()` | Save the VM state; returns an `InstanceRef` ([Saved instances](#saved-instances)) |
+| `save(*, instance_id=None)` | Save the VM state; returns an `InstanceRef`. `instance_id`: save under a new id and continue it ([Save under a new id](#save-under-a-new-id)) |
 | `close()` | Destroy the VM; it never saves ([Rules for save and reuse](#rules-for-save-and-reuse)) |
 | `spec` | `VmSpec`: what the VM is made of |
 | `startup_timing` | `StartupTiming`: how the VM started (below) |
@@ -815,7 +834,7 @@ Times in ms of the `new()` or `reuse()` call, measured on the host. After a cold
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `instance_id` | str | The id given to `new(instance_id=...)`, else the one the first save made (32 lowercase hex characters) |
+| `instance_id` | str | The id given to `new(instance_id=...)` or `save(instance_id=...)`, else the one the first save made (32 lowercase hex characters) |
 | `generation` | int | 1 after the first save; +1 for each later save |
 | `recent_commits` | tuple[RecentCommit, ...] | The last saves (`generation`, `commit_id`), newest first, at most 16 |
 | `key_id` | str | Id of the keyring key that protects the instance |
@@ -918,7 +937,7 @@ All VMs of a host run as the same user (layer 3): run workloads that must not sh
 - **No network by default.** Set `allow_network=True` to turn it on.
 - **Domain allow-list.** DNS does not resolve the domains that are not allowed. On port 443, the TLS SNI is checked, also against the DNS answers.
 - **Package check.** By default, only the top 10,000 PyPI and npm packages.
-- **Different random output in each VM**, also in VMs restored from the same memory snapshot.
+- **Different random output in each VM**, also in VMs that start from one memory snapshot or one saved instance: [Random values in copies](#random-values-in-copies).
 
 ### Supply chain
 
