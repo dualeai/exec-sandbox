@@ -698,6 +698,7 @@ class WarmVMPool:
         )
         if not (isinstance(response, WarmReplAckMessage) and response.status == "ok"):
             raise RuntimeError(f"REPL pre-warm failed for {language.value}: {response}")
+        vm.reseed_next_exec = False  # the warm-up ran the REPL's reseed (WarmReplRequest)
         logger.debug("REPL pre-warmed", extra={"vm_id": vm.vm_id, "language": language.value})
 
     async def _health_check_loop(self) -> None:
@@ -851,7 +852,9 @@ class WarmVMPool:
             """Single ping attempt - may raise on transient failure."""
             await vm.channel.connect(timeout_seconds=5)  # reconnects only a failed connection
             logger.debug("Health check: sending ping request", extra={"vm_id": vm.vm_id})
-            response = await vm.channel.send_request(PingRequest(), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS)
+            response = await vm.channel.send_request(
+                PingRequest(host_entropy=None), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS
+            )
             logger.debug(
                 "Health check: received response",
                 extra={"vm_id": vm.vm_id, "response_type": type(response).__name__},

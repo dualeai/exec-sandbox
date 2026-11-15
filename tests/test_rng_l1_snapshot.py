@@ -1,13 +1,17 @@
 """L1 snapshot restore must produce unique RNG output per VM.
 
 QEMU migration replays exact CPU+RAM+device state, including the kernel CRNG.
-Without the guest-agent's RNDRESEEDCRNG ioctl (called before every command
-dispatch), all VMs restored from the same vmstate would produce identical
+The host's first ping after a restore carries 32 random bytes: the guest agent adds
+them to the kernel input pool, then reseeds the CRNG (guest-agent/src/entropy.rs).
+Without them, on HVF (a reseed there gets no fresh secret bytes from the guest
+itself), VMs restored from the same vmstate would produce the same or predictable
 os.urandom() output — a critical security vulnerability.
 
-This test forces L1 restore for multiple VMs and asserts their random output
-diverges: the guest agent reseeds the CRNG (reseed_crng, called in
-guest-agent/src/connection.rs) before each command.
+These tests force L1 restores of one template and assert that the random output of
+the VMs differs: os.urandom (the kernel CRNG), JavaScript Math.random and
+crypto.getRandomValues, and bash $RANDOM. Different output is not unpredictable output:
+that the guest takes the host's bytes is tested on the ping itself
+(test_rng_quality.TestHostEntropyPing, and the entropy tests of the guest agent).
 """
 
 import asyncio
@@ -36,11 +40,11 @@ class TestL1SnapshotRNG:
     hardware-accelerated CPU state save/restore (KVM/HVF).
 
     The L1 snapshot saves full CPU+RAM+device state via QEMU migration.
-    On restore, the kernel CRNG resumes from the saved state. The guest-agent
-    forces an immediate CRNG reseed (RNDRESEEDCRNG ioctl) before every command
-    dispatch, ensuring each restored VM diverges. These tests validate that
-    the reseed mechanism works — failure means identical random output across
-    VMs, indicating a broken or missing reseed.
+    On restore, the kernel CRNG resumes from the saved state. The guest agent
+    adds the host entropy of the first ping after the restore to the input pool
+    and reseeds the CRNG, so each restored VM diverges. These tests check that the
+    outputs differ — failure means identical random output across VMs, indicating
+    a broken or missing reseed.
     """
 
     async def test_l1_restored_vms_different_random(self, scheduler: Scheduler) -> None:
@@ -102,8 +106,8 @@ class TestL1SnapshotRNG:
 
 
 # Math.random lives in the JS runtime, not the kernel: the guest CRNG reseed does
-# not cover it. The REPL feeds it from crypto.getRandomValues in both realms (the
-# exec context and the outer realm that require'd modules and
+# not cover it. The REPL replaces it with a function that reads getrandom(2) in
+# both realms (the exec context and the outer realm that require'd modules and
 # process.constructor.constructor reach).
 JS_RANDOM = """\
 const words = new Uint32Array(4);
@@ -113,19 +117,39 @@ console.log(JSON.stringify({ math: [Math.random(), Math.random()], outer, crypto
 """
 
 
+async def _two_l1_restores(scheduler: Scheduler, spec: VmSpec, *, prime: str, draw: str) -> tuple[str, str]:
+    """A cold boot of `spec` runs `prime` (its L1 template is saved after), then two VMs restored
+    from that template run `draw`: their two stdouts."""
+    result = await run_once(scheduler, spec, prime)
+    assert result.exit_code == 0, result.stderr
+    await wait_l1_saves(scheduler)
+    runs = [await run_timed(scheduler, spec, draw) for _ in range(2)]
+    for i, run in enumerate(runs):
+        assert run.result.exit_code == 0, f"VM {i} failed: {run.result.stderr}"
+        assert run.startup.l1_cache_hit, f"VM {i} did NOT come from L1 restore"
+    return runs[0].result.stdout, runs[1].result.stdout
+
+
 @skip_unless_hwaccel
 class TestL1SnapshotJsRNG:
     async def test_l1_restored_js_vms_different_random(self, scheduler: Scheduler) -> None:
-        prime = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log('prime')")
-        assert prime.exit_code == 0, prime.stderr
-        await wait_l1_saves(scheduler)
-
-        runs = [await run_timed(scheduler, VmSpec(language=Language.JAVASCRIPT), JS_RANDOM) for _ in range(2)]
-
-        for i, run in enumerate(runs):
-            assert run.result.exit_code == 0, f"VM {i} failed: {run.result.stderr}"
-            assert run.startup.l1_cache_hit, f"VM {i} did NOT come from L1 restore"
-        first, second = (json.loads(run.result.stdout.strip()) for run in runs)
+        outputs = await _two_l1_restores(
+            scheduler, VmSpec(language=Language.JAVASCRIPT), prime="console.log('prime')", draw=JS_RANDOM
+        )
+        first, second = (json.loads(output.strip()) for output in outputs)
         assert first["math"] != second["math"], "Math.random state cloned from the L1 template"
         assert first["outer"] != second["outer"], "outer-realm Math.random state cloned from the L1 template"
         assert first["crypto"] != second["crypto"], "crypto.getRandomValues state cloned from the L1 template"
+
+
+# bash $RANDOM lives in the shell process, not the kernel: the guest CRNG reseed does
+# not cover it. The first exec after a restore carries the reseed flag, and the shell
+# REPL then sets RANDOM from $SRANDOM (the kernel).
+@skip_unless_hwaccel
+class TestL1SnapshotShellRNG:
+    async def test_l1_restored_raw_vms_different_random(self, scheduler: Scheduler) -> None:
+        """bash $RANDOM gets a new seed at each restore of one L1 template."""
+        first, second = await _two_l1_restores(
+            scheduler, VmSpec(language=Language.RAW), prime="echo prime", draw="echo $RANDOM $RANDOM $RANDOM"
+        )
+        assert first != second, "bash $RANDOM state cloned from the L1 template"

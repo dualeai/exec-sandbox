@@ -270,6 +270,23 @@ async fn report(
     }
 }
 
+/// Answer a Ping: a Pong. With host entropy, `mix` (entropy::mix_host_entropy) adds it to
+/// the kernel and reseeds first; when that fails, an error and no Pong.
+async fn answer_ping(
+    writer: &ResponseWriter,
+    host_entropy: Option<&str>,
+    mix: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), CmdError> {
+    if let Some(host_entropy) = host_entropy
+        && let Err(error) = mix(host_entropy)
+    {
+        let message = format!("kernel random reseed with the host entropy failed: {error}");
+        log_error!("{message}");
+        return writer.send_error(message, ErrorType::Io.as_str()).await;
+    }
+    writer.send(&GuestResponse::Pong { version: VERSION }).await
+}
+
 /// Serve one host connection: from the first byte to the host close.
 ///
 /// Returns `Ok(())` when the host closes its side. It drops the writes that
@@ -367,23 +384,25 @@ pub(crate) async fn handle_connection(
         // Step the wall clock forward to the host's before any user code reads it.
         crate::clock::sync(host_time_ns);
 
-        // Reseed kernel CRNG before each command dispatch (~11μs).
-        // After L1 snapshot restore the VM resumes mid-loop with cloned CRNG;
-        // this forces divergence before any user code calls getrandom(). A
-        // file chunk is never first: its write_file reseeded already.
+        // Reseed the kernel CRNG before each command (~11 µs; a failure only logs,
+        // entropy.rs), so no user code reads the CRNG with the key it had before this
+        // command. A file chunk is never first: its write_file reseeded already.
         if !matches!(cmd, GuestCommand::FileChunk { .. }) {
-            crate::reseed_crng();
+            crate::entropy::reseed();
         }
 
         let writer = ResponseWriter::new(write_tx.clone(), op_id);
 
         match cmd {
-            GuestCommand::Ping => {
-                log_info!("Processing: ping");
-                if writer
-                    .send(&GuestResponse::Pong { version: VERSION })
-                    .await
-                    .is_err()
+            GuestCommand::Ping { host_entropy } => {
+                log_info!("Processing: ping (host_entropy={})", host_entropy.is_some());
+                if answer_ping(
+                    &writer,
+                    host_entropy.as_deref(),
+                    crate::entropy::mix_host_entropy,
+                )
+                .await
+                .is_err()
                 {
                     break Err("write queue closed".into());
                 }
@@ -450,6 +469,7 @@ pub(crate) async fn handle_connection(
                 code,
                 timeout,
                 env_vars,
+                reseed,
             } => {
                 // Gate all process spawning on network and capped-zram safety.
                 let t_net = crate::monotonic_ms();
@@ -473,13 +493,14 @@ pub(crate) async fn handle_connection(
                     t_net_done
                 );
                 log_info!(
-                    "Processing: execute_code (language={}, code_size={}, timeout={timeout}s, env_vars={})",
+                    "Processing: execute_code (language={}, code_size={}, timeout={timeout}s, env_vars={}, reseed={reseed})",
                     language.as_str(),
                     code.len(),
                     env_vars.len()
                 );
                 let outcome =
-                    execute_code_streaming(language, &code, timeout, &env_vars, &writer).await;
+                    execute_code_streaming(language, &code, timeout, &env_vars, reseed, &writer)
+                        .await;
                 if let Err(e) = report(&writer, outcome).await {
                     break Err(e);
                 }
@@ -831,6 +852,86 @@ mod tests {
         assert_eq!(line_of(&mut port).await, "two\n");
         host.write_all(b"ee\n").unwrap();
         assert_eq!(line_of(&mut port).await, "three\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // answer_ping
+    // -------------------------------------------------------------------------
+
+    /// The messages that answer_ping queues for `host_entropy`, and the host entropy its kernel
+    /// step got (the step returns `step_result`; entropy.rs tests the real step).
+    async fn ping_answers(
+        host_entropy: Option<&str>,
+        step_result: Result<(), String>,
+    ) -> (Vec<serde_json::Value>, Option<String>) {
+        let (tx, mut rx) = mpsc::channel(4);
+        let writer = ResponseWriter::new(tx, Some("op-1".to_string()));
+        let mut stepped = None;
+        answer_ping(&writer, host_entropy, |entropy| {
+            stepped = Some(entropy.to_string());
+            step_result
+        })
+        .await
+        .unwrap();
+        let mut answers = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            answers.push(serde_json::from_slice(&frame).unwrap());
+        }
+        (answers, stepped)
+    }
+
+    #[tokio::test]
+    async fn a_ping_without_host_entropy_gets_a_pong_and_no_kernel_step() {
+        let (answers, stepped) = ping_answers(None, Ok(())).await;
+
+        assert_eq!(
+            answers,
+            vec![serde_json::json!({"type": "pong", "version": VERSION, "op_id": "op-1"})]
+        );
+        assert_eq!(stepped, None);
+    }
+
+    #[tokio::test]
+    async fn a_ping_with_host_entropy_runs_the_kernel_step_before_its_pong() {
+        let (answers, stepped) = ping_answers(Some("AAEC"), Ok(())).await;
+
+        assert_eq!(
+            answers,
+            vec![serde_json::json!({"type": "pong", "version": VERSION, "op_id": "op-1"})]
+        );
+        assert_eq!(stepped.as_deref(), Some("AAEC"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_kernel_step_answers_the_ping_with_an_error_and_no_pong() {
+        let failure = Err("ioctl RNDRESEEDCRNG failed: no data".to_string());
+
+        let (answers, _) = ping_answers(Some("AAEC"), failure).await;
+
+        assert_eq!(
+            answers,
+            vec![serde_json::json!({
+                "type": "error",
+                "message": "kernel random reseed with the host entropy failed: ioctl RNDRESEEDCRNG failed: no data",
+                "error_type": "io_error",
+                "op_id": "op-1",
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_queue_fails_both_answers_of_a_ping() {
+        for host_entropy in [None, Some("AAEC")] {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+
+            let sent = answer_ping(&ResponseWriter::new(tx, None), host_entropy, |_| {
+                Err("no data".to_string())
+            })
+            .await;
+
+            assert!(sent.is_err(), "host_entropy={host_entropy:?}");
+        }
     }
 
     // -------------------------------------------------------------------------

@@ -1010,12 +1010,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # be saved and loaded. Idle guest memory returns to the host through
     # memory.reclaim + zswap; init_on_free zeroes freed guest pages.
 
-    # virtio-rng: continuous host→guest entropy via /dev/urandom backend.
-    # Feeds the kernel input pool so RNDRESEEDCRNG ioctl (guest-agent) has fresh
-    # entropy to reseed from after L1 snapshot restore. Without this, the input
-    # pool after restore contains only stale (cloned) entropy.
-    # max-bytes + period: rate-limit to 256B/1000ms (0.25KB/s). Ephemeral VMs
-    # only need initial entropy reseed; continuous high-rate entropy is wasteful.
+    # virtio-rng: bytes of the host's /dev/urandom for the guest kernel's input pool.
+    # They seed the CRNG at boot and refresh the pool while the VM runs. The guest's
+    # hwrng thread reads 64 bytes, then sleeps for the kernel's reseed interval
+    # (max(1 s, uptime / 2) in the first 120 s of uptime, then 60 s of guest time), so
+    # the device adds nothing at a restore. What makes VMs restored from one saved state
+    # differ: the host entropy of the first Ping after a restore, which the guest agent
+    # adds to the pool before its RNDRESEEDCRNG (guest-agent/src/entropy.rs).
+    # max-bytes + period: at most 256 B per 1000 ms.
     qemu_args.extend(
         [
             "-object",

@@ -272,6 +272,19 @@ _repl_globals.update(
 
 
 @_repl_private
+def _reseed() -> None:
+    """New seeds from the kernel for the interpreter's OpenSSL and the module-level random:
+    RAND_add reseeds the primary generator of OpenSSL, which the generators of all threads
+    follow; the module-level random gets a new seed, as CPython does after os.fork().
+    Random() objects keep theirs. A module that was never imported is not imported here; one
+    without these names (user code replaced it) fails the reseed."""
+    if (ssl := sys.modules.get("_ssl")) is not None:
+        ssl.RAND_add(_repl_os.urandom(32), 32.0)
+    if (random := sys.modules.get("random")) is not None:
+        random._inst.seed()  # noqa: SLF001 - the generator of the module functions
+
+
+@_repl_private
 def _serve() -> None:  # noqa: PLR0915
     """The command loop (its globals: _repl_globals)."""
 
@@ -334,10 +347,20 @@ def _serve() -> None:  # noqa: PLR0915
         header = _stdin_buf.readline()
         if not header:
             break
-        sentinel_id, code_len = header.decode().strip().split(" ", 1)
+        # reseed: "1" to reseed OpenSSL (_ssl) and the module-level random before the code runs
+        sentinel_id, code_len, reseed = header.decode().split()
         code = _stdin_buf.read(int(code_len)).decode()
         exit_code = 0
         try:
+            # First. A REPL that cannot reseed shows the error and exits, so the code does not
+            # run and the next exec gets a new REPL (its generators take new seeds at start)
+            if reseed == "1":
+                try:
+                    _reseed()
+                except BaseException as error:  # noqa: BLE001
+                    show_error(error)
+                    flush_output()
+                    _repl_os._exit(1)
             compiled = compile(code, "<exec>", "exec", flags=future, dont_inherit=True)
             future |= compiled.co_flags & _future_flags
             exec(compiled, ns)  # noqa: S102

@@ -1001,6 +1001,31 @@ class TestRestore:
             assert await self._restore(manager, key, MagicMock()) is None
         assert not any(f.exists() for f in files)
 
+    @pytest.mark.parametrize(("context", "saves"), [({"guest_error_type": "io_error"}, False), (None, True)])
+    async def test_a_guest_that_cannot_reseed_stops_the_saves_of_its_key(
+        self,
+        manager: MemorySnapshotManager,
+        mock_system_probes: dict[str, Any],
+        context: dict[str, str] | None,
+        saves: bool,
+    ) -> None:
+        """The restored guest answered the entropy ping with an error: the entry goes, and this
+        process saves the key no more (each later save of the key would fail at its first
+        restore). A guest that only stayed silent keeps the saves."""
+        key, files = await self._entry(manager)
+        error = TransientError(
+            "could not reseed", code=ErrorCode.GUEST_SILENT_AFTER_RESTORE, context=context, hint=None, instance_id=None
+        )
+        with patch.object(manager.vm_manager, "restore_vm", new=AsyncMock(side_effect=error)):
+            assert await self._restore(manager, key, MagicMock()) is None
+        assert not any(f.exists() for f in files)
+        task = await manager.schedule_background_save(self._SPEC, key=key, snapshot_drive=None)
+        assert (task is not None) is saves
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     async def test_rejection_found_through_context_chain(self, manager: MemorySnapshotManager) -> None:
         """QEMU died while refusing the stream: the error is raised without `from`."""
         key, files = await self._entry(manager)

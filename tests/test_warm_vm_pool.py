@@ -834,7 +834,8 @@ class TestWarmReplUnit:
 
     async def test_ok_ack_pools_each_warmed_vm(self, unit_test_vm_manager) -> None:
         """Each cold-booted VM gets one warm-up request for its own language; an "ok" ack
-        puts it in the pool of that language."""
+        puts it in the pool of that language, and the warm-up's reseed stands for the one of
+        the first exec (a VM restored from L1 asks for none then)."""
         from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
@@ -846,6 +847,7 @@ class TestWarmReplUnit:
                     (request,) = vm.channel.send_request.await_args.args
                     assert request == WarmReplRequest(language=language)
                     assert pool.pools[language].get_nowait() is vm
+                    assert vm.reseed_next_exec is False
             finally:
                 await pool.stop()
 

@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{Duration, interval};
 
 use crate::constants::*;
@@ -450,13 +450,15 @@ fn generate_sentinel() -> (String, String) {
     (id, prefix)
 }
 
-/// Write a code submission (header + body) to the REPL's stdin.
-async fn submit_code_to_repl(
-    stdin: &mut tokio::process::ChildStdin,
+/// Write a code submission (header + body) to the REPL's stdin. `reseed`: the REPL
+/// reseeds its own random generators from the kernel before the code runs.
+async fn submit_code_to_repl<W: AsyncWrite + Unpin>(
+    stdin: &mut W,
     sentinel_id: &str,
     code: &[u8],
+    reseed: bool,
 ) -> std::io::Result<()> {
-    let header = format!("{} {}\n", sentinel_id, code.len());
+    let header = format!("{sentinel_id} {} {}\n", code.len(), u8::from(reseed));
     stdin.write_all(header.as_bytes()).await?;
     stdin.write_all(code).await?;
     stdin.flush().await
@@ -620,7 +622,10 @@ async fn warm_exercise_repl(
         Language::Raw => b":",
     };
 
-    submit_code_to_repl(&mut repl.stdin, &sentinel_id, code).await?;
+    // With the reseed flag: the REPL's reseed path runs once here, before any user code, so a
+    // copy of this state runs it warm at its first exec. Measured on HVF, JavaScript (its
+    // BoringSSL reseed): 16 ms at the first run after a restore, 1 ms warm.
+    submit_code_to_repl(&mut repl.stdin, &sentinel_id, code, true).await?;
 
     log_info!(
         "[repl-readiness] phase={PHASE} language={} action=waiting timeout_ms={}",
@@ -689,12 +694,14 @@ async fn warm_exercise_repl(
     }
 }
 
-/// Execute code via persistent REPL with streaming output.
+/// Execute code via persistent REPL with streaming output. `reseed`: the REPL reseeds
+/// its own random generators from the kernel before the code runs.
 pub(crate) async fn execute_code_streaming(
     language: Language,
     code: &str,
     timeout: u64,
     env_vars: &HashMap<String, String>,
+    reseed: bool,
     writer: &ResponseWriter,
 ) -> Result<(), CmdError> {
     validate_code_params(code, timeout)?;
@@ -735,7 +742,14 @@ pub(crate) async fn execute_code_streaming(
     let code_bytes = full_code.as_bytes();
 
     // Write header + code to REPL stdin
-    let write_result = submit_code_to_repl(&mut repl.stdin, &sentinel_id, code_bytes).await;
+    // A REPL started for this exec took its seeds from the kernel at its start: no reseed
+    let write_result = submit_code_to_repl(
+        &mut repl.stdin,
+        &sentinel_id,
+        code_bytes,
+        reseed && !was_fresh_spawn,
+    )
+    .await;
     if let Err(e) = write_result {
         log_error!("REPL stdin write failed: {e}");
         kill_repl(&mut repl).await;
@@ -1041,6 +1055,21 @@ pub(crate) async fn execute_code_streaming(
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[rstest]
+    #[case(false, "1_2 5 0\nprint")]
+    #[case(true, "1_2 5 1\nprint")]
+    #[tokio::test]
+    async fn the_header_holds_the_id_the_code_length_and_the_reseed_flag(
+        #[case] reseed: bool,
+        #[case] expected: &str,
+    ) {
+        let mut stdin: Vec<u8> = Vec::new();
+        submit_code_to_repl(&mut stdin, "1_2", b"print", reseed)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(stdin).unwrap(), expected);
+    }
 
     #[rstest]
     #[case("42 (awk) S 7 7 7 0 -1", Some(("awk", "S")))]

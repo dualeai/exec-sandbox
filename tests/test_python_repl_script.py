@@ -1,5 +1,5 @@
 """The guest's Python REPL script run on this host (it needs Linux glibc): start-up cases that
-no VM test can set up. Requires Linux, no VM."""
+no VM test can set up, and the reseed flag. Requires Linux, no VM."""
 
 import os
 import re
@@ -18,13 +18,31 @@ def _sentinels(stderr: str) -> list[str]:
     return re.findall(r"^__SENTINEL_\w+?_-?\d+__$", stderr, re.MULTILINE)
 
 
-def _run_repl(*codes: str) -> tuple[list[str], str]:
-    """Send `codes` to the REPL as the execs s0, s1, ... Returns (stdout lines, stderr)."""
-    frames = "".join(f"s{i} {len(code.encode())}\n{code}" for i, code in enumerate(codes))
+def _frame(sentinel_id: str, code: str, *, reseed: bool) -> str:
+    """One exec as the agent writes it: the header (sentinel id, code length in bytes, reseed
+    flag), then the code."""
+    return f"{sentinel_id} {len(code.encode())} {int(reseed)}\n{code}"
+
+
+def _run_execs(*execs: tuple[str, bool]) -> tuple[list[str], str]:
+    """Send `execs` (code, reseed flag) to the REPL as the execs s0, s1, ... Returns (stdout
+    lines, stderr)."""
+    frames = "".join(_frame(f"s{i}", code, reseed=reseed) for i, (code, reseed) in enumerate(execs))
     run = subprocess.run(
         [sys.executable, str(_REPL)], input=frames.encode(), capture_output=True, timeout=60, check=False
     )
     return run.stdout.decode().splitlines(), run.stderr.decode()
+
+
+def _run_repl(*codes: str) -> tuple[list[str], str]:
+    """Send `codes` to the REPL as the execs s0, s1, ..., none with the reseed flag. Returns
+    (stdout lines, stderr)."""
+    return _run_execs(*((code, False) for code in codes))
+
+
+def _printed(stdout: list[str]) -> list[str]:
+    """The lines that user code printed: stdout without the end markers."""
+    return [line for line in stdout if not line.startswith("__STDOUT_END_")]
 
 
 @skip_unless_linux
@@ -36,7 +54,7 @@ def test_multiprocessing_imported_before_the_repl_still_forks(tmp_path: Path) ->
 
     run = subprocess.run(
         [sys.executable, str(_REPL)],
-        input=f"s1 {len(code)}\n{code}".encode(),
+        input=_frame("s1", code, reseed=False).encode(),
         env={**os.environ, "PYTHONPATH": str(tmp_path)},
         capture_output=True,
         timeout=60,
@@ -63,7 +81,7 @@ def test_a_failed_prctl_stops_the_repl_before_any_exec(tmp_path: Path) -> None:
 
     run = subprocess.run(
         [sys.executable, str(_REPL)],
-        input=f"s1 {len(code)}\n{code}".encode(),
+        input=_frame("s1", code, reseed=False).encode(),
         env={**os.environ, "PYTHONPATH": str(tmp_path)},
         capture_output=True,
         timeout=60,
@@ -259,7 +277,7 @@ def test_a_daemon_child_does_not_keep_the_pipes_open() -> None:
         "        fd = os.open('/dev/null', os.O_RDWR)\n        for t in (0, 1, 2):\n            os.dup2(fd, t)\n"
         "        import time\n        time.sleep(30)\n    os._exit(0)\nos.wait()"
     )
-    frames = "".join(f"s{i} {len(c.encode())}\n{c}" for i, c in enumerate((daemon, "import os; os._exit(3)")))
+    frames = "".join(_frame(f"s{i}", c, reseed=False) for i, c in enumerate((daemon, "import os; os._exit(3)")))
     started = time.monotonic()
     run = subprocess.run(
         [sys.executable, str(_REPL)], input=frames.encode(), capture_output=True, timeout=20, check=False
@@ -282,4 +300,83 @@ def test_a_fork_keeps_a_user_fd_that_took_a_copy_number(tmp_path: Path) -> None:
     _stdout, stderr = _run_repl(code)
 
     assert target.read_text() == "from the child", stderr
+    assert _sentinels(stderr) == ["__SENTINEL_s0_0__"], stderr
+
+
+@skip_unless_linux
+def test_the_reseed_flag_gives_the_module_random_a_new_seed() -> None:
+    """random.seed(42), then an exec without the flag: the stream goes on from the seed. The
+    same with the flag: the module-level generator has a new seed from the kernel. A Random()
+    object keeps its own seed."""
+    continues = "print(random.random() == random.Random(42).random(), own.random() == random.Random(7).random())"
+    stdout, stderr = _run_execs(
+        ("import random; random.seed(42); own = random.Random(7)", False),
+        (continues, False),
+        ("random.seed(42); own = random.Random(7)", False),
+        (continues, True),
+    )
+
+    assert _printed(stdout) == ["True True", "False True"], stderr
+    assert _sentinels(stderr) == [f"__SENTINEL_s{i}_0__" for i in range(4)], stderr
+
+
+@skip_unless_linux
+def test_two_reseeds_of_one_seed_give_different_streams() -> None:
+    """Two REPLs in the same state (random.seed(42)) each get the flag: the new seeds come from
+    the kernel, so their streams differ (a fixed seed would give the same in both)."""
+    runs = [_run_execs(("import random; random.seed(42)", False), ("print(random.random())", True)) for _ in range(2)]
+
+    printed = [_printed(stdout) for stdout, _ in runs]
+    assert all(len(lines) == 1 for lines in printed), runs
+    assert printed[0] != printed[1]
+
+
+@skip_unless_linux
+def test_the_reseed_imports_neither_ssl_nor_random() -> None:
+    """The reseed acts only on the modules that user code imported: it imports none (neither
+    was loaded before it, so the check would see an import)."""
+    stdout, stderr = _run_execs(
+        ("import sys; before = set(sys.modules)", False),
+        ("print(sorted({'_ssl', 'random'} & before), sorted({'_ssl', 'random'} & (set(sys.modules) - before)))", True),
+    )
+
+    assert _printed(stdout) == ["[] []"], stderr
+    assert _sentinels(stderr) == ["__SENTINEL_s0_0__", "__SENTINEL_s1_0__"], stderr
+
+
+@skip_unless_linux
+def test_the_reseed_adds_32_kernel_bytes_to_openssl() -> None:
+    """With _ssl loaded (here a fake that records its calls), the flag adds 32 bytes with 32
+    bytes of entropy (RAND_add) before the code runs; an exec without the flag adds none."""
+    stdout, stderr = _run_execs(
+        (
+            "import sys, types\ncalls = []\nfake = types.ModuleType('_ssl')\n"
+            "fake.RAND_add = lambda data, entropy: calls.append((type(data).__name__, len(data), entropy))\n"
+            "sys.modules['_ssl'] = fake",
+            False,
+        ),
+        ("print(calls)", False),
+        ("print(calls)", True),
+    )
+
+    assert _printed(stdout) == ["[]", "[('bytes', 32, 32.0)]"], stderr
+
+
+@skip_unless_linux
+def test_a_failed_reseed_ends_the_repl_before_its_code_runs() -> None:
+    """RAND_add raises: the REPL shows the error and exits with code 1 at the exec with the flag,
+    before its code runs, and reads no later exec (the agent starts a new REPL for it)."""
+    stdout, stderr = _run_execs(
+        (
+            "import sys, types\nfake = types.ModuleType('_ssl')\n"
+            "def RAND_add(data, entropy):\n    raise OSError('no entropy')\n"
+            "fake.RAND_add = RAND_add\nsys.modules['_ssl'] = fake",
+            False,
+        ),
+        ("print('ran')", True),
+        ("print('ok')", False),
+    )
+
+    assert _printed(stdout) == [], stderr
+    assert "OSError: no entropy" in stderr
     assert _sentinels(stderr) == ["__SENTINEL_s0_0__"], stderr

@@ -345,6 +345,9 @@ class QemuVM:
         self.exposed_ports: list[ExposedPort] = []
         # Restored from a saved state (VmManager.restore_vm: L1 template or saved instance), not cold booted
         self.l1_restored: bool = False
+        # The next exec asks the REPL to reseed its random generators (set by VmManager.restore_vm:
+        # every copy of one saved state starts with the same generator state)
+        self.reseed_next_exec: bool = False
         # Previous nr_throttled from cgroup cpu.stat (for delta-based warning)
         self._prev_nr_throttled: int = 0
         # Reads the QEMU events (start_event_watch); ends with QEMU
@@ -542,6 +545,7 @@ class QemuVM:
             request = ExecuteCodeRequest(
                 language=self.spec.language,
                 code=code,
+                reseed=self.reseed_next_exec,
                 timeout=timeout_seconds,
                 env_vars=env_vars or {},
             )
@@ -585,6 +589,8 @@ class QemuVM:
                 exc = guest_error_to_exception(msg, self.vm_id, operation="execute")
                 # Recoverable input errors: VM is fine, restore READY for session reuse
                 if isinstance(exc, InvalidInputError):
+                    if msg.error_type == constants.GuestErrorType.OUTPUT_LIMIT:
+                        self.reseed_next_exec = False  # the REPL ran the code, after its reseed
                     with contextlib.suppress(InternalError):
                         await self.transition_state(VmState.READY)
                     raise exc
@@ -620,6 +626,11 @@ class QemuVM:
                 soft_timeout_seconds=timeout_seconds,
                 hard_timeout_seconds=hard_timeout,
             )
+            # A result (or OUTPUT_LIMIT, above): the REPL reseeded before the code, or it ended (it
+            # died, or the guest killed it at the timeout) and the next exec gets a new REPL with
+            # new seeds. A refusal of the code or the env vars (host or guest, before the REPL
+            # reads the request) or a failure keeps the flag: one more reseed is harmless
+            self.reseed_next_exec = False
 
             # Measure external resources from host (cgroup v2)
             stats = NO_CGROUP_STATS if self.cgroup is None else self.cgroup.stats()
@@ -1551,7 +1562,9 @@ class QemuVM:
             # once, not a retry until the boot deadline (TransientError is not retried here)
             await self._check_host_disk()
             await self.channel.connect(timeout_seconds=1)
-            response = await self.channel.send_request(PingRequest(), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS)
+            response = await self.channel.send_request(
+                PingRequest(host_entropy=None), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS
+            )
             if not isinstance(response, PongMessage):
                 raise RuntimeError(f"Guest ping returned unexpected type: {type(response)}")
 

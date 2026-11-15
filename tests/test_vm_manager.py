@@ -5868,6 +5868,30 @@ class _RecordingCompletionChannel:
         pass
 
 
+class _RefuseOnceChannel(_RecordingCompletionChannel):
+    """A _RecordingCompletionChannel whose guest answers the first request with the error
+    `error_type`: code_error (its validation, before the REPL reads the request), or
+    output_limit_error (after the REPL ran the code)."""
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__()
+        self.error_type = error_type
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+
+        if self.requests:
+            async for message in super().stream_messages(request, timeout):
+                yield message
+            return
+        self.requests.append(request)
+        yield StreamingErrorMessage(error_type=self.error_type, message="refused")
+
+
 class _ImmediateCompletionChannel:
     """Connected channel returning one successful terminal event per request."""
 
@@ -6142,6 +6166,39 @@ class TestExecuteExceptionWrapping:
         vm = self._make_vm(_ConnectRaisesChannel(asyncio.CancelledError()))
         with pytest.raises(asyncio.CancelledError):
             await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
+
+    async def test_the_first_exec_after_a_restore_asks_for_a_reseed(self) -> None:
+        """restore_vm sets reseed_next_exec: the next exec request carries reseed=True, the ones
+        after it reseed=False."""
+        channel = _RecordingCompletionChannel()
+        vm = self._make_vm(channel)
+        vm.reseed_next_exec = True
+        for _ in range(2):
+            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
+        assert [r.reseed for r in channel.requests] == [True, False]
+        assert vm.reseed_next_exec is False
+
+    @pytest.mark.parametrize(
+        ("error_type", "code", "reseeds"),
+        [
+            ("code_error", ErrorCode.CODE_INVALID, [True, True, False]),
+            ("output_limit_error", ErrorCode.OUTPUT_LIMIT, [True, False, False]),
+        ],
+    )
+    async def test_the_reseed_waits_for_an_exec_the_repl_ran(
+        self, error_type: str, code: ErrorCode, reseeds: list[bool]
+    ) -> None:
+        """The guest refuses the first exec after a restore before its REPL reads it: the next
+        exec still asks for the reseed. An output limit comes after the REPL ran the code (and
+        its reseed): the next exec does not ask again."""
+        channel = _RefuseOnceChannel(error_type)
+        vm = self._make_vm(channel)
+        vm.reseed_next_exec = True
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is code):
+            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
+        for _ in range(2):
+            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
+        assert [r.reseed for r in channel.requests] == reseeds
 
     async def test_code_validation_error_propagates(self) -> None:
         """InvalidInputError CODE_INVALID from guest error propagates bare."""
@@ -7198,6 +7255,22 @@ class TestRestoreFailuresAfterLaunch:
             "console_log": "qemu-system: Unknown ramblock",  # QEMU's own reason: the VM and its log go next
         }
 
+    async def test_a_guest_that_cannot_reseed_passes_the_channel_error_on(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        """The channel's error of a guest that could not reseed (GUEST_SILENT_AFTER_RESTORE with
+        guest_error_type: what the L1 layer stops its saves on) leaves restore_vm as it is."""
+        reseed_failed = TransientError(
+            "The restored guest could not reseed its kernel random source: no entropy",
+            code=ErrorCode.GUEST_SILENT_AFTER_RESTORE,
+            context={"guest_error_type": "io_error"},
+            hint=None,
+            instance_id=None,
+        )
+        with pytest.raises(TransientError) as exc_info:
+            await self._restore(unit_test_vm_manager, tmp_path, returncode=None, connect_error=reseed_failed)
+        assert exc_info.value is reseed_failed
+
     async def test_socket_auth_failure_after_the_state_loaded_keeps_the_entry(
         self, unit_test_vm_manager, tmp_path: Path
     ) -> None:
@@ -7254,6 +7327,7 @@ class TestRestoreFailuresAfterLaunch:
         """Control: the same harness with a guest that answers gives a READY restored VM."""
         vm = await self._restore(unit_test_vm_manager, tmp_path, returncode=None, connect_error=None)
         assert vm.l1_restored is True
+        assert vm.reseed_next_exec is True  # every copy of one saved state reseeds at its first exec
         vm.transition_state.assert_awaited_once_with(VmState.READY)  # type: ignore[attr-defined]
 
 

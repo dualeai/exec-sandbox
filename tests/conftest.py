@@ -19,7 +19,7 @@ import boto3
 import pytest
 from _pytest.runner import runtestprotocol
 
-from exec_sandbox import subprocess_utils
+from exec_sandbox import constants, subprocess_utils
 from exec_sandbox._logging import LIBRARY_LOGGER_NAME, ExtrasFormatter
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
@@ -27,7 +27,7 @@ from exec_sandbox.exceptions import ErrorCode, SandboxError, TransientError
 from exec_sandbox.files.disk import file_stamp, make_private_dir, memory_filesystem
 from exec_sandbox.images import kernel_dir_of
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
-from exec_sandbox.models import ExecutionResult, ExposedPort, StartupTiming
+from exec_sandbox.models import ExecutionResult, ExposedPort, Language, StartupTiming
 from exec_sandbox.permission_utils import get_qemu_vm_uid
 from exec_sandbox.platform_utils import (
     HostArch,
@@ -37,6 +37,7 @@ from exec_sandbox.platform_utils import (
     detect_host_os,
     get_user_dir,
 )
+from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import check_tsc_deadline, detect_accel_type, probe_cache
@@ -445,6 +446,29 @@ async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
         yield manager
     finally:
         await manager.stop()
+
+
+@pytest.fixture
+async def running_vm(vm_manager: VmManager) -> AsyncGenerator[QemuVM]:
+    """A cold-booted Python VM, outside any session: for tests that send raw requests to the
+    guest agent (model_construct requests, pings) and read its replies."""
+    vm = await vm_manager.create_vm(
+        VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
+        tenant_id="test",
+        task_id="test-raw-guest",
+        cache_leases=(),
+        direct_write_target=None,
+        expose_ports=None,
+        on_boot_log=None,
+        snapshot_drive=None,
+        reservation=None,
+        retry_profile=constants.RETRY_USER_FACING,
+        mem_path=None,
+    )
+    try:
+        yield vm
+    finally:
+        await vm_manager.destroy_vm(vm)
 
 
 @pytest.fixture

@@ -23,7 +23,7 @@ from pydantic import TypeAdapter, ValidationError
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import gather_or_cancel
-from exec_sandbox.exceptions import CommunicationError, ErrorCode, InternalError, OutcomeUnknownError
+from exec_sandbox.exceptions import CommunicationError, ErrorCode, InternalError, OutcomeUnknownError, TransientError
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     GuestAgentRequest,
@@ -34,6 +34,7 @@ from exec_sandbox.guest_agent_protocol import (
     StreamingErrorMessage,
     StreamingMessage,
     WarmReplRequest,
+    new_host_entropy,
     request_line,
 )
 from exec_sandbox.socket_auth import connect_and_verify
@@ -663,7 +664,7 @@ class DualPortChannel:
         await channel.connect(timeout_seconds=5)
 
         # Request-response (auto-assigns op_id, routes reply)
-        response = await channel.send_request(PingRequest(), timeout=5)
+        response = await channel.send_request(PingRequest(host_entropy=None), timeout=5)
 
         # Stream execution output (auto op_id routing)
         async for msg in channel.stream_messages(ExecuteCodeRequest(...), timeout=30):
@@ -684,6 +685,9 @@ class DualPortChannel:
         self._event_channel: UnixSocketChannel = UnixSocketChannel(event_socket, expected_uid)
         self._dispatcher: FileOpDispatcher | None = None
         self._has_been_connected: bool = False
+        # The guest was restored and has not answered a ping with a pong since: each ping of the
+        # next probe carries new host entropy, so the guest reseeds its kernel random source
+        self._reseed_pending: bool = False
 
     async def connect(self, timeout_seconds: float) -> None:
         """Connect both command and event ports.
@@ -692,14 +696,17 @@ class DualPortChannel:
         the ping probe opens the connection again when it fails (at most once per probe
         attempt); the caller handles any other retry (e.g., wait_for_guest).
 
-        On reconnection (after a previous close(), or an L1 restore), probes the
-        guest agent with a PingRequest to confirm that the guest runs and reads
-        its port before the caller sends real work.
+        On reconnection (after a previous close(), or a restore: mark_restored), probes the
+        guest agent with a PingRequest to confirm that the guest runs and reads its port
+        before the caller sends real work. After a restore, each ping carries host entropy,
+        and the guest reseeds its kernel random source before its pong.
 
         Raises:
             What UnixSocketChannel.connect raises; on a reconnection, TimeoutError when no
             pong came after every probe attempt (GUEST_RECONNECT_PROBE_TIMEOUTS), and
-            InternalError GUEST_PROTOCOL when the guest answers a ping with another reply
+            InternalError GUEST_PROTOCOL when the guest answers a ping with another reply;
+            after a restore, TransientError GUEST_SILENT_AFTER_RESTORE when the guest answers
+            the ping with an io_error (it could not reseed its kernel random source)
         """
         # Already connected and dispatcher healthy — nothing to do.
         # Dispatcher EOF is the earliest signal that the guest has disconnected.
@@ -713,14 +720,17 @@ class DualPortChannel:
         await self._raw_connect(timeout_seconds)
 
         if self._has_been_connected:
-            await self._probe_guest_ready(timeout_seconds)
+            await self._probe_guest_ready(timeout_seconds, host_entropy=self._reseed_pending)
+            self._reseed_pending = False  # the pong came: the guest reseeded
 
         self._has_been_connected = True
 
     def mark_restored(self) -> None:
-        """The guest of this channel was restored from a save (L1) whose ports were
-        connected: its first connect() probes the guest, as a reconnection does."""
+        """The guest of this channel was restored from a save (an L1 memory snapshot or a saved
+        instance) whose ports were connected: its first connect() probes the guest, as a
+        reconnection does, with a ping that carries host entropy (the guest reseeds)."""
         self._has_been_connected = True
+        self._reseed_pending = True
 
     async def _raw_connect(self, timeout_seconds: float) -> None:
         """Low-level connect: open sockets and start dispatcher."""
@@ -741,9 +751,13 @@ class DualPortChannel:
                 self._dispatcher = FileOpDispatcher(reader)
                 self._dispatcher.start()
 
-    async def _probe_guest_ready(self, caller_timeout: float) -> None:
-        """Send PingRequests until a PongMessage confirms that the guest listens. Another
-        answer, or one this release cannot read, raises InternalError GUEST_PROTOCOL at once.
+    async def _probe_guest_ready(self, caller_timeout: float, *, host_entropy: bool) -> None:
+        """Send PingRequests until a PongMessage confirms that the guest listens; with
+        `host_entropy` (after a restore: mark_restored), each ping carries new host entropy
+        (new_host_entropy). Another answer, or one this release cannot read, raises
+        InternalError GUEST_PROTOCOL at once; with `host_entropy`, an io_error answer (the guest
+        could not reseed its kernel random source) raises TransientError
+        GUEST_SILENT_AFTER_RESTORE at once.
 
         The guest agent keeps its ports open, so QEMU and the guest kernel hold
         a ping until the agent reads it: a ping with no answer yet is slow, not
@@ -756,7 +770,8 @@ class DualPortChannel:
         attempts = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
         for attempt, probe_timeout in enumerate(constants.GUEST_RECONNECT_PROBE_TIMEOUTS, start=1):
             try:
-                response = await self.send_request(PingRequest(), timeout=probe_timeout)
+                ping = PingRequest(host_entropy=new_host_entropy() if host_entropy else None)
+                response = await self.send_request(ping, timeout=probe_timeout)
             except TimeoutError:
                 logger.debug(
                     "Reconnection probe got no pong yet, sending another ping",
@@ -778,6 +793,21 @@ class DualPortChannel:
             if isinstance(response, PongMessage):
                 logger.debug("Reconnection probe succeeded", extra={"attempt": attempt})
                 return
+            if (
+                host_entropy
+                and isinstance(response, StreamingErrorMessage)
+                and response.error_type == constants.GuestErrorType.IO
+            ):
+                # The restored guest could not reseed its kernel random source (its only error
+                # answer to a ping): without the host's bytes, its CRNG keeps the secret of the
+                # save, which every other VM of the same save holds too (entropy.rs)
+                raise TransientError(
+                    f"The restored guest could not reseed its kernel random source: {response.message}",
+                    code=ErrorCode.GUEST_SILENT_AFTER_RESTORE,
+                    context={"guest_error_type": response.error_type},
+                    hint=None,
+                    instance_id=None,
+                )
             # The guest answered, and not with a pong: another ping gets the same answer
             raise InternalError(
                 f'The guest agent answered a ping with a message of type "{response.type}", not a pong.',

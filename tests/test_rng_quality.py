@@ -7,7 +7,7 @@ Tests that cryptographic randomness works correctly in VMs:
 4. Different VMs produce different random sequences
 
 Note: L1 snapshot restore RNG uniqueness is tested separately in
-test_rng_l1_snapshot.py (validates the RNDRESEEDCRNG ioctl reseed).
+test_rng_l1_snapshot.py (validates the reseed with the host entropy after a restore).
 
 Based on:
 - NIST SP 800-90B entropy estimation principles
@@ -20,9 +20,14 @@ References:
 - https://github.com/firecracker-microvm/firecracker/blob/main/docs/entropy.md
 """
 
+import base64
+
 import pytest
 
+from exec_sandbox import constants
+from exec_sandbox.guest_agent_protocol import PingRequest, PongMessage, StreamingErrorMessage, new_host_entropy
 from exec_sandbox.models import Language
+from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import run_once
@@ -510,3 +515,23 @@ print("PASS" if 0.499 < ratio < 0.501 else "FAIL")
 
         assert result.exit_code == 0
         assert result.stdout.splitlines()[-1] == "PASS", result.stdout
+
+
+class TestHostEntropyPing:
+    """A ping with host entropy reaches the guest's kernel step: the bytes of new_host_entropy
+    get a pong (the kernel took them and reseeded); 31 bytes get the io_error of that step and
+    no pong."""
+
+    async def test_host_entropy_reaches_the_kernel_step(self, running_vm: QemuVM) -> None:
+        await running_vm.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+        good = await running_vm.channel.send_request(PingRequest(host_entropy=new_host_entropy()), timeout=10)
+        short = await running_vm.channel.send_request(
+            PingRequest(host_entropy=base64.b64encode(bytes(31)).decode()), timeout=10
+        )
+
+        assert isinstance(good, PongMessage), good
+        assert isinstance(short, StreamingErrorMessage), short
+        assert (short.error_type, short.message) == (
+            "io_error",
+            "kernel random reseed with the host entropy failed: host entropy has 31 bytes, not 32",
+        )

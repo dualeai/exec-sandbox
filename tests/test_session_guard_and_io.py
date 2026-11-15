@@ -1783,17 +1783,19 @@ class _FakeGuest:
     """The guest agent behind QEMU's two port sockets, served by this process: a real
     DualPortChannel connects to it (the peer check sees this user). Each ping on the command
     port gets the next answer of `answers`, then "pong": "pong"; "silent" (no answer yet: a
-    slow guest); "error" (an error event, not a pong); "unreadable" (a frame this release
-    cannot read); "drop" (the guest side closes both
-    ports). `pings` holds, for each ping, the number of the command-port connection it came
-    on (1 is the first); `connections` counts those connections; `eofs` counts the ports
-    that the host closed."""
+    slow guest); "error" (an error event, not a pong); "reseed-error" (the io_error event of a
+    failed reseed); "unreadable" (a frame this release cannot read); "drop" (the guest side
+    closes both ports). `pings` holds, for each ping, the number of the command-port connection
+    it came on (1 is the first); `entropy`, for each ping, whether it carried host entropy;
+    `connections` counts the command-port connections; `eofs` counts the ports that the host
+    closed."""
 
     def __init__(self, folder: Path, answers: list[str]) -> None:
         self.cmd_socket = str(folder / "cmd.sock")
         self.event_socket = str(folder / "event.sock")
         self.answers = answers
         self.pings: list[int] = []
+        self.entropy: list[bool] = []
         self.connections = 0
         self.eofs = 0
         self._event_writers: list[asyncio.StreamWriter] = []  # one for each event-port connection, in order
@@ -1865,14 +1867,15 @@ class _FakeGuest:
                 if request["action"] != "ping":
                     continue
                 self.pings.append(connection)
+                self.entropy.append("host_entropy" in request)
                 answer = self.answers.pop(0) if self.answers else "pong"
                 if answer == "pong":
                     pong = {"type": "pong", "version": "1.0", "op_id": request["op_id"]}
                     await self.send(pong, connection=connection)
-                elif answer == "error":
+                elif answer in ("error", "reseed-error"):
                     error = {
                         "type": "error",
-                        "error_type": "unknown",
+                        "error_type": "io_error" if answer == "reseed-error" else "unknown",
                         "message": "not a pong",
                         "op_id": request["op_id"],
                     }
@@ -2535,7 +2538,7 @@ class TestDualPortStreamDeadline:
             started = time.monotonic()
             with pytest.raises(StreamDeadlineExceededError, match=r"^stream exceeded 1s total deadline$"):
                 async for _message in channel.stream_messages(
-                    ExecuteCodeRequest(language=Language.PYTHON, code="x"), timeout=1
+                    ExecuteCodeRequest(language=Language.PYTHON, code="x", reseed=False), timeout=1
                 ):
                     pass
             elapsed = time.monotonic() - started
@@ -2564,16 +2567,37 @@ class TestDualPortConnectLifecycle:
         assert (guest.connections, guest.pings) == (1, [])
 
     async def test_first_connect_after_a_restore_probes(self, short_tmp_dir: Path) -> None:
-        """A channel of a guest restored from an L1 save (mark_restored, as restore_vm does):
-        its first connect sends one ping, as a reconnection does, and gets the pong. That
-        restore_vm makes the call is checked on a VM: without the probe, the restore of a
-        zeroed RAM template hangs (test_l1_damaged_entry, test_zeroed_ram_template_...)."""
+        """A channel of a guest restored from a save (mark_restored, as restore_vm does): its
+        first connect sends one ping, as a reconnection does, but with host entropy, and gets
+        the pong; a later reconnection pings without host entropy. That restore_vm makes the
+        call is checked on a VM: without the probe, the restore of a zeroed RAM template hangs
+        (test_l1_damaged_entry, test_zeroed_ram_template_...)."""
         async with _FakeGuest(short_tmp_dir, []) as guest:
             channel = guest.channel()
             channel.mark_restored()
             await channel.connect(timeout_seconds=5.0)
             await channel.close()
-        assert (guest.connections, guest.pings) == (1, [1])
+            await channel.connect(timeout_seconds=5.0)  # a reconnection, not a restore
+            await channel.close()
+        assert (guest.connections, guest.pings, guest.entropy) == (2, [1, 2], [True, False])
+
+    async def test_a_reseed_error_after_a_restore_is_guest_silent_after_restore(self, short_tmp_dir: Path) -> None:
+        """The restored guest answers its first ping with the io_error of a failed reseed:
+        TransientError GUEST_SILENT_AFTER_RESTORE at once, no second ping. Another error type
+        is no reseed failure: InternalError GUEST_PROTOCOL, as without a restore."""
+        async with _FakeGuest(short_tmp_dir, ["reseed-error", "error"]) as guest:
+            channel = guest.channel()
+            channel.mark_restored()
+            with pytest.raises(
+                TransientError, match="could not reseed", check=lambda e: e.code is ErrorCode.GUEST_SILENT_AFTER_RESTORE
+            ) as exc:
+                await channel.connect(timeout_seconds=5.0)
+            assert exc.value.context == {"guest_error_type": "io_error"}
+            await channel.close()
+            with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL):
+                await channel.connect(timeout_seconds=5.0)
+            await channel.close()
+        assert (guest.pings, guest.entropy) == ([1, 2], [True, True])  # one ping on each connection
 
     async def test_connect_after_close_probes(self, short_tmp_dir: Path) -> None:
         """close() does not make the channel new: the connect after it sends one ping on the
@@ -2693,13 +2717,18 @@ class TestDualPortProbeFailure:
 
     @pytest.mark.parametrize(
         ("answers", "pings"),
-        [pytest.param(["error"], [2], id="at-once"), pytest.param(["silent"] * 5 + ["error"], [2] * 6, id="last")],
+        [
+            pytest.param(["error"], [2], id="at-once"),
+            pytest.param(["silent"] * 5 + ["error"], [2] * 6, id="last"),
+            pytest.param(["reseed-error"], [2], id="reseed-error-with-no-restore"),
+        ],
     )
     async def test_another_answer_ends_the_probe(
         self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch, answers: list[str], pings: list[int]
     ) -> None:
-        """The guest answers a ping with another message (an error): GUEST_PROTOCOL at once,
-        no further ping (it would get the same answer)."""
+        """The guest answers a ping with another message (an error, also the io_error of a
+        reseed when no restore came first): GUEST_PROTOCOL at once, no further ping (it would
+        get the same answer)."""
         _probe_budget(monkeypatch, answers)
         async with _FakeGuest(short_tmp_dir, answers) as guest:
             channel = await _reconnect(guest)

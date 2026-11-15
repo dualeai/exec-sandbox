@@ -254,6 +254,10 @@ class MemorySnapshotManager(BaseCacheManager):
         # call for a key in flight returns at once, without a task (the save lock
         # stops a save of another process).
         self._in_flight_saves: dict[str, asyncio.Task[None]] = {}
+        # Keys whose restored guest could not reseed its kernel random source: the key fixes the
+        # guest (image, kernel, initramfs), so each later save of it would fail at its first
+        # restore and be removed
+        self._no_save_keys: set[str] = set()
 
     def _cache_paths(self, key: str) -> tuple[Path, Path]:
         """Return (vmstate_path, meta_path) for a given cache key."""
@@ -554,18 +558,21 @@ class MemorySnapshotManager(BaseCacheManager):
         None on a miss (a broken entry) or on any failed restore: the caller cold boots
         with the same reservation. An entry QEMU refused (incompatible or corrupt:
         MIGRATION_REJECTED or MIGRATION_UNSUPPORTED in the cause chain), or whose guest
-        never answered after its state loaded (GUEST_SILENT_AFTER_RESTORE), is removed with
-        all its files, as an eviction removes one (BaseCacheManager._remove_broken: not while
-        another lease holds it); otherwise every later restore of it fails again. A host
-        problem (no access to a file or a socket) keeps the entry.
+        never answered after its state loaded or could not reseed its kernel random source
+        (GUEST_SILENT_AFTER_RESTORE), is removed with all its files, as an eviction removes
+        one (BaseCacheManager._remove_broken: not while another lease holds it); otherwise
+        every later restore of it fails again. A host problem (no access to a file or a
+        socket) keeps the entry. A guest that could not reseed also stops the L1 saves of
+        the key in this process (schedule_background_save).
 
         Raises:
             InternalError: CLEANUP_UNCONFIRMED: the failed restore's QEMU may still run
                 and keeps the reservation, so no cold boot may use it
         """
         checked: tuple[Path, str] | None = None
+        key = entry.path.name.removesuffix(self._cache_ext)
         try:
-            checked = await self._check_entry(entry.path.name.removesuffix(self._cache_ext), lease=entry)
+            checked = await self._check_entry(key, lease=entry)
             if checked is None:
                 return None
             return await self.vm_manager.restore_vm(
@@ -606,7 +613,20 @@ class MemorySnapshotManager(BaseCacheManager):
         )
         if refused and checked is not None:
             await self._remove_broken(checked[0], stamp=checked[1], lease=None)
-            logger.info("L1 entry refused by QEMU, removed unless in use", extra={"vmstate_path": str(checked[0])})
+            logger.info(
+                "L1 entry refused (by QEMU, or by its guest after the load), removed unless in use",
+                extra={"vmstate_path": str(checked[0])},
+            )
+        # The guest answered the entropy ping with an error (guest_channel): no new saves
+        if (
+            isinstance(failure, SandboxError)
+            and failure.code is ErrorCode.GUEST_SILENT_AFTER_RESTORE
+            and "guest_error_type" in failure.context
+        ):
+            self._no_save_keys.add(key)
+            logger.warning(
+                "L1 saves stopped: the restored guest could not reseed its kernel random source", extra={"key": key}
+            )
         return None
 
     async def schedule_background_save(
@@ -623,13 +643,14 @@ class MemorySnapshotManager(BaseCacheManager):
         layer before its VM opens it.
         Returns the background task handle so callers can optionally await or
         monitor completion. Returns None (no-op) when QEMU is below the migration
-        floor (can_save), the entry exists, or a save of the key runs in this process.
+        floor (can_save), the entry exists, a save of the key runs in this process, or a
+        restore of the key in this process found a guest that could not reseed (restore).
 
         Used by the scheduler after a cold boot, and by the warm pool at start.
         The save lock prevents duplicate work: while another process saves the
         same key, the task skips (BlockingIOError, logged at debug level).
         """
-        if not await self.can_save():
+        if key in self._no_save_keys or not await self.can_save():
             return None
         if await self.check_cache(key):
             return None

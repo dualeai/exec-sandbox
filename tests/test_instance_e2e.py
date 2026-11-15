@@ -6,6 +6,8 @@ new -> exec -> save -> close -> reuse: the Python state and /home/user come back
 import asyncio
 import errno
 import hashlib
+import json
+import random
 import shutil
 import tempfile
 import threading
@@ -644,6 +646,87 @@ class TestAssets:
             ) as exc:
                 await worker.reuse(ref.instance_id)
         assert exc.value.action == "ROUTE"
+
+
+_PY_USE = "import os, random, ssl\n_ = (ssl.RAND_bytes(16), random.random())\nprint('ok')"
+_PY_DRAW = "print(ssl.RAND_bytes(16).hex(), random.random(), os.urandom(16).hex())"
+_JS_USE = (
+    "globalThis.c = require('crypto'); c.randomBytes(16); c.randomUUID(); "
+    "crypto.getRandomValues(new Uint8Array(16)); Math.random(); c.generateKeyPairSync('ed25519'); console.log('ok')"
+)
+_JS_DRAW = (
+    "console.log(JSON.stringify([c.randomBytes(16).toString('hex'), c.randomUUID(), "
+    "Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('hex'), "
+    "Buffer.from(crypto.getRandomValues(new Uint8Array(4096))).toString('hex').slice(0, 64), Math.random(), "
+    "c.generateKeyPairSync('ed25519').publicKey.export({format: 'der', type: 'spki'}).toString('hex'), "
+    "require('node:vm').runInNewContext('Math.random()')]))"
+)
+
+
+async def _two_copies(scheduler: Scheduler, spec: VmSpec, *, use: str, draw: str) -> tuple[str, str]:
+    """Save a VM after `use` ran, load the save twice, run `draw` in each copy: the stdout of each copy."""
+    async with await scheduler.new(spec) as vm:
+        assert (await vm.exec(use)).exit_code == 0
+        ref = await vm.save()
+    copies = [await scheduler.reuse(ref.instance_id) for _ in range(2)]
+    try:
+        results = [await copy.exec(draw) for copy in copies]
+    finally:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", InstanceNotSavedWarning)
+            for copy in copies:
+                await copy.close()
+    for result in results:
+        assert result.exit_code == 0, result.stderr
+    return results[0].stdout, results[1].stdout
+
+
+class TestRandomInCopies:
+    """Two VMs loaded from one save get new random values from their first call."""
+
+    async def test_python(self, store: tuple[Scheduler, str, object]) -> None:
+        scheduler, _, _ = store
+        first, second = await _two_copies(scheduler, _PY, use=_PY_USE, draw=_PY_DRAW)
+        for a, b in zip(first.split(), second.split(), strict=True):  # ssl.RAND_bytes, random, os.urandom
+            assert a != b
+
+    async def test_python_random_gets_a_new_seed_at_each_load(self, store: tuple[Scheduler, str, object]) -> None:
+        """random.seed(42) before a save does not continue after a load."""
+        scheduler, _, _ = store
+        seeded = random.Random(42)
+        _ = [seeded.random() for _ in range(3)]
+        continued = repr(seeded.random())
+        with pytest.warns(InstanceNotSavedWarning):  # the exec after the save is not saved
+            async with await scheduler.new(_PY) as vm:
+                assert (
+                    await vm.exec("import random\nrandom.seed(42)\n_ = [random.random() for _ in range(3)]")
+                ).exit_code == 0
+                ref = await vm.save()
+                assert (await vm.exec("print(repr(random.random()))")).stdout == f"{continued}\n"  # no load: continues
+        with pytest.warns(InstanceNotSavedWarning):  # the exec after the load is not saved
+            async with await scheduler.reuse(ref.instance_id) as vm:
+                loaded = (await vm.exec("print(repr(random.random()))")).stdout
+        assert loaded != f"{continued}\n"
+
+    async def test_javascript(self, store: tuple[Scheduler, str, object]) -> None:
+        """Each value differs in the two copies: the crypto wrappers, Math.random (its pool of the
+        save is dropped before each exec), the ed25519 key of generateKeyPairSync (BoringSSL's
+        generator of the REPL thread, reseeded at the first exec) and Math.random of a node:vm
+        context made in the copy."""
+        scheduler, _, _ = store
+        first, second = await _two_copies(scheduler, VmSpec(language=Language.JAVASCRIPT), use=_JS_USE, draw=_JS_DRAW)
+        for a, b in zip(json.loads(first), json.loads(second), strict=True):
+            assert a != b
+
+    async def test_shell(self, store: tuple[Scheduler, str, object]) -> None:
+        scheduler, _, _ = store
+        first, second = await _two_copies(
+            scheduler,
+            VmSpec(language=Language.RAW),
+            use="echo $RANDOM",
+            draw="echo $RANDOM $RANDOM $RANDOM",
+        )
+        assert first != second
 
 
 class TestFanOut:

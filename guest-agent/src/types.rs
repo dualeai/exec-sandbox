@@ -13,12 +13,20 @@ use std::collections::HashMap;
 /// A host request, tagged by `action`. The host models are in
 /// src/exec_sandbox/guest_agent_protocol.py. connection.rs reads the top-level
 /// `op_id` and `host_time_ns` from the raw JSON before this parse. The host
-/// sends every field that is not null (request_line), so none has a default here.
+/// sends every field that is not null (request_line), so none has a default here:
+/// an Option field is absent when the host has no value for it.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
 pub(crate) enum GuestCommand {
+    /// A health check.
     #[serde(rename = "ping")]
-    Ping,
+    Ping {
+        /// Base64 of 32 random bytes of the host. The agent mixes them into the kernel's
+        /// input pool (credited) and reseeds the CRNG before the Pong; it answers an
+        /// error instead when the value is not base64 of 32 bytes or one of these steps
+        /// fails (entropy.rs).
+        host_entropy: Option<String>,
+    },
 
     #[serde(rename = "install_packages")]
     InstallPackages {
@@ -35,6 +43,9 @@ pub(crate) enum GuestCommand {
         /// Seconds, at most MAX_TIMEOUT_SECONDS; 0 means MAX_TIMEOUT_SECONDS.
         timeout: u64,
         env_vars: HashMap<String, String>,
+        /// True: the REPL reseeds its own random generators from the kernel before the
+        /// code runs (the third field of the REPL header, repl/wrappers.rs).
+        reseed: bool,
     },
 
     #[serde(rename = "write_file")]
@@ -275,6 +286,78 @@ mod tests {
     fn test_deserialize_warm_repl_missing_language() {
         let json = r#"{"action":"warm_repl"}"#;
         assert!(serde_json::from_str::<GuestCommand>(json).is_err());
+    }
+
+    /// The two-phase parse of connection.rs: JSON value first, then the command.
+    fn command_of(json: &str) -> Result<GuestCommand, serde_json::Error> {
+        serde_json::from_value(serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn test_deserialize_ping_with_host_entropy() {
+        let json = r#"{"action":"ping","op_id":"p1","host_time_ns":1,"host_entropy":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}"#;
+        match command_of(json).unwrap() {
+            GuestCommand::Ping { host_entropy } => assert_eq!(
+                host_entropy.as_deref(),
+                Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
+            ),
+            _ => panic!("Expected Ping"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_ping_without_host_entropy() {
+        match command_of(r#"{"action":"ping","op_id":"p1","host_time_ns":1}"#).unwrap() {
+            GuestCommand::Ping { host_entropy } => assert_eq!(host_entropy, None),
+            _ => panic!("Expected Ping"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_ping_with_host_entropy_of_another_type_is_refused() {
+        let error = command_of(r#"{"action":"ping","host_entropy":5}"#).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid type: integer `5`, expected a string"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_deserialize_exec(#[case] reseed: bool) {
+        let json = format!(
+            r#"{{"action":"exec","language":"python","code":"print(1)","timeout":0,"env_vars":{{}},"reseed":{reseed}}}"#
+        );
+        match command_of(&json).unwrap() {
+            GuestCommand::ExecuteCode {
+                language,
+                code,
+                reseed: parsed,
+                ..
+            } => {
+                assert_eq!(language, Language::Python);
+                assert_eq!(code, "print(1)");
+                assert_eq!(parsed, reseed);
+            }
+            _ => panic!("Expected ExecuteCode"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(
+        r#"{"action":"exec","language":"python","code":"print(1)","timeout":0,"env_vars":{}}"#,
+        "missing field `reseed`"
+    )]
+    #[case(
+        r#"{"action":"exec","language":"python","code":"print(1)","timeout":0,"env_vars":{},"reseed":"yes"}"#,
+        "invalid type: string \"yes\", expected a boolean"
+    )]
+    fn test_deserialize_exec_without_a_boolean_reseed_is_refused(
+        #[case] json: &str,
+        #[case] reason: &str,
+    ) {
+        assert_eq!(command_of(json).unwrap_err().to_string(), reason);
     }
 
     // -------------------------------------------------------------------------

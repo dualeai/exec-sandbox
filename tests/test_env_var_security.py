@@ -8,7 +8,6 @@ References:
 - Terminal escape injection attacks
 """
 
-from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,7 +17,6 @@ from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.guest_agent_protocol import ExecuteCodeRequest, StreamingErrorMessage
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import run_once
 
@@ -103,29 +101,6 @@ class TestGuestAgentControlCharValidation:
     the public API.
     """
 
-    @pytest.fixture
-    async def running_vm(self, vm_manager: VmManager) -> AsyncGenerator["QemuVM", None]:
-        """Create a VM and yield it for testing."""
-        from exec_sandbox.qemu_vm import QemuVM  # noqa: TC001
-
-        vm: QemuVM = await vm_manager.create_vm(
-            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
-            tenant_id="test",
-            task_id="test-control-char",
-            cache_leases=(),
-            direct_write_target=None,
-            expose_ports=None,
-            on_boot_log=None,
-            snapshot_drive=None,
-            reservation=None,
-            retry_profile=constants.RETRY_USER_FACING,
-            mem_path=None,
-        )
-        try:
-            yield vm
-        finally:
-            await vm_manager.destroy_vm(vm)
-
     async def test_control_character_rejected_by_rust(self, running_vm: "QemuVM") -> None:
         """An escape sequence in a value: the guest replies with one env_var_error and runs
         nothing."""
@@ -134,6 +109,7 @@ class TestGuestAgentControlCharValidation:
             action="exec",
             language=Language.PYTHON,
             code="print('should not run')",
+            reseed=False,
             timeout=30,
             env_vars={"FOO": "\x1b[31mred\x1b[0m"},
         )

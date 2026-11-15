@@ -9,6 +9,8 @@ file_io.rs, packages.rs).
 
 from __future__ import annotations
 
+import base64
+import os
 import re
 import time
 from typing import Annotated, Literal
@@ -61,6 +63,11 @@ class GuestAgentRequest(BaseModel):
         return time.time_ns()
 
 
+def new_host_entropy() -> str:
+    """32 random bytes of the host, base64: a PingRequest's host_entropy."""
+    return base64.b64encode(os.urandom(32)).decode()
+
+
 def request_line(request: GuestAgentRequest) -> bytes:
     """`request` as the guest agent reads it: its JSON with no null field, then a newline (every
     host send site: GuestChannel, QemuVM's file transfers)."""
@@ -70,16 +77,25 @@ def request_line(request: GuestAgentRequest) -> bytes:
 class PingRequest(GuestAgentRequest):
     """Health check request.
 
-    Response: PongMessage with version field.
+    Response: PongMessage with version field; with host_entropy, a StreamingErrorMessage
+    (io_error) instead when the guest cannot reseed its kernel random source.
     """
 
     action: Literal["ping"] = Field(default="ping")  # type: ignore[assignment]
+    host_entropy: str | None = Field(
+        description=(
+            "32 random bytes of the host, base64 (new_host_entropy): the guest mixes them into its "
+            "kernel random source and reseeds it, and answers an error, not a pong, when it cannot. "
+            "None: no host bytes (the guest reseeds from its own input pool, as before each command)"
+        )
+    )
 
 
 class WarmReplRequest(GuestAgentRequest):
     """Warm the REPL of a language: the guest takes its live REPL, or starts one and waits
-    for its ready line, then runs a no-op on it, so the first exec of a user is not the
-    REPL's first.
+    for its ready line, then runs a no-op on it with the reseed flag (ExecuteCodeRequest.reseed),
+    so the first exec of a user is not the REPL's first, and a copy of a saved state runs its
+    reseed warm.
 
     Response: WarmReplAckMessage (status "ok" or "error").
     """
@@ -108,6 +124,12 @@ class ExecuteCodeRequest(GuestAgentRequest):
     # Note: empty-code and null-byte checks live in guest-agent validation.rs.
     # The host translates the guest's code_error response to InvalidInputError (CODE_INVALID)
     # via guest_error_to_exception. No Pydantic validator here.
+
+    reseed: bool = Field(
+        description="True: the REPL reseeds its random generators from the kernel before it runs the "
+        "code (Python: ssl and the module functions of random; JavaScript: BoringSSL's generator of the "
+        "REPL thread; bash: $RANDOM)"
+    )
 
     timeout: int = Field(
         ge=0, le=300, default=0, description="Execution timeout in seconds (0 = the default, 300 s; max 300 s)"

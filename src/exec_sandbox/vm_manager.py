@@ -1792,7 +1792,8 @@ class VmManager:
             TransientError: Restore failed (retryable): LOCAL_DISK, QEMU_CRASHED,
                 OVERLAY_FAILED, GVPROXY_FAILED, MIGRATION_FAILED (its cause chain holds
                 MIGRATION_REJECTED when QEMU refused the state, MIGRATION_UNSUPPORTED when
-                this QEMU cannot load VM state), GUEST_SILENT_AFTER_RESTORE,
+                this QEMU cannot load VM state), GUEST_SILENT_AFTER_RESTORE (the guest did not
+                answer once its state loaded, or could not reseed its kernel random source),
                 GUEST_UNAVAILABLE (the guest channel failed)
             ConfigError: HOST_DEPENDENCY: QEMU or gvproxy-wrapper cannot run, qemu-vm could not get access to a file
                 or a cgroup, or this process may not connect to the guest sockets or the
@@ -2029,10 +2030,11 @@ class VmManager:
                     instance_id=None,
                 ) from e
 
-            # Connect guest channel with reconnection probe.
-            # L1 restore needs probing because the virtio-serial chardev was connected
-            # at save time — the restored VM needs the host to re-sync the connection.
+            # Connect the guest channel with the reconnection probe: the virtio-serial chardev was
+            # connected at save time, so the host re-syncs the connection, and the probe's pings
+            # carry host entropy (the guest reseeds its kernel random source: mark_restored).
             infra.channel.mark_restored()
+            vm.reseed_next_exec = True  # every copy of this state starts with the same REPL generators
             try:
                 await infra.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
             except OSError as e:  # TimeoutError too; no answer, or QEMU closed its port (it stopped)

@@ -103,7 +103,8 @@ class ErrorCode(StrEnum):
     between two calls). The code did not run."""
     GUEST_SILENT_AFTER_RESTORE = "GUEST_SILENT_AFTER_RESTORE"
     """The guest of a memory snapshot restore (an L1 memory snapshot or a saved instance) did not
-    answer once its state loaded. A silent L1 memory snapshot is removed, and the VM boots cold."""
+    answer once its state loaded, or could not reseed its kernel random source then. A silent L1 memory
+    snapshot is removed, and the VM boots cold."""
     LOCAL_DISK = "LOCAL_DISK"
     """A local file the call needs is missing (not a path the caller gave: that is ARGUMENT_INVALID);
     or this host cannot open or write a local file now (disk full, quota, I/O error, out of file

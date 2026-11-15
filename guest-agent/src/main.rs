@@ -44,6 +44,7 @@ macro_rules! log_info {
 
 mod clock;
 mod connection;
+mod entropy;
 mod error;
 mod file_io;
 mod init;
@@ -65,51 +66,14 @@ pub(crate) fn monotonic_ms() -> u64 {
     (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
 }
 
-/// Force the kernel CRNG to reseed from its entropy input pool.
-///
-/// After L1 snapshot restore, the kernel CRNG state is byte-for-byte identical
-/// across all VMs restored from the same snapshot (CRNG_RESEED_INTERVAL is 300s,
-/// so the hwrng kthread won't feed new entropy in time). This ioctl forces an
-/// immediate reseed so each VM diverges before any user code calls getrandom().
-///
-/// Called at two points for defense-in-depth:
-/// 1. `listen_virtio_serial()` — each time the ports open (covers cold boot)
-/// 2. `handle_connection()` — before each command dispatch but a file chunk
-///    (covers L1 restore, where the VM resumes mid-loop with the ports already open)
-///
-/// Cost: ~11μs per call, negligible vs connection/exec overhead.
-fn reseed_crng() {
-    // RNDRESEEDCRNG = _IO('R', 0x07) = 0x5207
-    // libc::ioctl request type differs by target (c_ulong on glibc, c_int on musl)
-    const RNDRESEEDCRNG: libc::c_int = 0x5207;
-
-    unsafe {
-        let fd = libc::open(c"/dev/urandom".as_ptr(), libc::O_WRONLY);
-        if fd < 0 {
-            log_warn!("reseed_crng: failed to open /dev/urandom");
-            return;
-        }
-        let ret = libc::ioctl(fd, RNDRESEEDCRNG as _);
-        libc::close(fd);
-        if ret < 0 {
-            log_warn!(
-                "reseed_crng: ioctl RNDRESEEDCRNG failed (errno={})",
-                *libc::__errno_location()
-            );
-        } else {
-            log_info!("reseed_crng: kernel CRNG reseeded");
-        }
-    }
-}
-
 /// Serve the host over the virtio-serial ports.
 ///
 /// The ports stay open while they work. A host that closes its sockets (VM
-/// teardown, an L1 restore, a channel reset) ends one connection; the agent
-/// then serves the next host on the same ports. Closing a port would make the
-/// guest kernel drop the bytes that the host sends before QEMU sees the close
-/// (see connection::CommandPort). Only a port error makes the agent reopen
-/// the ports.
+/// teardown, a channel reset, a host that connects again) ends one connection;
+/// the agent then serves the next host on the same ports. Closing a port would
+/// make the guest kernel drop the bytes that the host sends before QEMU sees
+/// the close (see connection::CommandPort). Only a port error makes the agent
+/// reopen the ports.
 async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
     log_info!(
         "Guest agent opening virtio-serial ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH}"
@@ -130,7 +94,7 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         backoff_ms = INITIAL_BACKOFF_MS;
-        reseed_crng();
+        entropy::reseed();
         log_info!("[timing] agent_connected: {}ms (monotonic)", monotonic_ms());
 
         loop {

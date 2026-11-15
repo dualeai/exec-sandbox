@@ -98,7 +98,7 @@ async def _consume(messages: list[StreamingMessage], **callbacks: Any) -> Stream
     callback, _default_handling, but those in `callbacks`)."""
     return await consume_stream(
         _MockChannel(messages),  # type: ignore[arg-type]
-        PingRequest(),
+        PingRequest(host_entropy=None),
         timeout=10,
         vm_id="test-vm",
         **({"on_stdout": None, "on_stderr": None, "on_error": _default_handling} | callbacks),
@@ -116,7 +116,7 @@ async def _consume_error(
         channel = _ImmediateErrorChannel(error)
     return await consume_stream(
         channel,  # type: ignore[arg-type]
-        PingRequest(),
+        PingRequest(host_entropy=None),
         timeout=10,
         vm_id="test-vm",
         on_stdout=None,
