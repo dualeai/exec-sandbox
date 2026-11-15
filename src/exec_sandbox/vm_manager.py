@@ -61,7 +61,7 @@ from exec_sandbox.exceptions import (
     spawn_error,
 )
 from exec_sandbox.files.disk import allocated_bytes, clone_sparse, create_sparse
-from exec_sandbox.files.locks import EntryLease
+from exec_sandbox.files.locks import EntryLease, share_all
 from exec_sandbox.guest_channel import DualPortChannel, raise_send_buffer
 from exec_sandbox.gvproxy import start_gvproxy
 from exec_sandbox.images import GuestImages, guest_digests
@@ -215,18 +215,6 @@ class _PendingLaunch:
         leases, self.cache_leases = self.cache_leases, ()
         for lease in leases:
             lease.release()
-
-
-def _share_all(leases: tuple[EntryLease, ...]) -> tuple[EntryLease, ...]:
-    """A share of each lease: all of them, or none (the shares taken go when one fails)."""
-    shares: list[EntryLease] = []
-    try:
-        shares.extend(lease.share() for lease in leases)  # keeps the shares taken before a failure
-    except BaseException:
-        for share in shares:
-            share.release()
-        raise
-    return tuple(shares)
 
 
 def _record_vm(run_dir: PrivateRunDir, *, workdir: Path, vm_cgroup: Cgroup | None) -> None:
@@ -1315,7 +1303,7 @@ class VmManager:
         )
         # Before QEMU opens them: the launch's own shares of the cache leases. The pending
         # owner, then the VM, releases them once QEMU's death is confirmed.
-        pending.cache_leases = _share_all(cache_leases)
+        pending.cache_leases = share_all(cache_leases)
         as_qemu_vm = infra.workdir.use_qemu_vm_user
 
         def not_joined() -> ConfigError:

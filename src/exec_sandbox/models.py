@@ -151,7 +151,7 @@ class InstanceRef(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     instance_id: str = Field(
-        description="The id given to Scheduler.new(instance_id=...), else one the library made at the "
-        "first save (32 lowercase hex characters)"
+        description="The id given to Scheduler.new(instance_id=...) or Session.save(instance_id=...), else "
+        "one the library made at the first save (32 lowercase hex characters)"
     )
     generation: int = Field(description="1 after the first save; +1 for each later save by any caller")

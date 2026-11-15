@@ -43,7 +43,7 @@ from exec_sandbox.exceptions import (
     SocketAuthError,
     TransientError,
 )
-from exec_sandbox.files.locks import CacheEntry, EntryLease
+from exec_sandbox.files.locks import CacheEntry, EntryLease, share_all
 from exec_sandbox.images import GuestImages, guest_digests
 from exec_sandbox.models import ExposedPort, Language
 from exec_sandbox.platform_utils import (
@@ -70,7 +70,6 @@ from exec_sandbox.validation import (
 )
 from exec_sandbox.vm_manager import (
     VmManager,
-    _share_all,
     _stop_qemu,
 )
 from exec_sandbox.vm_spec import VmSpec
@@ -4209,7 +4208,7 @@ class TestLaunchLeases:
         assert second is not None
         second.release()
         with pytest.raises(ValueError, match="already released"):
-            _share_all((first, second))
+            share_all((first, second))
         first.release()
         assert evictable(held)  # no share of `first` was left behind
 

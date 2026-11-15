@@ -122,9 +122,10 @@ class _UseLock:
 class EntryLease:
     """A lease on the cache entry `path`: eviction skips the entry while any lease of it is
     open, in any process. The caller that looked the entry up holds one until its VM launch
-    is over; each VM holds its own (share) until its QEMU is confirmed dead. A lease holds
-    no lock where the lock file cannot be made (a read-only disk or folder: _open_use_lock).
-    release() is idempotent."""
+    is over; each VM holds its own (share) until its QEMU is confirmed dead; a save of a saved
+    instance holds shares of its VM's leases while it reads the VM's images (sharing). A
+    lease holds no lock where the lock file cannot be made (a read-only disk or folder:
+    _open_use_lock). release() is idempotent."""
 
     def __init__(self, path: Path, *, key: _LockKey | None) -> None:
         self.path = path
@@ -157,6 +158,30 @@ class EntryLease:
             held.work = "close"
             file, held.file = held.file, None
         _end_work(self._key, file)
+
+
+def share_all(leases: tuple[EntryLease, ...]) -> tuple[EntryLease, ...]:
+    """A share of each lease: all of them, or none (the shares taken go when one fails).
+    Raises ValueError when one of them is released (EntryLease.share)."""
+    shares: list[EntryLease] = []
+    try:
+        shares.extend(lease.share() for lease in leases)  # keeps the shares taken before a failure
+    except BaseException:
+        for share in shares:
+            share.release()
+        raise
+    return tuple(shares)
+
+
+@contextmanager
+def sharing(leases: tuple[EntryLease, ...]) -> Generator[None]:
+    """Hold a share of each lease (share_all) for the length of the block."""
+    shares = share_all(leases)
+    try:
+        yield
+    finally:
+        for share in shares:
+            share.release()
 
 
 def _end_work(key: _LockKey, file: IO[bytes] | None) -> None:

@@ -677,7 +677,7 @@ class TestReuseRestoreFailure:
                 await scheduler.reuse("my-vm")
 
         fakes.manager.restore_vm.assert_not_called()
-        instances.release.assert_awaited_once_with(state)
+        instances.release.assert_awaited_once_with(state, wait=True)
 
     async def test_state_qemu_refuses_routes(self, tmp_path: Path) -> None:
         error = TransientError(
@@ -709,7 +709,7 @@ class TestReuseRestoreFailure:
         assert exc.value is routed  # the instance store names the target: it knows the saver's facts
         instances.refused_by_qemu.assert_awaited_once_with(state, qemu_error="Migration failed: incompatible stream")
         assert exc.value.__cause__ is error
-        instances.release.assert_awaited_once_with(state)
+        instances.release.assert_awaited_once_with(state, wait=True)
         # Admission leaves out the loaded state's files: they stay while the request waits
         assert fakes.manager.reservation_context.call_args.kwargs["held"] == {Path("/saved"), Path("/assets/base.img")}
 
@@ -733,7 +733,7 @@ class TestReuseRestoreFailure:
 
         assert exc.value is error
         assert exc.value.instance_id == "my-vm"
-        instances.release.assert_awaited_once_with(state)
+        instances.release.assert_awaited_once_with(state, wait=True)
         records = [r.getMessage() for r in caplog.records if r.name == "exec_sandbox.scheduler"]
         assert records == ["Instance my-vm not reused: GUEST_SILENT_AFTER_RESTORE (RETRY): guest did not answer"]
         # The restore starts QEMU with the saved machine type, not this QEMU's alias, and the

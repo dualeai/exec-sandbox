@@ -93,7 +93,7 @@ async def test_unknown_digest_is_image_damaged(instance_env: InstanceEnv, tmp_pa
         vm.packages_image_digest = None
 
     with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.IMAGE_DAMAGED) as exc:
-        await env.manager.save(vm, None, new_instance_id=None)  # type: ignore[arg-type]
+        await env.manager.save(vm, None, new_instance_id=None, resumed=lambda: None)  # type: ignore[arg-type]
 
     assert exc.value.message == (
         f"VM {vm.vm_id}: the digest of a guest file it runs on is unknown (the file was missing "
@@ -108,7 +108,7 @@ async def test_unknown_machine_type_is_not_saved(instance_env: InstanceEnv, tmp_
     vm = await _vm_on_a_layer(instance_env, tmp_path)
     vm.machine_type = None
     with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY, match="machine type"):
-        await instance_env.manager.save(vm, None, new_instance_id=None)  # type: ignore[arg-type]
+        await instance_env.manager.save(vm, None, new_instance_id=None, resumed=lambda: None)  # type: ignore[arg-type]
     assert await instance_env.store.list_objects("") == []
 
 
@@ -127,7 +127,7 @@ async def test_unreadable_qemu_version_is_not_saved(
     monkeypatch.setattr("exec_sandbox.instance.manager.require_qemu_version", system_probes.require_qemu_version)
     monkeypatch.setattr("exec_sandbox.worker_facts.require_qemu_version", system_probes.require_qemu_version)
     with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY, match="QEMU version"):
-        await instance_env.manager.save(vm, None, new_instance_id=None)  # type: ignore[arg-type]
+        await instance_env.manager.save(vm, None, new_instance_id=None, resumed=lambda: None)  # type: ignore[arg-type]
     assert await instance_env.store.list_objects("") == []
 
 
@@ -229,7 +229,7 @@ async def test_a_save_that_qemu_does_not_answer_carries_deadline_diagnostics(
     vm.deadline_diagnostics = deadline_diagnostics  # type: ignore[attr-defined]
 
     with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED) as exc:
-        await env.manager.save(vm, None, new_instance_id=None)  # type: ignore[arg-type]
+        await env.manager.save(vm, None, new_instance_id=None, resumed=lambda: None)  # type: ignore[arg-type]
 
     if qemu_answers:
         assert asked == []
@@ -287,7 +287,7 @@ async def test_a_loaded_image_is_never_evicted(instance_env: InstanceEnv, tmp_pa
     assert await worker.assets.eviction_order().evict_next() is None  # in use: skipped
     assert all(path.exists() for path in cached)
 
-    await worker.release(state)
+    await worker.release(state, wait=True)
     evictions = worker.assets.eviction_order()
     assert [(await evictions.evict_next() or 0) > 0 for _ in cached] == [True, True]  # their bytes
     assert not any(path.exists() for path in cached)
@@ -306,7 +306,7 @@ async def test_the_save_keeps_the_egress_policy_of_the_vm(instance_env: Instance
 
     loaded = await env.load(saver.instance_id, manager=env.manager)
     assert loaded.body.egress_domains == ("a.example",)
-    await env.manager.release(loaded)
+    await env.manager.release(loaded, wait=True)
     assert (await env.manager.describe(saver.instance_id)).egress_domains == ("a.example",)
 
 
@@ -355,7 +355,7 @@ async def test_a_check_releases_its_lease(instance_env: InstanceEnv, tmp_path: P
     guest = (await saver.save()).body.guest
     await env.manager.drain()
     worker = worker_without_base_image(env, root=tmp_path / "worker-b")
-    await worker.release(await env.load(saver.instance_id, manager=worker))  # fills the asset cache
+    await worker.release(await env.load(saver.instance_id, manager=worker), wait=True)  # fills the asset cache
 
     await worker.check(saver.instance_id, packages_image=no_packages)
     evictions = worker.assets.eviction_order()
@@ -377,7 +377,7 @@ async def test_two_loads_of_one_image_download_it_once(instance_env: InstanceEnv
 
     one = worker_without_base_image(env, root=tmp_path / "worker-one")
     mark = len(env.proxy.log)
-    await one.release(await env.load(saver.instance_id, manager=one))
+    await one.release(await env.load(saver.instance_id, manager=one), wait=True)
     single = downloads(mark)
     assert single > 0
 
@@ -387,7 +387,7 @@ async def test_two_loads_of_one_image_download_it_once(instance_env: InstanceEnv
     assert downloads(mark) == single
     assert len({state.base_image for state in states}) == 1
     for state in states:
-        await two.release(state)
+        await two.release(state, wait=True)
 
 
 async def test_another_device_layout_routes_before_the_download(instance_env: InstanceEnv, tmp_path: Path) -> None:

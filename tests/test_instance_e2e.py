@@ -29,7 +29,7 @@ from exec_sandbox.exceptions import (
 )
 from exec_sandbox.instance import manager as instance_manager
 from exec_sandbox.instance.keyring import Keyring
-from exec_sandbox.models import Language
+from exec_sandbox.models import InstanceRef, Language
 from exec_sandbox.platform_utils import detect_host_arch
 from exec_sandbox.qemu_cmd import resolve_machine_type
 from tests.conftest import skip_unless_hwaccel
@@ -219,10 +219,11 @@ class TestSaveFailures:
         async with await scheduler.reuse(ref.instance_id) as vm:
             assert (await vm.exec("print(x)")).stdout.strip() == "2"
 
-    async def test_unknown_outcome_closes_the_session(
+    async def test_unknown_outcome_keeps_the_session_open(
         self, store: tuple[Scheduler, str, object], s3_proxy: S3Proxy
     ) -> None:
-        """No answer to the head write and no read-back: unknown outcome; the session closes."""
+        """No answer to the head write and no read-back: unknown outcome; the VM runs on and the
+        session stays open."""
         scheduler, _, _ = store
         async with await scheduler.new(_PY) as vm:
             s3_proxy.add("PUT_IF", _HEAD, DropAfter(), times=None)
@@ -232,7 +233,8 @@ class TestSaveFailures:
             ) as exc:
                 await vm.save()
             assert exc.value.action == "VERIFY"
-            assert vm.closed
+            assert not vm.closed
+            assert (await vm.exec("print(1)")).stdout == "1\n"
 
     async def test_local_disk_full_keeps_the_session_open(
         self, store: tuple[Scheduler, str, object], monkeypatch: pytest.MonkeyPatch
@@ -569,7 +571,7 @@ class TestNotSavedWarning:
                 await vm.exec("x = 2")
         assert [str(w.message) for w in caught if issubclass(w.category, InstanceNotSavedWarning)] == [
             f"Session closed with changes since the last save of instance {ref.instance_id} (generation 1); "
-            "call save() to keep them."
+            "call save(), or save(instance_id=...) under another id, to keep them."
         ]
 
 
@@ -644,6 +646,31 @@ class TestAssets:
         assert exc.value.action == "ROUTE"
 
 
+class TestFanOut:
+    async def test_children_of_one_save_are_saved_under_their_own_ids(
+        self, store: tuple[Scheduler, str, object]
+    ) -> None:
+        """Two sessions load X; each saves under a new id and continues it; X, C1 and C2 each
+        load their own state."""
+        scheduler, _, _ = store
+        async with await scheduler.new(_PY) as vm:
+            await vm.exec("x = 1")
+            source = await vm.save()
+        c1, c2 = await scheduler.reuse(source.instance_id), await scheduler.reuse(source.instance_id)
+        try:
+            await c1.exec("x = 2")
+            await c2.exec("x = 3")
+            assert await c1.save(instance_id="child-1") == InstanceRef(instance_id="child-1", generation=1)
+            assert await c2.save(instance_id="child-2") == InstanceRef(instance_id="child-2", generation=1)
+            assert c1.instance == InstanceRef(instance_id="child-1", generation=1)
+        finally:
+            await c1.close()
+            await c2.close()
+        for instance_id, value in ((source.instance_id, "1"), ("child-1", "2"), ("child-2", "3")):
+            async with await scheduler.reuse(instance_id) as vm:
+                assert (await vm.exec("print(x)")).stdout == f"{value}\n"
+
+
 class TestForcedId:
     """Scheduler.new(instance_id=...): one id rule for the SDK and the CLI."""
 
@@ -658,7 +685,7 @@ class TestForcedId:
 
     async def test_forced_id_that_exists_is_a_conflict(self, store: tuple[Scheduler, str, object]) -> None:
         """A second new VM with the same id never overwrites the first: its first save conflicts,
-        and the body object it uploaded is deleted."""
+        the session stays open and its VM runs on, and the body object it uploaded is deleted."""
         scheduler, prefix, s3 = store
         async with await scheduler.new(_PY, instance_id="taken") as vm:
             await vm.exec("x = 'first'")
@@ -669,7 +696,8 @@ class TestForcedId:
             with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT) as exc:
                 await vm.save()
             assert exc.value.action == "VERIFY"
-            assert vm.closed
+            assert not vm.closed
+            assert (await vm.exec("print(x)")).stdout == "second\n"  # the VM runs on
         assert _objects(s3, prefix, "taken") == [first]  # the loser's body is gone
         async with await scheduler.reuse("taken") as vm:
             assert (await vm.exec("print(x)")).stdout.strip() == "first"

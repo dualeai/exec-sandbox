@@ -685,7 +685,7 @@ class TestWorkerChecks:
         vm.use_qemu_vm_user = True
         mark = len(instance_env.proxy.log)
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc:
-            await instance_env.manager.save(vm, None, new_instance_id=None)  # type: ignore[arg-type]
+            await instance_env.manager.save(vm, None, new_instance_id=None, resumed=lambda: None)  # type: ignore[arg-type]
         assert exc.value.message == (
             "Could not give qemu-vm write access to the migration file (needs setfacl, package acl)"
         )

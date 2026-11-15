@@ -432,12 +432,13 @@ class Scheduler:
                 (the range of SchedulerConfig.session_idle_timeout_seconds). None: that config value.
             on_boot_log: Callback for the boot console output (kernel, init, guest agent).
                 When given, it turns on verbose boot logging (and skips the warm pool and L1).
-            instance_id: Id the session's first save() gives the new instance (1 to 64
+            instance_id: Id the session's first save() gives the new instance, unless that save
+                names another id (save(instance_id=...)) (1 to 64
                 lowercase letters, digits, ".", "_" or "-", starting with a letter or
                 digit), checked before any VM starts. None: the library makes a random
                 id. An id that already exists makes that save fail with
-                OutcomeUnknownError (INSTANCE_CONFLICT) and close the session (nothing is
-                overwritten).
+                OutcomeUnknownError (INSTANCE_CONFLICT); nothing is overwritten, and the
+                session stays open (save it under another id with save(instance_id=...)).
 
         Returns:
             Session that runs the code. Use it as an async context manager.
@@ -650,7 +651,7 @@ class Scheduler:
                         raise await instances.refused_by_qemu(state, qemu_error=refusal.message) from e
                     raise
         except BaseException:
-            await instances.release(state)
+            await instances.release(state, wait=True)
             raise
         for lease in state.asset_leases:  # the VM holds its own shares now
             lease.release()

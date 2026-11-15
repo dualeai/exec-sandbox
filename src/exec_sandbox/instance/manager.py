@@ -65,11 +65,20 @@ from exec_sandbox.exceptions import (
     no_instance_store,
 )
 from exec_sandbox.files.disk import clone_sparse, memory_filesystem
-from exec_sandbox.files.locks import CacheEntry, EntryLease
+from exec_sandbox.files.locks import CacheEntry, EntryLease, sharing
 from exec_sandbox.hash_utils import file_hash
 from exec_sandbox.images import image_digest
 from exec_sandbox.instance import ids
-from exec_sandbox.instance.commit import Base, Commit, commit_head, save_context
+from exec_sandbox.instance.commit import (
+    GONE_DURING_SAVE,
+    LANDED_FIRST,
+    RETRY_SAME_SAVE,
+    SAVE_ELSEWHERE,
+    Base,
+    Commit,
+    commit_head,
+    save_context,
+)
 from exec_sandbox.instance.head import MAX_HEAD_BYTES, describe_head, open_head, read_summary, seal_head
 from exec_sandbox.instance.keyring import KEY_BYTES, Keyring, wrap_data_key
 from exec_sandbox.instance.local_store import LocalInstanceStore
@@ -166,11 +175,14 @@ class InstanceState:
     header: HeadHeader
     body: HeadBody
     etag: str | None
-    """ETag of this session's head, the base of its next save. None: this session's
-    save committed, but another save is already on top (the next save conflicts)."""
+    """ETag of this session's head, the base of its next save. None: another save is on
+    top of this session's head (it committed and was superseded, or it lost a save race),
+    so the next save conflicts before it sends anything."""
     data_key: bytes = field(repr=False)
     folder: Path
-    """Private folder of this session's instance files (removed when the session closes)."""
+    """Private folder of this session's instance files (removed when the session closes,
+    when it saves under another id, or once another save is on top of this head: no later
+    save reads them)."""
     vmstate: Path
     home: Path
     base_image: Path
@@ -439,14 +451,20 @@ class InstanceManager(InstanceAdmin):
 
     # ------------------------------------------------------------------ save
 
-    async def save(self, vm: QemuVM, state: InstanceState | None, *, new_instance_id: str | None) -> InstanceState:
+    async def save(
+        self, vm: QemuVM, state: InstanceState | None, *, new_instance_id: str | None, resumed: Callable[[], None]
+    ) -> InstanceState:
         """Save the running VM as the next generation (the first when `state` is None).
 
         A first save uses `new_instance_id`, or a new random id when it is None.
-        The VM keeps running. Raises OutcomeUnknownError (INSTANCE_CONFLICT: another
+        The VM keeps running: `resumed()` runs at most once, when the VM runs again after its
+        pause and its state is in local files (nothing after it reads the guest's disk or
+        RAM); it does not run when the pause or the write fails. A MIGRATION_FAILED error has
+        context["vm_resumed"] True when the VM runs on (also when the QMP connection fails
+        before the pause). Raises OutcomeUnknownError (INSTANCE_CONFLICT: another
         save won, or a first save's id is taken; INSTANCE_SAVE_OUTCOME_UNKNOWN), or
-        InstanceGoneError INSTANCE_NOT_FOUND (deleted meanwhile): the caller closes the
-        session on those. TransientError LOCAL_DISK: local disk full or files gone;
+        InstanceGoneError INSTANCE_NOT_FOUND (deleted meanwhile): the VM runs on, and the
+        caller's session stays open on those. TransientError LOCAL_DISK: local disk full or files gone;
         nothing was saved. ConfigError IMAGE_DAMAGED: a guest image does not match its
         digest; nothing was saved. ConfigError HOST_DEPENDENCY: QEMU does not list the
         VM's machine type, or qemu-vm cannot get write access to the migration file;
@@ -469,7 +487,7 @@ class InstanceManager(InstanceAdmin):
         """
         instance_id = state.instance_id if state is not None else new_instance_id or ids.new_id()
         with self._in_flight(), named_instance(instance_id):
-            return await self._save(vm, state, instance_id=instance_id)
+            return await self._save(vm, state, instance_id=instance_id, resumed=resumed)
 
     async def stop(self) -> None:
         """Refuse new saves and loads (InvalidInputError SCHEDULER_STATE), then wait until
@@ -525,7 +543,9 @@ class InstanceManager(InstanceAdmin):
         (commit ids, mkdtemp): a removal that runs late never hits a newer file."""
         self._in_background(asyncio.to_thread(_remove_quietly, *paths))
 
-    async def _save(self, vm: QemuVM, state: InstanceState | None, *, instance_id: str) -> InstanceState:
+    async def _save(
+        self, vm: QemuVM, state: InstanceState | None, *, instance_id: str, resumed: Callable[[], None]
+    ) -> InstanceState:
         """save() itself (save() counts it as in flight)."""
         commit_id = ids.new_id()
         if state is not None and state.etag is None:
@@ -534,16 +554,21 @@ class InstanceManager(InstanceAdmin):
                 "This save was not stored.",
                 code=ErrorCode.INSTANCE_CONFLICT,
                 instance_id=state.instance_id,
-                hint="Load the instance again before you redo the work.",
+                hint=LANDED_FIRST + SAVE_ELSEWHERE,
                 context=save_context(generation=state.header.generation + 1, commit_id=commit_id),
             )
         obj: Path | None = None
-        with _local_files(instance_id, step="saving"):
+        # Shares of the VM's cache leases: a close() after resumed() may end the VM's own
+        # while this save still reads its images (_ensure_vm_assets)
+        with sharing(vm.cache_leases), _local_files(instance_id, step="saving"):
             folder = state.folder if state is not None else self._new_folder(instance_id)
             vmstate = folder / f"{commit_id}.vmstate"
             home = home_path_from_vmstate(vmstate)  # where VmManager.restore_vm looks for it
             try:
                 await self._snapshot(vm, vmstate=vmstate, home=home)
+                # The VM runs again and its state is in local files: the caller may let guest calls
+                # run (nothing below reads the guest's disk or RAM)
+                resumed()
                 facts = await self._host_facts(vm)
                 guest = self._guest_facts(vm)
                 await self._ensure_vm_assets(vm, guest=guest)
@@ -631,7 +656,7 @@ class InstanceManager(InstanceAdmin):
                 "Nothing was saved.",
                 code=ErrorCode.INSTANCE_NOT_FOUND,
                 instance_id=instance_id,
-                hint="Start again with a new instance.",
+                hint=GONE_DURING_SAVE,
                 context=None,
             )
         if superseded:
@@ -661,7 +686,8 @@ class InstanceManager(InstanceAdmin):
                 "was written, but the store did not tell if its saved state is still there.",
                 code=ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN,
                 instance_id=header.instance_id,
-                hint="Load the instance before you redo the work.",
+                hint="Its head is written, but its saved state may be gone from the store: reuse(id) tells "
+                "(InstanceGoneError INSTANCE_EXPIRED when it is gone). " + RETRY_SAME_SAVE,
                 context=save_context(generation=header.generation, commit_id=header.commit_id),
             ) from e
 
@@ -708,23 +734,30 @@ class InstanceManager(InstanceAdmin):
             # the save removes
             await run_stoppable(lambda stop: clone_sparse(vm.workdir.home_disk, home, stop=stop), undo=None)
 
-        async with MigrationClient(vm.qmp_socket, get_expected_socket_uid(vm.use_qemu_vm_user)) as client:
-            try:
-                await client.save_snapshot(
-                    vmstate,
-                    qemu_version=qemu_version,
-                    timeout=migration_timeout(vm.spec.memory_mb),
-                    use_template=False,
-                    keep_running=True,
-                    while_paused=copy_home,
-                    memory_limited=vm.cgroup is not None,
-                )
-            except TransientError as e:
-                # A QMP deadline (QEMU sent no answer in time): the run state, CPU time and
-                # threads of QEMU and the console tell a blocked main loop from a slow one
-                if isinstance(e.__cause__, TimeoutError):
-                    e.context.update(await vm.deadline_diagnostics(operation="save"))
-                raise
+        connected = False
+        try:
+            async with MigrationClient(vm.qmp_socket, get_expected_socket_uid(vm.use_qemu_vm_user)) as client:
+                connected = True
+                try:
+                    await client.save_snapshot(
+                        vmstate,
+                        qemu_version=qemu_version,
+                        timeout=migration_timeout(vm.spec.memory_mb),
+                        use_template=False,
+                        keep_running=True,
+                        while_paused=copy_home,
+                        memory_limited=vm.cgroup is not None,
+                    )
+                except TransientError as e:
+                    # A QMP deadline (QEMU sent no answer in time): the run state, CPU time and
+                    # threads of QEMU and the console tell a blocked main loop from a slow one
+                    if isinstance(e.__cause__, TimeoutError):
+                        e.context.update(await vm.deadline_diagnostics(operation="save"))
+                    raise
+        except TransientError as e:
+            if not connected and vm.process.returncode is None:  # QEMU runs and never paused the VM
+                e.context["vm_resumed"] = True
+            raise
 
     async def _chain_intact(self, instance_id: str, chain: tuple[ChainEntry, ...]) -> bool:
         """One listing: every object of the chain is in the store with the size and
@@ -1146,11 +1179,15 @@ class InstanceManager(InstanceAdmin):
 
     # ------------------------------------------------------------------ helpers
 
-    async def release(self, state: InstanceState) -> None:
-        """Release the state's leases on the asset cache, and remove a closed session's
-        instance files (what will not go is logged)."""
+    async def release(self, state: InstanceState, *, wait: bool) -> None:
+        """Release the state's leases on the asset cache and remove its instance files (what
+        will not go is logged). wait=False: the call never suspends; the removal runs in a worker
+        thread after it returns (drain() waits for it)."""
         _release(state.asset_leases)
-        await asyncio.to_thread(_remove_quietly, state.folder)
+        if wait:
+            await asyncio.to_thread(_remove_quietly, state.folder)
+        else:  # no await before this line: drain() must see the job (a Scheduler exit can come next)
+            self._remove_in_background(state.folder)
 
     def _new_folder(self, instance_id: str) -> Path:
         return Path(tempfile.mkdtemp(prefix=f"{instance_id}-", dir=self.work_dir))

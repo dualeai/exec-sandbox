@@ -156,9 +156,24 @@ def _check_absent(mine: HeadHeader, base: Base, *, repaired: bool, maybe_applied
         f"Instance {mine.instance_id} was deleted during this save. Nothing was saved.",
         code=ErrorCode.INSTANCE_NOT_FOUND,
         instance_id=mine.instance_id,
-        hint="Start again with a new instance.",
+        hint=GONE_DURING_SAVE,
         context=None,
     )
+
+
+# Hint parts of the store errors of a save (here and InstanceManager._save)
+LANDED_FIRST = (
+    "If an earlier save of this session had an unknown outcome, look for its commit id in "
+    "describe_instance(id).recent_commits first: it may be the save that is stored. "
+)
+SAVE_ELSEWHERE = (
+    "Else save this session under another id to keep its work, or load the instance again (it has the other "
+    "save) before you redo the work."
+)
+GONE_DURING_SAVE = (
+    "The session stays open: save it under another id to keep its work, or start again with a new instance."
+)
+RETRY_SAME_SAVE = "A retry of the same save (the same instance_id) never stores a second copy."
 
 
 def save_context(*, generation: int, commit_id: str) -> dict[str, object]:
@@ -173,7 +188,8 @@ def _conflict(mine: HeadHeader) -> OutcomeUnknownError:
         f"Instance {mine.instance_id}: {first}. This save was not stored.",
         code=ErrorCode.INSTANCE_CONFLICT,
         instance_id=mine.instance_id,
-        hint="Load the instance again before you redo the work, or use another id for a new instance.",
+        hint=LANDED_FIRST
+        + ("Else this id is taken: save under another id." if mine.generation == 1 else SAVE_ELSEWHERE),
         context=save_context(generation=mine.generation, commit_id=mine.commit_id),
     )
 
@@ -184,6 +200,7 @@ def _unknown(mine: HeadHeader) -> OutcomeUnknownError:
         f"(commit {mine.commit_id}) was saved.",
         code=ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN,
         instance_id=mine.instance_id,
-        hint="Read the instance's generation before you redo the work.",
+        hint='It was stored if describe_instance(id).recent_commits holds error.context["commit_id"]. '
+        + RETRY_SAME_SAVE,
         context=save_context(generation=mine.generation, commit_id=mine.commit_id),
     )

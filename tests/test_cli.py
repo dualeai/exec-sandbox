@@ -2444,7 +2444,7 @@ class TestCliInstanceRun:
         assert f"Instance {_ID} not saved: the VM stopped; it stays at generation 3." in result.stderr
 
     def test_order_is_uploads_exec_downloads_save(self, runner: CliRunner, tmp_path: Path) -> None:
-        """Downloads come before the save: a save that fails closes the session."""
+        """Downloads come before the save: a save that fails can close the session."""
         upload = tmp_path / "in.txt"
         upload.write_text("in")
         download = tmp_path / "out.txt"
@@ -2828,8 +2828,14 @@ def _expired() -> SandboxError:
 
 
 def _conflict() -> SandboxError:
+    """An INSTANCE_CONFLICT as the store raises it: with the generation and commit id of the save
+    that was not stored (save_context)."""
     return OutcomeUnknownError(
-        "Another save won.", code=ErrorCode.INSTANCE_CONFLICT, context=None, hint=None, instance_id=_ID
+        "Another save won.",
+        code=ErrorCode.INSTANCE_CONFLICT,
+        context={"generation": 4, "commit_id": "c" * 32},
+        hint=None,
+        instance_id=_ID,
     )
 
 
@@ -2893,8 +2899,26 @@ class TestCliInstanceErrors:
 
         assert result.exit_code == 125
         assert "INSTANCE_CONFLICT (VERIFY)" in result.stderr
-        assert f"sbx instance describe {_ID}" in result.stderr
+        assert "lists commit" not in result.stderr  # a conflict stored nothing
         assert "Created instance" not in result.stderr
+
+    def test_save_unknown_outcome_names_the_commit_to_look_for(self, runner: CliRunner) -> None:
+        """The store did not confirm the save: the advice names the command and the commit id."""
+        unknown = OutcomeUnknownError(
+            "No answer.",
+            code=ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN,
+            context={"generation": 2, "commit_id": "c" * 32},
+            hint=None,
+            instance_id=_ID,
+        )
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            vm = _new_instance(_mock_scheduler(scheduler_cls), exit_code=0)
+            vm.save.side_effect = unknown
+
+            result = runner.invoke(run_command, ["--instance", _ID, "-c", "pass"])
+
+        assert result.exit_code == 125
+        assert f"The save is stored if 'sbx instance describe {_ID}' lists commit {'c' * 32}." in result.stderr
 
     @pytest.mark.parametrize(
         ("error", "exit_code", "words"),

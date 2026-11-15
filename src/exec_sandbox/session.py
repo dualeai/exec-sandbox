@@ -18,16 +18,19 @@ Lifecycle:
     - exec() runs code in that VM; the state stays.
     - close() destroys the VM; the context manager calls it.
     - The idle timeout closes the session after a time with no call.
-    - These failures close the session: cancellation, an unknown outcome
-      (OutcomeUnknownError), each exec() error except InvalidInputError, exit
-      137, a VM found dead, a VM that QEMU stopped because the host disk is full
-      (TransientError LOCAL_DISK at the next call), and the save() failures
-      listed in Session.save. Details: Session.exec and Session.save.
+    - These failures close the session: cancellation, an unknown outcome of a
+      guest call (OutcomeUnknownError GUEST_OUTCOME_UNKNOWN), each
+      exec() error except InvalidInputError, exit 137, a VM found dead, a VM that
+      QEMU stopped because the host disk is full (TransientError LOCAL_DISK at the
+      next call), and the save() failures listed in Session.save. A save that the
+      store refuses or does not confirm leaves the session open. Details:
+      Session.exec and Session.save.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import os
 import stat
@@ -54,6 +57,7 @@ from exec_sandbox.exceptions import (
     SessionClosedError,
     no_instance_store,
 )
+from exec_sandbox.instance.ids import check_instance_id
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, InstanceRef, StartupTiming, TimingBreakdown
 from exec_sandbox.qemu_vm import local_path_error
 from exec_sandbox.vm_types import VmState
@@ -86,7 +90,9 @@ class Session:
     Variables, imports, functions and files stay from one call to the next,
     until close(). To keep the state after close(), call save() first.
 
-    The calls of one session (exec, the file calls, save) run one at a time.
+    The calls of one session (exec, the file calls, save) run one at a time, in the order
+    they reach the session (write_file first opens a local Path source). One exception: the calls made after a save() run once its VM runs again, while
+    the save stores the state (save() still returns only once the store committed it).
     """
 
     def __init__(
@@ -109,8 +115,20 @@ class Session:
         self._instance = instance
         # Id the first save gives a new instance (Scheduler.new(instance_id=...)); None: a new random id
         self._new_instance_id = new_instance_id
-        # exec()/write_file() succeeded since the last save (InstanceNotSavedWarning at a clean close)
-        self._unsaved = False
+        # exec() and write_file() calls that succeeded, and that count at the pause of the last
+        # successful save: they differ when changes are not saved (InstanceNotSavedWarning at close)
+        self._writes = 0
+        self._saved_writes = 0
+        # _writes at the pause of the save in flight, from the time its VM runs again (None: none):
+        # close() then counts them as saved, since the save goes on and stores them (or gives the
+        # store's error to its caller)
+        self._saving_writes: int | None = None
+        # Calls in flight (a guest call until it returns, a save until its end): the idle timer
+        # runs only when none is
+        self._busy = 0
+        # Saves of this session, one at a time up to their commit. Taken inside the guard, after
+        # _exec_lock: a save keeps its place in the queue of calls.
+        self._save_lock = asyncio.Lock()
         # A save in flight owns the instance files: close() leaves them to it (see save()).
         self._saving = False
         self._vm_manager = vm_manager
@@ -154,7 +172,8 @@ class Session:
     @property
     def instance(self) -> InstanceRef | None:
         """The saved instance this session continues: set by reuse() and by each
-        successful save(); None for a session from new() that was never saved."""
+        successful save() (save(instance_id=...) moves it to the new instance); None for a
+        session from new() that was never saved."""
         return _ref(self._instance)  # the header stays in memory after close removes the files
 
     @property
@@ -172,7 +191,7 @@ class Session:
     # -------------------------------------------------------------------------
 
     @asynccontextmanager
-    async def _guard(self) -> AsyncGenerator[None]:
+    async def _guard(self) -> AsyncGenerator[Callable[[], None]]:
         """Acquire exec lock with session lifecycle checks.
 
         Encapsulates the preamble shared by all public methods:
@@ -183,19 +202,34 @@ class Session:
         5. Suspend the idle timer for the duration of the operation
 
         Idle means "no operation in flight": the timer is cancelled while an
-        operation runs and re-armed when it finishes, so a long exec can never
-        be destroyed mid-flight by its own idle deadline.
+        operation runs and re-armed when the last one finishes, so a long exec can
+        never be destroyed mid-flight by its own idle deadline.
+
+        It yields a function that frees _exec_lock before the call ends (save() frees it
+        once its VM runs again); a second call of it does nothing, so the guard never frees
+        a lock that another call holds.
 
         On the way out it also owns VM retirement for cancellation and
         unknown-outcome failures: any dispatched guest operation may still be
-        running after CancelledError or OutcomeUnknownError, so the session
-        is closed before either propagates. A failed call that retired the VM
-        closes the session too: QEMU stopped it because the host disk is full
-        (TransientError LOCAL_DISK), or the REPL exited with code 137 between two
-        calls (TransientError GUEST_UNAVAILABLE).
+        running after CancelledError or an OutcomeUnknownError, so the session
+        is closed before either propagates. The store's answer to a save
+        (INSTANCE_CONFLICT, INSTANCE_SAVE_OUTCOME_UNKNOWN) is not such an outcome:
+        the save sent nothing to the guest, so the session stays open. A failed call
+        that retired the VM closes the session too: QEMU stopped it because the host
+        disk is full (TransientError LOCAL_DISK), or the REPL exited with code 137
+        between two calls (TransientError GUEST_UNAVAILABLE).
         """
         self._check_open()
-        async with self._exec_lock:
+        await self._exec_lock.acquire()
+        held = True
+
+        def release() -> None:
+            nonlocal held
+            if held:
+                held = False
+                self._exec_lock.release()
+
+        try:
             if self._closed:
                 raise _session_closed("Session closed while waiting for lock")
             if self._vm.state in (VmState.DESTROYING, VmState.DESTROYED) or self._vm.process.returncode is not None:
@@ -206,30 +240,34 @@ class Session:
                 # time out one transient error at a time.
                 await self._close_for_failure()
                 raise _session_closed("Session VM was retired")
+            self._busy += 1
             self._cancel_idle_timer()
             try:
-                yield
+                yield release
             except asyncio.CancelledError:
                 # Every dispatched guest operation can outlive its cancelled
                 # host waiter.  Retire the VM before permitting reuse, for
                 # file/list operations as well as code execution.
                 await self._close_for_failure()
                 raise
-            except OutcomeUnknownError:
-                # Dispatch may have reached the guest. Retire before exposing
-                # the reconciliation-required error so no API can reuse a VM
-                # whose command outcome is unknown.
-                await self._close_for_failure()
-                raise
-            except Exception:
-                # The call found the VM unusable and retired it: every next call
-                # would fail the same way. (The call changed the state checked above.)
-                if self._vm.state in (VmState.DESTROYING, VmState.DESTROYED):  # pyright: ignore[reportUnnecessaryContains]
+            except Exception as e:
+                # A guest call whose outcome is unknown (GUEST_OUTCOME_UNKNOWN: dispatch may have
+                # reached the guest), or a call that found the VM unusable and retired it (it
+                # changed the state checked above): no later call can use this VM.
+                if (
+                    isinstance(e, OutcomeUnknownError) and e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN
+                ) or self._vm.state in (
+                    VmState.DESTROYING,
+                    VmState.DESTROYED,
+                ):  # pyright: ignore[reportUnnecessaryContains]
                     await self._close_for_failure()
                 raise
             finally:
-                if not self._closed:
+                self._busy -= 1
+                if not self._closed and not self._busy:
                     self._reset_idle_timer()
+        finally:
+            release()
 
     def _check_open(self) -> None:
         """Raise SessionClosedError on a closed session. Every call checks it first, before
@@ -393,7 +431,7 @@ class Session:
             execute_ms = round((execute_end - execute_start) * 1000)
 
             self._exec_count += 1
-            self._unsaved = True
+            self._writes += 1
 
             # The timing the session measured (a copy: no new validation of the output)
             execution_result = result.model_copy(
@@ -455,7 +493,7 @@ class Session:
         try:
             async with self._guard():
                 await self._vm.write_file(path, stream, make_executable=make_executable)
-                self._unsaved = True
+                self._writes += 1
         finally:
             if owned:
                 stream.close()
@@ -526,7 +564,7 @@ class Session:
         async with self._guard():
             return await self._vm.list_files(path)
 
-    async def save(self) -> InstanceRef:
+    async def save(self, *, instance_id: str | None = None) -> InstanceRef:
         """Save the VM's state (memory, processes, files in /home/user) as a new generation.
 
         The first save of a session from new() makes the instance (generation 1)
@@ -534,11 +572,46 @@ class Session:
         save, and each save of a session from reuse(), adds one generation. It
         succeeds only if nobody saved the instance since this session loaded or
         last saved it. The VM pauses while its state is written, then keeps
-        running. save() runs none of your code.
+        running: the calls made after save() run then, while the save stores the state,
+        and save() returns once the store committed it (a later save() waits for it).
+        save() runs none of your code.
 
-        If the call is cancelled, the session closes and the head write still
-        finishes in the background: the save can be stored (read the generation,
-        as for VERIFY).
+        With `instance_id` set to another id than this session's instance, the save
+        makes generation 1 of a new instance with that id (an id that exists raises
+        INSTANCE_CONFLICT: nothing is overwritten); once it is stored, the session
+        continues the new instance (`session.instance`), and the previous instance
+        stays as its last save left it. After INSTANCE_SAVE_OUTCOME_UNKNOWN of such a
+        save, the session still continues the previous instance: call save() with the
+        same `instance_id` again (a retry never stores a second copy). If the first save
+        was stored, the retry raises INSTANCE_CONFLICT and the session does not move: the
+        first error's error.context["commit_id"] is then in
+        describe_instance(<instance_id>).recent_commits; reuse() that instance to continue
+        from it. This session's own id gives a plain save.
+
+        When close() runs during the save, the session is closed whatever the outcome: the
+        "still open" in the list below holds only for a save that no close() met.
+
+        A cancel while save() waits for an earlier exec() or file call leaves the session
+        open; a cancel while it waits for an earlier save() to commit closes it. Once save()
+        runs, a cancel closes the session, and the head write still finishes in the
+        background: the save can be stored. A cancel gives no commit id: a later save is
+        stored when describe_instance(id).generation is above session.instance.generation;
+        a first save or a save under another id is stored when describe_instance(<that id>)
+        finds the instance (list_instances() shows one under a random id).
+
+        When the store refuses the save or does not confirm it (OutcomeUnknownError,
+        InstanceGoneError), the VM runs on and the session stays open: close it, or
+        save it again. After INSTANCE_CONFLICT of a plain save of a saved instance,
+        another save holds the instance: a next plain save() fails at once (nothing is
+        sent), and close() gives no InstanceNotSavedWarning. After INSTANCE_CONFLICT of a
+        first save or of a save under another id, that id is taken: save under another id
+        (unless it is the retry above). After INSTANCE_NOT_FOUND of a later save, the
+        instance is gone: save under another id.
+
+        Args:
+            instance_id: None: this session's instance. Else 1 to 64 lowercase letters,
+                digits, ".", "_" or "-", starting with a letter or digit (checked before
+                any work).
 
         Raises:
             TransientError: INSTANCE_STORE_UNAVAILABLE or LOCAL_DISK (local disk full or
@@ -547,12 +620,16 @@ class Session:
                 full); nothing was saved; the session stays open when the VM runs again
                 (error.context["vm_resumed"]), else it closes.
             OutcomeUnknownError: INSTANCE_CONFLICT: another save was stored first, or the id
-                given to new() is taken; INSTANCE_SAVE_OUTCOME_UNKNOWN: the store did not confirm.
-                The session is closed (VM discarded).
+                given to new() is taken; nothing was saved. INSTANCE_SAVE_OUTCOME_UNKNOWN: the
+                store did not confirm; a retry of the same save (the same instance_id) never
+                stores a second copy (a plain save() after a failed save(instance_id=...) saves to
+                this session's instance).
+                The session is still open.
             SessionClosedError: The session is closed, or close() ran during this save
                 and stopped it.
             InvalidInputError: SCHEDULER_STATE: the Scheduler is stopping (its exit refuses
                 new saves); nothing was saved and the session is still open.
+                INSTANCE_INVALID_ID: `instance_id` breaks the id rule; nothing was sent.
             ConfigError: INSTANCE_CONFIG: no instance store (instance_store +
                 instance_keyring; checked first, so a closed session without a store
                 raises this, not SessionClosedError), or the store refused this worker or
@@ -564,22 +641,45 @@ class Session:
                 MIGRATION_UNSUPPORTED: this QEMU cannot save the VM; the session closes
                 unless the VM runs again (error.context["vm_resumed"]).
             InstanceGoneError: INSTANCE_NOT_FOUND: the instance was deleted meanwhile
-                (also during a first save); the session is closed.
+                (also during a first save); nothing was saved; the session is still open.
         """
         if self._instances is None:
             raise no_instance_store(instance_id=None)
-        async with self._guard():
+        self._check_open()
+        if instance_id is not None:
+            check_instance_id(instance_id)
+        async with self._guard() as release, self._save_lock:
+            if self._closed:  # close() ran while this save waited for an earlier one
+                raise _session_closed("Session closed while waiting for an earlier save()")
+            # A save under another id: the first save of that id; the session then continues it.
+            # Read after both locks: an earlier save may have moved the session.
+            own_id = self._instance.instance_id if self._instance is not None else self._new_instance_id
+            moving = instance_id is not None and instance_id != own_id
+            writes = self._writes  # no guest call runs until this save's pause
+            resumed = False
+
+            def on_resumed() -> None:  # the VM runs again: the calls queued after this save may run
+                nonlocal resumed
+                resumed = True
+                self._saving_writes = writes
+                release()
+
             self._saving = True
             try:
                 state = await self._instances.save(
-                    self._vm, self._instance, new_instance_id=self._new_instance_id if self._instance is None else None
+                    self._vm,
+                    None if moving else self._instance,
+                    new_instance_id=instance_id if moving else self._new_instance_id,  # for a first save only
+                    resumed=on_resumed,
                 )
-            except (OutcomeUnknownError, InstanceGoneError):
-                # This VM diverged from the stored instance: discard it (no later save can win).
-                await self._close_for_failure()
+            except (OutcomeUnknownError, InstanceGoneError) as e:
+                # The store's answer: the VM runs on and the session stays open. After a close()
+                # meanwhile, this error still goes to the caller, not SessionClosedError: it needs
+                # error.context["commit_id"].
+                await self._after_store_answer(e, instances=self._instances, moving=moving)
                 raise
             except Exception as e:
-                if self._closed:  # close() destroyed the VM during the save
+                if self._closed and not resumed:  # close() destroyed the VM before it ran again
                     raise _session_closed("Session closed during save()") from e
                 # By code, not by class: LOCAL_DISK and INSTANCE_STORE_UNAVAILABLE (also
                 # TransientError) leave the VM running, so the session stays open.
@@ -588,26 +688,73 @@ class Session:
                 raise
             finally:
                 self._saving = False
+                self._saving_writes = None
+                # close() left these files to the save. wait=False never suspends, so a cancel cannot
+                # land between this release and the one of the new state below.
                 if self._closed and self._instance is not None:
-                    await self._instances.release(self._instance)  # close() left these to the save
-            if self._closed:  # close() ran during the save: these files are the save's to release
-                await self._instances.release(state)
+                    await self._instances.release(self._instance, wait=False)
+            await self._release_after_save(state, instances=self._instances, moving=moving)
             self._instance = state
-            self._unsaved = False
+            self._saved_writes = writes
         return InstanceRef(instance_id=state.instance_id, generation=state.header.generation)
+
+    async def _release_after_save(self, state: InstanceState, *, instances: InstanceManager, moving: bool) -> None:
+        """The local files a successful save leaves. close() ran during the save: the new state's
+        files go (the last step: the removal runs to its end in a worker thread even if a cancel
+        comes then). Else the files no later save reads go
+        in the background: the old instance's after a save under another id, and the new state's
+        when another save is already on top of its commit."""
+        if self._closed:
+            await instances.release(state, wait=True)
+            return
+        if moving and self._instance is not None:  # the session moves to the new instance
+            await instances.release(self._instance, wait=False)
+        if state.etag is None:  # committed, then superseded: no later save reads these files
+            await instances.release(state, wait=False)
+
+    async def _after_store_answer(self, error: SandboxError, *, instances: InstanceManager, moving: bool) -> None:
+        """What the session keeps of its instance after the store's answer to a save
+        (INSTANCE_CONFLICT, INSTANCE_SAVE_OUTCOME_UNKNOWN, INSTANCE_NOT_FOUND). A save under
+        another id (`moving`) leaves this session's instance as it was, whatever the answer."""
+        if moving:
+            return
+        if error.code is ErrorCode.INSTANCE_CONFLICT and self._instance is not None and self._instance.etag is not None:
+            # Another save of this instance won: a next plain save fails before it sends anything
+            # (InstanceManager._save's check), and nothing reads these files again.
+            dead = self._instance
+            self._instance = dataclasses.replace(dead, etag=None)
+            if not self._closed:  # when closed, save()'s `finally` releases them
+                await instances.release(dead, wait=False)
+        elif error.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN and self._instance is None:
+            # A first save that may have landed: a retry is create-only on the same id, so it
+            # never makes a second instance (the error names the id the save used).
+            self._new_instance_id = error.instance_id
+
+    def _unsaved_instance(self) -> InstanceState | None:
+        """The instance whose changes close() would lose: exec()/write_file() calls ran that no
+        save stores (those after the last successful save, less those that a save in flight
+        holds: its pause came after them, and its VM runs again), and a plain save could still
+        store them (None: no such calls, or no such instance)."""
+        saved = self._saved_writes if self._saving_writes is None else self._saving_writes
+        instance = self._instance
+        if self._writes == saved or instance is None or instance.etag is None:
+            return None
+        return instance
 
     async def close(self) -> None:
         """Close the session and destroy the VM. Never saves, never deletes the stored instance.
 
         Warns (InstanceNotSavedWarning) when the session continues a saved
-        instance and exec()/write_file() ran since the last save. A second call
+        instance and exec()/write_file() ran since the last save, unless another save
+        of that instance won (no plain save of this session can store them). A second call
         starts no new cleanup: it raises the error of the first one again, if any.
         Raises InternalError (CLEANUP_UNCONFIRMED) when the end of the QEMU process is not confirmed.
         """
-        if not self._closed and self._unsaved and self._instance is not None:
+        if not self._closed and (unsaved := self._unsaved_instance()) is not None:
             warnings.warn(
-                f"Session closed with changes since the last save of instance {self._instance.instance_id} "
-                f"(generation {self._instance.header.generation}); call save() to keep them.",
+                f"Session closed with changes since the last save of instance {unsaved.instance_id} "
+                f"(generation {unsaved.header.generation}); call save(), or save(instance_id=...) "
+                "under another id, to keep them.",
                 InstanceNotSavedWarning,
                 stacklevel=2,
             )
@@ -650,7 +797,7 @@ class Session:
         finally:
             # The stored instance stays; its local files go
             if release_instance and self._instances is not None and self._instance is not None:
-                await self._instances.release(self._instance)
+                await self._instances.release(self._instance, wait=True)
         # destroy_vm keeps failed workdir/cgroup cleanup owned for retry, and
         # publishes DESTROYED only after QEMU and gvproxy death is confirmed.
         # Only that process boundary may hide a terminal execution result.
@@ -711,10 +858,10 @@ class Session:
         Session outlives it — close() publishes _close_task before any await).
         """
         self._idle_timer_handle = None
-        if self._unsaved and self._instance is not None:
+        if (unsaved := self._unsaved_instance()) is not None:
             logger.warning(
                 "Idle timeout closes a session with changes since the last save",
-                extra={"instance_id": self._instance.instance_id, "generation": self._instance.header.generation},
+                extra={"instance_id": unsaved.instance_id, "generation": unsaved.header.generation},
             )
         logger.info(
             "Session idle timeout",

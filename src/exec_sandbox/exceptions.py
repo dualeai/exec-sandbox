@@ -123,7 +123,8 @@ class ErrorCode(StrEnum):
     GUEST_OUTCOME_UNKNOWN = "GUEST_OUTCOME_UNKNOWN"
     """The call reached the guest, then the transport was lost. The code may have run."""
     INSTANCE_CONFLICT = "INSTANCE_CONFLICT"
-    """Another save was stored first, or the id given to new() is taken. This save was not stored."""
+    """Another save of the instance was stored first, or the id of a first save (Scheduler.new(instance_id=...),
+    Session.save(instance_id=...)) is taken. This save was not stored."""
     INSTANCE_SAVE_OUTCOME_UNKNOWN = "INSTANCE_SAVE_OUTCOME_UNKNOWN"
     """The store did not confirm the save, and reading it back could not tell whether it was stored."""
 
@@ -287,14 +288,14 @@ class TransientError(SandboxError):
 
 
 class OutcomeUnknownError(SandboxError):
-    """You do not know the state the call left.
+    """You do not know the state the call left, or must read it before you do the work again.
 
-    The code was sent and then the transport was lost; the store gave no clear
-    answer to a save; or another save was stored first (INSTANCE_CONFLICT). Read the
-    state (side effects of the code; for a save, `context["generation"]` and
-    `context["commit_id"]` name the commit it would make: it was stored if
-    `describe_instance(id).recent_commits` holds it) before you do the work again.
-    The session is closed.
+    GUEST_OUTCOME_UNKNOWN: the code was sent and then the transport was lost; the session
+    is closed. INSTANCE_SAVE_OUTCOME_UNKNOWN: the store gave no clear answer to a save;
+    `context["generation"]` and `context["commit_id"]` name the commit it would make: it
+    was stored if `describe_instance(id).recent_commits` holds it. INSTANCE_CONFLICT:
+    another save was stored first, or the id of a first save is taken; this save was not
+    stored. After either save code the session stays open.
     """
 
     action = ErrorAction.VERIFY
@@ -648,4 +649,5 @@ class SocketAuthError(CommunicationError):
 
 class InstanceNotSavedWarning(UserWarning):
     """A session of a saved instance closed cleanly after exec() or write_file()
-    calls that no save() followed: those changes are not in the store."""
+    calls that no save() followed: those changes are not in the store. Not raised once
+    another save of the instance won: no plain save of the session can store them."""

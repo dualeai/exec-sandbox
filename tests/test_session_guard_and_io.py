@@ -30,6 +30,7 @@ import threading
 import time
 import weakref
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Self
@@ -43,6 +44,7 @@ from exec_sandbox.exceptions import (
     CommunicationError,
     ConfigError,
     ErrorCode,
+    InstanceGoneError,
     InternalError,
     InvalidInputError,
     OutcomeUnknownError,
@@ -304,7 +306,8 @@ def _error(cls: type[SandboxError], code: ErrorCode, context: dict[str, Any] | N
 class TestSaveCloseRule:
     """save() closes the session by error code, not by class: a failed migration closes it
     unless the VM runs again (context["vm_resumed"]); a local disk or store failure
-    (TransientError too) leaves the VM running, so the session stays open."""
+    (TransientError too) and the store's answer to the save (a conflict, an unknown outcome,
+    an instance deleted meanwhile) leave the VM running, so the session stays open."""
 
     @pytest.mark.parametrize(
         ("cls", "code", "context", "closes"),
@@ -317,6 +320,9 @@ class TestSaveCloseRule:
             ),
             pytest.param(TransientError, ErrorCode.LOCAL_DISK, None, False, id="local-disk"),
             pytest.param(TransientError, ErrorCode.INSTANCE_STORE_UNAVAILABLE, None, False, id="store"),
+            pytest.param(OutcomeUnknownError, ErrorCode.INSTANCE_CONFLICT, None, False, id="conflict"),
+            pytest.param(OutcomeUnknownError, ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN, None, False, id="unknown"),
+            pytest.param(InstanceGoneError, ErrorCode.INSTANCE_NOT_FOUND, None, False, id="not-found"),
         ],
     )
     async def test_close_rule(
@@ -344,6 +350,44 @@ class TestSaveCloseRule:
         assert session.closed is closes
         assert mock_vm_manager.destroy_vm.await_count == (1 if closes else 0)
         await session.close()
+
+    @pytest.mark.parametrize(
+        ("cls", "code"),
+        [
+            (OutcomeUnknownError, ErrorCode.INSTANCE_CONFLICT),
+            (OutcomeUnknownError, ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN),
+            (InstanceGoneError, ErrorCode.INSTANCE_NOT_FOUND),
+        ],
+    )
+    async def test_a_close_during_the_save_keeps_the_store_answer(
+        self, cls: type[OutcomeUnknownError | InstanceGoneError], code: ErrorCode
+    ) -> None:
+        """The VM runs again, close() runs, then the store answers: the caller gets the store's
+        error with its context (the commit to look for), not SessionClosedError."""
+        _, mock_vm, mock_vm_manager = _make_session()
+        conflict = _error(cls, code, {"generation": 1, "commit_id": "0" * 32})
+        instances = AsyncMock()
+        session = Session(
+            vm=mock_vm,
+            vm_manager=mock_vm_manager,
+            spec=VmSpec(language=Language.PYTHON),
+            startup_timing=_STARTUP,
+            instances=instances,
+            instance=None,
+            new_instance_id=None,
+            idle_timeout_seconds=300,
+            default_timeout_seconds=30,
+        )
+
+        async def save(*_args: object, resumed: Callable[[], None], **_kwargs: object) -> None:
+            resumed()  # as InstanceManager.save: before any store answer
+            await session.close()
+            raise conflict
+
+        instances.save = AsyncMock(side_effect=save)
+        with pytest.raises(cls, check=lambda e: e is conflict):
+            await session.save()
+        assert session.closed
 
     async def test_close_during_a_failing_save_releases_the_instance_files_once(self) -> None:
         """close() during a save: the save owns the loaded instance's local files, and releases
@@ -2962,3 +3006,27 @@ class TestIdleTimerLifecycleStress:
         assert session.closed
         with pytest.raises(SessionClosedError):
             await session.list_files()
+
+
+class TestGuardCloseRule:
+    """A file call whose guest outcome is unknown (OutcomeUnknownError GUEST_OUTCOME_UNKNOWN)
+    closes the session: the request may have reached the guest. (A save's store answers keep
+    it open: test_close_rule, through save().)"""
+
+    @pytest.mark.parametrize("call", ["list_files", "read_file", "write_file"])
+    async def test_an_unknown_guest_outcome_of_a_file_call_closes_the_session(self, call: str) -> None:
+        session, mock_vm, _ = _make_session()
+        error = OutcomeUnknownError(
+            "injected", code=ErrorCode.GUEST_OUTCOME_UNKNOWN, context={}, hint=None, instance_id=None
+        )
+        setattr(mock_vm, call, AsyncMock(side_effect=error))  # exec() closes on its own errors: not this rule
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e is error):
+            match call:
+                case "list_files":
+                    await session.list_files()
+                case "read_file":
+                    await session.read_file("f.txt", destination=io.BytesIO())
+                case _:
+                    await session.write_file("f.txt", b"data")
+        assert session.closed
+        await session.close()

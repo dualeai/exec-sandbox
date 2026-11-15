@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 
     from exec_sandbox.admission import ResourceAdmissionController
+    from exec_sandbox.files.locks import EntryLease
     from exec_sandbox.instance.manager import InstanceState
     from exec_sandbox.instance.store import InstanceStore
     from tests.s3_faults import Bucket, S3Proxy
@@ -315,6 +316,7 @@ class FakeVm:
         self.spec = spec
         self.base_image = base_image
         self.packages_image: Path | None = None
+        self.cache_leases: tuple[EntryLease, ...] = ()  # QemuVM.cache_leases
         # The digests VmManager records when QEMU opens the images (InstanceManager._guest_facts)
         self.base_image_digest: str | None = image_digest(base_image)
         self.packages_image_digest: str | None = None
@@ -419,6 +421,9 @@ class FakeVmManager:
 
     async def destroy_vm(self, vm: FakeVm) -> bool:
         await vm.qmp.stop()
+        leases, vm.cache_leases = vm.cache_leases, ()  # as QemuVM.confirm_destroyed
+        for lease in leases:
+            lease.release()
         vm.state = VmState.DESTROYED
         return True
 
@@ -699,10 +704,13 @@ class InstanceEnv:
         return await vm.start()
 
     async def vm_from(self, state: InstanceState) -> FakeVm:
-        """The VM a reuse() of `state` runs: the loaded streams are its RAM and home disk."""
-        return await self.new_vm(
+        """The VM a reuse() of `state` runs: the loaded streams are its RAM and home disk, and
+        its egress domains are the head's (as Scheduler.reuse gives them to restore_vm)."""
+        vm = await self.new_vm(
             SparseImage.from_file(state.vmstate), SparseImage.from_file(state.home), spec=state.body.spec
         )
+        vm.egress_domains = state.body.egress_domains
+        return vm
 
     async def load(self, instance_id: str, *, manager: InstanceManager) -> InstanceState:
         return await manager.load(instance_id, packages_image=no_packages)
@@ -724,7 +732,7 @@ class InstanceEnv:
             got = (file_digest(state.vmstate), file_digest(state.home))
             assert got == (digest(expected[0]), digest(expected[1]))
         finally:
-            await manager.release(state)
+            await manager.release(state, wait=True)
         return state
 
     def work_files(self) -> set[Path]:
@@ -750,7 +758,7 @@ class Saver:
     async def save(self) -> InstanceState:
         """manager.save(); records the streams the guest had for the commit's byte check."""
         expected = self.vm.expected()
-        self.state = await self.manager.save(self.vm, self.state, new_instance_id=None)  # type: ignore[arg-type]
+        self.state = await self.manager.save(self.vm, self.state, new_instance_id=None, resumed=lambda: None)  # type: ignore[arg-type]
         self.env.saved[self.state.header.commit_id] = expected
         return self.state
 

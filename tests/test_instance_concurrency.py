@@ -10,18 +10,19 @@ import dataclasses
 import hashlib
 import io
 import logging
+import warnings
 from pathlib import Path
 
 import pytest
 
 from exec_sandbox import (
     ErrorCode,
+    InstanceNotSavedWarning,
     InstanceRef,
     Language,
     OutcomeUnknownError,
     Scheduler,
     Session,
-    SessionClosedError,
     VmSpec,
 )
 from tests.conftest import skip_unless_hwaccel
@@ -217,8 +218,10 @@ async def _reuse_all(scheduler: Scheduler, refs: list[InstanceRef], models: list
 
 @pytest.mark.timeout(300)
 async def test_fork_sequential(instance_world: InstanceWorld, primed_l1_dir: Path) -> None:
-    """A and B load generation 1; A saves generation 2; B's save then conflicts: B is closed,
-    its uploaded object and its local folder are gone, and the instance is A's state."""
+    """A and B load generation 1; A saves generation 2; B's save then conflicts: B stays open
+    and its VM runs on, its uploaded object is gone, close() gives no warning, and the instance
+    is A's state (the refused next save and the files of B: _assert_loser of the lifecycle
+    tests)."""
     world = instance_world
     async with world.scheduler(
         memory_snapshot_cache_dir=primed_l1_dir, warm_pool_size=0, disk_snapshot_cache_dir=None
@@ -248,18 +251,19 @@ async def test_fork_sequential(instance_world: InstanceWorld, primed_l1_dir: Pat
                 await b.save()
             assert exc.value.action == "VERIFY"
             assert exc.value.instance_id == ref.instance_id
-            assert b.closed
+            assert not b.closed
             assert b.instance == ref  # B never saved
-            with pytest.raises(SessionClosedError):
-                await b.exec("print(1)")
-            with pytest.raises(SessionClosedError):
+            assert (await b.exec("print(1)")).stdout == "1\n"
+            with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
                 await b.save()
-            with pytest.raises(SessionClosedError):
-                await b.write_file("state/after.bin", b"after")
-            with pytest.raises(SessionClosedError):
-                await b.read_file("state/note1.txt", destination=io.BytesIO())
-            with pytest.raises(SessionClosedError):
-                await b.list_files("state")
+            await b.write_file("state/after.bin", b"after")
+            buffer = io.BytesIO()
+            await b.read_file("state/after.bin", destination=buffer)
+            assert buffer.getvalue() == b"after"
+            assert "after.bin" in {f.name for f in await b.list_files("state")}
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", InstanceNotSavedWarning)
+                await b.close()  # another save won: no InstanceNotSavedWarning (no plain save of B can store)
 
             info = await scheduler.describe_instance(ref.instance_id)
             assert info.generation == 2

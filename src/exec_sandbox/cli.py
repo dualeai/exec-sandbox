@@ -579,8 +579,7 @@ _SPEC_OPTIONS: dict[str, tuple[str, str]] = {
 
 _ACTION_ADVICE: dict[ErrorAction, str] = {
     ErrorAction.RETRY: "Run the same command again later.",
-    ErrorAction.VERIFY: "Check before you run again: the code may have run, or the save may be "
-    "stored. For an instance, read the generation with 'sbx instance describe {id}'.",
+    ErrorAction.VERIFY: "Check before you run again: the code may have run, and the save may or may not be stored.",
     ErrorAction.RESTART: "Run the command again.",
     ErrorAction.FIX_INPUT: "Correct the command, then run again.",
     ErrorAction.FIX_CONFIG: "Correct the settings, then run again.",
@@ -825,7 +824,8 @@ def _report_error(error: SandboxError, *, saved: InstanceRef | None) -> int:
 
     One path for every error: its code and action, its message, its hint, the
     extra advice of its code (_CODE_ADVICE: install, prefetch, package allow-list,
-    boot timeout), then the advice of its action. After a run that saved (`saved`,
+    boot timeout), then the advice of its action (for INSTANCE_SAVE_OUTCOME_UNKNOWN, also
+    the commit to look for with 'sbx instance describe'). After a run that saved (`saved`,
     for a failed download) the action's advice gives way to a note: a new run
     starts from the saved state and runs the code again on it.
 
@@ -840,6 +840,11 @@ def _report_error(error: SandboxError, *, saved: InstanceRef | None) -> int:
         )
     else:
         suggestions.append(_ACTION_ADVICE[error.action].format(id=error.instance_id or "ID"))
+        if error.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN:  # its context names the commit (save_context)
+            suggestions.append(
+                f"The save is stored if 'sbx instance describe {error.instance_id}' lists commit "
+                f"{error.context['commit_id']}."
+            )
     click.echo(format_error(f"{error.code} ({error.action})", error.message, suggestions=suggestions), err=True)
     return _error_exit_code(action=error.action, code=error.code)
 

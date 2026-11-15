@@ -40,6 +40,7 @@ from exec_sandbox.instance.models import BLOCK_BYTES, ChainEntry, HeadBody
 from exec_sandbox.instance.pack import write_object
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import Applied, InstanceStore, NotApplied
+from exec_sandbox.models import InstanceRef
 from tests.instance_support import (
     BLOCK,
     BUDGET_KEYS,
@@ -485,7 +486,7 @@ class TestRollover:
             want = env.saved[state.header.commit_id]
             assert (file_digest(loaded.vmstate), file_digest(loaded.home)) == (digest(want[0]), digest(want[1]))
         finally:
-            await env.manager.release(loaded)
+            await env.manager.release(loaded, wait=True)
         assert env.proxy.entries("GET", _exact(old_pack), since=mark)[-1].status == 404
         assert env.proxy.count("GET", _exact(head_object(state.instance_id)), since=mark) == 2
 
@@ -1272,7 +1273,7 @@ class TestSupersededSave:
     async def test_next_save_after_a_superseded_commit_conflicts(self, env: InstanceEnv) -> None:
         """A's head write lands but its answer is lost, and B commits on top before A reads the
         head back: A's save is stored (generation 2), but A has no base left. A's next save is
-        refused before any upload (VERIFY), closes A, and leaves B's head."""
+        refused before any upload (VERIFY), A stays open, and B's head stays."""
         first = await _chain(env, packs=0, seed=191, manager=env.manager)
         iid = first.instance_id
         a_state = await env.load(iid, manager=env.manager)
@@ -1292,6 +1293,8 @@ class TestSupersededSave:
         _small_change(a_vm, 10)
         assert (await a.save()).generation == 2
         b_head = env.bucket.read(head_object(iid))
+        await env.manager.drain()
+        assert not a_state.folder.exists()  # a plain save keeps its folder: superseded at once, it goes
 
         _small_change(a_vm, 11)
         mark = len(env.proxy.log)
@@ -1304,9 +1307,46 @@ class TestSupersededSave:
         assert exc.value.context is not None
         assert exc.value.context["generation"] == 3  # the generation this save would have made
         assert ids.is_commit_id(exc.value.context["commit_id"])
-        assert a.closed
+        assert not a.closed
         assert env.proxy.count(("PUT", "MPU_CREATE", "PUT_IF"), since=mark) == 0
         assert env.bucket.read(head_object(iid)) == b_head
+        await a.close()
+
+    async def test_a_save_under_a_new_id_superseded_at_once_releases_its_files(self, env: InstanceEnv) -> None:
+        """save(instance_id=Y): Y's head lands but its answer is lost, and B commits Y@2 on top
+        before A reads the head back. A moves to Y (Y@1, with no base left), and A's local files of
+        Y and of X go at once (no later save reads them)."""
+        first = await _chain(env, packs=0, seed=193, manager=env.manager)
+        a_state = await env.load(first.instance_id, manager=env.manager)
+        a_vm = await env.vm_from(a_state)
+        a = fake_session(vm=a_vm, vm_manager=env.vm_manager, instances=env.manager, state=a_state, new_instance_id=None)
+        head = _exact(head_object("y-193"))
+        others: list[Saver] = []
+
+        async def b_commits_on_top(req: Request, resp: Response) -> None:
+            assert resp.status == 200  # A's head of Y landed
+            b = await _reuse(env, "y-193", manager=env.manager)
+            others.append(b)
+            _small_change(b.vm, 9)
+            assert (await b.save()).header.generation == 2
+
+        env.proxy.add("PUT_IF", head, After(b_commits_on_top))
+        env.proxy.add("PUT_IF", head, DropAfter())
+        _small_change(a_vm, 10)
+        assert (await a.save(instance_id="y-193")).generation == 1
+        assert a.instance == InstanceRef(instance_id="y-193", generation=1)
+        (b,) = others
+        for saver in (b, first):  # the files that the other session and the chain's own saver keep
+            assert saver.state is not None
+            await env.manager.release(saver.state, wait=True)
+        await env.manager.drain()
+        assert env.work_files() == set()  # A's files of Y and of X are gone
+        _small_change(a_vm, 11)
+        mark = len(env.proxy.log)
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
+            await a.save()  # no base left: B's Y@2 is on top of A's Y@1
+        assert env.proxy.count(("PUT", "MPU_CREATE", "PUT_IF"), since=mark) == 0
+        await a.close()
 
 
 class TestErrorsNameTheInstance:
