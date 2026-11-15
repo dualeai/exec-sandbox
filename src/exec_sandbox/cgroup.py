@@ -70,6 +70,10 @@ logger = get_logger(__name__)
 CGROUP_V2_BASE_PATH: Final[str] = "/sys/fs/cgroup"
 """Base path for cgroup v2 filesystem."""
 
+CGROUP_V1_BASE_PATH: Final[str] = "/sys/fs/cgroup"
+"""The cgroup v1 mount: a folder for each controller (memory/, cpu/), read for container limits
+where there is no cgroup v2."""
+
 CGROUP_APP_NAMESPACE: Final[str] = "code-exec"
 """Application cgroup namespace under /sys/fs/cgroup."""
 
@@ -148,35 +152,30 @@ def detect_cgroup_memory_limit_mb() -> float | None:
     Returns:
         Memory limit in MB, or None if no cgroup limit is set.
     """
-    # --- cgroup v2 ---
+    if (limit := _memory_limit()) is None:
+        return None
+    limit_bytes, path = limit
+    limit_mb = limit_bytes / (1024 * 1024)
+    logger.info("Detected cgroup memory limit", extra={"limit_mb": round(limit_mb), "path": str(path)})
+    return limit_mb
+
+
+def _memory_limit() -> tuple[int, Path] | None:
+    """The cgroup memory limit in bytes and the file that holds it: cgroup v2 ``memory.max``,
+    else cgroup v1 ``memory.limit_in_bytes``. None: no limit (v2 "max", v1 at its unlimited
+    value) or no file this process can read."""
     v2_path = Path(CGROUP_V2_BASE_PATH) / "memory.max"
     try:
-        raw = v2_path.read_text().strip()
-        if raw != "max":
-            limit_bytes = int(raw)
-            limit_mb = limit_bytes / (1024 * 1024)
-            logger.info(
-                "Detected cgroup v2 memory limit",
-                extra={"limit_mb": round(limit_mb), "path": str(v2_path)},
-            )
-            return limit_mb
+        if (raw := v2_path.read_text().strip()) != "max":
+            return int(raw), v2_path
     except (OSError, ValueError):
         pass
-
-    # --- cgroup v1 ---
-    v1_path = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    v1_path = Path(CGROUP_V1_BASE_PATH, "memory", "memory.limit_in_bytes")
     try:
-        limit_bytes = int(v1_path.read_text().strip())
-        if limit_bytes < _CGROUP_V1_UNLIMITED_THRESHOLD:
-            limit_mb = limit_bytes / (1024 * 1024)
-            logger.info(
-                "Detected cgroup v1 memory limit",
-                extra={"limit_mb": round(limit_mb), "path": str(v1_path)},
-            )
-            return limit_mb
+        if (limit := int(v1_path.read_text().strip())) < _CGROUP_V1_UNLIMITED_THRESHOLD:
+            return limit, v1_path
     except (OSError, ValueError):
         pass
-
     return None
 
 
@@ -208,10 +207,10 @@ def detect_cgroup_cpu_limit() -> float | None:
 
     # --- cgroup v1: cpu.cfs_quota_us / cpu.cfs_period_us ---
     try:
-        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text().strip())
+        quota = int(Path(CGROUP_V1_BASE_PATH, "cpu", "cpu.cfs_quota_us").read_text().strip())
         if quota == -1:
             return None  # unlimited
-        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text().strip())
+        period = int(Path(CGROUP_V1_BASE_PATH, "cpu", "cpu.cfs_period_us").read_text().strip())
         if period > 0:
             cpus = quota / period
             logger.info(
@@ -234,26 +233,15 @@ def read_container_available_memory_mb() -> float | None:
     Returns:
         Available memory in MB, or None if not in a cgroup.
     """
-    # --- cgroup v2 ---
+    if (limit := _memory_limit()) is None:
+        return None
+    limit_bytes, path = limit
+    usage_name = "memory.current" if path.name == "memory.max" else "memory.usage_in_bytes"  # v2, v1
     try:
-        max_raw = Path(CGROUP_V2_BASE_PATH, "memory.max").read_text().strip()
-        if max_raw != "max":
-            limit = int(max_raw)
-            current = int(Path(CGROUP_V2_BASE_PATH, "memory.current").read_text().strip())
-            return max(0, limit - current) / (1024 * 1024)
+        usage = int(path.with_name(usage_name).read_text().strip())
     except (OSError, ValueError):
-        pass
-
-    # --- cgroup v1 ---
-    try:
-        limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").read_text().strip())
-        if limit < _CGROUP_V1_UNLIMITED_THRESHOLD:
-            usage = int(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text().strip())
-            return max(0, limit - usage) / (1024 * 1024)
-    except (OSError, ValueError):
-        pass
-
-    return None
+        return None
+    return max(0, limit_bytes - usage) / (1024 * 1024)
 
 
 # =============================================================================
@@ -264,42 +252,22 @@ def read_container_available_memory_mb() -> float | None:
 @functools.cache
 def cgroup_v2_available() -> bool:
     """Whether the cgroup v2 filesystem is mounted and usable (cached; tests clear it with
-    cgroup_v2_available.cache_clear()).
-
-    Checks:
-    1. /sys/fs/cgroup exists and is a directory
-    2. cgroup.controllers file exists (cgroup v2 indicator; cgroup v1 has no such file at the root)
-    3. cgroup.controllers can be read (an empty list is logged, not refused)
+    cgroup_v2_available.cache_clear()): /sys/fs/cgroup/cgroup.controllers can be read (cgroup
+    v1 has no such file at the root; no folder, no file or no access: False). An empty list
+    is logged, not refused.
 
     Returns:
         True if cgroup v2 is mounted and usable, False otherwise
     """
-    cgroup_base = Path(CGROUP_V2_BASE_PATH)
-
-    # Check 1: Base path exists and is a directory
-    if not cgroup_base.is_dir():
-        logger.debug("cgroup v2 not available: /sys/fs/cgroup is not a directory")
-        return False
-
-    # Check 2: cgroup.controllers exists (cgroup v2 unified hierarchy indicator)
-    # In cgroup v1, this file doesn't exist at the root
-    controllers_file = cgroup_base / "cgroup.controllers"
-    if not controllers_file.exists():
-        logger.debug("cgroup v2 not available: cgroup.controllers not found (likely cgroup v1)")
-        return False
-
-    # Check 3: Verify we can read controllers (not a permission issue)
     try:
-        controllers = controllers_file.read_text().strip()
-        # Should contain at least some controllers like "cpu memory pids"
-        if not controllers:
-            logger.warning("cgroup v2 mounted but no controllers enabled")
-        else:
-            logger.debug(f"cgroup v2 available with controllers: {controllers}")
-    except OSError as e:  # PermissionError too
-        logger.debug(f"cgroup v2 not available: cannot read controllers: {e}")
+        controllers = (Path(CGROUP_V2_BASE_PATH) / "cgroup.controllers").read_text().strip()
+    except OSError as e:  # FileNotFoundError, NotADirectoryError, PermissionError
+        logger.debug(f"cgroup v2 not available: cannot read cgroup.controllers: {e}")
         return False
-
+    if not controllers:
+        logger.warning("cgroup v2 mounted but no controllers enabled")
+    else:
+        logger.debug(f"cgroup v2 available with controllers: {controllers}")
     return True
 
 
@@ -372,8 +340,9 @@ cgroup and make its own in its place."""
 
 def make_cgroup(path: Path, *, exist_ok: bool) -> None:
     """Make the cgroup folder `path`, and each missing one above it, with CGROUP_FOLDER_MODE
-    (mkdir's mode goes through the umask, which can only remove bits). A folder of this user
-    that is there already loses its group and other write bits. Blocking: a few mkdir calls.
+    (mkdir's mode goes through the umask, which can only remove bits). When `path` is there
+    already and belongs to this user, it loses its group and other write bits; folders above
+    it that are there already keep their mode. Blocking: a few mkdir calls.
 
     Raises:
         FileExistsError: `path` exists and not `exist_ok`
@@ -547,13 +516,18 @@ class Cgroup:
         peak_memory_mb: int | None = None
         nr_throttled: int | None = None
         try:
-            for line in (self.path / "cpu.stat").read_text().splitlines():
+            cpu_stat = (self.path / "cpu.stat").read_text().splitlines()
+        except (OSError, ValueError) as e:  # ValueError: bytes that are not UTF-8
+            cpu_stat = []
+            logger.debug(f"Failed to read cgroup cpu.stat: {e}", extra={"cgroup_path": str(self.path)})
+        for line in cpu_stat:  # each line on its own: a bad value loses only its stat
+            try:
                 if line.startswith("usage_usec"):
                     cpu_time_ms = int(line.split()[1]) // 1000
                 elif line.startswith("nr_throttled "):
                     nr_throttled = int(line.split()[1])
-        except (OSError, ValueError) as e:
-            logger.debug(f"Failed to read cgroup cpu.stat: {e}", extra={"cgroup_path": str(self.path)})
+            except (IndexError, ValueError) as e:
+                logger.debug(f"Bad cgroup cpu.stat line: {e}", extra={"cgroup_path": str(self.path)})
         try:  # memory.peak: Linux 5.19+
             peak_memory_mb = int((self.path / "memory.peak").read_text().strip()) // (1024 * 1024)
         except (OSError, ValueError) as e:
@@ -566,7 +540,7 @@ class Cgroup:
         lowers RSS with no kill (Meta's TMO, Transparent Memory Offloading: 20-32% fleet-wide
         memory saved). Without swap only file pages go: after a reclaim an idle Python pool VM
         kept 206 MiB, 10 MiB with swap and zswap. swappiness=200 needs Linux 6.9+; plain
-        reclaim (6.1+) before it.
+        reclaim (5.19+) before it.
 
         Returns:
             True if the reclaim was issued, False when it failed
@@ -768,7 +742,7 @@ def _reclaim(cgroup_path: Path, *, amount_bytes: int) -> bool:
             return False
 
     try:
-        # Fall back to plain reclaim (kernel 6.1+)
+        # Fall back to plain reclaim (kernel 5.19+)
         reclaim_file.write_text(str(amount_bytes))
         return True
     except OSError as e:

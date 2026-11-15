@@ -41,7 +41,7 @@ async def test_generations_exact(
         session = await scheduler.new(VmSpec(language=language))
         assert_origin(session, "l1")
         model = new_model(language, seed="generations")
-        await start_guest(session, model, ticker=True)
+        await start_guest(session, model)
         ref: InstanceRef | None = None
         try:
             for generation in range(1, generations + 1):
@@ -65,6 +65,6 @@ async def test_generations_exact(
             await session.close()
         assert ref is not None
         info = await scheduler.describe_instance(ref.instance_id)
-        assert (info.generation, info.verified) == (generations, True)
+        assert (info.generation, info.access) == (generations, "full")
         await reuse_and_check(scheduler, ref, model)
         assert world.instance_folders() == []

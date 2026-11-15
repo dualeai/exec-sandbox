@@ -4,15 +4,16 @@ Builds QEMU command arguments based on platform capabilities, acceleration type,
 and VM configuration.
 """
 
-import os
+import re
+from enum import StrEnum
 from pathlib import Path
+from typing import Final
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.images import GuestImages
-from exec_sandbox.models import ExposedPort
-from exec_sandbox.permission_utils import QEMU_VM_SUDO, get_qemu_vm_uid
+from exec_sandbox.permission_utils import QEMU_VM_SUDO
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_os, detect_host_x86_vendor
 from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import (
@@ -20,12 +21,11 @@ from exec_sandbox.system_probes import (
     detect_accel_type,
     probe_drive_direct_io,
     probe_io_uring_support,
-    probe_qemu_runnable,
-    probe_qemu_sandbox_support,
-    probe_qemu_version,
     probe_unshare_support,
     qemu_system_binary,
-    qemu_unrunnable_error,
+    require_qemu_machine_types,
+    require_qemu_sandbox_support,
+    require_qemu_version,
 )
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType
@@ -55,10 +55,10 @@ _X86_CPU_FLAGS = (
 _X86_KVM_PV_FLAGS = "+kvm-pv-ipi,+kvm-pv-tlb-flush,+kvm-pv-sched-yield,+kvm-poll-control,+kvm-asyncpf-int"
 
 
-def _qmp_monitor(chardev: str, *, qemu_version: tuple[int, int, int] | None) -> list[str]:
+def _qmp_monitor(chardev: str, *, qemu_version: tuple[int, int, int]) -> list[str]:
     """Arguments of a QMP monitor on `chardev`: the monitor-qmp object from QEMU 11.1, which
     deprecates `-mon` (a warning at each start), else `-mon`."""
-    if qemu_version is not None and qemu_version >= (11, 1, 0):
+    if qemu_version >= (11, 1, 0):
         return ["-object", f"monitor-qmp,id=mon-{chardev},chardev={chardev}"]
     return ["-mon", f"chardev={chardev},mode=control"]
 
@@ -72,6 +72,196 @@ def _x86_cpu(accel_type: AccelType, *, tsc_deadline: bool) -> str:
         parts.append("+tsc-deadline")
     parts += [f"vendor={detect_host_x86_vendor()}", "enforce"]
     return ",".join(parts)
+
+
+class Property(StrEnum):
+    """What a property of the QEMU command is to a saved VM's state (device_layout)."""
+
+    LAYOUT = "layout"
+    """What the guest sees and the saved state holds (a device, its slot, its role): a load
+    with another value loads silently wrong (a disk in another slot), so it must be equal."""
+    LOUD = "loud"
+    """Part of the migration stream: QEMU refuses a state saved with another value."""
+    SPEC = "spec"
+    """Set by the VmSpec (memory, vCPUs): the saved spec gives it."""
+    OWN_FACT = "own-fact"
+    """Checked as its own fact (HostFacts: accelerator, CPU model, machine type)."""
+    BOOT = "boot"
+    """Read at the cold boot only (kernel, initramfs, command line): a load boots nothing."""
+    HOST = "host"
+    """This host's (paths, sockets, caches, limits, sandbox): it may differ between workers."""
+
+
+_PROPERTY_CLASS: Final[dict[tuple[str, str, str], Property]] = {
+    # (option, driver, key): "*" matches any driver or key; key "" is the option itself.
+    # A key that build_qemu_cmd emits and this table lacks is LAYOUT (a false LAYOUT costs a
+    # ROUTE to another release; a missed one can load a disk into another slot). If not sure,
+    # choose LAYOUT.
+    ("-M", "*", ""): Property.LAYOUT,  # the board (its version is the machine type fact)
+    ("-M", "*", "memory-backend"): Property.LAYOUT,
+    ("-M", "*", "virtio-mmio-transports"): Property.LAYOUT,
+    ("-M", "*", "gic-version"): Property.LAYOUT,
+    ("-M", "*", "virtualization"): Property.LAYOUT,
+    ("-M", "*", "its"): Property.LAYOUT,
+    ("-M", "*", "highmem"): Property.LAYOUT,
+    ("-M", "*", "acpi"): Property.LAYOUT,
+    ("-M", "*", "isa-serial"): Property.LAYOUT,
+    ("-M", "*", "x-option-roms"): Property.LAYOUT,
+    ("-M", "*", "pit"): Property.OWN_FACT,  # pit/pic/rtc follow +tsc-deadline in the CPU model
+    ("-M", "*", "pic"): Property.OWN_FACT,
+    ("-M", "*", "rtc"): Property.OWN_FACT,
+    ("-M", "*", "dtb-randomness"): Property.BOOT,
+    ("-M", "*", "mem-merge"): Property.HOST,  # KSM: Linux only
+    ("-M", "*", "dump-guest-core"): Property.HOST,
+    ("-accel", "*", ""): Property.OWN_FACT,  # the accelerator fact
+    # Whose GIC: the loader's QEMU version picks it (QEMU's own on every version: 'hvf' below
+    # 11.1, 'hvf,kernel-irqchip=off' from 11.1), and the GIC state is in the stream
+    ("-accel", "*", "kernel-irqchip"): Property.LOUD,
+    ("-accel", "*", "tb-size"): Property.HOST,
+    ("-accel", "*", "thread"): Property.HOST,
+    ("-cpu", "*", "*"): Property.OWN_FACT,  # the CPU model fact
+    ("-m", "*", "*"): Property.SPEC,
+    ("-smp", "*", "*"): Property.SPEC,
+    ("-kernel", "*", "*"): Property.BOOT,
+    ("-initrd", "*", "*"): Property.BOOT,
+    ("-append", "*", "*"): Property.BOOT,
+    ("-object", "memory-backend", ""): Property.LAYOUT,  # RAM: its id names the block in the state
+    ("-object", "memory-backend", "id"): Property.LAYOUT,
+    ("-object", "*", "size"): Property.SPEC,
+    ("-object", "*", "mem-path"): Property.HOST,
+    ("-object", "*", "share"): Property.HOST,  # an L1 template saves shared, restores private
+    ("-object", "*", "readonly"): Property.HOST,  # how QEMU maps an L1 template's RAM file
+    ("-object", "*", "rom"): Property.HOST,
+    ("-object", "iothread", "*"): Property.HOST,
+    ("-object", "main-loop", "*"): Property.HOST,
+    ("-object", "monitor-qmp", "*"): Property.HOST,
+    ("-object", "rng-random", "*"): Property.HOST,
+    ("-device", "*", ""): Property.LAYOUT,  # each device, in slot order
+    ("-device", "virtio-blk-device", "drive"): Property.LAYOUT,  # which disk in which slot
+    ("-device", "virtio-blk-device", "serial"): Property.LAYOUT,  # the guest finds its disks by it
+    ("-device", "virtio-blk-device", "event_idx"): Property.LOUD,
+    ("-device", "virtio-blk-device", "num-queues"): Property.LOUD,
+    ("-device", "virtio-blk-device", "queue-size"): Property.LOUD,
+    ("-device", "virtio-blk-device", "iothread"): Property.HOST,
+    ("-device", "virtio-net-device", "netdev"): Property.HOST,
+    ("-device", "virtio-net-device", "*"): Property.LOUD,  # feature bits: in the stream
+    ("-device", "virtio-rng-device", "rng"): Property.HOST,
+    ("-device", "virtio-rng-device", "max-bytes"): Property.HOST,
+    ("-device", "virtio-rng-device", "period"): Property.HOST,
+    ("-device", "virtio-serial-device", "max_ports"): Property.LOUD,
+    ("-device", "virtserialport", "nr"): Property.LAYOUT,
+    ("-device", "virtserialport", "name"): Property.LAYOUT,  # the guest agent opens its ports by name
+    ("-device", "virtserialport", "chardev"): Property.HOST,
+    ("-device", "virtserialport", "id"): Property.HOST,
+    ("-device", "virtconsole", "nr"): Property.LAYOUT,
+    ("-device", "virtconsole", "chardev"): Property.HOST,
+    ("-drive", "", ""): Property.LAYOUT,
+    ("-drive", "", "id"): Property.LAYOUT,
+    ("-drive", "", "read-only"): Property.LAYOUT,  # the guest mounts the L2 layer read-only
+    ("-drive", "", "*"): Property.HOST,  # file, format, cache, aio, limits, error policy
+    **{
+        (option, "*", "*"): Property.HOST
+        for option in (
+            "-chardev",
+            "-netdev",
+            "-mon",
+            "-qmp",
+            "-sandbox",
+            "-run-with",
+            "-serial",
+            "-nic",
+            "-incoming",
+            "-nodefaults",
+            "-no-user-config",
+            "-nographic",
+            "-no-reboot",
+            "-name",
+            "-monitor",
+            "-display",
+        )
+    },
+}
+"""Class of each property of a QEMU command (Property), for device_layout."""
+
+
+def property_class(option: str, driver: str, key: str) -> Property | None:
+    """The class of a command property (_PROPERTY_CLASS, most specific row first; for the
+    option itself, key "", its own rows before a driver's "*" row); None: not in the table
+    (device_layout treats it as LAYOUT)."""
+    rows = (
+        ((option, driver, ""), (option, "*", ""), (option, driver, "*"), (option, "*", "*"))
+        if key == ""
+        else ((option, driver, key), (option, driver, "*"), (option, "*", key), (option, "*", "*"))
+    )
+    for row in rows:
+        if (found := _PROPERTY_CLASS.get(row)) is not None:
+            return found
+    return None
+
+
+def command_properties(cmd: list[str], *, binary: str) -> list[tuple[str, str, list[tuple[str, str]]]]:
+    """The options of a QEMU command after `binary`, the QEMU it runs (qemu_system_binary: a
+    prefix such as unshare, sudo or stdbuf is skipped, whatever the binary's name), each as
+    (option, driver, [(key, value)]): `-device virtio-blk-device,drive=hd0` is
+    ("-device", "virtio-blk-device", [("drive", "hd0")]). A versioned machine type is its
+    family (virt-11.1: virt): its version is the machine type fact. A RAM backend is
+    "memory-backend" (ram or file: the state holds its pages, not its kind)."""
+    start = cmd.index(binary) + 1
+    found: list[tuple[str, str, list[tuple[str, str]]]] = []
+    args = cmd[start:]
+    n = 0
+    while n < len(args):
+        option = args[n]
+        value = args[n + 1] if n + 1 < len(args) and not args[n + 1].startswith("-") else None
+        n += 2 if value is not None else 1
+        parts = value.split(",") if value is not None else []
+        driver = parts[0] if parts and "=" not in parts[0] else ""
+        pairs = [tuple(part.split("=", 1)) if "=" in part else (part, "") for part in parts[1 if driver else 0 :]]
+        if option == "-M":
+            driver = re.sub(r"-\d+\.\d+$", "", driver)
+        elif option == "-object" and driver.startswith("memory-backend-"):  # ram or file (an L1 template)
+            driver = "memory-backend"
+        found.append((option, driver, [(key, value) for key, value in pairs]))
+    return found
+
+
+def device_layout(cmd: list[str], *, binary: str) -> str:
+    """The guest-visible device layout of a QEMU command: one line for each option that is
+    LAYOUT or has a LAYOUT property, in command order (the slot order of its devices), with
+    its LAYOUT properties: "option driver key=value ...". Equal texts load each other's
+    state; another text loads silently wrong or not at all.
+
+    A last line holds the migration capabilities that every save and load sets
+    (constants.MIGRATION_CAPABILITIES): QEMU refuses a state saved with other ones, so a
+    release that changes them fails the comparison before any download."""
+    lines: list[str] = []
+    for option, driver, pairs in command_properties(cmd, binary=binary):
+        kept = [
+            f"{key}={value}" for key, value in pairs if property_class(option, driver, key) in (Property.LAYOUT, None)
+        ]
+        if kept or property_class(option, driver, "") in (Property.LAYOUT, None):
+            lines.append(" ".join(part for part in (option, driver, *kept) if part))
+    lines.append(f"migrate capabilities={','.join(constants.MIGRATION_CAPABILITIES)}")
+    return "\n".join(lines)
+
+
+def base_machine_type(arch: HostArch) -> str:
+    """The machine type a new VM starts with: the alias of the newest versioned virt board
+    on arm64, microvm (not versioned) on x86."""
+    return "virt" if arch == HostArch.AARCH64 else "microvm"
+
+
+async def resolve_machine_type(arch: HostArch, machine_type: str | None) -> str | None:
+    """The machine type a VM runs, as QEMU resolves it: `machine_type` (a saved instance's,
+    already resolved) or the alias of base_machine_type through the machine type probe.
+    None: this QEMU has no such type.
+
+    Raises:
+        ConfigError: HOST_DEPENDENCY: the probe found no machine type (require_qemu_machine_types)
+        TransientError: QEMU_CRASHED: the probe gave no answer this time (a limit, the binary
+            being written, a signal, no answer in time: require_qemu_machine_types)
+    """
+    return (await require_qemu_machine_types()).get(machine_type or base_machine_type(arch))
 
 
 async def guest_cpu_model(arch: HostArch, accel_type: AccelType) -> str:
@@ -106,8 +296,8 @@ async def guest_cpu_model(arch: HostArch, accel_type: AccelType) -> str:
     See: https://gitlab.com/qemu-project/qemu/-/issues/844
     """
     if arch == HostArch.X86_64:
-        # TCG never provides TSC_DEADLINE; KVM/HVF may lack it in nested VMs
-        tsc_deadline = accel_type in (AccelType.KVM, AccelType.HVF) and await check_tsc_deadline()
+        # TCG and HVF never provide TSC_DEADLINE (check_tsc_deadline); KVM may lack it in nested VMs
+        tsc_deadline = accel_type is AccelType.KVM and await check_tsc_deadline()
         return _x86_cpu(accel_type, tsc_deadline=tsc_deadline)
     return "host" if accel_type in (AccelType.HVF, AccelType.KVM) else "neoverse-v1,pauth=off"
 
@@ -119,7 +309,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     workdir: VmWorkingDirectory,
     spec: VmSpec,
     *,
-    expose_ports: list[ExposedPort] | None,
     direct_write: bool,
     debug_boot: bool,
     snapshot_drive: str | None,
@@ -128,6 +317,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     guest_port_fds: tuple[int, int] | None,
     mem_path: str | None,
     mem_path_share: bool,
+    machine_type: str | None,
 ) -> list[str]:
     """Build QEMU command for microVM execution.
 
@@ -136,12 +326,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         arch: Host CPU architecture
         vm_id: Unique VM identifier
         workdir: VM working directory: overlay, socket and home disk paths
-        spec: Creation settings (memory, vCPUs, network access, ...)
-        expose_ports: Ports to expose from guest to host, host ports resolved.
-            When set without allow_network, uses gvproxy with
-            BlockAllOutbound (Mode 1). When set with allow_network, uses gvproxy
-            with outbound filtering (Mode 2). In both modes gvproxy sets up the
-            forwards at its start (-port-forward).
+        spec: Creation settings (memory, vCPUs, network access, ...). Its network device
+            (spec.has_network_device: allow_network or expose_ports) connects to gvproxy,
+            which sets up the port forwards at its start (Modes 1-2 below)
         direct_write: Mount rootfs read-write (for snapshot creation).
         debug_boot: Enable verbose kernel/init boot logging. When True,
             sets loglevel=7, printk.devkmsg=on, init.quiet=0 for full
@@ -168,15 +355,22 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         mem_path_share: When True, memory-backend-file uses share=on (template
             save). When False, uses share=off,readonly=on,rom=off (clone restore,
             MAP_PRIVATE COW). Only meaningful when mem_path is set.
+        machine_type: The machine type of a saved instance (HostFacts.machine_type, as QEMU
+            resolved it at its first boot: virt-11.1, microvm), for its restore: the
+            properties of that versioned type keep the saved device ABI on a newer QEMU.
+            None: the newest one ("virt" or "microvm"), for a new VM and an L1 restore
+            (the L1 key holds the QEMU version).
 
     Returns:
         QEMU command as list of strings
 
     Raises:
-        ConfigError: HOST_DEPENDENCY: this host cannot run the QEMU binary
-            (probe_qemu_runnable), or ARM64 TCG with a QEMU below 9.0.4
-        TransientError: QEMU_CRASHED: the QEMU probe exec hit a process, memory or
-            file-handle limit (qemu_unrunnable_error)
+        ConfigError: HOST_DEPENDENCY: this host cannot run the QEMU binary, or its version
+            or accelerators cannot be read (require_qemu_version, detect_accel_type,
+            require_qemu_sandbox_support), or ARM64 TCG with a QEMU below 9.0.4
+        TransientError: QEMU_CRASHED: a QEMU probe hit a process, memory or file-handle
+            limit, the binary was being written, a signal ended it, or it gave no answer in
+            time (require_qemu_version, detect_accel_type, require_qemu_sandbox_support)
     """
     # Determine QEMU binary, machine type, and kernel based on architecture
     is_macos = detect_host_os() == HostOS.MACOS
@@ -185,14 +379,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     accel_type = await detect_accel_type(force_emulation=settings.force_emulation)
 
     # QEMU version gates several flags below (machine props, netdev reconnect,
-    # -run-with). Probe once up front; the result is cached in system_probes.
-    qemu_version = await probe_qemu_version()
-    if (unrunnable := await probe_qemu_runnable()) is not None:  # also without VmManager.start
-        raise qemu_unrunnable_error(unrunnable) from unrunnable[1]
-    logger.info(
-        "Hardware acceleration detection",
-        extra={"vm_id": vm_id, "accel_type": accel_type.value, "is_macos": is_macos},
-    )
+    # -run-with). Probe once up front; the result is cached in system_probes. A binary this
+    # host cannot run gets its own error (also without VmManager.start).
+    qemu_version = await require_qemu_version()
 
     # Build accelerator string for QEMU
     if accel_type == AccelType.HVF:
@@ -204,7 +393,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # or more (6 of 6 trials of a stop loop; 0 in 12000 stops with QEMU's GIC, the only
         # mode before 11.1). Cost per idle VM: about 25 context switches/s against 10-16 with
         # Apple's GIC (the guest's timer interrupts exit to QEMU); no exec latency change.
-        own_gic = arch == HostArch.AARCH64 and qemu_version is not None and qemu_version >= (11, 1, 0)
+        own_gic = arch == HostArch.AARCH64 and qemu_version >= (11, 1, 0)
         accel = "hvf,kernel-irqchip=off" if own_gic else "hvf"
     elif accel_type == AccelType.KVM:
         accel = "kvm"
@@ -215,8 +404,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # "virtualization use case" isolation guarantee only to microvm (x86) /
         # virt (aarch64) *with* a hardware accelerator (KVM/HVF). The TCG path is
         # explicitly NOT security-supported ("must not rely on QEMU for
-        # isolation"). It is a functional fallback for CI / trusted workloads
-        # only; prod isolation always runs on KVM or HVF.
+        # isolation"). It is a functional fallback. The library does not refuse it:
+        # detect_accel_type picks TCG when the host has no KVM or HVF (or with
+        # force_emulation), and VmManager.start logs a warning.
         # See: https://qemu-project.gitlab.io/qemu/system/security.html
         #
         # thread: multi (MTTCG: one host thread per vCPU) when the VM has more than one
@@ -231,10 +421,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         accel = (
             f"tcg,thread={'multi' if spec.cpu_cores > 1 else 'single'},tb-size={constants.DEFAULT_TCG_TB_CACHE_SIZE_MB}"
         )
-        logger.warning(
-            "Using TCG software emulation (slow) - KVM/HVF not available",
-            extra={"vm_id": vm_id, "accel": accel},
-        )
 
         # ARM64 TCG: QEMU < 9.0.4 has a deterministic crash in regime_is_user()
         # (target/arm/internals.h). The E10 mmuidx (normal EL1&0 translation regime)
@@ -242,7 +428,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # crashing every ARM64 kernel↔userspace transition. Fixed upstream in
         # commit 1505b651fdbd (Peter Maydell). Not backported to Ubuntu 24.04's
         # QEMU 8.2.2. Retries are pointless — the crash is deterministic.
-        if arch == HostArch.AARCH64 and qemu_version is not None and qemu_version < (9, 0, 4):
+        if arch == HostArch.AARCH64 and qemu_version < (9, 0, 4):
             version_str = ".".join(str(v) for v in qemu_version)
             raise ConfigError(
                 f"QEMU {version_str} has a deterministic ARM64 TCG crash in "
@@ -275,10 +461,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         #   boot and the DTB is smaller. Keep >= the live device count or QEMU aborts.
         #   Machine property added in QEMU 11.0 — gated to avoid aborting older
         #   local installs. See docs/system/arm/virt.rst.
-        mmio_transports = ",virtio-mmio-transports=8" if qemu_version is not None and qemu_version >= (11, 0, 0) else ""
-        machine_type = (
-            f"virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge={mem_merge}{mmio_transports}"
-            + ("" if is_macos else ",dump-guest-core=off")
+        mmio_transports = ",virtio-mmio-transports=8" if qemu_version >= (11, 0, 0) else ""
+        machine = (
+            f"{machine_type or base_machine_type(arch)},virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,"
+            f"mem-merge={mem_merge}{mmio_transports}" + ("" if is_macos else ",dump-guest-core=off")
         )
     else:
         # Machine type: microvm for all acceleration modes (KVM, HVF, TCG).
@@ -291,29 +477,19 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # pit=off and pic=off require TSC_DEADLINE CPU feature (LAPIC timer
         # replaces PIT as the timer source). Without TSC_DEADLINE, PIT/PIC
         # must remain enabled or the kernel hangs (no timer/interrupt source).
-        # TCG never provides TSC_DEADLINE; KVM/HVF may lack it in nested VMs.
-        if accel_type in (AccelType.KVM, AccelType.HVF):
+        # TCG and HVF never provide TSC_DEADLINE (check_tsc_deadline); KVM may lack it in nested VMs.
+        if accel_type is AccelType.KVM:
             tsc_available = await check_tsc_deadline()
-            if not tsc_available:
-                logger.info(
-                    "TSC_DEADLINE not available, keeping legacy timer devices (PIT/PIC/RTC)",
-                    extra={"vm_id": vm_id},
-                )
-        else:
-            logger.info(
-                "Using microvm with TCG emulation (hardware virtualization not available)",
-                extra={"vm_id": vm_id, "accel": accel},
-            )
 
-        # Build machine_type from components
-        parts = ["microvm", "acpi=off", "x-option-roms=off"]
+        # Build the -M value from components
+        parts = [machine_type or base_machine_type(arch), "acpi=off", "x-option-roms=off"]
         if tsc_available:
             parts.extend(["pit=off", "pic=off", "rtc=off"])
         # mem-merge: KSM page dedup (Linux only; macOS HVF does not support it)
         parts.extend(["isa-serial=off", f"mem-merge={'off' if is_macos else 'on'}"])
         if not is_macos:
             parts.append("dump-guest-core=off")
-        machine_type = ",".join(parts)
+        machine = ",".join(parts)
 
     # The configured QEMU path when it exists (e.g. CI build-from-source), else the bare
     # name from PATH: the binary the version and accelerator probes ran.
@@ -340,23 +516,22 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             f"memory-backend-file,id=mem0,size={spec.memory_mb}M,mem-path={mem_path},share=off,readonly=on,rom=off"
         )
     mem_backend_args = ["-object", backend_opts]
-    machine_type += ",memory-backend=mem0"
+    machine += ",memory-backend=mem0"
 
     # Auto-discover kernel and initramfs based on architecture
-    # Note: existence validated by validate_kernel_initramfs (VmManager.start, and
-    # VmManager._setup_vm_infra at each create and restore)
+    # Note: existence validated by validate_kernel_initramfs (VmManager.start)
     # Prefer uncompressed vmlinux for PVH direct boot (x86_64 only, ~50ms faster)
     # QEMU auto-detects PVH ELF note and skips kernel decompression
     images = GuestImages.from_settings(settings, arch=arch)
     kernel_path, initramfs_path = images.kernel, images.initramfs
 
     # Layer 5: Linux namespaces (optional - requires root or CAP_SYS_ADMIN: probe_unshare_support)
-    # QEMU always gets its own network namespace, also with network access: QEMU
+    # When this layer runs, QEMU gets its own network namespace in every network mode: QEMU
     # needs no host network. Guest traffic goes through gvproxy over a filesystem
     # Unix socket, which a namespace does not cut. QEMU itself then reaches no
     # host network.
     cmd: list[str] = []
-    if detect_host_os() != HostOS.MACOS and await probe_unshare_support():
+    if not is_macos and await probe_unshare_support():
         # --kill-child (this-user path only): QEMU, pid 1 of the new namespace (so every process
         # in it), gets SIGKILL when unshare ends; unshare ends with this process
         # (start_managed_process, end_with_this_process). On the qemu-vm path pid 1 is sudo: the exec of a
@@ -365,7 +540,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Build QEMU command arguments
     # Determine if we're using microvm (requires -nodefaults to avoid BIOS fallback)
-    is_microvm = "microvm" in machine_type
+    is_microvm = "microvm" in machine
 
     # Virtio transport: always MMIO (the virtio-*-device models). Both microvm (x86) and
     # virt (ARM64) use virtio-mmio. The kernel has CONFIG_VIRTIO_MMIO=y built-in
@@ -403,7 +578,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             await guest_cpu_model(arch, accel_type),
             *mem_backend_args,  # -object memory-backend-{ram,file},id=mem0
             "-M",
-            machine_type,
+            machine,
             "-no-reboot",
             "-m",
             f"{spec.memory_mb}M",
@@ -436,8 +611,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # disables anonymous 2MB hugepages (no khugepaged, no compaction stalls).
             # File-backed large folios work regardless of this sysfs setting.
             # NOTE (non-adoption): keeping anon THP off is deliberate for density —
-            # 2MB hugepages defeat free-page-reporting and KSM (both 4KB-granular)
-            # and add compaction stalls; enabling them would hurt host-RAM-per-VM.
+            # 2MB hugepages defeat KSM (4KB-granular) and add compaction stalls;
+            # enabling them would hurt host-RAM-per-VM.
             + " transparent_hugepage=never"
             # Boot verbosity: debug_boot enables full kernel/init logging for diagnostics
             # Note: loglevel=7 overrides loglevel=1 set in console_params (kernel uses last occurrence)
@@ -565,7 +740,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Layer 3: Seccomp sandbox — requires CONFIG_SECCOMP at QEMU compile time.
     # Probe rather than assume: some runners (e.g. CodSpeed macro) may resolve
     # a system QEMU built without --enable-seccomp.
-    if await probe_qemu_sandbox_support():
+    if await require_qemu_sandbox_support():
         qemu_args.extend(
             [
                 "-sandbox",
@@ -727,7 +902,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # write errors still go to the guest). The guest never gets the error (no
     # EIO, no ext4 error), and BLOCK_IO_ERROR carries nospace=true only for a
     # drive with this policy (with werror=report QEMU leaves it out). QemuVM's
-    # event watch then fails the calls at once (TransientError LOCAL_DISK).
+    # event watch then fails the calls at once: a call already sent raises
+    # OutcomeUnknownError, a later one TransientError LOCAL_DISK.
     qemu_args.extend(
         [
             "-drive",
@@ -870,19 +1046,20 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     #   - Port forwarding handled by gvproxy at startup
     #
     # Mode 2: Port forwarding with internet (expose_ports + allow_network)
-    #   - Uses gvproxy with OutboundAllow filtering (DNS + TLS)
+    #   - Uses gvproxy; outbound DNS and TLS go through OutboundAllow filtering when
+    #     dns_filter.resolved_domains gives domains; an empty list (allowed_domains=(), or
+    #     raw with None) allows all outbound
     #   - Port forwarding handled by gvproxy at startup
     #
     # Mode 3: Internet only (allow_network, no expose_ports)
-    #   - Standard gvproxy configuration with OutboundAllow filtering
+    #   - gvproxy as in Mode 2, without port forwards
     #
     # =============================================================
 
     # NOTE (non-adoption): the in-tree passt netdev (QEMU 10.1) is not used. It
     # lacks gvproxy's outbound filtering (allowed domains, outbound block) that
     # Modes 1-3 above depend on, so it is not a drop-in replacement.
-    needs_network = spec.allow_network or bool(expose_ports)
-    if needs_network:
+    if spec.has_network_device:
         # All modes use socket networking to gvproxy (fast ~300ms boot)
         # Build netdev options with reconnect for socket resilience
         # Helps recover from transient gvproxy disconnections (DNS failures, socket EOF)
@@ -891,26 +1068,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # Add reconnect parameter (version-dependent)
         # - QEMU 9.2+: reconnect-ms (milliseconds), reconnect removed in 10.0
         # - QEMU 8.0-9.1: reconnect (seconds), minimum 1s
-        if qemu_version is not None and qemu_version >= (9, 2, 0):
+        if qemu_version >= (9, 2, 0):
             netdev_opts += ",reconnect-ms=250"  # 250ms - balanced recovery
-        elif qemu_version is not None and qemu_version >= (8, 0, 0):
+        elif qemu_version >= (8, 0, 0):
             netdev_opts += ",reconnect=1"  # 1s minimum (integer-only param)
-
-        mode_desc = (
-            "Mode 1 (port-forward only, no internet)"
-            if expose_ports and not spec.allow_network
-            else "Mode 2 (port-forward + internet)"
-            if expose_ports and spec.allow_network
-            else "Mode 3 (internet only)"
-        )
-        logger.info(
-            f"Configuring socket networking via gvproxy ({mode_desc})",
-            extra={
-                "vm_id": vm_id,
-                "expose_ports": [(p.internal, p.external) for p in expose_ports] if expose_ports else None,
-                "allow_network": spec.allow_network,
-            },
-        )
 
         qemu_args.extend(
             [
@@ -939,8 +1100,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     #      bind()/listen() and uses the inherited fd directly. This eliminates
     #      the TOCTOU race between wait_for_socket() probe-close and
     #      MigrationClient's real connect on single-client QMP chardev.
-    #      The -qmp shorthand does NOT support fd= — must use the explicit
-    #      -chardev + -mon pair (same as libvirt since QEMU 2.12).
+    #      The -qmp shorthand does NOT support fd=: the explicit -chardev and a QMP
+    #      monitor on it are used (_qmp_monitor: -object monitor-qmp from QEMU 11.1, else
+    #      -mon, as libvirt does since QEMU 2.12).
     #      Refs:
     #        - QEMU chardev fd= support: chardev/char-socket.c tcp_chr_new_server()
     #        - libvirt fd-passing: https://libvirt.org/news.html (2018, QEMU 2.12)
@@ -964,7 +1126,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Event-only QMP monitor: QemuVM.start_event_watch keeps one connection for the
     # VM's life (BLOCK_IO_ERROR, VSERPORT_CHANGE, SHUTDOWN). The monitor above serves
     # one client at a time, and saves and diagnostics need it. QEMU makes the socket
-    # (as qemu-vm through sudo).
+    # (as qemu-vm when sudo starts it).
     qemu_args.extend(
         [
             "-chardev",
@@ -993,8 +1155,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # NOTE (non-adoption): -run-with chroot=/user= are not used. Both require a
     # privileged launcher (QEMU starts root, then drops), which conflicts with our
     # unprivileged model — sudo -u qemu-vm + fd-passing (socket-activated QMP).
-    # Filesystem confinement is already provided by `unshare --mount` on Linux.
-    if qemu_version is not None and qemu_version >= (10, 2, 0):
+    # unshare --mount (Linux, when probe_unshare_support passes) gives QEMU a private copy of
+    # the host mounts; it does not limit which files QEMU can open: file access follows the
+    # uid QEMU runs as (see the TODO (security) below).
+    if qemu_version >= (10, 2, 0):
         run_with_opts = "exit-with-parent=on"
         if not is_macos:
             run_with_opts += ",async-teardown=on"
@@ -1017,25 +1181,18 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # - Passing each disk as an fd (-add-fd) would remove the path access, but sudo
     #   >= 1.9.14 closes inherited fds (below), so it needs another launcher.
     # Options to evaluate: per-VM SELinux/AppArmor labels, a per-VM uid pool (jailer).
-    if workdir.use_qemu_vm_user:
-        # Skip sudo when already running as qemu-vm user. This enables fd
-        # inheritance (socket activation) which sudo >= 1.9.14 blocks via its
-        # closefrom security policy (closes all fds >= 3 before exec).
-        # See: https://www.sudo.ws/docs/man/sudo.man/
-        qemu_vm_uid = get_qemu_vm_uid()
-        if qemu_vm_uid is None or os.getuid() != qemu_vm_uid:
-            # QEMU_VM_SUDO: sudo -n -u qemu-vm, then a fixed sh script that sets umask 007
-            # and execs the command ("$@": no shell parsing of any argument, no injection).
-            # The chardev and QMP sockets QEMU makes are then 0770, group qemu-vm: the
-            # host (in group qemu-vm, checked by the probe) can connect, other users
-            # cannot. The umask is set after sudo, because sudo-rs ORs the caller's umask
-            # with 022 (no group write) and classic sudo lets PAM pam_umask set it.
-            # stdbuf -oL forces line-buffered stdout to ensure console output is captured
-            # immediately rather than being block-buffered (which happens with piped stdout).
-            # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security.
-            cmd.extend([*QEMU_VM_SUDO, "stdbuf", "-oL", *qemu_args])
-            return cmd
-        # Already running as qemu-vm — no sudo needed, fall through to direct exec
+    if workdir.use_qemu_vm_user:  # always from another user (probe_qemu_as_qemu_vm): sudo
+        # QEMU_VM_SUDO: sudo -n -u qemu-vm, then a fixed sh script that sets umask 007
+        # and execs the command ("$@": no shell parsing of any argument, no injection).
+        # The chardev and QMP sockets QEMU makes are then 0770, group qemu-vm: the
+        # host (in group qemu-vm, checked by the probe) can connect, other users
+        # cannot. The umask is set after sudo, because sudo-rs ORs the caller's umask
+        # with 022 (no group write) and classic sudo lets PAM pam_umask set it.
+        # stdbuf -oL forces line-buffered stdout to ensure console output is captured
+        # immediately rather than being block-buffered (which happens with piped stdout).
+        # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security.
+        cmd.extend([*QEMU_VM_SUDO, "stdbuf", "-oL", *qemu_args])
+        return cmd
 
     cmd.extend(qemu_args)
 

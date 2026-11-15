@@ -44,8 +44,9 @@ from typing import TYPE_CHECKING, Self
 from pydantic import ValidationError
 
 from exec_sandbox import constants
-from exec_sandbox._imports import require_instance_manager
+from exec_sandbox._imports import require_instance_admin, require_instance_manager
 from exec_sandbox._logging import get_logger
+from exec_sandbox._version import __version__
 from exec_sandbox.aio_utils import gather_or_cancel, settle_and_report
 from exec_sandbox.assets import ensure_assets, ensure_base_image, images_download_dir
 from exec_sandbox.config import MAX_SESSION_IDLE_TIMEOUT_SECONDS, MIN_SESSION_IDLE_TIMEOUT_SECONDS, SchedulerConfig
@@ -55,17 +56,19 @@ from exec_sandbox.exceptions import (
     ErrorCode,
     InternalError,
     InvalidInputError,
+    RouteKey,
+    SandboxError,
     TransientError,
-    host_mismatch,
+    named_instance,
     no_instance_store,
 )
 from exec_sandbox.files.locks import EntryLease  # noqa: TC001 - Used at runtime
-from exec_sandbox.images import kernel_dir_of
+from exec_sandbox.images import image_digest, kernel_dir_of
 from exec_sandbox.instance.ids import check_instance_id
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
-from exec_sandbox.migration_client import rejected_by_qemu
+from exec_sandbox.migration_client import qemu_refusal
 from exec_sandbox.models import ExposedPort, Language, StartupTiming
-from exec_sandbox.package_validator import PackageValidator
+from exec_sandbox.package_validator import BUNDLED_NPM_ALLOW_LIST, BUNDLED_PYPI_ALLOW_LIST, PackageValidator
 from exec_sandbox.platform_utils import detect_host_arch
 from exec_sandbox.port_forward import resolve_port_mappings
 from exec_sandbox.session import Session
@@ -73,6 +76,7 @@ from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import (
     raise_fd_limit,
     raise_nproc_limit,
+    require_qemu_machine_types,
     warn_cgroup_pids_limit,
     warn_damon,
     warn_max_map_count,
@@ -82,11 +86,12 @@ from exec_sandbox.system_probes import (
 )
 from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.warm_vm_pool import WarmVMPool
+from exec_sandbox.worker_facts import WorkerFacts, machine_facts, qemu_version_fact
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from exec_sandbox.instance.manager import InstanceManager, InstanceState
+    from exec_sandbox.instance.manager import InstanceAdmin, InstanceManager, InstanceState
     from exec_sandbox.instance.models import InstanceInfo
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.vm_spec import VmSpec
@@ -126,6 +131,8 @@ class Scheduler:
         wait_pool_ready(): wait until the warm pool is full.
         describe_instance(instance_id), list_instances(),
             delete_instance(instance_id): read and delete saved instances.
+        check_reuse(instance_id): what reuse() checks, with no download and no VM.
+        describe_worker(): this worker's facts, for a broker.
 
     Use one Scheduler per process: each Scheduler counts only its own VMs for
     admission. Run calls at the same time with asyncio.
@@ -153,19 +160,37 @@ class Scheduler:
         self._starting = False
         self._shutdown_task: asyncio.Task[None] | None = None
 
+    @property
+    def _vms(self) -> VmManager:
+        """The VM manager of a started scheduler (InternalError before: a bug)."""
+        if self._vm_manager is None:
+            raise _internal(_NOT_INITIALIZED)
+        return self._vm_manager
+
+    @property
+    def _snapshots(self) -> DiskSnapshotManager:
+        """The L2 snapshot manager of a started scheduler (InternalError before: a bug)."""
+        if self._snapshot_manager is None:
+            raise _internal(_NOT_INITIALIZED)
+        return self._snapshot_manager
+
     async def __aenter__(self) -> Self:
         """Start the Scheduler.
 
         Checks the host (open files, processes; warns about unsafe kernel settings)
-        and QEMU; downloads missing VM images from GitHub Releases (unless
-        auto_download_assets=False); opens the instance store (with instance_store:
+        and QEMU; downloads the missing kernel and initramfs from GitHub Releases (unless
+        auto_download_assets=False), and the base images of a warm pool (a base image
+        otherwise downloads at the first new() of its language); opens the instance store (with instance_store:
         keyring, settings, QEMU version, store check) and the snapshot caches; starts
         the warm pool (wait_pool_ready() waits until it is full).
 
         Raises:
             TransientError: ASSET_DOWNLOAD (a VM image download failed),
                 INSTANCE_STORE_UNAVAILABLE (the instance store check got no answer),
-                LOCAL_DISK (a host error on a cache folder: disk full, I/O error)
+                LOCAL_DISK (a host error on a cache folder or the home disk folder: disk full, I/O
+                error),
+                QEMU_CRASHED (a QEMU probe hit a process, memory or file-handle limit, or
+                gave no answer in time), OVERLAY_FAILED (qemu-storage-daemon did not start)
             InvalidInputError: SCHEDULER_STATE: already started, still starting, or still
                 shutting down
             ConfigError: ASSET_NOT_FOUND (a VM image is missing and was not downloaded),
@@ -174,7 +199,7 @@ class Scheduler:
                 (instance_store set and QEMU below 11.0), HOST_DEPENDENCY,
                 SETTING_INVALID (an EXEC_SANDBOX_* variable is not valid: the message names it, never
                 its value; EXEC_SANDBOX_HOME_DISK_DIR is not a folder of this user that only it can write;
-                or a cache folder cannot be made or written: disk_snapshot_cache_dir,
+                or a cache folder cannot be made or written: instance_asset_dir, disk_snapshot_cache_dir,
                 memory_snapshot_cache_dir, or the download cache under EXEC_SANDBOX_CACHE_DIR)
         """
         if self._started:
@@ -265,6 +290,8 @@ class Scheduler:
             # Admission evicts L2 and L1 entries before a VM waits for home disk space
             self._vm_manager.add_cache(self._snapshot_manager)
             self._vm_manager.add_cache(self._memory_snapshot_manager)
+            if self._instances is not None:  # images that loads fetched from the instance store
+                self._vm_manager.add_cache(self._instances.assets)
 
             # Initialize WarmVMPool (optional)
             if self.config.warm_pool_size > 0:
@@ -316,7 +343,7 @@ class Scheduler:
         4. Wait for instance saves in flight (InstanceManager.stop: new ones are refused)
         5. Stop VmManager: refuses new launches, waits for those in flight (new() and
            reuse() calls), then destroys the remaining VMs (sessions not closed) and
-           cleans up the overlay pool
+           stops the overlay daemon
         6. Close the instance store (after every VM that could save is gone)
 
         IMPORTANT: WarmVMPool must stop BEFORE MemorySnapshotManager. Background
@@ -342,24 +369,13 @@ class Scheduler:
         # Stop WarmVMPool (drains VMs, frees resource slots for background saves)
         if warm_pool:
             logger.info("Draining warm VM pool, this may take a moment")
-            try:
-                await warm_pool.stop()
-            except (OSError, RuntimeError, TimeoutError) as e:
-                logger.error("WarmVMPool stop error", extra={"error": str(e)})
-            except BaseException as e:  # noqa: BLE001 - core VM cleanup must still run
-                deferred_error = e
-                logger.error("WarmVMPool stop aborted", extra={"error": str(e)})
+            deferred_error = await _cleanup_step(warm_pool.stop())  # core VM cleanup still runs after it
 
         # Stop MemorySnapshotManager (wait for background saves: the drained pool freed their resource slots)
         if memory_snapshot_manager:
             logger.info("Waiting for in-flight background snapshot saves to complete")
-            try:
-                await memory_snapshot_manager.stop()
-            except (OSError, RuntimeError, TimeoutError) as e:
-                logger.error("MemorySnapshotManager stop error", extra={"error": str(e)})
-            except BaseException as e:  # noqa: BLE001 - core VM cleanup must still run
-                deferred_error = deferred_error or e
-                logger.error("MemorySnapshotManager stop aborted", extra={"error": str(e)})
+            save_error = await _cleanup_step(memory_snapshot_manager.stop())  # runs after a failed pool stop too
+            deferred_error = deferred_error or save_error
 
         # Wait for the L3 uploads in flight: a task left running is cancelled when the loop closes
         if snapshot_manager is not None:
@@ -373,7 +389,7 @@ class Scheduler:
 
         # Stop VmManager: it refuses new launches and closes admission, waits for the launches
         # in flight (a new() or reuse() past its start check: the VM it makes is tracked),
-        # then destroys every VM it tracks (overlay pool cleanup last). The count below is
+        # then destroys every VM it tracks (the overlay daemon stops last). The count below is
         # for the log only: it can miss a VM of a launch in flight.
         if vm_manager:
             if active_vms := vm_manager.get_active_vms():
@@ -436,7 +452,9 @@ class Scheduler:
                 bad name; packages for raw), PACKAGE_NOT_ALLOWED (package not in the
                 allow-list), PACKAGE_INSTALL_FAILED.
             ConfigError: INSTANCE_CONFIG (`instance_id` is set, but no instance store
-                is configured), HOST_DEPENDENCY, SETTING_INVALID (no write access to
+                is configured), ASSET_NOT_FOUND (the base image is not on this host and was
+                not downloaded: auto_download_assets off, offline mode, or not in the release),
+                HOST_DEPENDENCY, SETTING_INVALID (no write access to
                 disk_snapshot_cache_dir or, when a base image is downloaded, to the download
                 cache under EXEC_SANDBOX_CACHE_DIR; a read-only disk; or the folder cannot be
                 made again).
@@ -449,21 +467,14 @@ class Scheduler:
         idle_timeout = self._idle_timeout(idle_timeout_seconds)
         loop = asyncio.get_running_loop()
         start = loop.time()
-        vm, resolved_ports, is_cold_boot, admission_ms = await self._prepare_vm(
+        vm, is_cold_boot, admission_ms = await self._prepare_vm(
             spec, task_id=f"session-{id(self)}", on_boot_log=on_boot_log
         )
         total_ms = round((loop.time() - start) * 1000)
 
-        # Store resolved ports on VM so Session.exposed_ports can read them
-        vm.exposed_ports = resolved_ports
-
-        # _vm_manager guaranteed non-None by _prepare_vm
-        if self._vm_manager is None:
-            raise _internal(_NOT_INITIALIZED)
-
         session = Session(
             vm=vm,
-            vm_manager=self._vm_manager,
+            vm_manager=self._vms,
             spec=spec,
             startup_timing=_startup_timing(vm, is_cold_boot=is_cold_boot, total_ms=total_ms, admission_ms=admission_ms),
             instances=self._instances,
@@ -508,21 +519,22 @@ class Scheduler:
                 key; do not delete the instance), HOST_DEPENDENCY (for example qemu-vm
                 cannot get access to the loaded migration file).
             RouteError: INSTANCE_HOST_MISMATCH: this worker cannot run it: arch,
-                accelerator, CPU vendor, guest CPU model or exec-sandbox release differ
-                from the saved ones (checked before any download), a missing guest image,
-                or a QEMU that refuses the saved state.
-                CAPACITY_NEVER_FITS: the spec is larger than the whole budget (raised at once).
+                accelerator, CPU vendor or guest CPU model differ from the saved ones, its
+                QEMU lacks the saved machine type (checked before any download), a missing
+                guest image, data that another exec-sandbox release wrote and this one
+                cannot read, or a QEMU older than the saver's that refuses the saved state
+                (a refusal on the same or a newer QEMU is InternalError INTERNAL).
+                CAPACITY_NEVER_FITS: the spec is larger than the whole budget (raised before
+                the download).
             InstanceGoneError: INSTANCE_NOT_FOUND, INSTANCE_EXPIRED, INSTANCE_INTEGRITY
                 (the stored data was changed or damaged): start again with new().
             InternalError: The VM could not start (a bug or a broken host).
         """
         instances = self._require_instances(check_instance_id(instance_id))
         idle_timeout = self._idle_timeout(idle_timeout_seconds)
-        if self._vm_manager is None or self._snapshot_manager is None:
-            raise _internal(_NOT_INITIALIZED)
         loop = asyncio.get_running_loop()
         start = loop.time()
-        snapshots = self._snapshot_manager
+        snapshots = self._snapshots
 
         # The local L2 image is leased from its lookup on: admission (below) may evict
         # cache entries for disk space, never this one. The VM takes its own share.
@@ -532,27 +544,62 @@ class Scheduler:
             # A local L2 is used only if its digest matches; else load() downloads the
             # image by digest from the instance store.
             nonlocal packages_lease
-            if not spec.packages:
-                return None
-            lease = await snapshots.check_cache(language=spec.language, packages=list(spec.packages))
+            lease = await _packages_lease(snapshots, spec)
             if packages_lease is not None:  # an earlier attempt of the load
                 packages_lease.release()
             packages_lease = lease
             return lease.path if lease is not None else None
 
         try:
-            state = await instances.load(instance_id, packages_image=packages_image)
-            return await self._reuse_loaded(
-                instances,
-                instance_id,
-                state=state,
-                packages_lease=packages_lease,
-                start=start,
-                idle_timeout=idle_timeout,
+            with named_instance(instance_id):  # VM and guest errors name no instance
+                state = await instances.load(instance_id, packages_image=packages_image)
+                return await self._reuse_loaded(
+                    instances,
+                    instance_id,
+                    state=state,
+                    packages_lease=packages_lease,
+                    start=start,
+                    idle_timeout=idle_timeout,
+                )
+        except SandboxError as e:
+            # One outcome record per load; the values are in the text (the CLI log format shows no extra)
+            logger.warning(
+                f"Instance {instance_id} not reused: {e.code} ({e.action}): {e.message}",
+                extra={"instance_id": instance_id, "error_code": str(e.code), "action": e.action, "context": e.context},
             )
+            raise
         finally:
             if packages_lease is not None:
                 packages_lease.release()
+
+    async def check_reuse(self, instance_id: str) -> None:
+        """What reuse() checks before its download, with no download and no VM: the instance
+        exists, this keyring and this release open it, this worker has the saved host facts
+        and the budget, and each guest image is on this worker or in the store. QEMU still
+        decides at a reuse() (a refused state: RouteError on an older QEMU).
+
+        Raises what reuse() raises before its download: InvalidInputError
+        INSTANCE_INVALID_ID or SCHEDULER_STATE; InstanceGoneError INSTANCE_NOT_FOUND or
+        INSTANCE_INTEGRITY; ConfigError INSTANCE_CONFIG or INSTANCE_KEY_MISSING; RouteError
+        INSTANCE_HOST_MISMATCH or CAPACITY_NEVER_FITS; TransientError
+        INSTANCE_STORE_UNAVAILABLE or LOCAL_DISK (a lock file of the guest image cache cannot
+        be opened).
+        """
+        instances = self._require_instances(check_instance_id(instance_id))
+        snapshots = self._snapshots
+        leases: list[EntryLease] = []
+
+        async def packages_image(spec: VmSpec) -> Path | None:
+            if (lease := await _packages_lease(snapshots, spec)) is None:
+                return None
+            leases.append(lease)  # kept while the check reads its digest
+            return lease.path
+
+        try:
+            await instances.check(instance_id, packages_image=packages_image)
+        finally:
+            for lease in leases:
+                lease.release()
 
     async def _reuse_loaded(
         self,
@@ -565,24 +612,24 @@ class Scheduler:
         idle_timeout: int,
     ) -> Session:
         """reuse() after the load: restore the VM of `state`, then the session."""
-        if self._vm_manager is None:
-            raise _internal(_NOT_INITIALIZED)
         loop = asyncio.get_running_loop()
         load_ms = round((loop.time() - start) * 1000)
         spec = state.body.spec
-        leases = (packages_lease,) if packages_lease is not None and state.packages_image == packages_lease.path else ()
+        own_layer = packages_lease is not None and state.packages_image == packages_lease.path
+        leases = (*state.asset_leases, *((packages_lease,) if packages_lease is not None and own_layer else ()))
         try:
+            loader_qemu = await qemu_version_fact()  # for the outcome record; before a VM exists
             resolved_ports = resolve_port_mappings(list(spec.expose_ports)) if spec.expose_ports else []
             task_id = f"reuse-{id(state)}"
             admission_start = loop.time()
             # Kept while it waits: the loaded state's folder and the packages layer
             held = frozenset({state.folder, *(lease.path for lease in leases)})
-            async with self._vm_manager.reservation_context(
+            async with self._vms.reservation_context(
                 spec, vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}", held=held
             ) as reservation:
                 admission_ms = round((loop.time() - admission_start) * 1000)
                 try:
-                    vm = await self._vm_manager.restore_vm(
+                    vm = await self._vms.restore_vm(
                         spec,
                         tenant_id=constants.SCHEDULER_TENANT_ID,
                         task_id=task_id,
@@ -592,28 +639,40 @@ class Scheduler:
                         cache_leases=leases,
                         expose_ports=resolved_ports or None,
                         reservation=reservation,
+                        machine_type=state.body.host.machine_type,
+                        egress_domains=state.body.egress_domains,  # the policy at save
+                        boot=(state.body.guest.kernel, state.body.guest.initramfs),
+                        use_template=False,  # the RAM is in the saved vmstate
                     )
                 except TransientError as e:
-                    if rejected_by_qemu(e):
-                        # QEMU refused the saved state: a worker with the QEMU that wrote it can load it.
-                        raise host_mismatch(
-                            instance_id=instance_id,
-                            required={"qemu_version": state.body.host.qemu_version},
-                            found={"qemu_version": "this worker's QEMU refused the saved state"},
-                        ) from e
+                    if (refusal := qemu_refusal(e)) is not None:
+                        # QEMU refused the saved state: a worker with the saver's facts and QEMU can load it.
+                        raise await instances.refused_by_qemu(state, qemu_error=refusal.message) from e
                     raise
         except BaseException:
             await instances.release(state)
             raise
-        vm.exposed_ports = resolved_ports
+        for lease in state.asset_leases:  # the VM holds its own shares now
+            lease.release()
         total_ms = round((loop.time() - start) * 1000)
+        saver = state.body.host
         logger.info(
-            "Instance reused",
-            extra={"instance_id": instance_id, "generation": state.header.generation, "load_ms": load_ms},
+            f"Instance {instance_id} reused: generation {state.header.generation}, saved by release "
+            f'"{saver.release}" with QEMU "{saver.qemu_version}", loaded by release "{__version__}" with '
+            f'QEMU "{loader_qemu}" in VM {vm.vm_id}.',
+            extra={
+                "instance_id": instance_id,
+                "generation": state.header.generation,
+                "vm_id": vm.vm_id,
+                "saved_release": saver.release,
+                "saved_qemu_version": saver.qemu_version,
+                "qemu_version": loader_qemu,
+                "load_ms": load_ms,
+            },
         )
         return Session(
             vm=vm,
-            vm_manager=self._vm_manager,
+            vm_manager=self._vms,
             spec=spec,
             startup_timing=StartupTiming(
                 total_ms=total_ms,
@@ -639,15 +698,55 @@ class Scheduler:
         )
 
     async def describe_instance(self, instance_id: str) -> InstanceInfo:
-        """What the store holds for an instance (InstanceInfo: `spec` and `host` only
-        when this keyring has the instance's key); no VM starts.
+        """What the store holds for an instance (InstanceInfo: `access` says how much this
+        worker could read; `spec` and `host` only when it is "full"); no VM starts.
 
         Raises TransientError (INSTANCE_STORE_UNAVAILABLE), InvalidInputError
-        (INSTANCE_INVALID_ID, SCHEDULER_STATE: not started), ConfigError (INSTANCE_CONFIG),
-        RouteError (INSTANCE_HOST_MISMATCH: another release wrote it), InstanceGoneError
-        (INSTANCE_NOT_FOUND, INSTANCE_INTEGRITY: the head failed authentication).
+        (INSTANCE_INVALID_ID, SCHEDULER_STATE: not started), ConfigError (INSTANCE_CONFIG;
+        INSTANCE_KEY_MISSING when this keyring lacks the key and the public header is
+        another release's), RouteError (INSTANCE_HOST_MISMATCH: the header itself is
+        another release's), InstanceGoneError (INSTANCE_NOT_FOUND, INSTANCE_INTEGRITY:
+        the head failed authentication).
         """
         return await self._require_instances(check_instance_id(instance_id)).describe(instance_id)
+
+    async def describe_worker(self) -> WorkerFacts:
+        """This worker's facts, one value per RouteKey in the value forms of RouteError.required
+        (host facts, QEMU version and machine types, the guest images it holds, its whole
+        admission budget), and its instance key ids. A broker reads them once per worker, and
+        again after a change of QEMU, guest images or budget, and sends a call that raised
+        RouteError to a worker whose facts satisfy the error's `required`
+        (WorkerFacts.satisfies). The library places nothing. No VM starts; the probes are
+        the cached ones of the start (run again after a change of the QEMU binary).
+
+        Raises InvalidInputError (SCHEDULER_STATE: not started).
+        """
+        if not self._started or self._vm_manager is None:
+            raise _scheduler_state(_NOT_STARTED)
+        vm_manager, instances = self._vm_manager, self._instances
+        facts = await machine_facts(force_emulation=vm_manager.settings.force_emulation)
+        own = await asyncio.to_thread(_image_digests, vm_manager.images.present_base_images())
+        # The L2 images of this worker's cache: a load uses one whose digest matches
+        layers = self._snapshot_manager
+        own_layers = (
+            frozenset[str]()
+            if layers is None
+            else await asyncio.to_thread(lambda: _image_digests(layers.entry_paths()))
+        )
+        downloaded = frozenset[str]() if instances is None else await asyncio.to_thread(instances.asset_digests)
+        memory_mb, cpu = vm_manager.budget_facts()
+        return WorkerFacts(
+            values={
+                **{key: value for key, value in facts.items() if value is not None},
+                RouteKey.QEMU_VERSION: await qemu_version_fact(),
+                RouteKey.MACHINE_TYPE: frozenset(await require_qemu_machine_types()),
+                RouteKey.BASE_IMAGE: own | downloaded,
+                RouteKey.PACKAGES_IMAGE: own_layers | downloaded,
+                RouteKey.MEMORY_MB: None if memory_mb is None else str(round(memory_mb)),
+                RouteKey.CPU: None if cpu is None else f"{cpu:.2f}",
+            },
+            key_ids=() if instances is None else tuple(key.id for key in instances.keyring.keys),
+        )
 
     async def delete_instance(self, instance_id: str) -> bool:
         """Delete a saved instance; return True if it existed, False if not (a second
@@ -707,7 +806,7 @@ class Scheduler:
         *,
         task_id: str,
         on_boot_log: Callable[[str], None] | None,
-    ) -> tuple[QemuVM, list[ExposedPort], bool, int]:
+    ) -> tuple[QemuVM, bool, int]:
         """Create and boot a VM made from `spec`: warm pool, L1 restore or cold boot.
 
         Args:
@@ -716,7 +815,8 @@ class Scheduler:
             on_boot_log: Optional callback for streaming boot console output.
 
         Returns:
-            Tuple of (vm, resolved_ports, is_cold_boot, admission_ms).
+            Tuple of (vm, is_cold_boot, admission_ms); the VM holds its forwarded ports
+            (QemuVM.exposed_ports).
 
         Raises:
             InvalidInputError: SCHEDULER_STATE (scheduler not started), PACKAGE_NOT_ALLOWED
@@ -727,8 +827,6 @@ class Scheduler:
         """
         if not self._started:
             raise _scheduler_state(_NOT_STARTED)
-        if self._vm_manager is None:
-            raise _internal(_NOT_INITIALIZED)
 
         # Resolve port mappings (allocate ephemeral ports for those without explicit external;
         # resolve_port_mappings logs them)
@@ -741,23 +839,23 @@ class Scheduler:
         # (same result).
         if spec.packages and self.config.enable_package_validation:
             if self._package_validator is None:
-                self._package_validator = await PackageValidator.create()
+                self._package_validator = await PackageValidator.create(
+                    pypi_allow_list_path=BUNDLED_PYPI_ALLOW_LIST, npm_allow_list_path=BUNDLED_NPM_ALLOW_LIST
+                )
             self._package_validator.validate(list(spec.packages), spec.language)
 
         # Check L2 snapshot cache for disk caching (only if packages specified)
-        # Only use snapshots when packages need to be installed - empty packages case
-        # benefits from overlay pool pre-caching which requires using the original base image
+        # Only use snapshots when packages need to be installed: without packages the VM runs
+        # on the base image (its overlay is a clone of the template VmManager.start made)
         # The L2 layer is leased from its lookup on: admission (below) may evict cache
         # entries for disk space, never this one. Each VM launch takes its own share.
         snapshot: EntryLease | None = None
         if spec.packages:
-            if self._snapshot_manager is None:
-                raise _internal(_NOT_INITIALIZED)
             # The L2 cache key hashes the base image: it must be on disk first
             if self.config.auto_download_assets:
-                await ensure_base_image(spec.language, images_dir=self._vm_manager.images.images_dir)
+                await ensure_base_image(spec.language, images_dir=self._vms.images.images_dir)
             # L2 (local qcow2), then L3 (S3), else a build: DiskSnapshotManager.get_or_create_snapshot
-            snapshot = await self._snapshot_manager.get_or_create_snapshot(
+            snapshot = await self._snapshots.get_or_create_snapshot(
                 language=spec.language,
                 packages=list(spec.packages),
                 tenant_id=constants.SCHEDULER_TENANT_ID,
@@ -780,10 +878,8 @@ class Scheduler:
         on_boot_log: Callable[[str], None] | None,
         snapshot: EntryLease | None,
         resolved_ports: list[ExposedPort],
-    ) -> tuple[QemuVM, list[ExposedPort], bool, int]:
+    ) -> tuple[QemuVM, bool, int]:
         """_prepare_vm after the L2 lookup: warm pool, L1 restore or cold boot on `snapshot`."""
-        if self._vm_manager is None:
-            raise _internal(_NOT_INITIALIZED)
         snapshot_path = snapshot.path if snapshot is not None else None
         if snapshot_path is not None:
             logger.info(
@@ -807,7 +903,7 @@ class Scheduler:
             # (compute_cache_key -> VmManager.images.base_image) and before cold create_vm.
             # Skip when snapshot_path already fetched it.
             if self.config.auto_download_assets and not snapshot_path:
-                await ensure_base_image(spec.language, images_dir=self._vm_manager.images.images_dir)
+                await ensure_base_image(spec.language, images_dir=self._vms.images.images_dir)
 
             # L1 key, once per request (it hashes the base image, kernel and L2 layer).
             # It includes the network device (spec.has_network_device):
@@ -832,7 +928,7 @@ class Scheduler:
                 if l1_entry is not None:  # restore() releases it; this covers a failed admission
                     l1_entry.release()
 
-        return vm, resolved_ports, is_cold_boot, admission_ms
+        return vm, is_cold_boot, admission_ms
 
     async def _admit_and_launch(
         self,
@@ -848,13 +944,11 @@ class Scheduler:
         """_launch_for after a warm pool miss: admission, then an L1 restore of `l1_entry`
         (taken over by restore) or a cold boot on `snapshot`. Returns the VM and the
         admission time in ms."""
-        if self._vm_manager is None:
-            raise _internal(_NOT_INITIALIZED)
         memory = self._memory_snapshot_manager
         snapshot_path = snapshot.path if snapshot is not None else None
         held = frozenset(lease.path for lease in (snapshot, l1_entry) if lease is not None)
         admission_start = asyncio.get_running_loop().time()
-        async with self._vm_manager.reservation_context(
+        async with self._vms.reservation_context(
             spec, vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}", held=held
         ) as reservation:
             admission_ms = round((asyncio.get_running_loop().time() - admission_start) * 1000)
@@ -878,7 +972,7 @@ class Scheduler:
 
             # Cold boot fallback: L1 miss (or L1 skipped for a boot log)
             if vm is None:
-                vm = await self._vm_manager.create_vm(
+                vm = await self._vms.create_vm(
                     spec,
                     tenant_id=constants.SCHEDULER_TENANT_ID,
                     task_id=task_id,
@@ -890,7 +984,6 @@ class Scheduler:
                     direct_write_target=None,
                     retry_profile=constants.RETRY_USER_FACING,
                     mem_path=None,
-                    mem_path_share=False,
                 )
 
                 # Schedule background L1 save for next time
@@ -901,9 +994,24 @@ class Scheduler:
                         # The caller never receives the newly-created VM when
                         # post-acquisition scheduling is interrupted. Return
                         # ownership to VmManager before propagating the error.
-                        await self._vm_manager.destroy_vm(vm)
+                        await self._vms.destroy_vm(vm)
                         raise
         return vm, admission_ms
+
+
+def _image_digests(paths: list[Path]) -> frozenset[str]:
+    """SHA-256 of each readable image (image_digest: cached by the file's stamp); an image
+    this worker cannot read is not one it can serve."""
+    digests: set[str] = set()
+    for path in paths:
+        try:
+            digest = image_digest(path)
+        except OSError as e:
+            logger.warning("Guest image unreadable", extra={"image": str(path), "error": str(e)})
+            continue
+        if digest is not None:  # None: the file went away since it was listed
+            digests.add(digest)
+    return frozenset(digests)
 
 
 def _startup_timing(vm: QemuVM, *, is_cold_boot: bool, total_ms: int, admission_ms: int) -> StartupTiming:
@@ -931,6 +1039,38 @@ def _startup_timing(vm: QemuVM, *, is_cold_boot: bool, total_ms: int, admission_
         boot_retries=cold(vm.timing.boot_retries),
         instance_load_ms=None,
     )
+
+
+async def _packages_lease(snapshots: DiskSnapshotManager, spec: VmSpec) -> EntryLease | None:
+    """A lease on this worker's L2 image of `spec`, or None: no packages, or no L2 of its own
+    (a load then downloads the image by digest from the instance store)."""
+    if not spec.packages:
+        return None
+    try:
+        return await snapshots.check_cache(language=spec.language, packages=list(spec.packages))
+    except ConfigError as e:
+        if e.code is not ErrorCode.ASSET_NOT_FOUND:
+            raise
+        return None  # no base image of its own (the L2 key needs it), so no L2 here: a miss
+
+
+def instance_admin(config: SchedulerConfig) -> contextlib.AbstractAsyncContextManager[InstanceAdmin]:
+    """Describe, list and delete saved instances without a Scheduler: no VM, no guest image,
+    no QEMU (a cleanup job on any host). The store and keyring come from `config`, then the
+    EXEC_SANDBOX_* variables, as for a Scheduler. Use `async with instance_admin(config) as
+    admin:`, then `admin.describe(id)` (InstanceInfo, as Scheduler.describe_instance),
+    `admin.list_ids()` (async iterator, as Scheduler.list_instances) and `admin.delete(id)`
+    (as Scheduler.delete_instance).
+
+    Raises at the call: ConfigError SETTING_INVALID (an EXEC_SANDBOX_* variable),
+    EXTRA_MISSING (cryptography is not installed). Raises when the block opens: ConfigError
+    INSTANCE_CONFIG (no instance store, or a store or keyring that is not valid),
+    EXTRA_MISSING (the s3 extra, for an S3 store), TransientError INSTANCE_STORE_UNAVAILABLE
+    (a disk error of the local store). An S3 store that does not answer fails at the first
+    call (TransientError INSTANCE_STORE_UNAVAILABLE).
+    """
+    settings = settings_from_config(config, images_dir=images_download_dir())
+    return require_instance_admin(store=settings.instance_store or "local")(settings)
 
 
 def settings_from_config(config: SchedulerConfig, *, images_dir: Path) -> Settings:

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, overload
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.aio_utils import await_settled
+from exec_sandbox.aio_utils import await_cancellation_safe, await_settled
 from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.platform_utils import HostOS, ProcessWrapper, child_env, detect_host_os
 from exec_sandbox.process_registry import register_process, unregister_process
@@ -256,7 +256,7 @@ async def start_managed_process(
     steps: Sequence[tuple[str, str]],
     end_with_this_process: bool,
     pass_fds: tuple[int, ...],
-    on_process_started: Callable[[ProcessWrapper], None] | None,
+    on_process_started: Callable[[ProcessWrapper], None],
 ) -> ProcessWrapper:
     """Launch a subprocess with standard piping and process registration.
 
@@ -308,27 +308,16 @@ async def start_managed_process(
                 env=child_env(),
             )
         )
-        # Registration and the optional domain owner callback are synchronous:
-        # no cancellation point can separate child creation from publication.
+        # Registration and the owner callback are synchronous: no cancellation point can
+        # separate child creation from publication.
         register_process(proc)
-        if on_process_started is not None:
-            on_process_started(proc)
+        on_process_started(proc)
         return proc
 
     # asyncio.create_subprocess_exec() can create the OS child just before its
-    # awaiting caller is cancelled. Keep spawn in a manager-owned task and defer
-    # cancellation propagation until that task has either published the child or
-    # failed. This prevents an unregistered/unowned process at the await boundary.
-    spawn_task = asyncio.create_task(spawn_and_publish())
-    try:
-        return await asyncio.shield(spawn_task)
-    except asyncio.CancelledError:
-        await await_settled(spawn_task)
-        if not spawn_task.cancelled():
-            # Retrieve any spawn exception so the manager-owned task cannot emit
-            # an unhandled-task warning; the caller's cancellation stays primary.
-            spawn_task.exception()
-        raise
+    # awaiting caller is cancelled. Defer the cancellation until the spawn has either
+    # published the child or failed: no unregistered, unowned process at the await boundary.
+    return await await_cancellation_safe(spawn_and_publish())
 
 
 async def communicate_managed_process(
@@ -336,7 +325,7 @@ async def communicate_managed_process(
     *,
     process_name: str,
     context_id: str,
-) -> tuple[int | None, bytes, bytes]:
+) -> tuple[int, bytes, bytes]:
     """Run a transient child with cancellation-safe kill/reap/unregistration.
 
     Returns:
@@ -346,7 +335,7 @@ async def communicate_managed_process(
         OSError: the child did not start (start_managed_process)
     """
 
-    async def run_and_cleanup() -> tuple[int | None, bytes, bytes]:
+    async def run_and_cleanup() -> tuple[int, bytes, bytes]:
         owned_process: ProcessWrapper | None = None
 
         def publish_process(proc: ProcessWrapper) -> None:
@@ -358,7 +347,7 @@ async def communicate_managed_process(
                 cmd, steps=(), end_with_this_process=False, pass_fds=(), on_process_started=publish_process
             )
             stdout, stderr = await proc.communicate()
-            return proc.returncode, stdout, stderr
+            return await proc.wait(), stdout, stderr  # communicate() reaped it
         finally:
             if owned_process is not None:
                 delay = 1.0
@@ -380,11 +369,6 @@ async def communicate_managed_process(
                         # alive until death is confirmed; the outer waiter still
                         # propagates its own cancellation.
                         continue
-                    except Exception:
-                        logger.exception(
-                            "Transient process cleanup attempt failed",
-                            extra={"process_name": process_name, "context_id": context_id},
-                        )
                     try:
                         await asyncio.sleep(delay)
                     except asyncio.CancelledError:
@@ -486,7 +470,7 @@ async def drain_subprocess_output(
                 if decoded:
                     handler(decoded)
             except (UnicodeDecodeError, ValueError):
-                pass  # Ignore decode errors - non-UTF8 output is silently skipped
+                pass  # A line that is not UTF-8, or a ValueError of the handler: the line is skipped
 
     # Concurrent readers, one per pipe (prevent deadlock)
     async with asyncio.TaskGroup() as tg:
@@ -556,9 +540,9 @@ async def wait_for_socket(
     QMP control socket. Polls the filesystem because there is no async event
     to await (the file is created by an external process).
 
-    Two-phase wait: first the socket file must exist, then a probe-connect
-    must succeed. A connect between the file's creation and the end of listen()
-    gets ConnectionRefusedError (seen under load): the probe retries it.
+    A connect before the file exists gets FileNotFoundError, one between the file's
+    creation and the end of listen() ConnectionRefusedError (seen under load): the
+    probe retries both.
 
     Args:
         path: Path to the socket file.
@@ -579,12 +563,6 @@ async def wait_for_socket(
             socket belongs to another user (QEMU as qemu-vm) and this process lacks its group.
     """
     async with asyncio.timeout(timeout):
-        # Phase 1: wait for socket file to exist
-        while not path.exists():
-            abort_check()
-            await asyncio.sleep(_SOCKET_POLL_SECONDS)
-
-        # Phase 2: verify socket accepts connections
         while True:
             abort_check()
             try:
@@ -594,7 +572,7 @@ async def wait_for_socket(
                 w.close()
                 await w.wait_closed()
                 return None
-            except (ConnectionRefusedError, ConnectionResetError):
+            except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
                 await asyncio.sleep(_SOCKET_POLL_SECONDS)
             except PermissionError as e:  # no wait helps: the mode or the groups must change
                 raise socket_access_error(path, e) from e

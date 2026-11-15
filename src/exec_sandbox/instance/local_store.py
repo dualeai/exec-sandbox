@@ -103,6 +103,10 @@ class LocalInstanceStore(InstanceStore):
         # cancelled holds one, so no job ever uses a closed (or reused) fd number.
         weakref.finalize(self, os.close, root_fd)
 
+    @property
+    def location(self) -> str:
+        return str(self._root)
+
     @classmethod
     @contextlib.asynccontextmanager
     async def open(cls, *, root: Path) -> AsyncGenerator[LocalInstanceStore]:

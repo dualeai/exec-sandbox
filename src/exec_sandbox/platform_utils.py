@@ -284,7 +284,7 @@ class ProcessWrapper:
         # Wrap with psutil for PID-reuse safe monitoring. One attempt: the kernel lists a
         # child as soon as fork() returns. NoSuchProcess means the asyncio child watcher
         # already reaped a short process; returncode-based checks then apply.
-        if async_proc.pid and async_proc.returncode is None:
+        if async_proc.returncode is None:
             with contextlib.suppress(*_PSUTIL_GONE_ERRORS):
                 self.psutil_proc = psutil.Process(async_proc.pid)
 
@@ -305,7 +305,12 @@ class ProcessWrapper:
         - Terminated:        is_running()=False, is_stopped()=False → process gone
 
         Returns:
-            True if process exists (even if stopped), False if terminated
+            True while the process exists, stopped or not (a child that exited and is not
+            reaped yet too: psutil counts a zombie as running). False once it ended, and also
+            when this user can no longer see or read it (psutil NoSuchProcess or
+            AccessDenied, for example /proc mounted with hidepid after the child exec'd
+            sudo): terminate and kill then raise ProcessLookupError, and cleanup_process
+            counts that as an end.
         """
         if not self.psutil_proc:
             return self.async_proc.returncode is None
@@ -339,7 +344,7 @@ class ProcessWrapper:
             return False
 
     @property
-    def pid(self) -> int | None:
+    def pid(self) -> int:
         """Process ID."""
         return self.async_proc.pid
 

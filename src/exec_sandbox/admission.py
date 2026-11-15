@@ -73,18 +73,17 @@ from exec_sandbox.cgroup import (
     read_container_available_memory_mb,
 )
 from exec_sandbox.constants import (
-    DEFAULT_DISK_MB,
     DEFAULT_TCG_TB_CACHE_SIZE_MB,
     DEFAULT_VM_CPU_OVERHEAD_CORES,
     DEFAULT_VM_MEMORY_OVERHEAD_MB,
     GATE3_SELF_WAKE_INTERVAL_SECONDS,
 )
-from exec_sandbox.exceptions import ErrorCode, InvalidInputError, RouteError, TransientError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError, RouteError, RouteKey, TransientError
 from exec_sandbox.files.disk import OVERLAYFS_SUPER_MAGIC, allocated_bytes, overlay_upper, statfs_type
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 logger = get_logger(__name__)
 
@@ -119,7 +118,8 @@ class EvictionPass(Protocol):
 
 
 class EvictableCache(Protocol):
-    """A cache on disk that gives space back when asked: the L1 and L2 caches."""
+    """A cache on disk that gives space back when asked: the L1 and L2 caches, and the guest
+    images that loads fetched from the instance store (AssetCache)."""
 
     @property
     def cache_dir(self) -> Path: ...
@@ -458,10 +458,8 @@ _PROBE_CACHE_TTL_SECONDS: Final[float] = 0.1
 # 10% means 1 second out of 10 every task was blocked on memory I/O — serious thrashing.
 _PSI_FULL_THRESHOLD_PCT: Final[float] = 10.0
 
-# macOS memory pressure levels (from dispatch/source.h).
-# Returned by kern.memorystatus_vm_pressure_level sysctl.
-_MACOS_PRESSURE_NORMAL: Final[int] = 1
-_MACOS_PRESSURE_WARN: Final[int] = 2
+# macOS memory pressure level CRITICAL (dispatch/source.h; NORMAL 1, WARN 2), read from the
+# kern.memorystatus_vm_pressure_level sysctl
 _MACOS_PRESSURE_CRITICAL: Final[int] = 4
 
 
@@ -518,6 +516,26 @@ def _ttl_cache(ttl_seconds: float) -> Callable[[Callable[[Any], _R]], Callable[[
 def _forget_cached(owner: object, method: Callable[[Any], object]) -> None:
     """Drop the value a _ttl_cache method keeps on `owner`: its next call probes again."""
     vars(owner).pop(f"_ttl_{method.__name__}", None)
+
+
+def _vm_totals(memory_mb: float, cpu_cores: float, *, use_tcg: bool) -> tuple[float, float]:
+    """Memory (MB) and CPU (cores) a VM reserves: the guest's plus its overheads (single
+    source of truth; TCG adds the translation block cache)."""
+    total_memory_mb = memory_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
+    if use_tcg:
+        total_memory_mb += DEFAULT_TCG_TB_CACHE_SIZE_MB
+    return total_memory_mb, cpu_cores + DEFAULT_VM_CPU_OVERHEAD_CORES
+
+
+def budget_need(memory_mb: float, cpu_cores: float, *, use_tcg: bool) -> dict[RouteKey, str]:
+    """The budget facts a VM needs, its overheads counted, in the route value forms rounded
+    up (memory_mb whole MB, cpu two decimals): a worker whose budget facts (budget_facts,
+    rounded down) are not below them admits the VM."""
+    total_memory_mb, total_cpu = _vm_totals(memory_mb, cpu_cores, use_tcg=use_tcg)
+    return {
+        RouteKey.MEMORY_MB: str(math.ceil(round(total_memory_mb, 6))),
+        RouteKey.CPU: f"{math.ceil(round(total_cpu * 100, 6)) / 100:.2f}",
+    }
 
 
 class ResourceAdmissionController:
@@ -606,7 +624,6 @@ class ResourceAdmissionController:
         self._start_lock = asyncio.Lock()
 
         # Shutdown flag: set by stop() to unblock acquire() waiters immediately
-        self._stopped = False
 
         # Self-wake timer: periodically notifies blocked waiters so Gate 3
         # re-probes system memory (closes wakeup gap for external recovery)
@@ -640,7 +657,7 @@ class ResourceAdmissionController:
         async with self._start_lock:
             # Start self-wake timer if not already running (idempotent); none after stop(),
             # which would not end it
-            if self._self_wake_task is None and not self._stopped:
+            if self._self_wake_task is None and not self._stop_event.is_set():
                 self._self_wake_task = asyncio.create_task(self._self_wake_loop())
             if self._started:
                 return
@@ -722,10 +739,9 @@ class ResourceAdmissionController:
         Sets a stopped flag and notifies all waiters so they raise
         InvalidInputError (SCHEDULER_STATE) immediately instead of blocking until timeout.
         """
-        self._stopped = True
-        self._stop_event.set()  # a pass waiting for a syncfs ends at once
+        self._stop_event.set()  # stopped; a pass waiting for a syncfs ends at once
 
-        # Wake all blocked waiters so they see _stopped and exit
+        # Wake all blocked waiters so they see the stop and exit
         async with self._condition:
             self._condition.notify_all()
 
@@ -752,7 +768,7 @@ class ResourceAdmissionController:
         return avail
 
     @_ttl_cache(_PROBE_CACHE_TTL_SECONDS)
-    def _probe_memory_pressure(self) -> bool | None:
+    def _probe_memory_pressure(self) -> bool:
         """Check if system memory pressure warrants rejecting admission.
 
         Each platform has its own decision logic — no shared threshold:
@@ -764,9 +780,9 @@ class ResourceAdmissionController:
           operation and does not trigger rejection.
 
         Returns:
-            True to reject (system under pressure), False to admit,
-            None if unavailable (gate skipped).
-            Cost: ~3-5µs per call (procfs read or sysctl, cached 100ms).
+            True to reject (system under pressure), False to admit, also when the platform
+            gives no reading (gate skipped). Cost: ~3-5µs per call (procfs read or sysctl,
+            cached 100ms).
 
         Note:
             We opened https://github.com/giampaolo/psutil/issues/2725 to add
@@ -779,15 +795,12 @@ class ResourceAdmissionController:
             return self._probe_psi_linux()
         if host_os is HostOS.MACOS:
             return self._probe_pressure_macos()
-        return None
+        return False
 
     @staticmethod
-    def _probe_psi_linux() -> bool | None:
-        """Read PSI full avg10 from /proc/pressure/memory (Linux).
-
-        Returns True if pressure >= threshold (reject), False otherwise,
-        None if PSI is unavailable.
-        """
+    def _probe_psi_linux() -> bool:
+        """Read PSI full avg10 from /proc/pressure/memory (Linux): True if pressure >= threshold
+        (reject), False otherwise, also when PSI is unavailable or its value is not finite."""
         try:
             content = Path("/proc/pressure/memory").read_text()
             for line in content.splitlines():
@@ -795,25 +808,16 @@ class ResourceAdmissionController:
                     for token in line.split():
                         if token.startswith("avg10="):
                             val = float(token[6:])
-                            if not math.isfinite(val):
-                                return None
-                            return val >= _PSI_FULL_THRESHOLD_PCT
+                            return math.isfinite(val) and val >= _PSI_FULL_THRESHOLD_PCT
         except (OSError, ValueError):
             pass
-        return None
+        return False
 
     @staticmethod
-    def _probe_pressure_macos() -> bool | None:
-        """Read kernel memory pressure level via sysctl (macOS).
-
-        Returns True at CRITICAL (reject), False at NORMAL/WARN (admit),
-        None if sysctl fails or returns unknown level.
-        """
+    def _probe_pressure_macos() -> bool:
+        """Read kernel memory pressure level via sysctl (macOS): True at CRITICAL (reject),
+        False otherwise (NORMAL, WARN, an unknown level, a failed sysctl)."""
         level = _read_macos_memory_pressure_level()
-        if level is None:
-            return None
-        if level not in {_MACOS_PRESSURE_NORMAL, _MACOS_PRESSURE_WARN, _MACOS_PRESSURE_CRITICAL}:
-            return None
         # CRITICAL only: WARN is common during normal operation (active compressor, many apps
         # open), and blocking at WARN makes the tool unusable on most dev machines
         return level == _MACOS_PRESSURE_CRITICAL
@@ -843,13 +847,15 @@ class ResourceAdmissionController:
 
         Memory: host_total * (1 - reserve_ratio) * overcommit_ratio
         CPU:    (host_cpu_count - host_cpu_reserve) * overcommit_ratio
+        Rounded to 6 decimals once: the float noise of the products (1.4 - 0.5 cores at 12.5x
+        is 11.249999999999998) would refuse a VM that the budget facts (budget_facts) admit.
         """
         available_mb = self._host_memory_mb * (1.0 - self._host_memory_reserve_ratio)
-        self._memory_budget_mb = max(0.0, available_mb) * self._memory_overcommit_ratio
+        self._memory_budget_mb = round(max(0.0, available_mb) * self._memory_overcommit_ratio, 6)
         available_cpus = max(0.0, self._host_cpu_count - self._host_cpu_reserve_cores)
-        self._cpu_budget = available_cpus * self._cpu_overcommit_ratio
+        self._cpu_budget = round(available_cpus * self._cpu_overcommit_ratio, 6)
 
-    async def acquire(  # noqa: PLR0912, PLR0915
+    async def acquire(
         self,
         vm_id: str,
         memory_mb: float,
@@ -877,7 +883,7 @@ class ResourceAdmissionController:
         Args:
             vm_id: VM identifier (for logging, does not need to be unique)
             memory_mb: Guest memory in MB (overhead is added automatically)
-            cpu_cores: CPU cores to reserve
+            cpu_cores: Guest CPU cores (DEFAULT_VM_CPU_OVERHEAD_CORES is added automatically)
             timeout: Max seconds to wait for resources
             use_tcg: Whether TCG emulation is used (adds extra memory overhead)
             disk_mb: Home disk size the guest can fill
@@ -896,48 +902,16 @@ class ResourceAdmissionController:
             RouteError: CAPACITY_NEVER_FITS: a request larger than the whole budget
             InvalidInputError: SCHEDULER_STATE: a stopped controller
         """
-        # Calculate effective limits: guest + overhead (single source of truth)
-        total_memory_mb = memory_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
-        if use_tcg:
-            total_memory_mb += DEFAULT_TCG_TB_CACHE_SIZE_MB
-        total_cpu = cpu_cores + DEFAULT_VM_CPU_OVERHEAD_CORES
-
+        # Budgets are static: a request above the whole budget can never be
+        # admitted, so fail now instead of after `timeout`.
+        self.check_fits(vm_id, memory_mb, cpu_cores, use_tcg=use_tcg, target={})
+        total_memory_mb, total_cpu = _vm_totals(memory_mb, cpu_cores, use_tcg=use_tcg)
         reservation = ResourceReservation(
             vm_id=vm_id,
             memory_mb=total_memory_mb,
             cpu_cores=total_cpu,
             disk_mb=disk_mb,
         )
-
-        # Budgets are static: a request above the whole budget can never be
-        # admitted, so fail now instead of after `timeout`.
-        if total_memory_mb > self._memory_budget_mb or total_cpu > self._cpu_budget:
-            required: dict[str, str] = {}
-            found: dict[str, str] = {}
-            if total_memory_mb > self._memory_budget_mb:
-                required["memory_mb"] = str(round(total_memory_mb))
-                found["memory_mb"] = str(round(self._memory_budget_mb))
-            if total_cpu > self._cpu_budget:
-                required["cpu"] = str(round(total_cpu, 2))
-                found["cpu"] = str(round(self._cpu_budget, 1))
-            mem_budget_str, cpu_budget_str = self._budget_texts()  # one may be unlimited
-            raise RouteError(
-                f"VM {vm_id} can never fit: requested {round(total_memory_mb)}MB memory, "
-                f"{round(total_cpu, 2)} CPU; total budget {mem_budget_str}MB memory, "
-                f"{cpu_budget_str} CPU.",
-                code=ErrorCode.CAPACITY_NEVER_FITS,
-                required=required,
-                found=found,
-                context={
-                    "vm_id": vm_id,
-                    "requested_memory_mb": round(total_memory_mb),
-                    "requested_cpu": round(total_cpu, 2),
-                    "memory_budget_mb": mem_budget_str,
-                    "cpu_budget": cpu_budget_str,
-                },
-                hint="Run it on a worker whose budget holds it (see `required`), or ask for a smaller VM.",
-                instance_id=None,
-            )
 
         logger.debug(
             "Acquiring resources",
@@ -967,7 +941,7 @@ class ResourceAdmissionController:
                             self._condition.notify(1)
                         self._waiting[request] += 1
                         try:
-                            while not self._stopped:
+                            while not self._stop_event.is_set():
                                 blocked = self._blocking_gate(total_memory_mb, total_cpu, disk_mb)
                                 if blocked is None:
                                     break
@@ -981,7 +955,7 @@ class ResourceAdmissionController:
                             self._waiting[request] -= 1
                             if not self._waiting[request]:
                                 del self._waiting[request]
-                        if self._stopped:
+                        if self._stop_event.is_set():
                             raise InvalidInputError(
                                 f"Admission controller stopped while waiting for VM {vm_id}",
                                 code=ErrorCode.SCHEDULER_STATE,
@@ -1002,7 +976,7 @@ class ResourceAdmissionController:
             raise self._timeout_error(reservation, timeout=timeout, blocked=blocked) from None
         finally:
             self._disk_needs.pop(reservation.reservation_id, None)
-            if not admitted and not self._stopped:
+            if not admitted and not self._stop_event.is_set():
                 # A release wakes one waiter of a size (release): one that leaves (LOCAL_DISK, a
                 # timeout, cancelled even once notified) passes that wake-up on, else the next one
                 # waits for the self-wake (10 s)
@@ -1043,6 +1017,59 @@ class ResourceAdmissionController:
             self._condition.notify_all()
         else:
             self._condition.notify(1)
+
+    def check_fits(
+        self, vm_id: str, memory_mb: float, cpu_cores: float, *, use_tcg: bool, target: Mapping[RouteKey, str]
+    ) -> tuple[dict[RouteKey, str], dict[RouteKey, str | None]]:
+        """The budget facts a VM of this size needs (budget_need) and this budget's (None: no
+        limit), as a RouteError's `required` and `found` give them. Raise when the VM, with
+        its overheads, is larger than the whole budget: it can never be admitted. `target`:
+        route facts the caller checked before (this worker has them), added to the error's
+        `required` and `found`.
+
+        Raises:
+            RouteError: CAPACITY_NEVER_FITS
+        """
+        # The whole target (both dimensions) rounded up, the budget rounded down (as
+        # budget_facts): a worker whose budget is not below `required` admits it.
+        memory_budget, cpu_budget = self.budget_facts()
+        need = budget_need(memory_mb, cpu_cores, use_tcg=use_tcg)
+        have = {
+            RouteKey.MEMORY_MB: None if memory_budget is None else str(round(memory_budget)),
+            RouteKey.CPU: None if cpu_budget is None else f"{cpu_budget:.2f}",
+        }
+        total_memory_mb, total_cpu = _vm_totals(memory_mb, cpu_cores, use_tcg=use_tcg)
+        if total_memory_mb <= self._memory_budget_mb and total_cpu <= self._cpu_budget:
+            return need, have
+        # The message and context give the values of required and found (one may be unlimited)
+        mem_budget_str = have[RouteKey.MEMORY_MB] or "unlimited"
+        cpu_budget_str = have[RouteKey.CPU] or "unlimited"
+        raise RouteError(
+            f"VM {vm_id} can never fit: requested {need[RouteKey.MEMORY_MB]}MB memory, "
+            f"{need[RouteKey.CPU]} CPU; total budget {mem_budget_str}MB memory, "
+            f"{cpu_budget_str} CPU.",
+            code=ErrorCode.CAPACITY_NEVER_FITS,
+            required={**target, **need},
+            found={**target, **have},
+            context={
+                "vm_id": vm_id,
+                "requested_memory_mb": need[RouteKey.MEMORY_MB],
+                "requested_cpu": need[RouteKey.CPU],
+                "memory_budget_mb": mem_budget_str,
+                "cpu_budget": cpu_budget_str,
+            },
+            hint="Run it on a worker whose budget holds it (see `required`), or ask for a smaller VM.",
+            instance_id=None,
+        )
+
+    def budget_facts(self) -> tuple[float | None, float | None]:
+        """The whole memory budget (whole MB) and CPU budget (cores, two decimals), rounded
+        down, VM overheads counted as in CAPACITY_NEVER_FITS; None for a dimension no probe
+        sized (no limit). A request whose `required` is not above them fits the budget."""
+        return (
+            None if math.isinf(self._memory_budget_mb) else float(math.floor(self._memory_budget_mb)),
+            None if math.isinf(self._cpu_budget) else math.floor(round(self._cpu_budget * 100, 6)) / 100,
+        )
 
     def _budget_texts(self) -> tuple[str, str]:
         """The memory budget (whole MB) and the CPU budget (0.1 core) as error texts;
@@ -1161,48 +1188,6 @@ class ResourceAdmissionController:
             self._ease_shared_stop(now=asyncio.get_running_loop().time())
             self._wake_waiters()
 
-    def effective_max_vms(self, guest_memory_mb: float, cpu_per_vm: float) -> int:
-        """Compute how many VMs could theoretically fit given the current budget.
-
-        Uses total budget (not available), i.e. ignores current allocations.
-        Useful for sizing pools at startup before any VMs are running.
-
-        Memory per VM is computed as guest_memory_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB, as
-        acquire() does without use_tcg.
-        CPU per VM includes DEFAULT_VM_CPU_OVERHEAD_CORES, same as acquire().
-        Disk: the home disks of default size (DEFAULT_DISK_MB) that gate 4 admits on
-        the free space now, as if no VM of this controller ran; no limit when the
-        free space cannot be read. The disk alone sizes no pool: -1 stays -1.
-
-        Args:
-            guest_memory_mb: Guest memory per VM (without the VM overhead)
-            cpu_per_vm: Guest CPU cores per VM (without overhead)
-
-        Returns:
-            Effective max VMs, or -1 if both budgets are unlimited (every capacity probe failed)
-        """
-        total_memory_per_vm = guest_memory_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
-        total_cpu_per_vm = cpu_per_vm + DEFAULT_VM_CPU_OVERHEAD_CORES
-
-        # Per-dimension max (the overheads keep each divisor above 0); an infinite budget has none
-        max_by_memory = (
-            None if math.isinf(self._memory_budget_mb) else int(self._memory_budget_mb / total_memory_per_vm)
-        )
-        max_by_cpu = None if math.isinf(self._cpu_budget) else int(self._cpu_budget / total_cpu_per_vm)
-
-        if max_by_memory is None and max_by_cpu is None:
-            return -1  # Both unlimited
-
-        # Their disks' blocks would be free again, and no reserve would be counted
-        max_by_disk: int | None = None
-        disk = self._probe_disk()
-        if disk is not None:
-            free_mb, written_mb = disk
-            room_mb = free_mb + written_mb - self._disk_free_floor_mb
-            max_by_disk = max(0, int(room_mb / (DEFAULT_DISK_MB / self._disk_overcommit_ratio)))
-
-        return min(m for m in (max_by_memory, max_by_cpu, max_by_disk) if m is not None)
-
     def _blocking_gate(self, memory_mb: float, cpu_cores: float, disk_mb: float) -> _Gate | None:
         """The first admission gate that refuses the request.
 
@@ -1256,8 +1241,7 @@ class ResourceAdmissionController:
 
         # Gate 3b: Memory pressure (Linux PSI / macOS sysctl, ~3-5µs, cached 100ms)
         # Each platform has its own rejection logic (no shared threshold).
-        pressure = self._probe_memory_pressure()
-        if pressure is True:
+        if self._probe_memory_pressure():
             logger.debug("Gate 3b (memory pressure) blocked")
             return _Gate.MEMORY_PRESSURE
 
@@ -1311,9 +1295,9 @@ class ResourceAdmissionController:
         (`evictions`)."""
         if self._no_gain_passes >= _SHARED_NO_GAIN_PASSES and not evictions.stopped:
             evictions.stopped = evictions.shared_stop = True  # the caches gave nothing to the requests before
-        while not self._stopped:  # acquire raises SCHEDULER_STATE then
+        while not self._stop_event.is_set():  # acquire raises SCHEDULER_STATE then
             async with self._evict_lock:
-                if self._stopped:  # it waited for the lock behind a pass that stop() ended
+                if self._stop_event.is_set():  # it waited for the lock behind a pass that stop() ended
                     return
                 if evictions.checked and self._nothing_to_evict_at == self._room_version:
                     return  # a pass at this room version found nothing to evict: wait for a change
@@ -1462,7 +1446,8 @@ class ResourceAdmissionController:
         the evictions of the request (`evictions`). A pass whose syncfs may hide its gain
         (_Evictions.sync_first) gives no verdict: the next one syncs before it evicts. Returns
         whether the request checks its room again at once: the pass evicted, its space
-        showed, and the request does not fit."""
+        showed (or its sync hid the gain: the next pass syncs first, _Evictions.sync_first),
+        and the request does not fit."""
         if evictions.sync_first and not await self._sync_filesystem():
             self._recheck_soon()  # the sync still writes the dirty data: check again once it may be done
             return False
@@ -1484,7 +1469,7 @@ class ResourceAdmissionController:
             return False
         after = await self._space_after_pass(disk_mb, start=start, evicted_mb=evicted_mb)
         end = after.space
-        if end is None or self._stopped:
+        if end is None or self._stop_event.is_set():
             return False
         if end.shortfall_mb <= 0:
             self._gave_space()  # it fits: the run of passes of nothing ends
@@ -1546,7 +1531,7 @@ class ResourceAdmissionController:
         and the others' `others_mb` fit (the free space showed the removals at once)."""
         orders = [(cache, cache.eviction_order()) for cache in self._caches]  # each cache listed once
         evicted_mb = 0.0
-        while orders and evicted_mb < lacking_mb and not self._stopped:
+        while orders and evicted_mb < lacking_mb and not self._stop_event.is_set():
             cache, order = orders.pop(0)
             try:
                 freed = await order.evict_next()
@@ -1630,7 +1615,13 @@ class ResourceAdmissionController:
             if gain is not None and gain > best:
                 best, grew_at = gain, now
             seen = max(best, 0.0)
-            if self._stopped or space is None or gain is None or space.shortfall_mb <= 0 or gain >= evicted_mb:
+            if (
+                self._stop_event.is_set()
+                or space is None
+                or gain is None
+                or space.shortfall_mb <= 0
+                or gain >= evicted_mb
+            ):
                 return space, False, seen
             if now - grew_at >= settle.quiet:
                 return space, False, seen
@@ -1643,7 +1634,7 @@ class ResourceAdmissionController:
         """Wake every waiter once the removed space still coming (_Pending) has shown or its
         pass has ended, once one waiting request fits, or once a running syncfs has ended: the
         requests that wait for it check again then. One timer at a time; none after stop()."""
-        if not self._stopped and (self._recheck_task is None or self._recheck_task.done()):
+        if not self._stop_event.is_set() and (self._recheck_task is None or self._recheck_task.done()):
             self._recheck_task = asyncio.get_running_loop().create_task(self._recheck_later())
 
     async def _recheck_later(self) -> None:
@@ -1654,7 +1645,7 @@ class ResourceAdmissionController:
         (the room changed: they make room again, so a request that waits for its sync before
         a pass runs that pass then, not at the self-wake); not before (100 waiters woken twice
         a second each listed the caches: 0.3 core per cache)."""
-        while not self._stopped:
+        while not self._stop_event.is_set():
             await asyncio.sleep(_GAIN_MAX_POLL_SECONDS)
             if (pending := self._pending) is None:
                 if self._syncfs_job is None or self._syncfs_job.done():
@@ -1679,7 +1670,7 @@ class ResourceAdmissionController:
         within _SYNCFS_WAIT_SECONDS. One runs at a time: a call while one runs waits for that
         one. A sync not done in time, or when stop() comes, goes on in its thread; none starts
         after stop() (asyncio.run would wait for its thread: 8-16 s on gp3)."""
-        if self._stopped:
+        if self._stop_event.is_set():
             return False
         if self._syncfs_job is None or self._syncfs_job.done():
             self._syncfs_job = asyncio.get_running_loop().create_task(asyncio.to_thread(_syncfs, self._disk_dir))
@@ -1692,7 +1683,7 @@ class ResourceAdmissionController:
             )
         finally:
             stopping.cancel()
-        return self._syncfs_job.done() and not self._stopped
+        return self._syncfs_job.done() and not self._stop_event.is_set()
 
     def note_shared_blocks(self, disk_name: str, shared_bytes: int) -> None:
         """A home disk about to be cloned from an L1 template: its first `shared_bytes` of

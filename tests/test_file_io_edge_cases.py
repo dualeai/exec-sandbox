@@ -424,8 +424,8 @@ os.truncate('/home/user/readable_sparse', 256)
 
 
 def _make_write_header(op_id: str, path: str) -> bytes:
-    """Build a raw write_file JSON frame."""
-    return json.dumps({"action": "write_file", "op_id": op_id, "path": path}).encode() + b"\n"
+    """Build a raw write_file JSON frame (every field: the guest refuses a header without one)."""
+    return json.dumps({"action": "write_file", "op_id": op_id, "path": path, "make_executable": False}).encode() + b"\n"
 
 
 def _make_file_end(op_id: str) -> bytes:
@@ -460,7 +460,7 @@ class TestWriteAbortRecovery:
             op_id = uuid4().hex
 
             # Register op so we can receive the error response
-            op_queue = channel.register_op(op_id)
+            op_queue = channel.register_op(op_id, changes_state=True)
 
             try:
                 # Send header

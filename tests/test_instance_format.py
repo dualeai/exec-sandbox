@@ -8,6 +8,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import pickle
 import re
 import secrets
@@ -18,10 +19,15 @@ import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import BaseModel, ConfigDict
 
-from exec_sandbox import __version__
-from exec_sandbox.exceptions import ConfigError, ErrorCode, InstanceGoneError, InvalidInputError, RouteError
+from exec_sandbox.exceptions import (
+    ConfigError,
+    ErrorCode,
+    InstanceGoneError,
+    InvalidInputError,
+    RouteError,
+)
 from exec_sandbox.instance import codec, head, ids, keyring, models, pack
-from tests.instance_support import GOLDEN_KEY, GOLDEN_KEY_ID, head_header, new_keyring
+from tests.instance_support import GOLDEN_KEY, GOLDEN_KEY_ID, head_header, new_keyring, seal_foreign_head
 
 if sys.version_info >= (3, 14):
     from compression import zstd
@@ -102,13 +108,14 @@ class TestKeyring:
         assert exc.value.action == "FIX_CONFIG"
 
     def test_missing_key_names_it(self) -> None:
-        """The message names the missing key id and the ids this keyring holds."""
+        """The message names the missing key id and the ids this keyring holds; the context
+        holds the missing id, for a broker that routes by key (WorkerFacts.key_ids)."""
         ring = keyring.Keyring.parse(GOLDEN_KEY)
         with pytest.raises(
             ConfigError, match='uses key id "abc"', check=lambda e: e.code is ErrorCode.INSTANCE_KEY_MISSING
         ) as exc:
             ring.get("abc", instance_id=_ID)
-        assert exc.value.instance_id == _ID
+        assert (exc.value.instance_id, exc.value.context) == (_ID, {"key_id": "abc"})
         assert GOLDEN_KEY_ID in str(exc.value)
 
     def test_wrap_round_trip_and_tamper(self) -> None:
@@ -208,11 +215,8 @@ class TestBlockCodec:
         with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
             codec.open_block(cipher, record, self._aad(), instance_id=_ID)
         assert exc.value.action == "ROUTE"
-        assert (exc.value.instance_id, exc.value.required, exc.value.found) == (
-            _ID,
-            {"release": "one that reads this block"},
-            {"release": __version__},
-        )
+        assert (exc.value.instance_id, exc.value.required, exc.value.found) == (_ID, {}, {})
+        assert str(exc.value).endswith(": this release cannot read its block.")
 
     def test_aad_has_one_width_for_every_instance_id(self) -> None:
         """Instance ids of any length bind through their SHA-256: no separator, no boundary shift.
@@ -228,7 +232,6 @@ class TestHead:
     def test_round_trip(self) -> None:
         data_key = secrets.token_bytes(32)
         data, header = _sealed(self._RING, data_key=data_key)
-        assert head.read_header(data, instance_id=_ID) == header
         assert head.open_head(data, self._RING, instance_id=_ID) == (header, _BODY, data_key)
         assert head.authenticate(data, self._RING, instance_id=_ID) == header
 
@@ -264,7 +267,7 @@ class TestHead:
             match="belongs to another instance",
             check=lambda e: e.code is ErrorCode.INSTANCE_INTEGRITY,
         ):
-            head.read_header(data, instance_id=_ID)
+            head.read_summary(data, instance_id=_ID)
 
     def test_authenticated_body_this_release_cannot_read_routes(self) -> None:
         """A body that authenticates but does not parse: written by this library, ROUTE, not RECREATE."""
@@ -279,6 +282,75 @@ class TestHead:
             head.open_head(data, self._RING, instance_id=_ID)
         assert exc.value.action == "ROUTE"
         head.authenticate(data, self._RING, instance_id=_ID)  # the read-back never parses the body
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            pytest.param({"added_later": 1}, id="new-field"),
+            pytest.param({"generation": "2"}, id="changed-type"),
+        ],
+    )
+    def test_authenticated_header_this_release_cannot_read_routes(self, fields: dict[str, object]) -> None:
+        """A header that authenticates but does not parse (a field this release does not know, a
+        changed type): another release wrote it. ROUTE to another release (empty `required`), never
+        RECREATE."""
+        data = seal_foreign_head(
+            kek=self._RING.latest,
+            instance_id=_ID,
+            header_fields=fields,
+            body_json=head.canonical_json(_BODY.model_dump(mode="json")),
+        )
+        for open_head in (head.open_head, head.authenticate):
+            with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
+                open_head(data, self._RING, instance_id=_ID)
+            assert (exc.value.action, exc.value.instance_id) == ("ROUTE", _ID)
+            assert (exc.value.required, exc.value.found) == ({}, {})  # no fact names the release that reads it
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param({**_BODY.model_dump(mode="json"), "added_later": 1}, id="new-field"),
+            pytest.param(
+                {
+                    **_BODY.model_dump(mode="json"),
+                    "host": {**_BODY.host.model_dump(mode="json"), "qemu_version": "11.1"},
+                },
+                id="qemu-version-form",
+            ),
+            pytest.param(
+                {
+                    **_BODY.model_dump(mode="json"),
+                    "chain": [{**e.model_dump(mode="json"), "block_bytes": 32 * 1024} for e in _BODY.chain],
+                },
+                id="block-size",
+            ),
+        ],
+    )
+    def test_authenticated_body_of_another_release_routes(self, body: dict[str, object]) -> None:
+        """A body with a field this release does not know, or a value form it does not read (a
+        QEMU version that is not MAJOR.MINOR.PATCH, which the QEMU rule compares part by part):
+        ROUTE to another release, whichever release the body names (the versions of one fleet
+        can be equal: no release key)."""
+        data = seal_foreign_head(
+            kek=self._RING.latest, instance_id=_ID, header_fields={}, body_json=head.canonical_json(body)
+        )
+        with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
+            head.open_head(data, self._RING, instance_id=_ID)
+        assert (exc.value.required, exc.value.found) == ({}, {})
+
+    @pytest.mark.parametrize(
+        ("plain", "release"),
+        [
+            pytest.param(b'{"host":{"release":"1.2.3"},"x":1}', "1.2.3", id="named"),
+            pytest.param(b'{"host":{"release":""}}', None, id="empty"),
+            pytest.param(b'{"host":{"release":12}}', None, id="not-a-string"),
+            pytest.param(b'{"x":1}', None, id="no-host"),
+            pytest.param(b"[1]", None, id="not-an-object"),
+            pytest.param(b"not json", None, id="not-json"),
+        ],
+    )
+    def test_writer_release(self, plain: bytes, release: str | None) -> None:
+        assert head.writer_release(plain) == release
 
     def test_authenticate_with_the_named_key_only(self) -> None:
         """The body must open with the data key the header wraps, and the keyring must hold
@@ -310,7 +382,6 @@ class TestHead:
             pytest.param({"wrapped_data_key": "b" * 78}, id="short-wrapped-key"),
             pytest.param({"generation": 0}, id="generation-0"),
             pytest.param({"recent_commits": []}, id="no-recent"),
-            pytest.param({"unknown": 1}, id="extra-field"),
             pytest.param({"generation": "2"}, id="string-generation"),
         ],
     )
@@ -326,7 +397,7 @@ class TestHead:
         with pytest.raises(
             InstanceGoneError, match="header is not valid", check=lambda e: e.code is ErrorCode.INSTANCE_INTEGRITY
         ):
-            head.read_header(data, instance_id=_ID)
+            head.read_summary(data, instance_id=_ID)
 
     @pytest.mark.parametrize(
         "recent",
@@ -374,7 +445,7 @@ class TestHead:
         header_bytes = b"[" * 60000
         data = head.MAGIC + len(header_bytes).to_bytes(4, "big") + header_bytes
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_INTEGRITY):
-            head.read_header(data + bytes(codec.NONCE_BYTES), instance_id=_ID)
+            head.read_summary(data + bytes(codec.NONCE_BYTES), instance_id=_ID)
 
     @pytest.mark.parametrize("data", [b"", b"NOTAHEAD" + bytes(20), head.MAGIC + (2**31).to_bytes(4, "big")])
     def test_garbage_fails(self, data: bytes) -> None:
@@ -384,8 +455,27 @@ class TestHead:
 
 class TestGoldenVectors:
     """Format permanence: stored bytes open, and sealing the same inputs gives the same bytes.
-    A failure here means stored instances no longer load: change the layout on purpose
-    (MAGIC, keys) and regenerate the vectors, never by accident."""
+
+    Design choice: one stored layout, with no format number and no migration code. A layout
+    change is a breaking change, accepted on purpose: it keeps the format code small, and
+    authentication already tells data of this library from damaged data. A failure here
+    means instances saved before your change will not load after it. Before you regenerate
+    the vectors, weigh what the change gives against what it breaks:
+    - Head header (except its envelope), head body, HostFacts, VmSpec or chain fields, and
+      BLOCK_BYTES (each chain entry states it): every other release from this one on raises
+      RouteError (ROUTE) for the instances of this one, and this one for theirs. The data stays intact. v1.0.0 and v1.0.1 parse the
+      header before the key: for them a header change is INSTANCE_INTEGRITY.
+    - The body field host.release: describe_instance shows it as writer_release (which
+      release saved the instance). Moved or renamed, describe shows no writer release.
+    - The envelope (MAGIC, the header length, instance_id, key_id, wrapped_data_key: see
+      models.HeadEnvelope), the header and head size limits, PACK_MAGIC, the trailer, the
+      AADs: the other release cannot authenticate or place the bytes and raises
+      INSTANCE_INTEGRITY. Its action is RECREATE: clients that follow it delete good data.
+    - The store key layout or the default s3_instance_prefix: INSTANCE_NOT_FOUND or
+      INSTANCE_EXPIRED, also RECREATE.
+    - The key-id label: INSTANCE_KEY_MISSING (FIX_CONFIG) on every instance.
+    If the gain is worth it, regenerate the vectors and list the break under the breaking
+    changes of the release notes."""
 
     def test_block_record(self) -> None:
         v = _VECTORS
@@ -403,10 +493,8 @@ class TestGoldenVectors:
         kek = keyring.Key(id=v["kek_id"], secret=bytes.fromhex(v["kek_secret"]))
         assert keyring.key_id(kek.secret) == v["kek_id"]
         data = bytes.fromhex(v["head"])
-        header = head.read_header(data, instance_id=v["instance_id"])
+        header, body, data_key = head.open_head(data, keyring.Keyring(keys=(kek,)), instance_id=v["instance_id"])
         assert header == models.HeadHeader.model_validate_json(json.dumps(v["header"]))
-        opened_header, body, data_key = head.open_head(data, keyring.Keyring(keys=(kek,)), instance_id=v["instance_id"])
-        assert opened_header == header
         assert data_key == bytes.fromhex(v["data_key"])
         assert body.model_dump(mode="json") == v["body"]
         resealed = head.seal_head_with_nonce(header=header, body=body, data_key=data_key, nonce=bytes(range(12)))
@@ -435,6 +523,85 @@ class TestGoldenVectors:
                 )
                 digests = [hashlib.sha256(targets[s].read_bytes()).hexdigest() for s in sorted(targets)]
                 assert digests == v["streams_after"][entry.commit_id], entry.kind
+
+    def test_body_objects_reseal_to_the_same_bytes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """write_object of the streams the chain rebuilds (a full copy, then a pack on its
+        baseline), with the nonces of the golden objects, gives the golden bytes: the index
+        form, the record order and the trailer are pinned on the write side too."""
+        v = _VECTORS
+        data_key = bytes.fromhex(v["data_key"])
+        body = models.HeadBody.model_validate_json(json.dumps(v["body"]))
+        streams = (models.STREAM_VMSTATE, models.STREAM_HOME)
+        targets = {s: tmp_path / f"stream-{s}" for s in streams}
+        for target in targets.values():
+            pack.new_stream_file(target)
+        before: dict[int, Path] | None = None
+        for n, entry in enumerate(body.chain):
+            golden = bytes.fromhex(v["objects"][entry.commit_id])
+            obj = tmp_path / entry.commit_id
+            obj.write_bytes(golden)
+            with contextlib.ExitStack() as files:
+                fds = {s: files.enter_context(targets[s].open("r+b")).fileno() for s in streams}
+                pack.apply_object(
+                    obj,
+                    data_key=data_key,
+                    instance_id=v["instance_id"],
+                    commit_id=entry.commit_id,
+                    targets=fds,
+                    sizes=dict(enumerate(entry.stream_sizes)),
+                )
+            after = {s: tmp_path / f"after-{n}-{s}" for s in streams}
+            for s in streams:
+                after[s].write_bytes(targets[s].read_bytes())
+            nonces = _nonces_of(golden, data_key=data_key, instance_id=v["instance_id"], commit_id=entry.commit_id)
+            resealed = tmp_path / f"{entry.commit_id}.resealed"
+            drawn = _GoldenNonces(nonces)
+            with monkeypatch.context() as patched:
+                patched.setattr(pack, "os", drawn)
+                patched.setattr(codec, "os", drawn)
+                pack.write_object(
+                    resealed,
+                    data_key=data_key,
+                    instance_id=v["instance_id"],
+                    commit_id=entry.commit_id,
+                    streams={s: (after[s], None if before is None else before[s]) for s in streams},
+                )
+            assert (nonces, resealed.read_bytes()) == ([], golden), entry.kind
+            before = after
+
+
+class _GoldenNonces:
+    """The `os` of pack and codec during a reseal: urandom gives the golden nonces in order,
+    every other name is the real os module's."""
+
+    def __init__(self, nonces: list[bytes]) -> None:
+        self._nonces = nonces
+
+    def urandom(self, size: int) -> bytes:
+        assert size == codec.NONCE_BYTES
+        return self._nonces.pop(0)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(os, name)
+
+
+def _nonces_of(obj: bytes, *, data_key: bytes, instance_id: str, commit_id: str) -> list[bytes]:
+    """The nonces of a body object in the order its writer drew them: each record's (the
+    first 12 bytes of each, the records back to back in stream then block order), then the
+    index's. The record lengths come from the object's index, read with the data key."""
+    trailer = obj[-(12 + len(pack.PACK_MAGIC)) :]  # index offset (8 bytes), index length (4), magic
+    index_offset, index_len = int.from_bytes(trailer[:8], "big"), int.from_bytes(trailer[8:12], "big")
+    sealed = obj[index_offset : index_offset + index_len]
+    aad = codec.object_index_aad(instance_id=instance_id, commit_id=commit_id)
+    index = json.loads(AESGCM(data_key).decrypt(sealed[:12], sealed[12:], aad))
+    nonces: list[bytes] = []
+    position = 0
+    for stream in sorted(index, key=int):
+        for _block, length in index[stream]:
+            nonces.append(obj[position : position + 12])
+            position += length
+    assert position == index_offset
+    return [*nonces, sealed[:12]]
 
 
 def test_instance_errors_pickle_with_hint() -> None:

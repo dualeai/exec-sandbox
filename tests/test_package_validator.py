@@ -8,7 +8,7 @@ import pytest
 
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language
-from exec_sandbox.package_validator import PackageValidator
+from exec_sandbox.package_validator import BUNDLED_NPM_ALLOW_LIST, BUNDLED_PYPI_ALLOW_LIST, PackageValidator
 
 
 def _no_version(spec: str) -> str:
@@ -692,7 +692,9 @@ class TestPackageValidatorCreate:
     async def test_create_uses_default_paths(self) -> None:
         """With no paths, create() loads the catalogs shipped in the package."""
         # Should not raise - uses default bundled catalogs
-        validator = await PackageValidator.create()
+        validator = await PackageValidator.create(
+            pypi_allow_list_path=BUNDLED_PYPI_ALLOW_LIST, npm_allow_list_path=BUNDLED_NPM_ALLOW_LIST
+        )
 
         # Should have loaded real packages from catalogs
         validator.validate(["pandas==2.0.0"], language=Language.PYTHON)

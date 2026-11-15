@@ -97,6 +97,10 @@ class S3InstanceStore(InstanceStore):
         self._bucket = bucket
         self._prefix = prefix
 
+    @property
+    def location(self) -> str:
+        return f"s3://{self._bucket}/{self._prefix}"
+
     @classmethod
     @contextlib.asynccontextmanager
     async def open(

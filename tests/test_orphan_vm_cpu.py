@@ -35,6 +35,8 @@ from tests.cpu_helpers import (
     assert_cpu_idle,
     collect_cpu_samples,
     collect_cpu_samples_bulk,
+    gone,
+    sampled,
 )
 
 if TYPE_CHECKING:
@@ -77,7 +79,6 @@ class TestOrphanVmCpu:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -123,7 +124,6 @@ class TestOrphanVmCpu:
                     reservation=None,
                     retry_profile=constants.RETRY_USER_FACING,
                     mem_path=None,
-                    mem_path_share=False,
                 )
                 for i in range(num_vms)
             ]
@@ -165,7 +165,6 @@ class TestOrphanVmCpu:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -207,17 +206,17 @@ class TestDestroyProcessCleanup:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
 
         # Verify process is running
-        assert is_process_alive(vm.process), "QEMU should be running before destroy"
+        qemu = sampled(vm.process)  # QEMU itself, also behind sudo
+        assert qemu.is_running(), "QEMU should be running before destroy"
 
         # destroy_vm() returns once the process is gone: no wait after it
         assert await vm_manager.destroy_vm(vm) is True
-        assert not is_process_alive(vm.process), "QEMU process should be dead after destroy"
+        assert gone(qemu), "QEMU process should be dead after destroy"
 
     async def test_destroy_kills_gvproxy_process(self, vm_manager: VmManager) -> None:
         """VmManager.destroy_vm() should terminate the gvproxy process."""
@@ -233,7 +232,6 @@ class TestDestroyProcessCleanup:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -241,10 +239,11 @@ class TestDestroyProcessCleanup:
         assert vm.gvproxy_proc.pid is not None, "gvproxy should have a PID"
 
         # Verify both are running
-        assert is_process_alive(vm.process), "QEMU should be running"
+        qemu = sampled(vm.process)  # QEMU itself, also behind sudo
+        assert qemu.is_running(), "QEMU should be running"
         assert is_process_alive(vm.gvproxy_proc), "gvproxy should be running"
 
         # destroy_vm() returns once both processes are gone: no wait after it
         assert await vm_manager.destroy_vm(vm) is True
-        assert not is_process_alive(vm.process), "QEMU should be dead"
+        assert gone(qemu), "QEMU should be dead"
         assert not is_process_alive(vm.gvproxy_proc), "gvproxy should be dead"

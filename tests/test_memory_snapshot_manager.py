@@ -48,7 +48,7 @@ from exec_sandbox.exceptions import (
 from exec_sandbox.files.disk import pwrite_all
 from exec_sandbox.files.locks import CacheEntry, EntryLease
 from exec_sandbox.guest_agent_protocol import WarmReplAckMessage
-from exec_sandbox.memory_snapshot_files import open_live_ram_dir, remove_dead_live_ram_dirs
+from exec_sandbox.memory_snapshot_files import SnapshotMetadata, open_live_ram_dir, remove_dead_live_ram_dirs
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager, _publish_ram, _vmstate_digest
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import get_arch_name
@@ -145,9 +145,22 @@ def test_cache_folder_is_private_whatever_the_umask(tmp_path: Path, images_dir: 
     assert [stat.S_IMODE(p.stat().st_mode) & 0o777 for p in (cache.parent, cache)] == [0o700, 0o700]
 
 
+class _Layouts:
+    """VmManager.restore_layout of the `manager` fixture: a text of its arguments, with no
+    command build (a real one runs this host's QEMU probes); `calls` keeps the arguments."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[VmSpec, str | None, bool]] = []
+
+    async def __call__(self, spec: VmSpec, *, machine_type: str | None, packages: bool) -> str:
+        self.calls.append((spec, machine_type, packages))
+        return f"-device virtio-blk-device serial=home\nnet={spec.has_network_device} packages={packages}"
+
+
 @pytest.fixture
-def manager(cache_dir: Path, images_dir: Path) -> MemorySnapshotManager:
-    """MemorySnapshotManager with real Settings + real VmManager (not started)."""
+def manager(cache_dir: Path, images_dir: Path, monkeypatch: pytest.MonkeyPatch) -> MemorySnapshotManager:
+    """MemorySnapshotManager with real Settings + real VmManager (not started), whose
+    restore_layout is a _Layouts."""
     from exec_sandbox.settings import Settings
     from exec_sandbox.vm_manager import VmManager
 
@@ -157,6 +170,7 @@ def manager(cache_dir: Path, images_dir: Path) -> MemorySnapshotManager:
         kernel_path=images_dir / "kernels",
     )
     vm_manager = VmManager(settings)  # Not started — safe for unit tests
+    monkeypatch.setattr(vm_manager, "restore_layout", _Layouts())
     return MemorySnapshotManager(settings, vm_manager)
 
 
@@ -194,7 +208,7 @@ def _save_vm(*, home_disk: Path, qemu_vm: bool) -> MagicMock:
     vm.qmp_socket = Path("/tmp/fake.sock")
     vm.use_qemu_vm_user = qemu_vm
     vm.workdir.home_disk = home_disk
-    vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+    vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(status="ok"))
     return vm
 
 
@@ -290,7 +304,7 @@ def mock_system_probes() -> Generator[dict[str, Any], None, None]:
 
     with (
         patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
-        patch("exec_sandbox.memory_snapshot_manager.probe_qemu_version", new_callable=AsyncMock) as mock_qemu,
+        patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as mock_qemu,
         patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
         # QEMU as this user (no sudo probe on a Linux host with the qemu-vm setup)
         patch("exec_sandbox.memory_snapshot_manager.probe_qemu_as_qemu_vm", new_callable=AsyncMock, return_value=False),
@@ -311,7 +325,7 @@ class TestComputeCacheKey:
         language: Language = Language.PYTHON,
         packages: list[str] | None = None,
         memory_mb: int = 512,
-        qemu_version: tuple[int, int, int] | None = (9, 2, 0),
+        qemu_version: tuple[int, int, int] = (9, 2, 0),
         accel: str = "HVF",
         allow_network: bool = False,
         l2_path: Path | None = None,
@@ -324,7 +338,7 @@ class TestComputeCacheKey:
 
         with (
             patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
-            patch("exec_sandbox.memory_snapshot_manager.probe_qemu_version", new_callable=AsyncMock) as mock_qemu,
+            patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as mock_qemu,
             patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
         ):
             mock_arch.return_value = HostArch.AARCH64
@@ -347,6 +361,22 @@ class TestComputeCacheKey:
         key_a = await self._compute_key(manager, packages=["pandas==2.2.3"], l2_path=l2_a)
         key_b = await self._compute_key(manager, packages=["pandas==2.2.3"], l2_path=l2_b)
         assert key_a != key_b
+
+    @pytest.mark.parametrize("image", ["base", "kernel", "initramfs"])
+    async def test_guest_image_bytes_pin_key(
+        self, manager: MemorySnapshotManager, images_dir: Path, image: str
+    ) -> None:
+        """A rebuilt base image, kernel or initramfs (other bytes at the same path) -> another
+        L1 key: a snapshot of the old guest never restores on the new one."""
+        images = manager.vm_manager.images
+        path = {
+            "base": next(images_dir.glob("python-*-base-*.qcow2")),
+            "kernel": images.kernel,
+            "initramfs": images.initramfs,
+        }[image]
+        key = await self._compute_key(manager)
+        path.write_bytes(b"rebuilt " + image.encode())
+        assert await self._compute_key(manager) != key
 
     async def test_image_digests_in_one_worker_thread_job(
         self, manager: MemorySnapshotManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -422,7 +452,7 @@ class TestComputeCacheKey:
         for tsc_deadline in (True, False):
             with (
                 patch("exec_sandbox.memory_snapshot_manager.detect_host_arch", return_value=HostArch.X86_64),
-                patch("exec_sandbox.memory_snapshot_manager.probe_qemu_version", new_callable=AsyncMock) as qemu,
+                patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as qemu,
                 patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as accel,
                 patch("exec_sandbox.qemu_cmd.check_tsc_deadline", new_callable=AsyncMock, return_value=tsc_deadline),
                 patch("exec_sandbox.qemu_cmd.detect_host_x86_vendor", return_value="GenuineIntel"),
@@ -431,6 +461,39 @@ class TestComputeCacheKey:
                 accel.return_value = AccelType.KVM
                 keys.append(await manager.compute_cache_key(VmSpec(language=Language.PYTHON), l2_path=None))
         assert keys[0] != keys[1]
+
+    async def test_another_device_layout_another_key(
+        self, manager: MemorySnapshotManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A release whose restore command has other devices (VmManager.restore_layout) never
+        restores an L1 entry saved with the old ones: no format number to bump by hand."""
+        key = await self._compute_key(manager)
+        real = manager.vm_manager.restore_layout
+
+        async def moved_disk(spec: VmSpec, *, machine_type: str | None, packages: bool) -> str:
+            return (await real(spec, machine_type=machine_type, packages=packages)).replace(
+                "serial=home", "serial=data"
+            )
+
+        monkeypatch.setattr(manager.vm_manager, "restore_layout", moved_disk)
+        assert await self._compute_key(manager) != key
+
+    async def test_the_key_holds_the_layout_of_an_l1_restore(
+        self, manager: MemorySnapshotManager, tmp_path: Path
+    ) -> None:
+        """The layout in the key is that of an L1 restore of the spec: this QEMU's machine type
+        alias (machine_type None) and an L2 drive when the key has an L2 layer. The layout
+        holds the migration capabilities (TestDeviceLayout in test_vm_manager.py)."""
+        l2 = tmp_path / "l2.qcow2"
+        l2.write_bytes(b"layer")
+        await self._compute_key(manager, allow_network=True)
+        await self._compute_key(manager, l2_path=l2)
+        layouts = manager.vm_manager.restore_layout
+        assert isinstance(layouts, _Layouts)
+        assert [(spec.allow_network, machine_type, packages) for spec, machine_type, packages in layouts.calls] == [
+            (True, None, False),
+            (False, None, True),
+        ]
 
     async def test_different_network_different_key(self, manager: MemorySnapshotManager) -> None:
         """Different allow_network values produce different keys (topology differs)."""
@@ -448,13 +511,6 @@ class TestComputeCacheKey:
         key_ab = await self._compute_key(manager, packages=["a", "b"])
         key_ba = await self._compute_key(manager, packages=["b", "a"])
         assert key_ab == key_ba
-
-    async def test_none_qemu_version(self, manager: MemorySnapshotManager) -> None:
-        """An unknown QEMU version gives a stable key of its own."""
-        key = await self._compute_key(manager, qemu_version=None)
-        assert _KEY.fullmatch(key), key
-        assert key == await self._compute_key(manager, qemu_version=None)
-        assert key != await self._compute_key(manager, qemu_version=(9, 2, 0))
 
 
 class TestVmstateDigest:
@@ -580,6 +636,7 @@ class TestCheckCache:
         meta = manager.cache_dir / f"{key}.vmstate.meta"
         vmstate.write_bytes(b"" if empty else _VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
+        vmstate.with_suffix(".ram").write_bytes(b"ram")  # and its RAM template
         meta.write_text(json.dumps({"test": True} if empty else {"test": True, "vmstate_sha256": _VMSTATE_DIGEST}))
         return vmstate
 
@@ -619,10 +676,10 @@ class TestCheckCache:
         assert result is None
         assert vmstate.exists()
 
-    async def test_no_sha256_in_metadata_still_hits(
+    async def test_no_sha256_in_metadata_is_a_miss(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Metadata without vmstate_sha256: no digest check, and the entry is a hit."""
+        """Metadata without vmstate_sha256 (every save writes one): a miss, and the entry goes."""
         key = await manager.compute_cache_key(
             VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
         )
@@ -633,7 +690,8 @@ class TestCheckCache:
         meta.write_text(json.dumps({"test": True}))  # No vmstate_sha256 field
 
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result == vmstate
+        assert result is None
+        assert not vmstate.exists()
 
 
 @pytest.mark.usefixtures("mock_system_probes")
@@ -670,6 +728,27 @@ class TestCheckCacheAtime:
         with patch.object(manager, "_entry_problem", new=checked_then_evicted):
             await manager.check_cache(key)
         assert not files[0].exists()
+
+
+class TestSnapshotMetadata:
+    """SnapshotMetadata.from_json: every save writes a digest; anything else is no metadata."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param('{"vmstate_sha256": 12345}', id="not-a-string"),
+            pytest.param('{"vmstate_sha256": ""}', id="empty"),
+            pytest.param("{}", id="absent"),
+            pytest.param("[1, 2]", id="not-an-object"),
+            pytest.param("not json", id="not-json"),
+        ],
+    )
+    def test_no_digest_is_no_metadata(self, text: str) -> None:
+        assert SnapshotMetadata.from_json(text) is None
+
+    def test_a_digest_round_trips(self) -> None:
+        meta = SnapshotMetadata(vmstate_sha256=_VMSTATE_DIGEST)
+        assert SnapshotMetadata.from_json(meta.to_json()) == meta
 
 
 class TestHomeDiskEntry:
@@ -727,9 +806,7 @@ class TestHomeDiskEntry:
         vmstate = manager.cache_dir / f"{key}.vmstate"
         vmstate.write_bytes(_VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")
-        (manager.cache_dir / f"{key}.vmstate.meta").write_text(
-            json.dumps({"vmstate_sha256": _VMSTATE_DIGEST, "use_template": True})
-        )
+        (manager.cache_dir / f"{key}.vmstate.meta").write_text(json.dumps({"vmstate_sha256": _VMSTATE_DIGEST}))
 
         assert await manager.check_cache(key) is None
         # Only the lock files of the removal stay (lock files are never deleted: files.locks)
@@ -805,6 +882,10 @@ class TestRestore:
             cache_leases=ANY,
             expose_ports=None,
             reservation=reservation,
+            machine_type=None,
+            egress_domains=None,
+            boot=None,
+            use_template=True,
         )
         leases = restore_vm.await_args.kwargs["cache_leases"]
         assert [lease.path for lease in leases] == [files[0], self._layer(manager)]
@@ -1244,7 +1325,7 @@ class TestTemplateRamInMemory:
             vm.qmp_socket = Path("/tmp/fake.sock")
             vm.use_qemu_vm_user = True
             vm.workdir.home_disk = home_disk
-            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(status="ok"))
             yield vm
 
         async def write_vmstate(path: Path, **_kwargs: object) -> None:
@@ -1302,7 +1383,7 @@ class TestTemplateRamInMemory:
             vm.qmp_socket = Path("/tmp/fake.sock")
             vm.use_qemu_vm_user = False
             vm.workdir.home_disk = home_disk
-            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(status="ok"))
             yield vm
 
         async def write_vmstate_then_logout(path: Path, **_kwargs: object) -> None:
@@ -1422,7 +1503,7 @@ class TestTemplateRamInMemory:
             vm.qmp_socket = Path("/tmp/fake.sock")
             vm.use_qemu_vm_user = False
             vm.workdir.home_disk = home_disk
-            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(status="ok"))
             yield vm
 
         async def write_vmstate(path: Path, **_kwargs: object) -> None:
@@ -1492,7 +1573,7 @@ class TestTemplateRamInMemory:
             vm.qmp_socket = Path("/tmp/fake.sock")
             vm.use_qemu_vm_user = False
             vm.workdir.home_disk = home_disk
-            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+            vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(status="ok"))
             yield vm
 
         async def write_vmstate(path: Path, **_kwargs: object) -> None:
@@ -1976,6 +2057,7 @@ class TestScheduleBackgroundSave:
         meta = manager.cache_dir / f"{key}.vmstate.meta"
         vmstate.write_bytes(_VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
+        vmstate.with_suffix(".ram").write_bytes(b"ram")  # and its RAM template
         meta.write_text(json.dumps({"test": True, "vmstate_sha256": _VMSTATE_DIGEST}))
         vms = _SaveVms(gate=_open_gate(), fail=False)
 
@@ -2001,7 +2083,6 @@ class TestScheduleBackgroundSave:
     @pytest.mark.parametrize(
         ("qemu_version", "scheduled"),
         [
-            pytest.param(None, False, id="unknown"),
             pytest.param((10, 99, 99), False, id="just-below"),
             pytest.param((11, 0, 0), True, id="floor"),
         ],
@@ -2010,7 +2091,7 @@ class TestScheduleBackgroundSave:
         self,
         manager: MemorySnapshotManager,
         mock_system_probes: dict[str, Any],
-        qemu_version: tuple[int, int, int] | None,
+        qemu_version: tuple[int, int, int],
         scheduled: bool,
     ) -> None:
         """Below QEMU 11.0 every save fails: no sacrificial VM is booted for it."""
@@ -2040,7 +2121,7 @@ class TestComputeCacheKeyEdgeCases:
         packages: list[str] | None = None,
         memory_mb: int = 512,
         cpu_cores: int = 1,
-        qemu_version: tuple[int, int, int] | None = (9, 2, 0),
+        qemu_version: tuple[int, int, int] = (9, 2, 0),
         accel: str = "HVF",
         allow_network: bool = False,
     ) -> str:
@@ -2050,7 +2131,7 @@ class TestComputeCacheKeyEdgeCases:
         accel_map = {"HVF": AccelType.HVF, "KVM": AccelType.KVM, "TCG": AccelType.TCG}
         with (
             patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
-            patch("exec_sandbox.memory_snapshot_manager.probe_qemu_version", new_callable=AsyncMock) as mock_qemu,
+            patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as mock_qemu,
             patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
         ):
             mock_arch.return_value = HostArch.AARCH64
@@ -2140,6 +2221,7 @@ class TestCheckCacheEdgeCases:
         meta = manager.cache_dir / f"{key}.vmstate.meta"
         vmstate.write_bytes(data)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
+        vmstate.with_suffix(".ram").write_bytes(b"ram")  # and its RAM template
         meta.write_text(
             json.dumps({"test": True, "vmstate_sha256": _VMSTATE_DIGEST} if meta_dict is None else meta_dict)
         )
@@ -2178,7 +2260,7 @@ class TestCheckCacheEdgeCases:
     async def test_metadata_sha256_is_not_string(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Metadata has vmstate_sha256 as int → coerced to str, SHA-256 mismatch → miss, entry removed."""
+        """Metadata has vmstate_sha256 as int → no digest → miss, entry removed."""
         vmstate, _meta = await self._populate(manager, meta_dict={"vmstate_sha256": 12345})
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is None
@@ -2187,10 +2269,11 @@ class TestCheckCacheEdgeCases:
     async def test_metadata_sha256_empty_string(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Metadata has vmstate_sha256 = "" → falsy, SHA-256 check skipped, still hits."""
-        vmstate, _meta = await self._populate(manager, data=b"not the digest's bytes", meta_dict={"vmstate_sha256": ""})
+        """Metadata has vmstate_sha256 = "": no digest to check (every save writes one) → miss, entry removed."""
+        vmstate, _meta = await self._populate(manager, meta_dict={"vmstate_sha256": ""})
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result == vmstate
+        assert result is None
+        assert not vmstate.exists()
 
     async def test_1_byte_vmstate(self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]) -> None:
         """Minimal valid vmstate (1 byte, a zero byte): its size is not zero, so it is a cache hit.
@@ -2538,6 +2621,7 @@ class TestIntegrationCycles:
         meta = manager.cache_dir / f"{key}.vmstate.meta"
         vmstate.write_bytes(_VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
+        vmstate.with_suffix(".ram").write_bytes(b"ram")  # and its RAM template
         meta.write_text(json.dumps({"test": True, "vmstate_sha256": _VMSTATE_DIGEST}))
         return vmstate, meta
 
@@ -2619,6 +2703,7 @@ class TestIntegrationCycles:
         meta = mgr1.cache_dir / f"{key}.vmstate.meta"
         vmstate.write_bytes(_VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
+        vmstate.with_suffix(".ram").write_bytes(b"ram")  # and its RAM template
         meta.write_text(json.dumps({"vmstate_sha256": _VMSTATE_DIGEST}))
 
         # Check with second manager

@@ -5,32 +5,19 @@ These are NOT probes (optional feature detection) - they validate hard requireme
 
 import asyncio
 import os
-from pathlib import Path
 
 from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.images import GuestImages, kernel_names
-from exec_sandbox.platform_utils import HostArch, arch_name
-
-__all__ = [
-    "clear_kernel_validation_cache",
-    "validate_kernel_initramfs",
-]
-
-# Pre-flight validation cache keyed by (kernel folder, arch)
-_kernel_validated: set[tuple[Path, HostArch]] = set()
+from exec_sandbox.platform_utils import arch_name
 
 
 async def validate_kernel_initramfs(images: GuestImages) -> None:
     """Pre-flight check: a kernel (any of kernel_names(images.arch)) and the initramfs
-    exist in images.kernel_dir (cached, one time per folder and arch).
+    exist in images.kernel_dir. VmManager.start runs it, once per start.
 
     This is NOT a probe (optional feature) - it's a hard requirement.
     Raises ConfigError (ASSET_NOT_FOUND) if files are missing.
     """
-    cache_key = (images.kernel_dir, images.arch)
-    if cache_key in _kernel_validated:
-        return
-
     kernels = [images.kernel_dir / name for name in kernel_names(images.arch)]
     initramfs = images.initramfs
     # One worker-thread job: the kernel folder comes from the caller's config (images_dir,
@@ -56,10 +43,3 @@ async def validate_kernel_initramfs(images: GuestImages) -> None:
             hint=None,
             instance_id=None,
         )
-
-    _kernel_validated.add(cache_key)
-
-
-def clear_kernel_validation_cache() -> None:
-    """Clear the kernel validation cache (for testing)."""
-    _kernel_validated.clear()

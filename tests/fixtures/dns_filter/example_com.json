@@ -1,0 +1,20 @@
+{
+  "_doc": "create_outbound_patterns(['example.com']) and what gvproxy's matcher (gvisor-tap-vsock fork, pkg/services/dns/dns.go matchesAllowlist: lowercase, no trailing dot, Go regexp MatchString) answers for each host. Read by tests/test_dns_filter.py and gvproxy-wrapper/main_test.go.",
+  "domains": [
+    "example.com"
+  ],
+  "patterns": [
+    "^(.*\\.)?example\\.com\\.?$"
+  ],
+  "hosts": {
+    "example.com": true,
+    "www.example.com": true,
+    "a.b.example.com": true,
+    "EXAMPLE.com": true,
+    "www.example.com.": true,
+    "exampleXcom": false,
+    "notexample.com": false,
+    "example.com.evil.org": false,
+    "example.co": false
+  }
+}

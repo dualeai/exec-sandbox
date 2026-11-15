@@ -27,10 +27,8 @@ def register_process(proc: "ProcessWrapper") -> None:
     """Register a process for tracking.
 
     Args:
-        proc: ProcessWrapper to track (a process without a pid is skipped)
+        proc: ProcessWrapper to track
     """
-    if proc.pid is None:
-        return
     _process_groups.add(proc.pid)
     logger.debug("Registered process group", extra={"pid": proc.pid})
 
@@ -41,7 +39,7 @@ def unregister_process(proc: "ProcessWrapper | None") -> None:
     Args:
         proc: ProcessWrapper to untrack (None safe - returns immediately)
     """
-    if proc is None or proc.pid is None:
+    if proc is None:
         return
     _process_groups.discard(proc.pid)
     logger.debug("Unregistered process group", extra={"pid": proc.pid})

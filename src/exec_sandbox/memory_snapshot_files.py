@@ -57,27 +57,24 @@ class SnapshotMetadata:
     cache key holds what the entry was made from (compute_cache_key)."""
 
     vmstate_sha256: str
-    """_vmstate_digest (memory_snapshot_manager) of the vmstate; empty: not checked."""
-    use_template: bool
-    """The guest RAM is the {key}.ram template (memory-backend-file), not in the vmstate."""
+    """_vmstate_digest (memory_snapshot_manager) of the vmstate. The guest RAM is the
+    {key}.ram template (memory-backend-file), never in the vmstate."""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
 
     @classmethod
     def from_json(cls, text: str) -> SnapshotMetadata | None:
-        """Parse JSON text into SnapshotMetadata, or None when it is not a JSON object."""
+        """Parse JSON text into SnapshotMetadata, or None when it is not a JSON object with a
+        digest."""
         try:
             parsed = json.loads(text)
         except ValueError:  # json.JSONDecodeError too
             return None
         if not isinstance(parsed, dict):
             return None
-        fields = cast("dict[str, object]", parsed)
-        return cls(
-            vmstate_sha256=str(fields.get("vmstate_sha256", "")),
-            use_template=bool(fields.get("use_template", False)),
-        )
+        digest = cast("dict[str, object]", parsed).get("vmstate_sha256")
+        return cls(vmstate_sha256=digest) if isinstance(digest, str) and digest else None
 
 
 def _live_ram_root() -> Path:
@@ -90,14 +87,13 @@ def remove_dead_live_ram_dirs() -> None:
     each holds up to a whole guest RAM in memory, until the next template save of this user
     would remove it. VmManager.start runs it, after it killed the VMs of dead processes.
     Sync (a listing): async callers use asyncio.to_thread. With no /dev/shm folder
-    (macOS) there is nothing to remove. A folder that is not private is logged, not raised.
-
-    Raises:
-        OSError: the folder of this user in /dev/shm cannot be opened or listed (remove_dead_folders)
+    (macOS) there is nothing to remove. A folder that is not private, or that cannot be opened
+    or listed (no access, a file-handle limit), is logged, not raised: those RAM folders stay,
+    and the next start tries again.
     """
     try:
         remove_dead_folders(_live_ram_root())  # checks the root before it removes anything in it
-    except ConfigError as e:
+    except (ConfigError, OSError) as e:
         logger.warning("RAM folders of stopped L1 saves stay in /dev/shm", extra={"error": str(e)})
 
 

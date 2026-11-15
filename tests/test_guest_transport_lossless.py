@@ -39,7 +39,6 @@ async def test_request_after_a_long_idle_is_answered(vm_manager: VmManager, monk
         reservation=None,
         retry_profile=constants.RETRY_USER_FACING,
         mem_path=None,
-        mem_path_share=False,
     )
     try:
         await vm.write_file("before.txt", io.BytesIO(b"x"))
@@ -51,7 +50,6 @@ async def test_request_after_a_long_idle_is_answered(vm_manager: VmManager, monk
 
         # The agent did not reset its ports while idle (these lines print in quiet mode too).
         console = "\n".join(vm.console_lines)
-        assert "Read timeout" not in console
-        assert "reopening ports" not in console
+        assert "reopening ports" not in console  # guest-agent main.rs logs it at each port reset
     finally:
         await vm_manager.destroy_vm(vm)

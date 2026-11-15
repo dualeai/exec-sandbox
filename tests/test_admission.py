@@ -52,10 +52,11 @@ from exec_sandbox.constants import (
     DEFAULT_MEMORY_OVERCOMMIT_RATIO,
     RESOURCE_ADMISSION_TIMEOUT_SECONDS,
 )
-from exec_sandbox.exceptions import ErrorAction, ErrorCode, InvalidInputError, RouteError, TransientError
+from exec_sandbox.exceptions import ErrorAction, ErrorCode, InvalidInputError, RouteError, RouteKey, TransientError
 from exec_sandbox.files.disk import overlay_upper
 from exec_sandbox.files.locks import CacheEntry
 from exec_sandbox.platform_utils import HostOS, detect_host_os
+from exec_sandbox.worker_facts import WorkerFacts
 from tests.conftest import skip_unless_linux, skip_unless_macos, time_with
 from tests.test_files_locks import SizedCache, evicted_in_child, leased_in_child
 
@@ -135,9 +136,10 @@ def _probe_clock() -> Generator[Callable[[], None]]:
         yield later
 
 
-async def _budgets(ctrl: ResourceAdmissionController) -> dict[str, str]:
+async def _budgets(ctrl: ResourceAdmissionController) -> dict[str, str | None]:
     """The memory and CPU budgets of `ctrl`, as the error of a request above both gives them
-    (RouteError CAPACITY_NEVER_FITS, `found`: memory in whole MB, CPU to 0.1 core)."""
+    (RouteError CAPACITY_NEVER_FITS, `found`: memory in whole MB, CPU with two decimals;
+    None: no limit)."""
     with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS) as exc_info:
         await ctrl.acquire(
             "vm-huge", memory_mb=10**12, cpu_cores=10**6, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
@@ -177,7 +179,77 @@ async def test_budget_calculation() -> None:
         cpu_reserve_cores=0.5,
     )
     # 16000 * 0.9 * 1.5 = 21600; (8 - 0.5) * 4 = 30
-    assert await _budgets(ctrl) == {"memory_mb": "21600", "cpu": "30.0"}
+    assert await _budgets(ctrl) == {"memory_mb": "21600", "cpu": "30.00"}
+
+
+async def test_budget_facts_round_down_and_the_target_rounds_up() -> None:
+    """budget_facts (the route facts of the budget) round down and CAPACITY_NEVER_FITS's
+    `required` rounds up: a worker whose budget facts are not below `required` admits the
+    VM, and the worker that raised the error never satisfies its own `required`.
+    Budgets: 1000 * 0.9 * 1.0 = 900.4 MB is not reachable with whole numbers, so 900.5 MB
+    of host memory gives 810.45 MB; (1.7 - 0.5) * 1.05 = 1.26 cores."""
+    ctrl = _make_controller(
+        host_memory_mb=900.5,
+        reserve_ratio=0.1,
+        memory_overcommit=1.0,
+        host_cpu_count=1.7,
+        cpu_overcommit=1.05,
+        cpu_reserve_cores=0.5,
+    )
+    assert ctrl.budget_facts() == (810.0, 1.26)
+    with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS) as exc_info:
+        # 730.6 + 80 MB of overhead = 810.6 > 810.45; 1.01 + 0.25 = 1.26 cores fit
+        await ctrl.acquire(
+            "vm-big", memory_mb=730.6, cpu_cores=1.01, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
+    required = exc_info.value.required
+    assert required == {"memory_mb": "811", "cpu": "1.26"}
+    worker = WorkerFacts(values=dict(exc_info.value.found), key_ids=())  # this worker, as the error found it
+    assert not worker.satisfies(required)
+    bigger = WorkerFacts(values={RouteKey.MEMORY_MB: "811", RouteKey.CPU: "1.26"}, key_ids=())
+    assert bigger.satisfies(required)
+
+
+@pytest.mark.parametrize(
+    ("host_cpu_count", "cpu_reserve_cores", "cpu_overcommit", "cpu_cores"),
+    [pytest.param(1.4, 0.5, 12.5, 11.0, id="11.25-cores"), pytest.param(47.5, 0.0, 2.3, 109.0, id="109.25-cores")],
+)
+async def test_a_vm_at_the_budget_fits_whatever_the_float_noise(
+    host_cpu_count: float, cpu_reserve_cores: float, cpu_overcommit: float, cpu_cores: float
+) -> None:
+    """A budget that is a float product ((1.4 - 0.5) * 12.5 is 11.249999999999998) admits a VM
+    that needs exactly that budget (11 + 0.25 cores): the budget facts give the same value, and
+    acquire() admits it, so a worker never refuses what its own facts say it holds."""
+    ctrl = _make_controller(
+        host_cpu_count=host_cpu_count, cpu_reserve_cores=cpu_reserve_cores, cpu_overcommit=cpu_overcommit
+    )
+    need, have = ctrl.check_fits("vm", 256, cpu_cores, use_tcg=False, target={})
+    assert need[RouteKey.CPU] == have[RouteKey.CPU] == f"{cpu_cores + 0.25:.2f}"
+    with _mock_system_memory(100_000):  # host memory never decides here
+        reservation = await ctrl.acquire(
+            "vm", memory_mb=256, cpu_cores=cpu_cores, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+        )
+    await ctrl.release(reservation)
+
+
+def test_check_fits_adds_the_checked_target() -> None:
+    """check_fits (the load's check before the download): the route facts checked before
+    (this worker has them) are in `required` and `found` with the budget; a VM that fits
+    passes. Budgets as in test_budget_calculation: 21600 MB of memory, 30 cores."""
+    ctrl = _make_controller(
+        host_memory_mb=16_000.0,
+        reserve_ratio=0.1,
+        memory_overcommit=1.5,
+        host_cpu_count=8.0,
+        cpu_overcommit=4.0,
+        cpu_reserve_cores=0.5,
+    )
+    target = {RouteKey.ARCH: "aarch64", RouteKey.MACHINE_TYPE: "virt-11.1"}
+    ctrl.check_fits("my-vm", 512, 1.0, use_tcg=False, target=target)  # fits: no error
+    with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS) as exc_info:
+        ctrl.check_fits("my-vm", 512, 64.0, use_tcg=False, target=target)
+    assert dict(exc_info.value.required) == {**target, "memory_mb": "592", "cpu": "64.25"}
+    assert dict(exc_info.value.found) == {**target, "memory_mb": "21600", "cpu": "30.00"}
 
 
 async def test_budget_reserve_ratio_scales() -> None:
@@ -198,37 +270,40 @@ async def test_budget_reserve_ratio_scales() -> None:
 
 async def test_memory_gate_blocks_when_budget_exhausted() -> None:
     """Acquire blocks when memory budget would be exceeded."""
-    # 4000 MB host, 10 % reserve, 1.0x overcommit: a budget of 3600 MB. Each VM of 256 MB
-    # reserves 336 MB: 10 fit (3360 MB), the 11th (3696 MB) blocks.
-    ctrl = _make_controller(
-        host_memory_mb=4_000.0,
-        reserve_ratio=0.1,
-        memory_overcommit=1.0,
-    )
-
-    reservations = []
-    for i in range(10):
-        r = await ctrl.acquire(
-            f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    with _mock_system_memory(100_000):  # host memory never decides: the budget gates do
+        # 4000 MB host, 10 % reserve, 1.0x overcommit: a budget of 3600 MB. Each VM of 256 MB
+        # reserves 336 MB: 10 fit (3360 MB), the 11th (3696 MB) blocks.
+        ctrl = _make_controller(
+            host_memory_mb=4_000.0,
+            reserve_ratio=0.1,
+            memory_overcommit=1.0,
         )
-        reservations.append(r)
 
-    # Next should block (budget exhausted)
-    acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-block", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
-    )
-    await _until_waiting_or_done(ctrl, acquire_task)
-    assert not acquire_task.done()
+        reservations = []
+        for i in range(10):
+            r = await ctrl.acquire(
+                f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+            )
+            reservations.append(r)
 
-    # Release one → unblocks
-    await ctrl.release(reservations[0])
-    r_new = await asyncio.wait_for(acquire_task, timeout=5.0)
-    assert r_new.vm_id == "vm-block"
+        # Next should block (budget exhausted)
+        acquire_task = asyncio.create_task(
+            ctrl.acquire(
+                "vm-block", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset()
+            )
+        )
+        await _until_waiting_or_done(ctrl, acquire_task)
+        assert not acquire_task.done()
 
-    # Cleanup
-    for r in reservations[1:]:
-        await ctrl.release(r)
-    await ctrl.release(r_new)
+        # Release one → unblocks
+        await ctrl.release(reservations[0])
+        r_new = await asyncio.wait_for(acquire_task, timeout=5.0)
+        assert r_new.vm_id == "vm-block"
+
+        # Cleanup
+        for r in reservations[1:]:
+            await ctrl.release(r)
+        await ctrl.release(r_new)
 
 
 # ============================================================================
@@ -243,33 +318,34 @@ async def test_cpu_gate_blocks_when_budget_exhausted() -> None:
     With 3.0 host CPUs, 0 reserve, 1.0x overcommit → 3.0 budget.
     Each VM: 1.25 effective → 2 fit, 3rd blocks.
     """
-    ctrl = _make_controller(
-        host_memory_mb=100_000.0,
-        host_cpu_count=3.0,
-        cpu_overcommit=1.0,
-        cpu_reserve_cores=0.0,
-    )
+    with _mock_system_memory(100_000):  # host memory never decides: the budget gates do
+        ctrl = _make_controller(
+            host_memory_mb=100_000.0,
+            host_cpu_count=3.0,
+            cpu_overcommit=1.0,
+            cpu_reserve_cores=0.0,
+        )
 
-    r1 = await ctrl.acquire(
-        "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
-    )
-    r2 = await ctrl.acquire(
-        "vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
-    )
+        r1 = await ctrl.acquire(
+            "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
+        r2 = await ctrl.acquire(
+            "vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
 
-    # 3rd should block (2.5 + 1.25 = 3.75 > 3.0)
-    acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
-    )
-    await _until_waiting_or_done(ctrl, acquire_task)
-    assert not acquire_task.done()
+        # 3rd should block (2.5 + 1.25 = 3.75 > 3.0)
+        acquire_task = asyncio.create_task(
+            ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
+        )
+        await _until_waiting_or_done(ctrl, acquire_task)
+        assert not acquire_task.done()
 
-    await ctrl.release(r1)
-    r3 = await asyncio.wait_for(acquire_task, timeout=5.0)
-    assert r3.vm_id == "vm-3"
+        await ctrl.release(r1)
+        r3 = await asyncio.wait_for(acquire_task, timeout=5.0)
+        assert r3.vm_id == "vm-3"
 
-    await ctrl.release(r2)
-    await ctrl.release(r3)
+        await ctrl.release(r2)
+        await ctrl.release(r3)
 
 
 # ============================================================================
@@ -284,34 +360,35 @@ async def test_multi_core_vms_consume_proportional_budget() -> None:
     With 5.0 host CPUs, 0 reserve, 1.0x overcommit → 5.0 budget.
     2 VMs use 4.5, 3rd would need 6.75 → blocks.
     """
-    ctrl = _make_controller(
-        host_memory_mb=100_000.0,
-        host_cpu_count=5.0,
-        cpu_overcommit=1.0,
-        cpu_reserve_cores=0.0,
-    )
+    with _mock_system_memory(100_000):  # host memory never decides: the budget gates do
+        ctrl = _make_controller(
+            host_memory_mb=100_000.0,
+            host_cpu_count=5.0,
+            cpu_overcommit=1.0,
+            cpu_reserve_cores=0.0,
+        )
 
-    r1 = await ctrl.acquire(
-        "vm-1", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
-    )
-    r2 = await ctrl.acquire(
-        "vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
-    )
+        r1 = await ctrl.acquire(
+            "vm-1", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
+        r2 = await ctrl.acquire(
+            "vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
 
-    # 3rd 2-core VM should block (4.5 + 2.25 = 6.75 > 5.0)
-    acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-3", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
-    )
-    await _until_waiting_or_done(ctrl, acquire_task)
-    assert not acquire_task.done()
+        # 3rd 2-core VM should block (4.5 + 2.25 = 6.75 > 5.0)
+        acquire_task = asyncio.create_task(
+            ctrl.acquire("vm-3", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
+        )
+        await _until_waiting_or_done(ctrl, acquire_task)
+        assert not acquire_task.done()
 
-    # Release one → unblocks
-    await ctrl.release(r1)
-    r3 = await asyncio.wait_for(acquire_task, timeout=5.0)
-    assert r3.vm_id == "vm-3"
+        # Release one → unblocks
+        await ctrl.release(r1)
+        r3 = await asyncio.wait_for(acquire_task, timeout=5.0)
+        assert r3.vm_id == "vm-3"
 
-    await ctrl.release(r2)
-    await ctrl.release(r3)
+        await ctrl.release(r2)
+        await ctrl.release(r3)
 
 
 async def test_mixed_core_vms_share_budget() -> None:
@@ -320,44 +397,45 @@ async def test_mixed_core_vms_share_budget() -> None:
     Each VM gets 0.25 core of overhead added to its guest cores.
     With 4.0 host CPUs, 0 reserve, 1.0x overcommit → 4.0 budget.
     """
-    ctrl = _make_controller(
-        host_memory_mb=100_000.0,
-        host_cpu_count=4.0,
-        cpu_overcommit=1.0,
-        cpu_reserve_cores=0.0,
-    )
-
-    # 1-core (1.25 eff) + 2-core (2.25 eff) = 3.50 (fits in 4.0 budget)
-    r1 = await ctrl.acquire(
-        "vm-1", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
-    )
-    r2 = await ctrl.acquire(
-        "vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
-    )
-
-    # Even a 1-core VM should block now (1.25 > 0.50 remaining)
-    acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-3", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
-    )
-    await _until_waiting_or_done(ctrl, acquire_task)
-    assert not acquire_task.done()
-
-    # The 0.50 left holds a 0.25-core VM (0.50 effective), and nothing more (0.01 core: 0.26)
-    r_fill = await ctrl.acquire(
-        "vm-fill", memory_mb=256, cpu_cores=0.25, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
-    )
-    with pytest.raises(TransientError, check=lambda e: e.context["blocking_gate"] == "cpu_budget"):
-        await ctrl.acquire(
-            "vm-more", memory_mb=256, cpu_cores=0.01, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+    with _mock_system_memory(100_000):  # host memory never decides: the budget gates do
+        ctrl = _make_controller(
+            host_memory_mb=100_000.0,
+            host_cpu_count=4.0,
+            cpu_overcommit=1.0,
+            cpu_reserve_cores=0.0,
         )
-    await ctrl.release(r_fill)
 
-    await ctrl.release(r1)
-    r3 = await asyncio.wait_for(acquire_task, timeout=5.0)
-    assert r3.vm_id == "vm-3"
+        # 1-core (1.25 eff) + 2-core (2.25 eff) = 3.50 (fits in 4.0 budget)
+        r1 = await ctrl.acquire(
+            "vm-1", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
+        r2 = await ctrl.acquire(
+            "vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+        )
 
-    await ctrl.release(r2)
-    await ctrl.release(r3)
+        # Even a 1-core VM should block now (1.25 > 0.50 remaining)
+        acquire_task = asyncio.create_task(
+            ctrl.acquire("vm-3", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
+        )
+        await _until_waiting_or_done(ctrl, acquire_task)
+        assert not acquire_task.done()
+
+        # The 0.50 left holds a 0.25-core VM (0.50 effective), and nothing more (0.01 core: 0.26)
+        r_fill = await ctrl.acquire(
+            "vm-fill", memory_mb=256, cpu_cores=0.25, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+        )
+        with pytest.raises(TransientError, check=lambda e: e.context["blocking_gate"] == "cpu_budget"):
+            await ctrl.acquire(
+                "vm-more", memory_mb=256, cpu_cores=0.01, disk_mb=0, timeout=_REFUSED, use_tcg=False, held=frozenset()
+            )
+        await ctrl.release(r_fill)
+
+        await ctrl.release(r1)
+        r3 = await asyncio.wait_for(acquire_task, timeout=5.0)
+        assert r3.vm_id == "vm-3"
+
+        await ctrl.release(r2)
+        await ctrl.release(r3)
 
 
 async def test_overcommit_allows_more_cpu_than_physical() -> None:
@@ -366,33 +444,36 @@ async def test_overcommit_allows_more_cpu_than_physical() -> None:
     3 physical CPUs, 0.5 reserve, 4.0x overcommit → (3-0.5)*4 = 10.0 CPU budget.
     Each 1-core VM effective: 1.25. 8 VMs * 1.25 = 10.0 (exact fit).
     """
-    ctrl = _make_controller(
-        host_memory_mb=100_000.0,
-        host_cpu_count=3.0,
-        cpu_overcommit=4.0,
-        cpu_reserve_cores=0.5,
-    )
-
-    reservations = []
-    for i in range(8):
-        r = await ctrl.acquire(
-            f"vm-{i}", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+    with _mock_system_memory(100_000):  # host memory never decides: the budget gates do
+        ctrl = _make_controller(
+            host_memory_mb=100_000.0,
+            host_cpu_count=3.0,
+            cpu_overcommit=4.0,
+            cpu_reserve_cores=0.5,
         )
-        reservations.append(r)
 
-    # 9th should block
-    acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-block", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset())
-    )
-    await _until_waiting_or_done(ctrl, acquire_task)
-    assert not acquire_task.done()
+        reservations = []
+        for i in range(8):
+            r = await ctrl.acquire(
+                f"vm-{i}", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
+            )
+            reservations.append(r)
 
-    await ctrl.release(reservations[0])
-    r_new = await asyncio.wait_for(acquire_task, timeout=5.0)
+        # 9th should block
+        acquire_task = asyncio.create_task(
+            ctrl.acquire(
+                "vm-block", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=1.0, use_tcg=False, held=frozenset()
+            )
+        )
+        await _until_waiting_or_done(ctrl, acquire_task)
+        assert not acquire_task.done()
 
-    for r in reservations[1:]:
-        await ctrl.release(r)
-    await ctrl.release(r_new)
+        await ctrl.release(reservations[0])
+        r_new = await asyncio.wait_for(acquire_task, timeout=5.0)
+
+        for r in reservations[1:]:
+            await ctrl.release(r)
+        await ctrl.release(r_new)
 
 
 # ============================================================================
@@ -404,9 +485,15 @@ async def test_overcommit_allows_more_cpu_than_physical() -> None:
     ("memory_mb", "cpu_cores", "required", "found"),
     [
         # 1000000 + 80 MB of overhead, above the 21600 MB budget
-        pytest.param(1_000_000, _CPU, {"memory_mb": "1000080"}, {"memory_mb": "21600"}, id="memory"),
+        pytest.param(
+            1_000_000,
+            _CPU,
+            {"memory_mb": "1000080", "cpu": f"{_CPU + 0.25:.2f}"},
+            {"memory_mb": "21600", "cpu": "30.00"},
+            id="memory",
+        ),
         # 64 + 0.25 cores of overhead, above the 30-core budget
-        pytest.param(256, 64.0, {"cpu": "64.25"}, {"cpu": "30.0"}, id="cpu"),
+        pytest.param(256, 64.0, {"memory_mb": "336", "cpu": "64.25"}, {"memory_mb": "21600", "cpu": "30.00"}, id="cpu"),
     ],
 )
 async def test_acquire_never_fits_fails_at_once(
@@ -414,8 +501,8 @@ async def test_acquire_never_fits_fails_at_once(
 ) -> None:
     """A request above the whole budget fails at once, without waiting for the timeout.
 
-    It is a RouteError (a worker with a larger budget can run it); `required` and
-    `found` list only the value that is too big. Budgets as in test_budget_calculation:
+    It is a RouteError (a worker with a larger budget can run it); `required` holds the
+    whole target (both dimensions, the VM overhead included), `found` the budgets. Budgets as in test_budget_calculation:
     21600 MB of memory, 30 cores.
     """
     ctrl = _make_controller(
@@ -593,8 +680,7 @@ async def test_concurrent_same_vm_id_no_collision() -> None:
 
 async def test_psutil_failure_degrades_to_unlimited() -> None:
     """When cgroup and psutil both fail at start(), the budgets are unlimited: no admission
-    control. Gates 3a and 3b read nothing either: any request is admitted, and
-    effective_max_vms() reports no limit (-1)."""
+    control. Gates 3a and 3b read nothing either: any request is admitted."""
     ctrl = _probed_controller()
     with (
         patch("exec_sandbox.admission.detect_cgroup_memory_limit_mb", return_value=None),
@@ -617,7 +703,6 @@ async def test_psutil_failure_degrades_to_unlimited() -> None:
             )
             for i in range(3)
         ]
-        assert ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0) == -1
     for r in reservations:
         await ctrl.release(r)
     await ctrl.stop()
@@ -676,7 +761,7 @@ async def test_cgroup_memory_limit_used_as_capacity() -> None:
         await ctrl.start()
 
     # 4096 * 0.9 * 1.0 = 3686.4; (2 - 0.5) * 1.0 = 1.5
-    assert await _budgets(ctrl) == {"memory_mb": "3686", "cpu": "1.5"}
+    assert await _budgets(ctrl) == {"memory_mb": "3686", "cpu": "1.50"}
     await ctrl.stop()
 
 
@@ -694,7 +779,7 @@ async def test_cgroup_falls_through_to_psutil_when_unlimited() -> None:
         await ctrl.start()
 
     # 8192 * 0.9 * 1.0 = 7372.8; (4 - 0.5) * 1.0 = 3.5
-    assert await _budgets(ctrl) == {"memory_mb": "7373", "cpu": "3.5"}
+    assert await _budgets(ctrl) == {"memory_mb": "7372", "cpu": "3.50"}
     await ctrl.stop()
 
 
@@ -716,7 +801,7 @@ async def test_manual_override_beats_cgroup() -> None:
         await ctrl.start()
 
     # 32000 * 0.9 * 1.0 = 28800; (16 - 0.5) * 1.0 = 15.5
-    assert await _budgets(ctrl) == {"memory_mb": "28800", "cpu": "15.5"}
+    assert await _budgets(ctrl) == {"memory_mb": "28800", "cpu": "15.50"}
     await ctrl.stop()
 
 
@@ -731,7 +816,7 @@ _GIB_VMEM = SimpleNamespace(total=8 * 1024 * 1024 * 1024)
             {"host_memory_mb": 32_000.0},
             (4096.0, 2.0),
             (_GIB_VMEM, 4),
-            {"memory_mb": "28800", "cpu": "1.5"},
+            {"memory_mb": "28800", "cpu": "1.50"},
             id="memory-given-cgroup",
         ),
         # memory from the cgroup: 4096 * 0.9 = 3686.4; CPUs given: 16 - 0.5 = 15.5
@@ -739,7 +824,7 @@ _GIB_VMEM = SimpleNamespace(total=8 * 1024 * 1024 * 1024)
             {"host_cpu_count": 16.0},
             (4096.0, 2.0),
             (_GIB_VMEM, 4),
-            {"memory_mb": "3686", "cpu": "15.5"},
+            {"memory_mb": "3686", "cpu": "15.50"},
             id="cpus-given-cgroup",
         ),
         # no cgroup limit: CPUs from psutil, 4 - 0.5 = 3.5
@@ -747,7 +832,7 @@ _GIB_VMEM = SimpleNamespace(total=8 * 1024 * 1024 * 1024)
             {"host_memory_mb": 32_000.0},
             (None, None),
             (_GIB_VMEM, 4),
-            {"memory_mb": "28800", "cpu": "3.5"},
+            {"memory_mb": "28800", "cpu": "3.50"},
             id="memory-given-psutil",
         ),
         # no cgroup limit: memory from psutil, 8192 * 0.9 = 7372.8
@@ -755,7 +840,7 @@ _GIB_VMEM = SimpleNamespace(total=8 * 1024 * 1024 * 1024)
             {"host_cpu_count": 16.0},
             (None, None),
             (_GIB_VMEM, 4),
-            {"memory_mb": "7373", "cpu": "15.5"},
+            {"memory_mb": "7372", "cpu": "15.50"},
             id="cpus-given-psutil",
         ),
         # the psutil CPU probe fails: no CPU limit (not a budget from 1 CPU)
@@ -763,7 +848,7 @@ _GIB_VMEM = SimpleNamespace(total=8 * 1024 * 1024 * 1024)
             {"host_memory_mb": 32_000.0},
             (None, None),
             (_GIB_VMEM, OSError("no psutil")),
-            {"memory_mb": "28800"},
+            {"memory_mb": "28800", "cpu": None},
             id="memory-given-psutil-fails",
         ),
         # the psutil memory probe fails: no memory limit (not a budget of 0)
@@ -771,17 +856,23 @@ _GIB_VMEM = SimpleNamespace(total=8 * 1024 * 1024 * 1024)
             {"host_cpu_count": 16.0},
             (None, None),
             (OSError("no psutil"), 4),
-            {"cpu": "15.5"},
+            {"memory_mb": None, "cpu": "15.50"},
             id="cpus-given-psutil-fails",
         ),
         # nothing given, the memory probe fails: the CPU probe still runs, 4 - 0.5 = 3.5
-        pytest.param({}, (None, None), (OSError("no psutil"), 4), {"cpu": "3.5"}, id="memory-probe-fails-cpus-counted"),
+        pytest.param(
+            {},
+            (None, None),
+            (OSError("no psutil"), 4),
+            {"memory_mb": None, "cpu": "3.50"},
+            id="memory-probe-fails-cpus-counted",
+        ),
         # psutil cannot count the CPUs (None): no CPU limit, not a budget from 1 CPU
         pytest.param(
             {"host_memory_mb": 32_000.0},
             (None, None),
             (_GIB_VMEM, None),
-            {"memory_mb": "28800"},
+            {"memory_mb": "28800", "cpu": None},
             id="cpu-count-none",
         ),
     ],
@@ -790,12 +881,12 @@ async def test_one_manual_override_stands_and_the_other_is_probed(
     given: dict[str, float],
     cgroup: tuple[float | None, float | None],
     psutil_probes: tuple[object, object],
-    budgets: dict[str, str],
+    budgets: dict[str, str | None],
 ) -> None:
     """Only one of host_memory_mb and host_cpu_count given: start() keeps it and probes only
     the other (cgroup limit, else psutil), never replaces the given one. A dimension no
     probe can size has no limit, as when every probe fails: the error of a request
-    above both budgets then lists only the limited one."""
+    above both budgets then gives None for it."""
     ctrl = ResourceAdmissionController(
         disk_dir=_DISK_DIR,
         disk_free_floor_mb=0,
@@ -1071,13 +1162,22 @@ def _pressure(
 ) -> Generator[None]:
     """Gate 3b on a `host_os` host: the macOS sysctl reads `level` (None: the call fails), the
     Linux PSI file holds `psi` (an exception: its read raises it). Gate 3a reads 8192 MB
-    available (a cgroup figure)."""
-    read = {"return_value": psi} if isinstance(psi, str) else {"side_effect": psi}
+    available (a cgroup figure). Only /proc/pressure/memory holds `psi`: a probe that reads
+    another file (/proc/pressure/cpu, /proc/pressure/io) reads that real file."""
+    real_read_text = Path.read_text
+
+    def read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if str(path) != "/proc/pressure/memory":
+            return real_read_text(path, *args, **kwargs)
+        if isinstance(psi, str):
+            return psi
+        raise psi
+
     with (
         patch("exec_sandbox.admission.read_container_available_memory_mb", return_value=8192.0),
         patch("exec_sandbox.admission.detect_host_os", return_value=host_os),
         patch("exec_sandbox.admission._read_macos_memory_pressure_level", return_value=level),
-        patch("exec_sandbox.admission.Path.read_text", **read),
+        patch("exec_sandbox.admission.Path.read_text", autospec=True, side_effect=read_text),
     ):
         yield
 
@@ -1204,7 +1304,7 @@ class TestMemoryPressureGate:
         try:
             Path("/proc/pressure/memory").read_text()
         except OSError:
-            assert result is None
+            assert result is False  # no reading: the gate admits
         else:
             assert isinstance(result, bool)
 
@@ -1324,41 +1424,6 @@ async def test_stop_unblocks_waiting_acquires() -> None:
         await asyncio.wait_for(acquire_task, timeout=2.0)
 
     await ctrl.release(r1)
-
-
-# ============================================================================
-# effective_max_vms
-# ============================================================================
-
-
-def test_effective_max_vms() -> None:
-    """effective_max_vms: the VMs of a size that the smaller of the memory and CPU budgets
-    holds, with the per-VM overheads."""
-    # Memory budget 16000 MB, CPU budget 1000 cores: memory sets the count
-    memory_bound = _make_controller(
-        host_memory_mb=16_000.0,
-        reserve_ratio=0.0,
-        memory_overcommit=1.0,
-        host_cpu_count=1000.0,
-        cpu_reserve_cores=0.0,
-        cpu_overcommit=1.0,
-    )
-    assert memory_bound.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0) == 47  # 16000 / 336
-    assert memory_bound.effective_max_vms(guest_memory_mb=1024, cpu_per_vm=1.0) == 14  # 16000 / 1104
-    assert memory_bound.effective_max_vms(guest_memory_mb=256, cpu_per_vm=4.0) == 47  # guest CPU: no effect
-
-    # CPU budget 8 cores, memory budget 10 TB: CPU sets the count
-    cpu_bound = _make_controller(
-        host_memory_mb=10_000_000.0,
-        reserve_ratio=0.0,
-        memory_overcommit=1.0,
-        host_cpu_count=8.0,
-        cpu_reserve_cores=0.0,
-        cpu_overcommit=1.0,
-    )
-    assert cpu_bound.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0) == 6  # 8 / 1.25
-    assert cpu_bound.effective_max_vms(guest_memory_mb=256, cpu_per_vm=4.0) == 1  # 8 / 4.25
-    assert cpu_bound.effective_max_vms(guest_memory_mb=1024, cpu_per_vm=1.0) == 6  # guest memory: no effect
 
 
 # ============================================================================
@@ -1548,11 +1613,32 @@ class TestDiskGate:
         )
 
     @staticmethod
-    def _default_disks(ctrl: ResourceAdmissionController) -> int:
-        """The VMs with a default (1024 MB) home disk that effective_max_vms() counts: (free +
-        written by the home disks - floor) / (1024 / ratio). The memory and CPU budgets hold
-        far more."""
-        return ctrl.effective_max_vms(guest_memory_mb=1, cpu_per_vm=1.0)
+    async def _default_disks(ctrl: ResourceAdmissionController) -> int:
+        """The VMs with a 1024 MB home disk that gate 4 admits now, one after the other (all
+        released after): each reserves 1024 / ratio of the free space above the floor. The
+        memory and CPU budgets hold far more."""
+        held: list[ResourceReservation] = []
+        try:
+            for _ in range(100):
+                try:
+                    held.append(
+                        await ctrl.acquire(
+                            f"count-{len(held)}",
+                            memory_mb=1,
+                            cpu_cores=_CPU,
+                            disk_mb=1024,
+                            timeout=_REFUSED,
+                            use_tcg=False,
+                            held=frozenset(),
+                        )
+                    )
+                except TransientError as e:
+                    assert e.context["blocking_gate"] == "home_disk_space"
+                    break
+            return len(held)
+        finally:
+            for reservation in held:
+                await ctrl.release(reservation)
 
     @pytest.mark.parametrize(("ratio", "fits"), [(1.0, 1), (8.0, 12)])
     async def test_the_disk_overcommit_ratio_sets_the_reserve(self, tmp_path: Path, ratio: float, fits: int) -> None:
@@ -1643,38 +1729,36 @@ class TestDiskGate:
         await ctrl.release(second)
         await ctrl.release(first)
 
-    def test_cloned_disk_shared_blocks_are_not_written(self, tmp_path: Path) -> None:
+    async def test_cloned_disk_shared_blocks_are_not_written(self, tmp_path: Path) -> None:
         """A clone's blocks shared with its L1 template take no space until overwritten: they
-        give no room once the VM is gone. A default disk counts 4 MB here (ratio 256), and 2 MB
-        are free."""
+        give no room once the VM is gone."""
         disk_file = tmp_path / "vm.img"
         disk_file.write_bytes(os.urandom(4 * _MIB))
         ctrl = self._controller(tmp_path, floor_mb=0, ratio=256.0)
         with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(2).usage), _probe_clock() as later:
             ctrl.note_shared_blocks("vm.img", disk_file.stat().st_blocks * 512)
-            assert self._default_disks(ctrl) == 0  # (2 + 0) / 4
+            assert _written_mb(ctrl) == 0  # the shared blocks are not written
             disk_file.unlink()
             later()
-            assert self._default_disks(ctrl) == 0  # the probe sees the disk gone: it forgets its note
+            assert _written_mb(ctrl) == 0  # no disk file left (the next step shows the note went)
             disk_file.write_bytes(os.urandom(4 * _MIB))  # a new, fully written disk, same name
             later()
-            assert self._default_disks(ctrl) == 1  # (2 + 4) / 4: the old note did not stay
+            assert _written_mb(ctrl) == pytest.approx(4, abs=0.1)  # the old note did not stay
 
-    def test_a_note_made_before_the_clone_survives_a_probe(self, tmp_path: Path) -> None:
+    async def test_a_note_made_before_the_clone_survives_a_probe(self, tmp_path: Path) -> None:
         """The VM manager notes the shared blocks before the clone exists, so a probe in that
         window does not count the clone as written: that probe keeps the note of a disk
-        not made yet, and the next one counts the clone's shared blocks as not written. A
-        default disk counts 4 MB here (ratio 256), and 2 MB are free."""
+        not made yet, and the next one counts the clone's shared blocks as not written."""
         ctrl = self._controller(tmp_path, floor_mb=0, ratio=256.0)
         with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(2).usage), _probe_clock() as later:
             ctrl.note_shared_blocks("vm.img", 4 * _MIB)
-            assert self._default_disks(ctrl) == 0  # a probe before the clone is made
+            assert _written_mb(ctrl) == 0  # a probe before the clone is made
             (tmp_path / "vm.img").write_bytes(os.urandom(4 * _MIB))
             later()
-            assert self._default_disks(ctrl) == 0  # (2 + 0) / 4
+            assert _written_mb(ctrl) == 0  # the clone's shared blocks
             ctrl.forget_shared_blocks("vm.img")  # the clone was a plain copy
             later()
-            assert self._default_disks(ctrl) == 1  # (2 + 4) / 4
+            assert _written_mb(ctrl) == pytest.approx(4, abs=0.1)
 
     async def test_unreadable_disk_dir_skips_the_gate(self, tmp_path: Path) -> None:
         """No free-space figure (disk_dir gone): the gate admits, it does not block every VM."""
@@ -1684,15 +1768,17 @@ class TestDiskGate:
         )
         await ctrl.release(reservation)
 
-    def test_probe_reads_free_space_and_written_blocks(self, tmp_path: Path) -> None:
-        """The free space and the blocks the home disks (*.img) use count as room for a pool:
-        the disks go with their VMs. Other files in disk_dir do not count. A default disk counts
-        4 MB here (ratio 256), and 2 MB are free."""
+    async def test_probe_reads_free_space_and_written_blocks(self, tmp_path: Path) -> None:
+        """The probe reads the blocks the home disks (*.img) use; other files in disk_dir do not
+        count."""
         (tmp_path / "vm.img").write_bytes(os.urandom(4 * _MIB))
         (tmp_path / "other.file").write_bytes(os.urandom(4 * _MIB))  # not a home disk
         ctrl = self._controller(tmp_path, floor_mb=0, ratio=256.0)
         with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(2).usage):
-            assert self._default_disks(ctrl) == 1  # (2 + 4) / 4; with other.file it would be 2
+            assert _written_mb(ctrl) == pytest.approx(4, abs=0.1)  # with other.file it would be 8
+            probe = ctrl._probe_disk()  # pyright: ignore[reportPrivateUsage]
+            assert probe is not None
+            assert probe[0] == 2  # the free space, as the filesystem gives it
 
     async def test_eviction_gives_space_back_before_waiting(self, tmp_path: Path) -> None:
         """Gate 4 blocks: the request evicts the oldest entries, each cache in turn, until it fits;
@@ -3827,17 +3913,24 @@ class TestDiskGate:
             async with asyncio.timeout(1):
                 await ctrl.release(await second)
 
-    async def test_effective_max_vms_counts_the_disk(self, tmp_path: Path) -> None:
-        """Pools are sized on the VMs gate 4 admits: 10 default disks (1024 MB, a 256 MB reserve
-        each) fit in the 2688 MB above the floor."""
+    async def test_default_disks_fit_by_their_reserve(self, tmp_path: Path) -> None:
+        """10 default disks (1024 MB, a 256 MB reserve each) fit in the 2688 MB above the floor."""
         ctrl = self._controller(tmp_path, floor_mb=1000)
         with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(1000 + 2688).usage):
-            assert ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0) == 10
+            assert await self._default_disks(ctrl) == 10
 
 
 # ============================================================================
 # Wake-up with mixed request sizes (VmSpec sizes differ)
 # ============================================================================
+
+
+def _written_mb(ctrl: ResourceAdmissionController) -> float:
+    """The MB the home disks of disk_dir have written, as gate 4's probe reads it (private:
+    the gate admits on it with the reserves of its own VMs, which these tests hold none of)."""
+    probe = ctrl._probe_disk()  # pyright: ignore[reportPrivateUsage]
+    assert probe is not None
+    return probe[1]
 
 
 async def _self_wake(ctrl: ResourceAdmissionController) -> None:

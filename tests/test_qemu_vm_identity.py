@@ -22,8 +22,8 @@ import pytest
 from exec_sandbox import cgroup, constants
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import Language
-from exec_sandbox.permission_utils import _probe_cache as permission_probe_cache  # pyright: ignore[reportPrivateUsage]
-from exec_sandbox.permission_utils import get_qemu_vm_uid, probe_qemu_as_qemu_vm, qemu_vm_acl_perms
+from exec_sandbox.permission_utils import get_qemu_vm_gid, get_qemu_vm_uid, probe_qemu_as_qemu_vm, qemu_vm_acl_perms
+from exec_sandbox.system_probes import probe_cache
 from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import skip_unless_linux
 
@@ -80,14 +80,13 @@ async def test_vm_runs_as_qemu_vm_with_group_sockets(vm_manager: VmManager) -> N
         reservation=None,
         retry_profile=constants.RETRY_USER_FACING,
         mem_path=None,
-        mem_path_share=False,
     )
     try:
         uids = set(_vm_processes(vm.vm_id).values())
         assert uids == {get_qemu_vm_uid()}
         sock = Path(vm.workdir.cmd_socket).stat()
         assert (stat.S_IMODE(sock.st_mode), sock.st_uid) == (0o770, get_qemu_vm_uid())
-        assert sock.st_gid in os.getgroups() or sock.st_gid == os.getegid()
+        assert sock.st_gid == get_qemu_vm_gid()  # group qemu-vm, so this process may connect
         assert await _run(vm, "print(6 * 7)") == "42"
     finally:
         assert await vm_manager.destroy_vm(vm) is True
@@ -108,7 +107,6 @@ async def test_destroy_leaves_no_cgroup_and_no_process(vm_manager: VmManager) ->
         reservation=None,
         retry_profile=constants.RETRY_USER_FACING,
         mem_path=None,
-        mem_path_share=False,
     )
     if vm.cgroup is None:
         await vm_manager.destroy_vm(vm)
@@ -169,11 +167,11 @@ async def test_l1_save_then_restore_as_qemu_vm(
     )
     key = await memory.compute_cache_key(_SPEC, l2_path=None)
     if not saved_by_qemu_vm:
-        permission_probe_cache.qemu_as_qemu_vm = False  # this one save runs QEMU as this user
+        probe_cache.qemu_as_qemu_vm = False  # this one save runs QEMU as this user
     try:
         vmstate = await _save(memory, key)
     finally:
-        permission_probe_cache.qemu_as_qemu_vm = True
+        probe_cache.qemu_as_qemu_vm = True
     ram = vmstate.with_suffix(".ram")
     assert {f.stat().st_uid for f in (vmstate, ram)} == {os.getuid()}
     expected_acl = 4 if saved_by_qemu_vm else None  # r; a save as this user grants nothing

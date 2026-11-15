@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from pydantic.fields import FieldInfo
 
 from exec_sandbox.config import SchedulerConfig
@@ -159,3 +159,15 @@ class TestSchedulerConfigCacheDir:
 
         assert config1.disk_snapshot_cache_dir == Path("/first/disk-snapshots")
         assert config2.disk_snapshot_cache_dir == Path("/second/disk-snapshots")
+
+
+class TestInstanceKeyring:
+    @pytest.mark.parametrize("value", [pytest.param("k1,k2", id="str"), pytest.param(SecretStr("k1,k2"), id="secret")])
+    def test_a_str_is_kept_as_a_secret(self, value: str | SecretStr) -> None:
+        """The str that keyring.get_password returns is taken as it is, and kept as a
+        SecretStr: never in a repr, a log or a dump."""
+        config = SchedulerConfig(instance_keyring=value)
+        assert isinstance(config.instance_keyring, SecretStr)
+        assert config.instance_keyring.get_secret_value() == "k1,k2"
+        assert "k1" not in repr(config)
+        assert "k1" not in config.model_dump_json()

@@ -112,16 +112,20 @@ def create_outbound_patterns(domains: Sequence[str]) -> list[str]:
     return patterns
 
 
-def generate_outbound_allow_json(
-    allowed_domains: Sequence[str] | None,
-    language: str,
-) -> str:
+def resolved_domains(allowed_domains: Sequence[str] | None, language: str) -> tuple[str, ...]:
+    """The domains a VM may reach with the network on: `allowed_domains`, or for None the
+    package registries of the language (raw has none). Empty: no filter, all allowed."""
+    if allowed_domains is None:
+        return tuple({"python": PYTHON_PACKAGE_DOMAINS, "javascript": NPM_PACKAGE_DOMAINS}.get(language, []))
+    return tuple(allowed_domains)
+
+
+def generate_outbound_allow_json(allowed_domains: Sequence[str]) -> str:
     """Generate gvproxy OutboundAllow JSON.
 
     Args:
-        allowed_domains: Custom allowed domains; empty for no domain filter (all
-                        outbound allowed); None for the language's package registries
-        language: Programming language (for default package registries)
+        allowed_domains: The domains the guest may reach (resolved_domains); empty for no
+            domain filter (all outbound allowed)
 
     Returns:
         JSON string for gvproxy -outbound-allow flag
@@ -130,17 +134,11 @@ def generate_outbound_allow_json(
         ValueError: A domain is not valid (validate_domain)
 
     Example:
-        >>> json_str = generate_outbound_allow_json(None, "python")
-        >>> "pypi" in json_str
+        >>> "pypi" in generate_outbound_allow_json(resolved_domains(None, "python"))
         True
-        >>> json_str = generate_outbound_allow_json([], "python")  # No filter: all allowed
-        >>> json_str
+        >>> generate_outbound_allow_json([])  # No filter: all allowed
         '[]'
     """
-    # None: the language's package registries (raw has none: no filter)
-    if allowed_domains is None:
-        allowed_domains = {"python": PYTHON_PACKAGE_DOMAINS, "javascript": NPM_PACKAGE_DOMAINS}.get(language, [])
-
     # No domain ("[]") = no domain filter: with allow_network, all outbound is allowed
     # (by design). Blocking all outbound is the -block-outbound flag, set only
     # when ports are exposed without allow_network.

@@ -33,45 +33,58 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
+import itertools
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from exec_sandbox import constants
 from exec_sandbox._imports import require_s3_instance_store
 from exec_sandbox._logging import get_logger
 from exec_sandbox._version import __version__
 from exec_sandbox.aio_utils import run_stoppable
+from exec_sandbox.base_cache_manager import BaseCacheManager
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
     InstanceGoneError,
+    InternalError,
     InvalidInputError,
     OutcomeUnknownError,
+    RouteError,
+    RouteKey,
     SandboxError,
     TransientError,
     host_mismatch,
+    named_instance,
     no_instance_store,
 )
-from exec_sandbox.files.disk import clone_sparse, make_private_dir, memory_filesystem
+from exec_sandbox.files.disk import clone_sparse, memory_filesystem
+from exec_sandbox.files.locks import CacheEntry, EntryLease
 from exec_sandbox.hash_utils import file_hash
 from exec_sandbox.images import image_digest
 from exec_sandbox.instance import ids
 from exec_sandbox.instance.commit import Base, Commit, commit_head, save_context
-from exec_sandbox.instance.head import MAX_HEAD_BYTES, open_head, read_header, seal_head
+from exec_sandbox.instance.head import MAX_HEAD_BYTES, describe_head, open_head, read_summary, seal_head
 from exec_sandbox.instance.keyring import KEY_BYTES, Keyring, wrap_data_key
 from exec_sandbox.instance.local_store import LocalInstanceStore
 from exec_sandbox.instance.models import (
+    BLOCK_BYTES,
     RECENT_COMMITS,
     STREAM_HOME,
     STREAM_VMSTATE,
     ChainEntry,
+    GuestFacts,
     HeadBody,
     HeadHeader,
+    HeadSummary,
     HostFacts,
+    InstanceAccess,
     InstanceInfo,
     RecentCommit,
 )
@@ -93,9 +106,9 @@ from exec_sandbox.permission_utils import (
     grant_qemu_vm_acl,
     probe_qemu_vm_user,
 )
-from exec_sandbox.platform_utils import HostArch, detect_host_arch, detect_host_x86_vendor
-from exec_sandbox.qemu_cmd import guest_cpu_model
-from exec_sandbox.system_probes import detect_accel_type, probe_qemu_version
+from exec_sandbox.settings import kept_secret
+from exec_sandbox.system_probes import require_qemu_machine_types, require_qemu_version
+from exec_sandbox.worker_facts import machine_facts, qemu_version_fact
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Coroutine, Generator, Mapping
@@ -111,12 +124,12 @@ logger = get_logger(__name__)
 _LOAD_ATTEMPTS = 3
 """Head reads per load while body objects vanish because newer saves replaced them."""
 _OBJECT_KIND = {"full": "f", "pack": "p"}
-_CHECKED_FACTS = ("arch", "accelerator", "cpu_vendor", "cpu_model", "release")
-"""Host facts a load must match. cpu_model: QEMU refuses a state saved with other CPU
-features, but only at restore, after the download. Images are fetched by digest.
-qemu_version is not checked: QEMU accepts or refuses the saved state at restore (then
-ROUTE). release: the saved guest agent runs on in RAM and speaks its own release's
-protocol, so a load on another exec-sandbox release is refused (ROUTE), never migrated."""
+_CHECKED_FACTS = (RouteKey.ARCH, RouteKey.ACCELERATOR, RouteKey.CPU_VENDOR, RouteKey.CPU_MODEL)
+"""Host facts a load must match (with the machine type, rule CONTAINS). cpu_model: QEMU
+refuses a state saved with other CPU features, but only at restore, after the download.
+Images are fetched by digest. qemu_version is not checked: QEMU accepts or refuses the
+saved state at restore. The exec-sandbox release is not checked: a release loads the
+instances of another one; data it cannot read raises RouteError (another release)."""
 MAX_CHAIN_PACKS = 64
 """Packs after a full copy before the next full copy: bounds the head (one entry
 per pack) and the load (one download per object)."""
@@ -135,6 +148,14 @@ class _VanishedError(Exception):
     def __init__(self, key: str) -> None:
         super().__init__(key)
         self.key = key
+
+
+class AssetCache(BaseCacheManager):
+    """The guest images that loads fetched from the store, by digest (`<digest>.img`): under
+    the disk-pressure eviction of admission (VmManager.add_cache), oldest first, never one
+    a VM runs on or a load holds (EntryLease)."""
+
+    _cache_ext: ClassVar[str] = ".img"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -156,10 +177,27 @@ class InstanceState:
     """Local base image with the saved digest (the overlay's backing file)."""
     packages_image: Path | None
     """Local L2 packages image with the saved digest, None without packages."""
+    asset_leases: tuple[EntryLease, ...]
+    """Leases on the images of the asset cache this state runs on (eviction skips them):
+    the restore's VM takes its own shares; release() closes these."""
 
     @property
     def instance_id(self) -> str:
         return self.header.instance_id
+
+
+def instance_keyring(settings: Settings) -> Keyring:
+    """The keyring of the instance store, parsed (no store call). Raises ConfigError
+    INSTANCE_CONFIG when it is not set or not valid (Keyring.parse)."""
+    if (secret := kept_secret(settings.instance_keyring)) is None:  # a SecretStr already: the type narrows
+        raise ConfigError(
+            "instance_store is set, but instance_keyring is not: saved instances are sealed with its keys.",
+            code=ErrorCode.INSTANCE_CONFIG,
+            instance_id=None,
+            hint="Set instance_keyring (EXEC_SANDBOX_INSTANCE_KEYRING), or unset instance_store.",
+            context=None,
+        )
+    return Keyring.parse(secret.get_secret_value())
 
 
 @contextlib.asynccontextmanager
@@ -172,15 +210,7 @@ async def _open_store(settings: Settings) -> AsyncGenerator[tuple[InstanceStore,
     when the store's extra is not installed."""
     if settings.instance_store is None:
         raise no_instance_store(instance_id=None)
-    if settings.instance_keyring is None:
-        raise ConfigError(
-            "instance_store is set, but instance_keyring is not: saved instances are sealed with its keys.",
-            code=ErrorCode.INSTANCE_CONFIG,
-            instance_id=None,
-            hint="Set instance_keyring (EXEC_SANDBOX_INSTANCE_KEYRING), or unset instance_store.",
-            context=None,
-        )
-    keyring = Keyring.parse(settings.instance_keyring.get_secret_value())
+    keyring = instance_keyring(settings)
     match settings.instance_store:
         case "s3":
             if settings.s3_bucket is None:
@@ -229,33 +259,38 @@ class InstanceAdmin:
         self.keyring = keyring
 
     async def describe(self, instance_id: str) -> InstanceInfo:
-        """Public header always; the sealed part when this keyring has the key (verified).
+        """Public header always; the sealed part when this keyring has the key and this
+        release reads the body (InstanceInfo.access).
 
         Raises InvalidInputError INSTANCE_INVALID_ID (before any store call),
         InstanceGoneError INSTANCE_NOT_FOUND when there is no head, InstanceGoneError
-        INSTANCE_INTEGRITY or RouteError INSTANCE_HOST_MISMATCH when the head does not
-        open with the key it names, and the store's errors (TransientError
-        INSTANCE_STORE_UNAVAILABLE, ConfigError INSTANCE_CONFIG).
+        INSTANCE_INTEGRITY when the head fails authentication, ConfigError
+        INSTANCE_KEY_MISSING when this keyring lacks the key and this release cannot
+        read even the summary of the public header (do not delete: another release
+        may have written it), RouteError INSTANCE_HOST_MISMATCH when the head
+        authenticates but even its summary (generation, recent commits, key id) does
+        not parse, and the store's errors (TransientError INSTANCE_STORE_UNAVAILABLE,
+        ConfigError INSTANCE_CONFIG).
         """
         ids.check_instance_id(instance_id)
-        with _named(instance_id):
-            got = await self.store.get(head_key(instance_id), max_bytes=MAX_HEAD_BYTES)
+        with named_instance(instance_id):
+            with _object_named(head_key(instance_id), None):  # an oversized head is INSTANCE_INTEGRITY
+                got = await self.store.get(head_key(instance_id), max_bytes=MAX_HEAD_BYTES)
             if got is None:
-                raise _not_found(instance_id)
-            # One read: `verified` speaks for the very bytes the other fields come from.
+                raise _not_found(instance_id, store=self.store)
+            # One read: `access` speaks for the very bytes the other fields come from.
             try:
-                header, body, _ = open_head(got[0], self.keyring, instance_id=instance_id)
-            except ConfigError:  # INSTANCE_KEY_MISSING: the only ConfigError of open_head
-                header, body = read_header(got[0], instance_id=instance_id), None
-            return InstanceInfo(
-                instance_id=instance_id,
-                generation=header.generation,
-                recent_commits=header.recent_commits,
-                key_id=header.key_id,
-                verified=body is not None,
-                spec=None if body is None else body.spec,
-                host=None if body is None else body.host,
-            )
+                with _object_named(head_key(instance_id), None):
+                    summary, body, writer = describe_head(got[0], self.keyring, instance_id=instance_id)
+            except ConfigError as missing:  # INSTANCE_KEY_MISSING: the only ConfigError of describe_head
+                try:
+                    summary = read_summary(got[0], instance_id=instance_id)
+                except InstanceGoneError:  # unauthenticated and unreadable here: maybe another release's
+                    raise missing from None
+                return _info(summary, access="no_key", writer_release=None, body=None)
+            if body is None:  # authenticated, written by another release: the data is intact
+                return _info(summary, access="other_release", writer_release=writer, body=None)
+            return _info(summary, access="full", writer_release=writer, body=body)
 
     async def delete(self, instance_id: str) -> bool:
         """Head first (the instance is gone and unreadable at once), then every body
@@ -268,7 +303,7 @@ class InstanceAdmin:
         INSTANCE_STORE_UNAVAILABLE, ConfigError INSTANCE_CONFIG) can come after the
         head is gone: a new call returns False and removes what is left."""
         ids.check_instance_id(instance_id)
-        with _named(instance_id):
+        with named_instance(instance_id):
             existed = await self.store.exists(head_key(instance_id))
             if existed:
                 await self.store.delete_many([head_key(instance_id)])
@@ -287,6 +322,31 @@ class InstanceAdmin:
         """Every object under the instance's prefix."""
         await self.store.delete_many([o.key for o in await self.store.list_objects(instance_prefix(instance_id))])
 
+    async def list_assets(self) -> list[str]:
+        """Digests (full SHA-256) of the guest images in the store. A save stores its images
+        before its head: a cleanup that deletes the images no head names must keep those
+        newer than its longest save."""
+        listed = await self.store.list_objects(asset_key(""))
+        names = (entry.key.removeprefix(asset_key("")) for entry in listed)
+        return [name for name in names if re.fullmatch(r"[0-9a-f]{64}", name)]
+
+    async def delete_asset(self, digest: str) -> bool:
+        """Delete the guest image `digest` from the store; False: it was not there. An
+        instance whose body names it then loads only on a worker that has the image (else
+        RouteError). Raises InvalidInputError ARGUMENT_INVALID for a digest that is not
+        64 lowercase hex characters, before any store call."""
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise InvalidInputError(
+                "An image digest is 64 lowercase hex characters (SHA-256).",
+                code=ErrorCode.ARGUMENT_INVALID,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
+        existed = await self.store.exists(asset_key(digest))
+        await self.store.delete_many([asset_key(digest)])
+        return existed
+
     async def list_ids(self) -> AsyncGenerator[str]:
         """Ids that have any object in the store (with or without a head), in store
         order; names that are not ids are skipped."""
@@ -300,11 +360,13 @@ class InstanceManager(InstanceAdmin):
     Open with `InstanceManager.open` (checks the keyring, QEMU and the store)."""
 
     def __init__(
-        self, *, store: InstanceStore, keyring: Keyring, work_dir: Path, asset_dir: Path, vm_manager: VmManager
+        self, *, store: InstanceStore, keyring: Keyring, work_dir: Path, assets: AssetCache, vm_manager: VmManager
     ) -> None:
         super().__init__(store=store, keyring=keyring)
         self.work_dir = work_dir
-        self.asset_dir = asset_dir
+        self.assets = assets
+        """Images from the store; the Scheduler gives it to admission's eviction."""
+        self.asset_dir = assets.cache_dir
         self._vm_manager = vm_manager
         self._calls = 0
         """Saves and loads in flight (they use the store, the VM and the work folder)."""
@@ -323,17 +385,22 @@ class InstanceManager(InstanceAdmin):
     ) -> AsyncGenerator[InstanceManager]:
         """Saved instances live in the store `instance_store` names. Fail fast, in
         this order: keyring, store settings, QEMU floor, work folder (not on a
-        memory filesystem), store probe. Each raises ConfigError INSTANCE_CONFIG
-        (FIX_CONFIG; MIGRATION_UNSUPPORTED for a QEMU below the floor), or
-        TransientError INSTANCE_STORE_UNAVAILABLE when the store does not answer. A
-        store whose extra is not installed raises ConfigError EXTRA_MISSING. When the
+        memory filesystem), asset cache folder, store probe. Each raises ConfigError
+        INSTANCE_CONFIG (FIX_CONFIG; MIGRATION_UNSUPPORTED for a QEMU below the floor), or
+        TransientError INSTANCE_STORE_UNAVAILABLE when the store does not answer. The
+        QEMU version probe raises ConfigError HOST_DEPENDENCY or TransientError
+        QEMU_CRASHED (require_qemu_version). A store whose extra is not installed raises
+        ConfigError EXTRA_MISSING. The asset cache folder (instance_asset_dir) raises
+        ConfigError SETTING_INVALID when it cannot be made or is not private,
+        TransientError LOCAL_DISK for a disk error. A file error of the work folder (its
+        mkdir, the probe's scratch file) is an OSError. When the
         block ends, the saves, loads and background jobs still in flight end (drain)
         before the store closes."""
         async with _open_store(settings) as (store, keyring):
-            qemu = await probe_qemu_version()
-            if qemu is None or qemu < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
+            qemu = await require_qemu_version()
+            if qemu < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
                 floor = ".".join(map(str, constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION))
-                found = ".".join(map(str, qemu)) if qemu else "unknown"
+                found = ".".join(map(str, qemu))
                 raise ConfigError(
                     f"Saved instances need QEMU >= {floor}; this worker has {found}.",
                     code=ErrorCode.MIGRATION_UNSUPPORTED,
@@ -351,17 +418,18 @@ class InstanceManager(InstanceAdmin):
                     context={"work_dir": str(work_dir), "filesystem": filesystem},
                 )
             work_dir.mkdir(mode=0o700, exist_ok=True)
-            make_private_dir(settings.instance_asset_dir)
+            assets = AssetCache(settings.instance_asset_dir, setting="instance_asset_dir")
             await probe(store, scratch=work_dir)
+            key_ids = [key.id for key in keyring.keys]
             logger.info(
-                "Instance store ready",
-                extra={"store": settings.instance_store, "key_ids": [key.id for key in keyring.keys]},
+                f"Instance store ready ({settings.instance_store}), key ids newest first: {', '.join(key_ids)}.",
+                extra={"store": settings.instance_store, "key_ids": key_ids},
             )
             manager = cls(
                 store=store,
                 keyring=keyring,
                 work_dir=work_dir,
-                asset_dir=settings.instance_asset_dir,
+                assets=assets,
                 vm_manager=vm_manager,
             )
             try:
@@ -380,7 +448,13 @@ class InstanceManager(InstanceAdmin):
         InstanceGoneError INSTANCE_NOT_FOUND (deleted meanwhile): the caller closes the
         session on those. TransientError LOCAL_DISK: local disk full or files gone;
         nothing was saved. ConfigError IMAGE_DAMAGED: a guest image does not match its
-        digest; nothing was saved.
+        digest; nothing was saved. ConfigError HOST_DEPENDENCY: QEMU does not list the
+        VM's machine type, or qemu-vm cannot get write access to the migration file;
+        ConfigError MIGRATION_UNSUPPORTED or TransientError MIGRATION_FAILED: the migration failed
+        (MigrationClient.save_snapshot); InvalidInputError SCHEDULER_STATE: stop() began;
+        nothing was saved. The store's errors (TransientError INSTANCE_STORE_UNAVAILABLE,
+        ConfigError INSTANCE_CONFIG) of an upload or of the head write: no head write of
+        this save applied.
         Any other failure before the head write leaves the head unchanged (uploaded
         objects can stay: delete_instance or an expiry rule of the store removes
         them). If the caller is cancelled during the head write, the write finishes
@@ -394,7 +468,7 @@ class InstanceManager(InstanceAdmin):
         needs no check: delete removes the head first, so its If-Match write fails.
         """
         instance_id = state.instance_id if state is not None else new_instance_id or ids.new_id()
-        with self._in_flight(), _named(instance_id):
+        with self._in_flight(), named_instance(instance_id):
             return await self._save(vm, state, instance_id=instance_id)
 
     async def stop(self) -> None:
@@ -409,8 +483,8 @@ class InstanceManager(InstanceAdmin):
         """Wait until no save, no load and no background job runs: a head write runs on
         after its save is cancelled, and the work files of a save or a load (folders, body
         objects, an asset's .part file) are removed in a worker thread after it returns.
-        A call that starts meanwhile is waited for too. Shutdown calls it before the VMs,
-        the work folder and the store clients go."""
+        A call that starts meanwhile is waited for too. stop() calls it once it refuses
+        new saves and loads."""
         while not (self._idle.is_set() and all(job.done() for job in self._background)):
             await self._idle.wait()
             # Only jobs that have not ended: a gather of ended jobs completes without a yield,
@@ -471,7 +545,8 @@ class InstanceManager(InstanceAdmin):
             try:
                 await self._snapshot(vm, vmstate=vmstate, home=home)
                 facts = await self._host_facts(vm)
-                await self._ensure_vm_assets(vm, facts=facts)
+                guest = self._guest_facts(vm)
+                await self._ensure_vm_assets(vm, guest=guest)
                 kind, obj, size, data_key = await self._write_body(
                     instance_id=instance_id, commit_id=commit_id, state=state, vmstate=vmstate, home=home
                 )
@@ -483,9 +558,16 @@ class InstanceManager(InstanceAdmin):
                 raise
         self._remove_in_background(obj)  # uploaded: the store holds it now
 
-        entry = ChainEntry(commit_id=commit_id, kind=kind, size=size, stream_sizes=stream_sizes, etag=object_etag)
+        entry = ChainEntry(
+            block_bytes=BLOCK_BYTES,
+            commit_id=commit_id,
+            kind=kind,
+            size=size,
+            stream_sizes=stream_sizes,
+            etag=object_etag,
+        )
         chain = (entry,) if kind == "full" or state is None else (*state.body.chain, entry)
-        body = HeadBody(spec=vm.spec, host=facts, chain=chain)
+        body = HeadBody(spec=vm.spec, host=facts, guest=guest, egress_domains=vm.egress_domains, chain=chain)
         header = self._next_header(state, instance_id=instance_id, commit_id=commit_id, data_key=data_key)
         generation = header.generation
         commit = Commit(
@@ -525,6 +607,7 @@ class InstanceManager(InstanceAdmin):
             home=home,
             base_image=vm.base_image,
             packages_image=vm.packages_image,
+            asset_leases=(),  # the VM holds its own shares of the images it runs on
         )
 
     async def _commit(self, commit: Commit, base: Base, *, uploaded: str, superseded: list[str]) -> str | None:
@@ -608,7 +691,7 @@ class InstanceManager(InstanceAdmin):
 
     async def _snapshot(self, vm: QemuVM, *, vmstate: Path, home: Path) -> None:
         """Migration file and a copy of the home disk, both of one stopped instant."""
-        qemu_version = await probe_qemu_version()
+        qemu_version = await require_qemu_version()
         new_stream_file(vmstate)
         if vm.use_qemu_vm_user and not await grant_qemu_vm_acl([vmstate], perms="rw"):
             raise ConfigError(
@@ -712,29 +795,35 @@ class InstanceManager(InstanceAdmin):
     async def load(
         self, instance_id: str, *, packages_image: Callable[[VmSpec], Awaitable[Path | None]]
     ) -> InstanceState:
-        """Head, host check (ROUTE before any download), then the chain as local files.
+        """Head, host and budget checks (ROUTE before any download), then the chain as local files.
 
         `packages_image` finds the local L2 image for the stored spec (None: none here).
-        Does not check the id (callers do). Raises InstanceGoneError
-        INSTANCE_NOT_FOUND when there is no head, ConfigError INSTANCE_KEY_MISSING when
-        this keyring lacks its key, InstanceGoneError INSTANCE_INTEGRITY or RouteError
-        INSTANCE_HOST_MISMATCH (another release) when it does not open, and the store's
-        errors; RouteError INSTANCE_HOST_MISMATCH when the host facts differ (arch,
-        accelerator, CPU vendor, guest CPU model, or the exec-sandbox release that saved
-        it) or a guest image is neither on this worker nor in the store (or the store's
-        copy does not match its digest); InstanceGoneError INSTANCE_EXPIRED when a body object stays
-        gone; TransientError INSTANCE_STORE_UNAVAILABLE when the head keeps changing;
-        TransientError LOCAL_DISK for a local file error (nothing was loaded).
+        Does not check the id (callers do). Raises InvalidInputError SCHEDULER_STATE once
+        stop() began; InstanceGoneError INSTANCE_NOT_FOUND when there is no head,
+        ConfigError INSTANCE_KEY_MISSING when this keyring lacks its key, InstanceGoneError
+        INSTANCE_INTEGRITY or RouteError INSTANCE_HOST_MISMATCH (another release) when it
+        does not open, and the store's errors; RouteError INSTANCE_HOST_MISMATCH when the
+        host facts differ (arch, accelerator, CPU vendor, guest CPU model, the machine
+        type this QEMU has), when this release runs another device layout for the VM, or
+        when a guest image is neither on this worker nor in the store (or the store's copy
+        does not match its digest); RouteError CAPACITY_NEVER_FITS when the VM is larger
+        than this worker's whole budget; ConfigError HOST_DEPENDENCY or TransientError
+        QEMU_CRASHED when a QEMU probe or the layout build fails
+        (VmManager.restore_layout); ConfigError HOST_DEPENDENCY when qemu-vm cannot get
+        read access to the migration file; InstanceGoneError INSTANCE_EXPIRED when a body
+        object stays gone; TransientError INSTANCE_STORE_UNAVAILABLE when the head keeps
+        changing; TransientError LOCAL_DISK for a local file error (nothing was loaded).
         """
         previous_etag: str | None = None
         missing: str | None = None
-        with self._in_flight(), _named(instance_id):
+        with self._in_flight(), named_instance(instance_id):
             for _ in range(_LOAD_ATTEMPTS):
-                got = await self.store.get(head_key(instance_id), max_bytes=MAX_HEAD_BYTES)
-                if got is None:
-                    raise _not_found(instance_id)
-                data, etag = got
-                header, body, data_key = open_head(data, self.keyring, instance_id=instance_id)
+                with _object_named(head_key(instance_id), None):  # an oversized head is INSTANCE_INTEGRITY
+                    got = await self.store.get(head_key(instance_id), max_bytes=MAX_HEAD_BYTES)
+                    if got is None:
+                        raise _not_found(instance_id, store=self.store)
+                    data, etag = got
+                    header, body, data_key = open_head(data, self.keyring, instance_id=instance_id)
                 if etag == previous_etag and missing is not None:
                     if await self.store.exists(missing):  # one false "no such key" never makes an instance expire
                         raise TransientError(
@@ -752,17 +841,25 @@ class InstanceManager(InstanceAdmin):
                         hint="Start again with Scheduler.new().",
                         context=None,
                     )
-                await self._check_host(instance_id, body)
+                checked = await self._check_host(instance_id, body)
                 with _local_files(instance_id, step="loading"):
-                    base_image, packages = await self._resolve_images(instance_id, body, packages_image)
-                    folder = self._new_folder(instance_id)
+                    base_image, packages, leases = await self._resolve_images(
+                        instance_id, body, packages_image, checked=checked
+                    )
+                    try:
+                        folder = self._new_folder(instance_id)
+                    except BaseException:
+                        _release(leases)
+                        raise
                     try:
                         vmstate, home = await self._download(header, body, data_key, folder)
                     except _VanishedError as e:
+                        _release(leases)
                         self._remove_in_background(folder)
                         previous_etag, missing = etag, e.key
                         continue
                     except BaseException:
+                        _release(leases)
                         self._remove_in_background(folder)
                         raise
                     return InstanceState(
@@ -775,6 +872,7 @@ class InstanceManager(InstanceAdmin):
                         home=home,
                         base_image=base_image,
                         packages_image=packages,
+                        asset_leases=leases,
                     )
         raise TransientError(
             f"Instance {instance_id}: the head kept changing while it was loaded.",
@@ -784,16 +882,77 @@ class InstanceManager(InstanceAdmin):
             context=None,
         )
 
-    async def _check_host(self, instance_id: str, body: HeadBody) -> None:
-        local = await self._machine_facts()
-        saved = body.host.model_dump()
-        differ = [name for name in _CHECKED_FACTS if saved[name] != local[name]]
-        if differ:
-            raise host_mismatch(
-                instance_id=instance_id,
-                required={name: str(saved[name]) for name in differ},
-                found={name: str(local[name]) for name in differ},
+    async def check(self, instance_id: str, *, packages_image: Callable[[VmSpec], Awaitable[Path | None]]) -> None:
+        """What load checks before its download, with no download: the head opens with this
+        keyring and this release, this host and its budget pass (_check_host), and each guest
+        image is on this worker or in the store (a load checks the digest of a store copy).
+        `packages_image` as for load. Does not check the id (callers do). Raises what load
+        raises before its download."""
+        with self._in_flight(), named_instance(instance_id):
+            with _object_named(head_key(instance_id), None):
+                got = await self.store.get(head_key(instance_id), max_bytes=MAX_HEAD_BYTES)
+                if got is None:
+                    raise _not_found(instance_id, store=self.store)
+                _header, body, _data_key = open_head(got[0], self.keyring, instance_id=instance_id)
+            checked = await self._check_host(instance_id, body)
+            images = [(RouteKey.BASE_IMAGE, body.guest.base_image, self._local_base_image(body.spec), checked)]
+            if body.guest.packages_image is not None:
+                local = await packages_image(body.spec)
+                with_base = checked.plus(RouteKey.BASE_IMAGE, body.guest.base_image)
+                images.append((RouteKey.PACKAGES_IMAGE, body.guest.packages_image, local, with_base))
+            for role, digest, local, at in images:
+                with _local_files(instance_id, step="loading"):  # a lease's lock file error: LOCAL_DISK
+                    here = await self._local_image(role=role, digest=digest, local=local)
+                if here is not None and here[1] is not None:
+                    here[1].release()  # nothing runs on it
+                if here is None and not await self.store.exists(asset_key(digest)):
+                    raise _image_missing(instance_id, role=role, digest=digest, checked=at, problem=_IMAGE_NOWHERE)
+
+    async def _check_host(self, instance_id: str, body: HeadBody) -> _Checked:
+        """The checked facts of the saved host and the budget the VM needs, before any
+        download: ROUTE when this host's facts differ (INSTANCE_HOST_MISMATCH) or the VM can
+        never fit its whole budget (CAPACITY_NEVER_FITS)."""
+        target = _target(body.host)
+        found = await self._found(target)
+        if found != target:
+            raise host_mismatch(instance_id=instance_id, required=target, found=found, reason=None)
+        here = await self._vm_manager.restore_layout(
+            body.spec, machine_type=body.host.machine_type, packages=body.guest.packages_image is not None
+        )
+        if here != body.host.device_layout:
+            raise _layout_differs(instance_id, saved=body.host.device_layout, here=here)
+        need, have = await self._vm_manager.check_fits(body.spec, vm_id=instance_id, target=target)
+        return _Checked(required={**target, **need}, found={**target, **have})
+
+    async def refused_by_qemu(self, state: InstanceState, *, qemu_error: str) -> SandboxError:
+        """The error of a loaded state this worker's QEMU refused. QEMU loads a state that
+        the same or an older QEMU saved: on an older QEMU, ROUTE to a worker with the saver's
+        facts, the budget the VM needs, its guest images and a QEMU of the saved version or newer (qemu_version,
+        rule AT_LEAST); on the
+        same or a newer QEMU, InternalError (REPORT): QEMU broke that rule, or the device
+        model of this release differs. `qemu_error`: QEMU's reason, in the message."""
+        host = state.body.host
+        local_qemu = await qemu_version_fact()
+        if RouteKey.QEMU_VERSION.holds(local_qemu, host.qemu_version):
+            return InternalError(
+                f"Instance {state.header.instance_id}: QEMU {local_qemu} refused a state that QEMU "
+                f"{host.qemu_version} saved: {qemu_error}.",
+                code=ErrorCode.INTERNAL,
+                context=None,
+                hint=None,
+                instance_id=state.header.instance_id,
             )
+        checked = await self._check_host(state.header.instance_id, state.body)  # the load passed them
+        guest = state.body.guest
+        images = {RouteKey.BASE_IMAGE: guest.base_image}  # this worker has them: the load resolved them
+        if guest.packages_image is not None:
+            images[RouteKey.PACKAGES_IMAGE] = guest.packages_image
+        return host_mismatch(
+            instance_id=state.header.instance_id,
+            required={**checked.required, **images, RouteKey.QEMU_VERSION: host.qemu_version},
+            found={**checked.found, **images, RouteKey.QEMU_VERSION: local_qemu},
+            reason=f"this worker's QEMU refused the saved state ({qemu_error})",
+        )
 
     async def _download(self, header: HeadHeader, body: HeadBody, data_key: bytes, folder: Path) -> tuple[Path, Path]:
         """The chain into two new stream files, opened once. At most _OBJECTS_AHEAD
@@ -812,19 +971,22 @@ class InstanceManager(InstanceAdmin):
         async def fetch(n: int) -> None:
             entry = body.chain[n]
             key = body_key(instance_id, entry.commit_id, _OBJECT_KIND[entry.kind])
-            if not await self.store.download(key, dest=objects[n], max_bytes=entry.size, expected_size=entry.size):
-                raise _VanishedError(key)
+            with _object_named(key, entry.commit_id):  # a wrong size is INSTANCE_INTEGRITY
+                if not await self.store.download(key, dest=objects[n], max_bytes=entry.size, expected_size=entry.size):
+                    raise _VanishedError(key)
 
         def apply(n: int, targets: Mapping[int, int]) -> None:
+            entry = body.chain[n]
             try:
-                apply_object(
-                    objects[n],
-                    data_key=data_key,
-                    instance_id=instance_id,
-                    commit_id=body.chain[n].commit_id,
-                    targets=targets,
-                    sizes=dict(enumerate(body.chain[n].stream_sizes)),
-                )
+                with _object_named(body_key(instance_id, entry.commit_id, _OBJECT_KIND[entry.kind]), entry.commit_id):
+                    apply_object(
+                        objects[n],
+                        data_key=data_key,
+                        instance_id=instance_id,
+                        commit_id=entry.commit_id,
+                        targets=targets,
+                        sizes=dict(enumerate(entry.stream_sizes)),
+                    )
             finally:
                 _remove_quietly(objects[n])
 
@@ -862,12 +1024,12 @@ class InstanceManager(InstanceAdmin):
 
     # ------------------------------------------------------------------ assets
 
-    async def _ensure_vm_assets(self, vm: QemuVM, *, facts: HostFacts) -> None:
+    async def _ensure_vm_assets(self, vm: QemuVM, *, guest: GuestFacts) -> None:
         """Store the VM's guest images by digest before the commit (at commit time,
         the store holds every image the head names)."""
-        await self._ensure_asset(vm.base_image, facts.base_image)
-        if vm.packages_image is not None and facts.packages_image is not None:
-            await self._ensure_asset(vm.packages_image, facts.packages_image)
+        await self._ensure_asset(vm.base_image, guest.base_image)
+        if vm.packages_image is not None and guest.packages_image is not None:
+            await self._ensure_asset(vm.packages_image, guest.packages_image)
 
     async def _ensure_asset(self, path: Path, digest: str) -> None:
         """Upload a guest image under its digest unless the store has it at its size.
@@ -894,21 +1056,74 @@ class InstanceManager(InstanceAdmin):
             logger.info("Instance asset uploaded", extra={"digest": digest, "bytes": path.stat().st_size})
 
     async def _resolve_images(
-        self, instance_id: str, body: HeadBody, packages_image: Callable[[VmSpec], Awaitable[Path | None]]
-    ) -> tuple[Path, Path | None]:
-        base = await self._resolve_image(
-            instance_id, role="base_image", digest=body.host.base_image, local=self._local_base_image(body.spec)
-        )
-        if body.host.packages_image is None:
-            return base, None
-        packages = await self._resolve_image(
-            instance_id, role="packages_image", digest=body.host.packages_image, local=await packages_image(body.spec)
-        )
-        return base, packages
+        self,
+        instance_id: str,
+        body: HeadBody,
+        packages_image: Callable[[VmSpec], Awaitable[Path | None]],
+        *,
+        checked: _Checked,
+    ) -> tuple[Path, Path | None, tuple[EntryLease, ...]]:
+        """The base and the packages image (None without packages), and the leases on the
+        ones of the asset cache (released here on an error)."""
+        leases: list[EntryLease] = []
+        try:
+            base, lease = await self._resolve_image(
+                instance_id,
+                role=RouteKey.BASE_IMAGE,
+                digest=body.guest.base_image,
+                local=self._local_base_image(body.spec),
+                checked=checked,
+            )
+            leases.extend([lease] if lease is not None else [])
+            if body.guest.packages_image is None:
+                return base, None, tuple(leases)
+            packages, lease = await self._resolve_image(
+                instance_id,
+                role=RouteKey.PACKAGES_IMAGE,
+                digest=body.guest.packages_image,
+                local=await packages_image(body.spec),
+                checked=checked.plus(RouteKey.BASE_IMAGE, body.guest.base_image),
+            )
+            leases.extend([lease] if lease is not None else [])
+        except BaseException:
+            _release(leases)
+            raise
+        return base, packages, tuple(leases)
 
-    async def _resolve_image(self, instance_id: str, *, role: str, digest: str, local: Path | None) -> Path:
-        """A local image with `digest`: the worker's own, a cached download, or a new
-        download from the store (checked against the digest). ROUTE when none."""
+    async def _resolve_image(
+        self, instance_id: str, *, role: RouteKey, digest: str, local: Path | None, checked: _Checked
+    ) -> tuple[Path, EntryLease | None]:
+        """A local image with `digest`: the worker's own, one of the asset cache, or a new
+        download from the store (checked against the digest) into the asset cache; with the
+        lease on an image of the asset cache (None: the worker's own). ROUTE when none, with
+        the facts checked before (`checked`, this worker passed them) and the image."""
+        if (found := await self._local_image(role=role, digest=digest, local=local)) is not None:
+            return found
+        cached = self.asset_dir / f"{digest}.img"
+        async with CacheEntry(cached).saving() as missing:  # eviction needs this lock too
+            if not missing:  # another load put it there meanwhile
+                return cached, await _asset_lease(cached)
+            part = self.asset_dir / f"{digest}.{ids.new_id()}.part"
+            try:
+                if not await self.store.download(
+                    asset_key(digest), dest=part, max_bytes=_MAX_ASSET_BYTES, expected_size=None
+                ):
+                    problem = _IMAGE_NOWHERE
+                elif await file_hash(part, "sha256") != digest:
+                    problem = "the store's copy of the image does not match its digest"
+                else:
+                    part.replace(cached)
+                    logger.info("Instance asset downloaded", extra={"digest": digest, "role": role})
+                    return cached, await _asset_lease(cached)
+            finally:
+                self._remove_in_background(part)  # up to GBs; gone already after the rename
+        raise _image_missing(instance_id, role=role, digest=digest, checked=checked, problem=problem)
+
+    async def _local_image(
+        self, *, role: RouteKey, digest: str, local: Path | None
+    ) -> tuple[Path, EntryLease | None] | None:
+        """The worker's own image when it has `digest` (no lease), else the asset cache's,
+        leased (eviction skips it); None: neither is here."""
         if local is not None:
             try:
                 same = await asyncio.to_thread(image_digest, local) == digest
@@ -918,79 +1133,107 @@ class InstanceManager(InstanceAdmin):
                 )
                 same = False
             if same:
-                return local
-        cached = self.asset_dir / f"{digest}.img"
-        if cached.exists():  # only ever renamed into place after its digest was checked
-            return cached
-        part = self.asset_dir / f"{digest}.{ids.new_id()}.part"
-        try:
-            if not await self.store.download(
-                asset_key(digest), dest=part, max_bytes=_MAX_ASSET_BYTES, expected_size=None
-            ):
-                problem = "not on this worker, not in the store"
-            elif await file_hash(part, "sha256") != digest:
-                problem = "the store's copy does not match its digest"
-            else:
-                part.replace(cached)
-                logger.info("Instance asset downloaded", extra={"digest": digest, "role": role})
-                return cached
-        finally:
-            self._remove_in_background(part)  # up to GBs; gone already after the rename
-        # The instance is intact: a worker that has the image can load it.
-        raise host_mismatch(instance_id=instance_id, required={role: digest}, found={role: problem})
+                return local, None
+        cached = self.asset_dir / f"{digest}.img"  # only ever renamed into place after its digest was checked
+        lease = await CacheEntry(cached).lease()  # None: not here (never fetched, or evicted)
+        return None if lease is None else (cached, lease)
 
     def _local_base_image(self, spec: VmSpec) -> Path | None:
         try:
             return self._vm_manager.images.base_image(spec.language)
-        except (ConfigError, FileNotFoundError):
+        except ConfigError:  # ASSET_NOT_FOUND: in no folder of this worker
             return None
 
     # ------------------------------------------------------------------ helpers
 
     async def release(self, state: InstanceState) -> None:
-        """Remove a closed session's instance files (what will not go is logged)."""
+        """Release the state's leases on the asset cache, and remove a closed session's
+        instance files (what will not go is logged)."""
+        _release(state.asset_leases)
         await asyncio.to_thread(_remove_quietly, state.folder)
 
     def _new_folder(self, instance_id: str) -> Path:
         return Path(tempfile.mkdtemp(prefix=f"{instance_id}-", dir=self.work_dir))
 
-    async def _machine_facts(self) -> dict[str, str | None]:
-        """This host: arch, accelerator, CPU vendor (x86 only), guest CPU model, QEMU version and
-        exec-sandbox release."""
-        arch = detect_host_arch()
-        accel = await detect_accel_type(force_emulation=self._vm_manager.settings.force_emulation)
-        qemu = await probe_qemu_version()
+    def asset_digests(self) -> frozenset[str]:
+        """Digests of the guest images this worker downloaded from the store: each one is
+        renamed to <digest>.img in the asset folder only after its digest check."""
+        try:
+            names = [path.name for path in self.asset_dir.iterdir()]
+        except OSError:  # the folder is gone (a cleanup between runs): none here
+            return frozenset()
+        return frozenset(
+            name.removesuffix(".img")
+            for name in names
+            if name.endswith(".img") and re.fullmatch(r"[0-9a-f]{64}", name.removesuffix(".img"))
+        )
+
+    async def _machine_facts(self) -> dict[RouteKey, str | None]:
+        """This host's checked facts (worker_facts.machine_facts)."""
+        return await machine_facts(force_emulation=self._vm_manager.settings.force_emulation)
+
+    async def _found(self, target: dict[RouteKey, str]) -> dict[RouteKey, str | None]:
+        """This worker's value for each key of a host target (a CONTAINS key: the target's
+        value when this worker has it, else None)."""
+        local = await self._machine_facts()
+        machine_types = await require_qemu_machine_types()
         return {
-            "arch": arch.name.lower(),
-            "accelerator": str(accel.value),
-            "cpu_vendor": detect_host_x86_vendor() if arch == HostArch.X86_64 else None,
-            "cpu_model": await guest_cpu_model(arch, accel),
-            "qemu_version": ".".join(map(str, qemu)) if qemu else "unknown",
-            "release": __version__,
+            key: (value if value in machine_types else None) if key is RouteKey.MACHINE_TYPE else local[key]
+            for key, value in target.items()
         }
 
-    async def _host_facts(self, vm: QemuVM) -> HostFacts:
-        """The saved VM's facts: this host, and the digests of the images the VM runs on,
-        taken when QEMU opened them (after reuse() these may differ from this worker's own
-        images; a file evicted or rebuilt at the same path since does not change them).
+    def _guest_facts(self, vm: QemuVM) -> GuestFacts:
+        """The files the saved guest booted on: the digests of its images, taken when QEMU
+        opened them (after reuse() these may differ from this worker's own images; a file
+        evicted or rebuilt at the same path since does not change them), and of its kernel
+        and initramfs (a reused VM keeps those of its first boot).
 
         Raises:
-            ConfigError: IMAGE_DAMAGED: a digest is unknown (the image was missing at the
-                VM's start); nothing is saved
+            ConfigError: IMAGE_DAMAGED: a digest is unknown (the file was missing at the VM's
+                start); nothing is saved
         """
-        base_digest = vm.base_image_digest
-        packages_digest = vm.packages_image_digest
-        if base_digest is None or (vm.packages_image is not None and packages_digest is None):
+        base, packages, kernel, initramfs = (
+            vm.base_image_digest,
+            vm.packages_image_digest,
+            vm.kernel_digest,
+            vm.initramfs_digest,
+        )
+        if base is None or kernel is None or initramfs is None or (vm.packages_image is not None and packages is None):
             raise ConfigError(
-                f"VM {vm.vm_id}: the digest of a guest image it runs on is unknown (the file was missing "
+                f"VM {vm.vm_id}: the digest of a guest file it runs on is unknown (the file was missing "
                 "when the VM started). It was not saved.",
                 code=ErrorCode.IMAGE_DAMAGED,
                 context={"base_image": str(vm.base_image), "packages_image": str(vm.packages_image)},
                 hint="Download or rebuild the guest images.",
                 instance_id=None,
             )
+        return GuestFacts(base_image=base, packages_image=packages, kernel=kernel, initramfs=initramfs)
+
+    async def _host_facts(self, vm: QemuVM) -> HostFacts:
+        """The saving host's facts (recomputed at each save: HostFacts).
+
+        Raises:
+            ConfigError: HOST_DEPENDENCY: the QEMU machine type of the VM is unknown
+        """
+        if vm.machine_type is None:  # a load starts QEMU with it: never store a VM without it
+            raise ConfigError(
+                f"VM {vm.vm_id}: the QEMU machine type it runs is unknown (this QEMU does not list the "
+                "type it started with). It was not saved.",
+                code=ErrorCode.HOST_DEPENDENCY,
+                context=None,
+                hint="Restart the worker after a QEMU change, then save a new session.",
+                instance_id=None,
+            )
+        facts = await self._machine_facts()
+        qemu_version = await qemu_version_fact()  # a refusal compares it with the loader's
         return HostFacts.model_validate(
-            {**await self._machine_facts(), "base_image": base_digest, "packages_image": packages_digest}
+            {
+                **{key.value: value for key, value in facts.items()},
+                "qemu_version": qemu_version,
+                "release": __version__,  # a diagnostic: the release of this save
+                "machine_type": vm.machine_type,
+                "device_layout": vm.device_layout,
+            }
         )
 
 
@@ -1048,22 +1291,104 @@ def _close_after(job: asyncio.Future[None] | None, fds: Collection[int]) -> None
         job.add_done_callback(close)
 
 
-def _not_found(instance_id: str) -> InstanceGoneError:
-    return InstanceGoneError(
-        f"No instance {instance_id} in the store (never saved, deleted or expired).",
-        code=ErrorCode.INSTANCE_NOT_FOUND,
+def _target(host: HostFacts) -> dict[RouteKey, str]:
+    """The checked facts of a saved host, as route values (a fact that does not apply, such
+    as cpu_vendor on ARM, is absent)."""
+    saved = host.model_dump()
+    return {key: saved[key] for key in _CHECKED_FACTS if saved[key] is not None} | {
+        RouteKey.MACHINE_TYPE: host.machine_type
+    }
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Checked:
+    """The route facts a load checked so far, as a RouteError gives them: what the instance
+    needs (`required`) and this worker's values (`found`, which pass)."""
+
+    required: dict[RouteKey, str]
+    found: dict[RouteKey, str | None]
+
+    def plus(self, key: RouteKey, value: str) -> _Checked:
+        """These facts and `key`, which this worker has (`value`)."""
+        return _Checked(required={**self.required, key: value}, found={**self.found, key: value})
+
+
+def _info(
+    header: HeadSummary,
+    *,
+    access: InstanceAccess,
+    writer_release: str | None,
+    body: HeadBody | None,
+) -> InstanceInfo:
+    return InstanceInfo(
+        instance_id=header.instance_id,
+        generation=header.generation,
+        recent_commits=header.recent_commits,
+        key_id=header.key_id,
+        access=access,
+        writer_release=writer_release,
+        spec=None if body is None else body.spec,
+        host=None if body is None else body.host,
+        guest=None if body is None else body.guest,
+        egress_domains=None if body is None else body.egress_domains,
+    )
+
+
+_IMAGE_NOWHERE = "the image is not on this worker and not in the store"
+
+
+def _release(leases: Collection[EntryLease]) -> None:
+    for lease in leases:
+        lease.release()
+
+
+async def _asset_lease(path: Path) -> EntryLease:
+    """A lease on an image of the asset cache, taken under its save lock (eviction needs that
+    lock too, so the image is there); a file error is LOCAL_DISK (_local_files)."""
+    if (lease := await CacheEntry(path).lease()) is None:
+        raise FileNotFoundError(errno.ENOENT, "guest image removed under its save lock", str(path))
+    return lease
+
+
+def _layout_differs(instance_id: str, *, saved: str, here: str) -> RouteError:
+    """ROUTE to another release: this release's QEMU command for the saved VM has another
+    device layout; the message names the first line that differs."""
+    pairs = itertools.zip_longest(saved.splitlines(), here.splitlines(), fillvalue="nothing")
+    old, new = next((pair for pair in pairs if pair[0] != pair[1]), ("?", "?"))
+    reason = f"this release runs another device layout for it (saved {old!r}, here {new!r})"
+    return host_mismatch(instance_id=instance_id, required={}, found={}, reason=reason)
+
+
+def _image_missing(instance_id: str, *, role: RouteKey, digest: str, checked: _Checked, problem: str) -> RouteError:
+    """ROUTE for a guest image this worker cannot get: the instance is intact, and a worker
+    that has the image (and the facts checked before) can load it."""
+    return host_mismatch(
         instance_id=instance_id,
-        hint="Start again with Scheduler.new().",
-        context=None,
+        required={**checked.required, role: digest},
+        found={**checked.found, role: None},
+        reason=problem,
     )
 
 
 @contextlib.contextmanager
-def _named(instance_id: str) -> Generator[None]:
-    """Store errors do not know which instance they served: name it for the caller."""
+def _object_named(key: str, commit_id: str | None) -> Generator[None]:
+    """Name the store object in each INSTANCE_INTEGRITY error raised in the block (its key,
+    and the commit that wrote it for a body object): an operator tells a damaged copy of
+    one object from another."""
     try:
         yield
-    except SandboxError as e:
-        if e.instance_id is None:
-            e.instance_id = instance_id
+    except InstanceGoneError as e:
+        if e.code is ErrorCode.INSTANCE_INTEGRITY:
+            e.context.update({"key": key} if commit_id is None else {"key": key, "commit_id": commit_id})
         raise
+
+
+def _not_found(instance_id: str, *, store: InstanceStore) -> InstanceGoneError:
+    """No head: name where it looked (a wrong bucket, prefix or folder gives this error too)."""
+    return InstanceGoneError(
+        f"No instance {instance_id} in the store {store.location} (never saved, deleted or expired).",
+        code=ErrorCode.INSTANCE_NOT_FOUND,
+        instance_id=instance_id,
+        hint="Check that this is the store that saved it, else start again with Scheduler.new().",
+        context={"store": store.location, "key": head_key(instance_id)},
+    )

@@ -41,6 +41,7 @@ from exec_sandbox.exceptions import (
     SessionClosedError,
     TransientError,
 )
+from exec_sandbox.instance import manager as instance_manager
 from exec_sandbox.instance.store import head_key
 from exec_sandbox.models import InstanceRef, StartupTiming
 from exec_sandbox.session import Session
@@ -294,6 +295,7 @@ class TestGenerations:
         rollovers). After each save the stored generation is the session's; at seeded points an
         unsaved change is dropped (close warns) and reuse() gives back exactly the last save."""
         env = lab.env
+        mark = len(env.proxy.log)  # this example's requests only (examples share the env)
         rng = random.Random(seed)
         fork = await lab.new(seed, instance_id=None)
         instance_id = ""
@@ -320,6 +322,8 @@ class TestGenerations:
         head = await lab.check(instance_id, 100)
         assert env.bucket.body_keys(instance_id) == sorted(chain_keys(head))
         assert env.work_files() == set()
+        # The first save and the pack cap make two full copies: more come from the byte budget
+        assert env.proxy.count(("PUT", "MPU_CREATE"), rf"^s/{instance_id}/b/.*\.f$", since=mark) > 2
 
 
 # ----------------------------------------------------------------------------- one session, FIFO
@@ -515,6 +519,62 @@ class TestCloseDuringSave:
                 head = await lab.check(instance_id, 2)
                 assert env.bucket.body_keys(instance_id) == sorted(chain_keys(head))
         assert env.work_files() == set()
+
+    async def test_cancelled_save_stops_the_home_copy_first(self, lab: Lab, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A save cancelled while the VM is stopped and its home disk is copied: the copy stops
+        (its stop event) and the cancel comes out once the copy ended, then the VM runs again
+        (QMP cont). The rule of test_instance_e2e, without a VM. The seam: the manager module's
+        name for files.disk.clone_sparse (disk_full_once)."""
+        copying, ended = threading.Event(), threading.Event()
+
+        def stoppable_copy(_source: Path, target: Path, *, stop: threading.Event | None) -> bool:
+            target.write_bytes(b"partial")
+            copying.set()
+            assert stop is not None
+            stop.wait(timeout=30)
+            target.unlink()
+            ended.set()
+            raise InterruptedError(errno.EINTR, "The copy was stopped")
+
+        instance_id = await lab.base(31)
+        fork = await lab.reuse(instance_id)
+        _change(fork.vm, _op("put", "ram", block=1, value=31, tag=None))
+        monkeypatch.setattr(instance_manager, "clone_sparse", stoppable_copy)
+        saving = asyncio.create_task(lab.save(fork))
+        assert await asyncio.to_thread(copying.wait, 10)
+        saving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await _within(saving)
+        assert ended.is_set()  # the copy ended before the cancel came out
+        assert "cont" in fork.vm.qmp.commands  # the stopped VM runs again
+        assert await lab.generation(instance_id) == 1
+
+    async def test_a_cancelled_save_that_loses_removes_its_object(self, lab: Lab) -> None:
+        """Two sessions of one instance: B's head write is held, A's save lands, B is cancelled,
+        then its head write is released and loses (CONFLICT). The uploaded body object of B is
+        removed all the same (the shielded commit), not left as an orphan."""
+        env = lab.env
+        instance_id = await lab.base(32)
+        a, b = await lab.reuse(instance_id), await lab.reuse(instance_id)
+        _change(b.vm, _op("put", "ram", block=1, value=7, tag=None))
+        gate = _gate(env, b, instance_id, "head-put")  # the first head write only: B's
+        before = set(env.bucket.body_keys(instance_id))
+        saving_b = asyncio.create_task(lab.save(b))
+        await _within(gate.reached())
+        uploaded_by_b = set(env.bucket.body_keys(instance_id)) - before
+        assert len(uploaded_by_b) == 1  # its body object landed before its head write
+        _change(a.vm, _op("put", "ram", block=1, value=9, tag=None))
+        await _within(lab.save(a))
+        saving_b.cancel()
+        gate.release()
+        with pytest.raises(asyncio.CancelledError):
+            await _within(saving_b)
+        await _within(env.manager.drain())
+        lab.want[(instance_id, 2)] = a.guest.snapshots[-1]
+        head = await lab.check(instance_id, 2)  # A's save
+        assert env.bucket.body_keys(instance_id) == sorted(chain_keys(head))  # no orphan of B
+        assert not uploaded_by_b & set(env.bucket.body_keys(instance_id))
+        await a.session.close()
 
     async def test_drain_waits_for_cancelled_commit(self, lab: Lab) -> None:
         """A save cancelled during its head write: drain() (what Scheduler exit awaits before the

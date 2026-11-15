@@ -1,7 +1,7 @@
 """Constants for exec-sandbox configuration and limits."""
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final
 
 # ============================================================================
@@ -57,31 +57,6 @@ DEFAULT_TIMEOUT_SECONDS: Final[int] = 30
 MAX_TIMEOUT_SECONDS: Final[int] = 300
 """Maximum code execution timeout in seconds (5 minutes)."""
 
-VM_BOOT_TIMEOUT_SECONDS: Final[int] = 45
-"""VM boot timeout in seconds (guest agent ready check).
-
-Sized for CI nested virtualization (AMD nested KVM: 50-90% CPU degradation per
-Cloud Hypervisor issue #4827). Bare-metal boots complete in <1s; the timeout is
-for the full boot + guest-agent ready sequence under worst-case contention."""
-
-VM_BOOT_MAX_RETRIES: Final[int] = 4
-"""Maximum attempts for a VM boot (CPU contention resilience).
-
-Four attempts give a transient overlay daemon error (connection refused at
-startup) time to clear."""
-
-VM_BOOT_RETRY_MIN_SECONDS: Final[float] = 0.1
-"""Minimum backoff between VM boot retries (100ms base).
-
-Under CI CPU contention the host scheduler needs time to reschedule the QEMU
-process: 20ms retries are too tight."""
-
-VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 2.0
-"""Maximum backoff between VM boot retries (2s cap with jitter).
-
-Lets the overlay daemon recover from transient connection-refused errors
-(a daemon restart takes ~100-500ms)."""
-
 
 @dataclass(frozen=True, slots=True)
 class RetryProfile:
@@ -99,21 +74,39 @@ class RetryProfile:
 
 
 RETRY_USER_FACING: Final[RetryProfile] = RetryProfile(
-    max_attempts=VM_BOOT_MAX_RETRIES,
-    boot_timeout_seconds=VM_BOOT_TIMEOUT_SECONDS,
-    retry_min_seconds=VM_BOOT_RETRY_MIN_SECONDS,
-    retry_max_seconds=VM_BOOT_RETRY_MAX_SECONDS,
+    # Four attempts give a transient overlay daemon error (connection refused at startup)
+    # time to clear
+    max_attempts=4,
+    # The guest agent ready check. Sized for CI nested virtualization (AMD nested KVM:
+    # 50-90% CPU degradation per Cloud Hypervisor issue #4827). Bare-metal boots complete
+    # in <1s; the timeout is for the full boot + guest-agent ready sequence under
+    # worst-case contention
+    boot_timeout_seconds=45,
+    # Under CI CPU contention the host scheduler needs time to reschedule the QEMU
+    # process: 20ms retries are too tight
+    retry_min_seconds=0.1,
+    # A 2 s cap with jitter lets the overlay daemon recover from transient
+    # connection-refused errors (a daemon restart takes ~100-500ms)
+    retry_max_seconds=2.0,
 )
 """Default retry profile for user-facing VMs (scheduler)."""
 
-RETRY_BACKGROUND: Final[RetryProfile] = RetryProfile(
-    max_attempts=2,
-    boot_timeout_seconds=30,
-    retry_min_seconds=VM_BOOT_RETRY_MIN_SECONDS,
-    retry_max_seconds=VM_BOOT_RETRY_MAX_SECONDS,
-)
-"""Retry profile for background VMs (warm pool, snapshot creation, L1 saves).
-Fewer attempts and a shorter boot timeout: no user request waits on these boots."""
+RETRY_BACKGROUND: Final[RetryProfile] = replace(RETRY_USER_FACING, max_attempts=2, boot_timeout_seconds=30)
+"""Retry profile for background VMs (warm pool, snapshot creation, L1 saves): the same
+backoff, fewer attempts and a shorter boot timeout: no user request waits on these boots."""
+
+GUEST_NETWORK_SUBNET: Final = "192.168.127.0/24"
+"""The guest network of gvproxy-wrapper (passed as -subnet). The guest agent sets the guest
+side at its boot (guest-agent/src/init.rs: GUEST_IP/24, its default route to the gateway):
+change both together. A saved VM keeps the network of its boot."""
+GUEST_GATEWAY_IP: Final = "192.168.127.1"
+"""Gateway and DNS server of the guest network (gvproxy-wrapper -gateway-ip)."""
+GUEST_GATEWAY_MAC: Final = "5a:94:ef:e4:0c:dd"
+"""MAC address of the gateway (gvproxy-wrapper -gateway-mac)."""
+GUEST_IP: Final = "192.168.127.2"
+"""The guest's address: the target of each port forward."""
+GUEST_MTU: Final = 1500
+"""MTU of the guest network (gvproxy-wrapper -mtu)."""
 
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent."""
@@ -188,7 +181,7 @@ Also used host-side to compute hard_timeout (+ EXECUTION_TIMEOUT_MARGIN_SECONDS 
 first-op network gate allowance, see disk_snapshot_manager)."""
 
 PACKAGE_INSTALL_MAX_RETRIES: Final[int] = 3
-"""Maximum retry attempts for transient network errors during package install."""
+"""Attempts of one package install, the first included (transient network errors)."""
 
 L3_UPLOAD_STOP_GRACE_SECONDS: Final[float] = 30.0
 """How long DiskSnapshotManager.stop() (Scheduler exit) waits for the L3 uploads in flight
@@ -354,7 +347,8 @@ WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 15
 """Health check interval for warm VMs in seconds."""
 
 WARM_POOL_HEALTH_CHECK_MAX_RETRIES: Final[int] = 3
-"""Maximum retry attempts before declaring VM unhealthy (matches K8s failureThreshold)."""
+"""Attempts of one health check, the first ping included, before the VM counts as unhealthy
+(matches K8s failureThreshold)."""
 
 WARM_POOL_HEALTH_CHECK_RETRY_MIN_SECONDS: Final[float] = 0.1
 """Minimum backoff between health check retries."""
@@ -398,58 +392,13 @@ Floor is 11.0: it is the first release where mapped-ram coexists with
 x-ignore-shared without a null-deref ("Bad address") crash, letting the template
 and full-RAM paths share ONE unified capability list (no version fork). The
 QEMU pin in versions.lock (the QEMU that CI builds) is above this floor. Below the floor,
-save and restore raise ConfigError MIGRATION_UNSUPPORTED (no legacy fallback). Changing
-capabilities requires bumping MEMORY_SNAPSHOT_FORMAT_VERSION."""
+save and restore raise ConfigError MIGRATION_UNSUPPORTED (no legacy fallback)."""
 
-MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 6
-"""Migration format version, part of the L1 cache key (memory_snapshot_manager). Bump
-it when the QMP capabilities, the migration protocol or the guest devices change, so
-that no L1 entry of another format is restored.
-
-Version 6: one capability list (mapped-ram + multifd, and x-ignore-shared always set
-with an explicit state: on for templates); no virtio-balloon; the L2 snapshot drive
-(hd1) read-only outside the L2 build (its virtio-blk device carries VIRTIO_BLK_F_RO);
-a home disk drive (hd2, serial=home), with a .home file per entry; on ARM64 HVF with
-QEMU 11.1+, QEMU's own GIC (kernel-irqchip=off: qemu_cmd), not Apple's.
-
-NOTE: the migration stream layout is QEMU-version- AND parameter-specific — a
-QEMU upgrade or a change to multifd-channels / direct-io (both baked into the
-mapped-ram file layout) requires restore-QEMU == save-QEMU. Any such change must
-bump this version so stale, incompatible snapshots are not restored.
-"""
-
-# ============================================================================
-# Overlay Pool
-# ============================================================================
-
-OVERLAY_POOL_FALLBACK_SIZE: Final[int] = 5
-"""Overlay pool size when host resources are unknown (psutil unavailable).
-
-Provides a reasonable default for pre-created overlays per base image
-when the admission controller cannot determine host capacity."""
-
-OVERLAY_POOL_SIZE_RATIO: Final[float] = 1.0
-"""Overlay pool size as ratio of effective max VMs (100%).
-
-Matches the max concurrent VM count, so a full admission cycle gets pool hits
-(<1 ms). The pool fills in the background after start (84 overlays in ~125 ms on
-an M-series Mac); until then acquire() creates overlays on demand (~0.3 ms once the
-template of the base image exists, ~5 ms for the first).
-With 24 max VMs, pool will have 24 pre-created overlays per base image
-(~200KB each = ~5MB per image, negligible disk cost).
-"""
-
-OVERLAY_POOL_CREATION_CONCURRENCY: Final[int] = 2
-"""Overlays the pool fill creates at once (the on-demand path of acquire() does not wait for it).
-
-The first overlay of each base image version is QMP exchanges, which the daemon serves one at
-a time (~5 ms); each later one is a clone of that template (~0.3 ms, no QMP). With 2 fill
-workers, 3 base images x 28 overlays are ready ~125 ms after start on an M-series Mac
-(822 ms when each overlay is made through QMP).
-"""
-
-OVERLAY_POOL_REPLENISH_INTERVAL_SECONDS: Final[float] = 0.5
-"""Interval between replenishment checks."""
+MIGRATION_CAPABILITIES: Final[tuple[str, ...]] = ("multifd", "mapped-ram")
+"""Migration capabilities that every save and every restore turn on: QEMU refuses a stream
+whose sender set other ones ("received capability is off"). x-ignore-shared is set too,
+with an explicit state (on for an L1 template only). Part of the L1 cache key: a change
+here never restores an L1 entry saved with the old list."""
 
 # ============================================================================
 # QEMU Storage Daemon

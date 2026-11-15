@@ -98,7 +98,7 @@ async def test_parallel_sessions(instance_world: InstanceWorld, primed_l1_dir: P
             model = new_model(Language.PYTHON, seed="parallel")
 
             async def b_work() -> InstanceRef:
-                await start_guest(b, model, ticker=True)
+                await start_guest(b, model)
                 await play_round(b, model)
                 return await b.save()
 
@@ -171,7 +171,7 @@ async def test_many_instances_save_at_once(instance_world: InstanceWorld, primed
             for session in [*sessions, *busy]:
                 assert_origin(session, "l1")
             models = [new_model(lang, seed=f"many/{i}") for i, lang in enumerate(languages)]
-            await asyncio.gather(*(start_guest(s, m, ticker=True) for s, m in zip(sessions, models, strict=True)))
+            await asyncio.gather(*(start_guest(s, m) for s, m in zip(sessions, models, strict=True)))
 
             await asyncio.gather(*(play_round(s, m) for s, m in zip(sessions, models, strict=True)))
             first = await _saves_while_busy(sessions, busy)  # full copies
@@ -226,7 +226,7 @@ async def test_fork_sequential(instance_world: InstanceWorld, primed_l1_dir: Pat
         async with await scheduler.new(_PY) as first:
             assert_origin(first, "l1")
             model = new_model(Language.PYTHON, seed="fork")
-            await start_guest(first, model, ticker=True)
+            await start_guest(first, model)
             await play_round(first, model)
             ref = await first.save()
             await close_saved(first)

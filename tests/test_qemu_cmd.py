@@ -12,17 +12,24 @@ import stat
 from collections.abc import AsyncIterator
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from exec_sandbox import constants
-from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox import constants, system_probes
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch
-from exec_sandbox.qemu_cmd import build_qemu_cmd
+from exec_sandbox.qemu_cmd import build_qemu_cmd, resolve_machine_type
 from exec_sandbox.settings import Settings
-from exec_sandbox.system_probes import probe_qemu_accelerators, probe_qemu_version
+from exec_sandbox.system_probes import (
+    probe_qemu_accelerators,
+    probe_qemu_machine_types,
+    probe_qemu_version,
+    require_qemu_machine_types,
+    require_qemu_version,
+)
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
@@ -33,12 +40,19 @@ _VARIABLE = "EXEC_SANDBOX_QEMU_BIN_ARM" if detect_host_arch() == HostArch.AARCH6
 
 
 def _fake_qemu(path: Path, *, version: str, accelerator: str) -> Path:
-    """A qemu-system stand-in: `--version` and `-accel help` answer as that QEMU would."""
+    """A qemu-system stand-in: `--version`, `-accel help` and `-machine help` answer as that QEMU
+    would (the machine list in QEMU's format: an alias line, then the versioned type of that
+    QEMU, virt-MAJOR.MINOR)."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    virt = "virt-" + ".".join(version.split(".")[:2])
     path.write_text(
         "#!/bin/sh\n"
         f'if [ "$1" = "--version" ]; then echo "QEMU emulator version {version}"; exit 0; fi\n'
         f'if [ "$1" = "-accel" ]; then printf "Accelerators supported in QEMU binary:\\ntcg\\n{accelerator}\\n"; exit 0; fi\n'
+        'if [ "$1" = "-machine" ]; then printf "Supported machines are:\\n'
+        f"virt                 QEMU ARM Virtual Machine (alias of {virt})\\n"
+        f"{virt}            QEMU ARM Virtual Machine\\n"
+        'none                 empty machine\\n"; exit 0; fi\n'
         "exit 1\n"
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -69,8 +83,7 @@ async def _command(workdir: VmWorkingDirectory, tmp_path: Path, *, sandbox: bool
             ("check_tsc_deadline", True),
             ("probe_unshare_support", unshare),
             ("probe_io_uring_support", False),
-            ("probe_qemu_sandbox_support", sandbox),
-            ("get_qemu_vm_uid", None),
+            ("require_qemu_sandbox_support", sandbox),
             ("detect_host_x86_vendor", "AuthenticAMD"),
         ]:
             stack.enter_context(patch(f"exec_sandbox.qemu_cmd.{name}", return_value=value))
@@ -81,7 +94,6 @@ async def _command(workdir: VmWorkingDirectory, tmp_path: Path, *, sandbox: bool
             "qemu-binary",
             workdir,
             VmSpec(language=Language.PYTHON),
-            expose_ports=None,
             direct_write=False,
             debug_boot=False,
             snapshot_drive=None,
@@ -90,6 +102,7 @@ async def _command(workdir: VmWorkingDirectory, tmp_path: Path, *, sandbox: bool
             guest_port_fds=None,
             mem_path=None,
             mem_path_share=False,
+            machine_type=None,
         )
 
 
@@ -105,12 +118,14 @@ class TestOneQemuBinary:
 
         assert await probe_qemu_version() == (11, 0, 0)
         assert await probe_qemu_accelerators() == {"tcg", "kvm"}
+        assert await probe_qemu_machine_types() == {"virt": "virt-11.0", "virt-11.0": "virt-11.0", "none": "none"}
         assert await _launched_binary(workdir, tmp_path) == str(configured)
 
     async def test_missing_file_falls_back_to_path_for_probes_and_launch(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workdir: VmWorkingDirectory
     ) -> None:
-        """The configured file does not exist: the probes and the VM both run the name on PATH."""
+        """The configured file does not exist: the probes and the VM both run the file of the
+        name on PATH, by its full path (sudo's PATH may differ)."""
         on_path = _fake_qemu(tmp_path / "on-path" / _NAME, version="9.2.0", accelerator="hvf")
         path = f"{tmp_path / 'on-path'}:/usr/bin:/bin"
         monkeypatch.setenv("PATH", path)
@@ -118,9 +133,198 @@ class TestOneQemuBinary:
 
         assert await probe_qemu_version() == (9, 2, 0)
         assert await probe_qemu_accelerators() == {"tcg", "hvf"}
-        launched = await _launched_binary(workdir, tmp_path)
-        assert launched == _NAME
-        assert shutil.which(launched, path=path) == str(on_path)
+        assert await _launched_binary(workdir, tmp_path) == str(on_path) == shutil.which(_NAME, path=path)
+
+
+class TestQemuMachineTypesUnreadable:
+    @pytest.mark.parametrize("kind", ["exit-1", "exec-error"])
+    async def test_no_machine_type_without_the_probe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+    ) -> None:
+        """`-machine help` fails (an exit code, or an exec error): no machine type, so no VM
+        launch (its -M type is kept for a save): HOST_DEPENDENCY names the binary."""
+        binary = _fake_qemu(tmp_path / "qemu" / _NAME, version="11.1.3", accelerator="kvm")
+        binary.write_text(binary.read_text().replace('if [ "$1" = "-machine" ]', 'if [ "$1" = "-machine-x" ]'))
+        monkeypatch.setenv(_VARIABLE, str(binary))
+        if kind == "exec-error":
+            monkeypatch.setattr(
+                "exec_sandbox.system_probes.run_probe", AsyncMock(side_effect=PermissionError(13, "no"))
+            )
+        assert await probe_qemu_machine_types() == {}
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info:
+            await resolve_machine_type(detect_host_arch(), None)
+        assert str(exc_info.value) == f"The QEMU machine types could not be read ({binary} -machine help)."
+        assert exc_info.value.context == {"binary": str(binary)}
+
+
+class TestFailedQemuProbe:
+    async def test_a_failed_probe_runs_again(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A QEMU probe that fails (a timeout, a fork error, a binary half written by an
+        upgrade) is not cached: the next call asks QEMU again, and a real answer is cached."""
+        monkeypatch.setenv(_VARIABLE, str(_fake_qemu(tmp_path / "qemu" / _NAME, version="11.1.3", accelerator="kvm")))
+        answers: list[object] = [TimeoutError(), (0, b"QEMU emulator version 11.1.3\n", b"")]
+        probe = AsyncMock(side_effect=answers)
+        monkeypatch.setattr("exec_sandbox.system_probes.run_probe", probe)
+
+        assert await probe_qemu_version() is None
+        assert await probe_qemu_version() == (11, 1, 3)
+        assert await probe_qemu_version() == (11, 1, 3)  # cached
+        assert probe.await_count == 2
+
+
+class TestQemuProbeErrors:
+    @pytest.mark.parametrize(
+        ("failure", "error"),
+        [
+            pytest.param(TimeoutError(), TransientError, id="no-answer-in-time"),
+            pytest.param(OSError(errno.EAGAIN, "Resource temporarily unavailable"), TransientError, id="fork-limit"),
+            pytest.param(PermissionError(errno.EACCES, "Permission denied"), ConfigError, id="no-access"),
+            pytest.param(OSError(errno.ETXTBSY, "Text file busy"), TransientError, id="binary-being-written"),
+            pytest.param((-9, b"", b""), TransientError, id="killed-by-a-signal"),
+            pytest.param((1, b"", b""), ConfigError, id="exits-with-an-error"),
+        ],
+    )
+    @pytest.mark.parametrize("probe", ["version", "machine-types", "resolve-machine-type"])
+    async def test_a_probe_failure_that_can_pass_is_transient(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: OSError | tuple[int, bytes, bytes],
+        error: type[Exception],
+        probe: str,
+    ) -> None:
+        """No version or machine types because the probe hit a fork limit, no answer in time, a
+        binary being written, or a signal that killed QEMU: TransientError QEMU_CRASHED (the next
+        call probes again), not FIX_CONFIG; a binary this user cannot run, or QEMU's own error
+        exit, stays ConfigError HOST_DEPENDENCY."""
+        monkeypatch.setenv(_VARIABLE, str(_fake_qemu(tmp_path / "qemu" / _NAME, version="11.1.3", accelerator="kvm")))
+        answer = {"side_effect": failure} if isinstance(failure, BaseException) else {"return_value": failure}
+        monkeypatch.setattr("exec_sandbox.system_probes.run_probe", AsyncMock(**answer))
+        ask = {
+            "version": require_qemu_version,
+            "machine-types": require_qemu_machine_types,
+            "resolve-machine-type": lambda: resolve_machine_type(HostArch.X86_64, None),
+        }[probe]
+        with pytest.raises(error) as exc_info:
+            await ask()
+        code = ErrorCode.QEMU_CRASHED if error is TransientError else ErrorCode.HOST_DEPENDENCY
+        assert getattr(exc_info.value, "code", None) is code
+
+    async def test_no_answer_in_time_says_so(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A probe timeout (a TimeoutError with no text) names the missing answer."""
+        binary = _fake_qemu(tmp_path / "qemu" / _NAME, version="11.1.3", accelerator="kvm")
+        monkeypatch.setenv(_VARIABLE, str(binary))
+        monkeypatch.setattr("exec_sandbox.system_probes.run_probe", AsyncMock(side_effect=TimeoutError()))
+        with pytest.raises(TransientError, match=r" --version \(no answer in time\)\.$"):
+            await require_qemu_version()
+
+    async def test_no_accelerator_answer_is_no_hvf_answer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The kernel supports HVF but the accelerator probe got no answer in time: the HVF
+        check raises it (TransientError), so no VM is sized for one accelerator and launched
+        under another; the next check asks QEMU again."""
+        monkeypatch.setenv(_VARIABLE, str(_fake_qemu(tmp_path / "qemu" / _NAME, version="11.1.3", accelerator="hvf")))
+
+        answers: list[object] = [TimeoutError(), (0, b"Accelerators supported in QEMU binary:\ntcg\nhvf\n", b"")]
+
+        async def probe(cmd: tuple[str, ...], **_kwargs: object) -> tuple[int, bytes, bytes]:
+            if cmd[0] == "/usr/sbin/sysctl":
+                return 0, b"1\n", b""  # kern.hv_support
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer  # type: ignore[return-value]
+
+        monkeypatch.setattr("exec_sandbox.system_probes.run_probe", probe)
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED):
+            await system_probes.check_hvf_available()
+        assert await system_probes.check_hvf_available() is True
+
+
+class TestNoQemuBinary:
+    async def test_no_binary_names_the_variable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No QEMU file at the configured path and none on PATH: the error says so and names
+        the variable that sets the path (not "could not be read")."""
+        monkeypatch.setenv(_VARIABLE, str(tmp_path / "missing" / _NAME))
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info:
+            await require_qemu_version()
+        assert str(exc_info.value) == f"No QEMU binary {_NAME} on this host."
+        assert exc_info.value.hint == f"Install QEMU, or set {_VARIABLE} to its path."
+
+    async def test_a_file_this_user_cannot_run_is_not_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A QEMU file on PATH without the exec bit: "could not be read", not "No QEMU binary"."""
+        binary = _fake_qemu(tmp_path / "on-path" / _NAME, version="11.1.3", accelerator="kvm")
+        binary.chmod(0o644)
+        monkeypatch.setenv(_VARIABLE, str(tmp_path / "missing" / _NAME))
+        monkeypatch.setenv("PATH", str(binary.parent))
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info:
+            await require_qemu_version()
+        assert str(exc_info.value) == f"The QEMU version could not be read ({binary} --version)."
+
+
+class TestQemuOnPath:
+    async def test_a_qemu_moved_on_path_is_found_again(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """QEMU moves to another folder of PATH: the probes find and ask its new file (here a
+        newer QEMU), not the gone one ("No QEMU binary")."""
+        first = _fake_qemu(tmp_path / "a" / _NAME, version="11.0.0", accelerator="kvm")
+        monkeypatch.setenv(_VARIABLE, str(tmp_path / "missing" / _NAME))
+        monkeypatch.setenv("PATH", f"{tmp_path / 'a'}:{tmp_path / 'b'}")
+        assert await require_qemu_version() == (11, 0, 0)
+        first.unlink()
+        _fake_qemu(tmp_path / "b" / _NAME, version="11.0.5", accelerator="kvm")
+        assert await require_qemu_version() == (11, 0, 5)
+
+    async def test_a_lower_case_variable_is_read(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The QEMU path variable in lower case: the probes run that file, as the VMs do."""
+        binary = _fake_qemu(tmp_path / "qemu" / _NAME, version="11.0.7", accelerator="kvm")  # no real QEMU's
+        monkeypatch.delenv(_VARIABLE, raising=False)
+        monkeypatch.setenv(_VARIABLE.lower(), str(binary))
+        assert await require_qemu_version() == (11, 0, 7)
+
+
+class TestQemuUpgradeUnderAWorker:
+    async def test_a_new_binary_at_the_same_path_is_probed_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A package upgrade writes a new QEMU binary at the same path while the worker runs:
+        the next QEMU probes ask the new binary, so saves and command gates never use the old
+        version. An unchanged binary is not run again."""
+        binary = _fake_qemu(tmp_path / "qemu" / _NAME, version="11.0.0", accelerator="kvm")
+        monkeypatch.setenv(_VARIABLE, str(binary))
+        assert await probe_qemu_version() == (11, 0, 0)
+        assert await probe_qemu_accelerators() == {"tcg", "kvm"}
+        with patch("exec_sandbox.system_probes.run_probe", side_effect=AssertionError("the QEMU probe ran again")):
+            assert await probe_qemu_version() == (11, 0, 0)
+            assert await probe_qemu_accelerators() == {"tcg", "kvm"}
+
+        _fake_qemu(tmp_path / "new" / _NAME, version="11.1.3", accelerator="hvf").replace(binary)  # a new file
+
+        assert await probe_qemu_version() == (11, 1, 3)
+        assert await probe_qemu_accelerators() == {"tcg", "hvf"}
+        assert (await probe_qemu_machine_types())["virt"] == "virt-11.1"
+
+    async def test_an_upgrade_during_the_probe_is_probed_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The binary is replaced while its probe runs: the answer is kept with the stamp of
+        the binary it came from (taken before the probe), so the next call asks the new one."""
+        binary = _fake_qemu(tmp_path / "qemu" / _NAME, version="11.0.0", accelerator="kvm")
+        monkeypatch.setenv(_VARIABLE, str(binary))
+        real = system_probes.run_probe
+
+        async def upgraded_meanwhile(*args: Any, **kwargs: Any) -> Any:
+            answer = await real(*args, **kwargs)  # the old binary answers
+            if not (tmp_path / "new").exists():
+                _fake_qemu(tmp_path / "new" / _NAME, version="11.1.3", accelerator="kvm").replace(binary)
+            return answer
+
+        monkeypatch.setattr("exec_sandbox.system_probes.run_probe", upgraded_meanwhile)
+        assert await probe_qemu_version() == (11, 0, 0)
+        assert await probe_qemu_version() == (11, 1, 3)
 
 
 class TestQemuThisHostCannotRun:
@@ -152,17 +356,20 @@ class TestQemuThisHostCannotRun:
         assert exc_info.value.context == {"binary": str(binary), "errno": errno.ENOEXEC}
 
     @pytest.mark.parametrize("kind", ["unparsable-version", "no-exec-bit"])
-    async def test_other_probe_failures_build_the_command(
+    async def test_no_vm_command_without_a_qemu_version(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workdir: VmWorkingDirectory, kind: str
     ) -> None:
-        """An unparsable version, or a binary this user may not run (EACCES: qemu-vm may), stays
-        a warning: only a binary that this host cannot exec at all stops."""
+        """An unparsable version, or a binary this user may not run (EACCES): every VM needs the
+        version (command line, migration, saved facts), so no command is built."""
         binary = _fake_qemu(tmp_path / "configured" / _NAME, version="x", accelerator="kvm")
         if kind == "no-exec-bit":
             binary.chmod(0o644)
         monkeypatch.setenv(_VARIABLE, str(binary))
         assert await probe_qemu_version() is None
-        assert (await _command(workdir, tmp_path, sandbox=False, unshare=False))[0] == str(binary)
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info:
+            await _command(workdir, tmp_path, sandbox=False, unshare=False)
+        assert str(exc_info.value) == f"The QEMU version could not be read ({binary} --version)."
+        assert exc_info.value.context == {"binary": str(binary)}
 
 
 class TestHostDiskFull:
@@ -250,3 +457,26 @@ class TestNamespaces:
 
         assert cmd[0] == "unshare"
         assert cmd[cmd.index("--") - 1] == "--kill-child=SIGKILL"
+
+
+class TestResolveMachineType:
+    @pytest.mark.parametrize(
+        ("arch", "saved", "resolved"),
+        [
+            pytest.param(HostArch.AARCH64, None, "virt-11.1", id="new-arm64-vm-gets-the-alias-target"),
+            pytest.param(HostArch.AARCH64, "virt-11.0", "virt-11.0", id="saved-type-this-qemu-has"),
+            pytest.param(HostArch.AARCH64, "virt-12.0", None, id="saved-type-this-qemu-lacks"),
+            pytest.param(HostArch.X86_64, None, "microvm", id="x86-not-versioned"),
+        ],
+    )
+    async def test_resolution(
+        self, monkeypatch: pytest.MonkeyPatch, arch: HostArch, saved: str | None, resolved: str | None
+    ) -> None:
+        """The type a VM runs, from the cached machine type probe: the saved type, or the target of
+        the release's alias (virt on arm64; microvm, which has no alias, on x86)."""
+
+        async def machine_types() -> dict[str, str]:
+            return {"virt": "virt-11.1", "virt-11.1": "virt-11.1", "virt-11.0": "virt-11.0", "microvm": "microvm"}
+
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.require_qemu_machine_types", machine_types)
+        assert await resolve_machine_type(arch, saved) == resolved

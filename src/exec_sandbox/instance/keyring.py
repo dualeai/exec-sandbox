@@ -32,9 +32,7 @@ _MIN_DISTINCT_BYTES = 16
 _PRINTABLE = range(0x20, 0x7F)
 """A random 32-byte key is all printable ASCII with probability ~2e-14: such a key is a password."""
 
-_GENERATE_HINT = (
-    'Generate a key with: python -c "import base64, secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())"'
-)
+_GENERATE_HINT = 'Generate a key with: python3 -c "import base64, secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())"'
 
 
 def key_id(secret: bytes) -> str:
@@ -106,7 +104,7 @@ class Keyring:
             instance_id=instance_id,
             hint=f'All workers must share one keyring. Add key "{wanted_id}" back, or send the call to a worker '
             "that has it. Do not delete the instance: unless its head was changed in the store, the data is intact.",
-            context=None,
+            context={"key_id": wanted_id},
         )
 
 

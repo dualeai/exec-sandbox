@@ -148,6 +148,11 @@ class InstanceStore(ABC):
     objects).
     """
 
+    @property
+    @abstractmethod
+    def location(self) -> str:
+        """Where the store is, for messages: s3://bucket/prefix, or the folder."""
+
     @abstractmethod
     async def get(self, key: str, /, *, max_bytes: int) -> tuple[bytes, str] | None:
         """Bytes and ETag of a small object, or None when it does not exist.

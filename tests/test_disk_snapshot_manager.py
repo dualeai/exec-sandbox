@@ -81,16 +81,13 @@ _KEY = (
 language, v and the library major.minor, the SHA-256 of the base image, then the SHA-256 of the
 sorted packages, each after its byte length and a colon ("13:numpy==1.26.016:requests==2.31.0")."""
 
-_BASE_KEY = "python-v1.22-6dd92b6803cad3cd9acb764c9dc1ac30dfe0a0e4de6f608f84aebab9c06e4d90-base"
-"""The L2 key of the python base image with no packages."""
-
 _L3_OBJECT = f"snapshots/{_KEY}.qcow2.zst"
 """The S3 object of the _KEY layer (the default prefix, snapshots/)."""
 
 
 @pytest.fixture
 async def make_keyed_manager(make_vm_settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
-    """(DiskSnapshotManager, Settings) whose keys the tests know (_KEY, _BASE_KEY): the library
+    """(DiskSnapshotManager, Settings) whose key the tests know (_KEY): the library
     version is _VERSION and the base images hold _PYTHON_BASE and _NODE_BASE. Its VmManager is
     not started: a lookup, a download and an upload use only its images, and a start (host
     probes, qemu-storage-daemon) costs ~0.15 s per test. The manager makes its cache folder;
@@ -189,7 +186,7 @@ def _fake_builds(
         raise_if_host_disk_full=AsyncMock(),
     )
 
-    async def qemu_img(cmd: list[str], **kwargs: Any) -> tuple[int | None, bytes, bytes]:
+    async def qemu_img(cmd: list[str], **kwargs: Any) -> tuple[int, bytes, bytes]:
         if cmd[:2] == ["qemu-img", "create"]:
             Path(cmd[-2]).write_bytes(content)
             return 0, b"", b""
@@ -303,22 +300,14 @@ class TestCacheKey:
         assert await _checked(manager, Language.PYTHON, _PACKAGES) == entry
         assert await _checked(manager, Language.PYTHON, list(reversed(_PACKAGES))) == entry
 
-    async def test_entry_without_packages_is_the_base_key(self, make_keyed_manager) -> None:
-        manager, settings = await make_keyed_manager()
-        entry = settings.disk_snapshot_cache_dir / f"{_BASE_KEY}.qcow2"
-        await create_test_qcow2(entry)
-
-        assert await _checked(manager, Language.PYTHON, []) == entry
-
     @pytest.mark.parametrize(
         ("language", "packages"),
         [
             (Language.PYTHON, ["requests==2.31.0"]),
             (Language.PYTHON, [*_PACKAGES, "flask==3.0.0"]),
-            (Language.PYTHON, []),
             (Language.JAVASCRIPT, _PACKAGES),
         ],
-        ids=["fewer-packages", "more-packages", "no-packages", "other-language"],
+        ids=["fewer-packages", "more-packages", "other-language"],
     )
     async def test_other_packages_or_language_is_a_miss(
         self, make_keyed_manager, language: Language, packages: list[str]
@@ -438,7 +427,7 @@ class TestDiskSnapshotManagerIntegration:
         self, tmp_path: Path, language: Language, host_arch: HostArch, suffix: str
     ) -> None:
         """A folder with both architectures (make build IMAGE_ARCH=all) gives the host's image,
-        and the overlay pool fills for the same one; a download in progress (.zst) is no image."""
+        and VmManager.start makes the overlay template of the same one; a download in progress (.zst) is no image."""
         images = tmp_path / "images"
         images.mkdir()
         stem = {Language.PYTHON: "python-3.14-base", Language.JAVASCRIPT: "node-1.4-base", Language.RAW: "raw-base"}[
@@ -503,7 +492,7 @@ class TestL2Cache:
         await create_test_qcow2(snapshot_path)
         runs: list[str] = []
 
-        async def qemu_img_fails_once(*args: Any, **kwargs: Any) -> tuple[int | None, bytes, bytes]:
+        async def qemu_img_fails_once(*args: Any, **kwargs: Any) -> tuple[int, bytes, bytes]:
             runs.append("qemu-img")
             if len(runs) == 1:
                 raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
@@ -1129,7 +1118,9 @@ class TestBuildRetryAfterDiskFull:
     async def _build(self, snapshot_manager: DiskSnapshotManager) -> Path:
         return await asyncio.wait_for(
             _built_path(
-                snapshot_manager.get_or_create_snapshot(Language.PYTHON, [], tenant_id="t", task_id="t", memory_mb=512)
+                snapshot_manager.get_or_create_snapshot(
+                    Language.PYTHON, _PACKAGES, tenant_id="t", task_id="t", memory_mb=512
+                )
             ),
             self._TIMEOUT,
         )
@@ -1450,7 +1441,7 @@ class TestBuildRetryAfterDiskFull:
         with pytest.raises(
             ConfigError,
             check=lambda e: e.code is ErrorCode.SETTING_INVALID,
-            match=f"^Cache folder .+ cannot be made: Not a directory\nHint: Set {setting} to a folder",
+            match=f"^Folder .+ cannot be made: Not a directory\nHint: Set {setting} to a folder",
         ):
             manager(vm_manager.settings, vm_manager)
 
@@ -1885,10 +1876,10 @@ class TestCacheHierarchy:
     async def test_broken_l2_entry_leaves_no_lease(self, make_keyed_manager) -> None:
         """A broken entry (qemu-img check fails) is a miss: it goes, and so does its lease."""
         snapshot_manager, settings = await make_keyed_manager()
-        broken = settings.disk_snapshot_cache_dir / f"{_BASE_KEY}.qcow2"
+        broken = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
         broken.write_bytes(b"\x00\xff\xde\xad" * 64)
 
-        assert await snapshot_manager.check_cache(Language.PYTHON, []) is None
+        assert await snapshot_manager.check_cache(Language.PYTHON, _PACKAGES) is None
         assert not broken.exists()
         assert not leased_here(broken)
 
@@ -1896,14 +1887,14 @@ class TestCacheHierarchy:
         """A check that finds the entry broken removes it as an eviction does: not while a VM
         of another process runs on it (its lease), and its own lease goes first."""
         snapshot_manager, settings = await make_keyed_manager()
-        broken = settings.disk_snapshot_cache_dir / f"{_BASE_KEY}.qcow2"
+        broken = settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
         broken.write_bytes(b"\x00\xff\xde\xad" * 64)
 
         with leased_in_child(broken):
-            assert await snapshot_manager.check_cache(Language.PYTHON, []) is None
+            assert await snapshot_manager.check_cache(Language.PYTHON, _PACKAGES) is None
             assert broken.exists()
             assert not leased_here(broken)
-        assert await snapshot_manager.check_cache(Language.PYTHON, []) is None
+        assert await snapshot_manager.check_cache(Language.PYTHON, _PACKAGES) is None
         assert not broken.exists()
 
     async def test_leaked_clusters_only_is_a_valid_image(self, make_keyed_manager) -> None:

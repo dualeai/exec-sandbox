@@ -436,15 +436,16 @@ class TestSudoRmBound:
         stand_in.write_text(f'#!/bin/sh\necho $$ > "{pid_file}"\nexec sleep 30\n')
         stand_in.chmod(0o755)
         monkeypatch.setenv("PATH", f"{stand_in.parent}{os.pathsep}{os.environ['PATH']}")
-        monkeypatch.setattr(constants, "SUDO_RM_TIMEOUT_SECONDS", 0.2)
+        # 1 s: the stand-in writes its pid long before the bound, also on a loaded host
+        monkeypatch.setattr(constants, "SUDO_RM_TIMEOUT_SECONDS", 1.0)
 
         start = asyncio.get_running_loop().time()
         assert await sudo_rm(folder) is False
         assert asyncio.get_running_loop().time() - start < 5.0  # far below the stand-in's 30 s
         assert folder.exists()
-        if pid_file.exists():
-            with contextlib.suppress(psutil.Error):
-                assert "sleep" not in " ".join(psutil.Process(int(pid_file.read_text())).cmdline())
+        pid = int(pid_file.read_text())  # it ran, so its kill is checked
+        with contextlib.suppress(psutil.NoSuchProcess):  # gone: killed
+            assert "sleep" not in " ".join(psutil.Process(pid).cmdline())  # a reused pid runs another program
 
 
 class TestSudoRmChild:
@@ -1537,7 +1538,7 @@ class TestMakeCacheDir:
         with pytest.raises(expected) as exc:
             make_cache_dir(tmp_path / "cache", setting="disk_snapshot_cache_dir")
         assert exc.value.code is code
-        assert exc.value.context == {"cache_dir": str(tmp_path / "cache"), "errno": error}
+        assert exc.value.context == {"folder": str(tmp_path / "cache"), "errno": error}
 
 
 class TestMakeOwnedDir:

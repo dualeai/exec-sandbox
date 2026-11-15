@@ -13,16 +13,14 @@ from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
 
-# Real path traversal vectors — these use actual ".." or absolute paths
-# that the path validator rejects at the component level.
+# Real path traversal vectors — these use actual ".." or absolute paths that the guest's
+# lexical path check rejects. The full list is a Rust unit test where the rule lives
+# (guest-agent/src/file_io.rs test_validate_file_path_refuses_the_traversal_vectors): here one
+# relative and one absolute vector check that each file operation maps the refusal to
+# PATH_INVALID.
 FILESYSTEM_TRAVERSAL_VECTORS = [
     "../etc/passwd",
-    "../../etc/shadow",
-    "../../../root/.ssh/id_rsa",
-    "subdir/../../etc/passwd",
-    "subdir/../subdir/../../etc/passwd",
     "/etc/passwd",
-    "/home/user/../../../etc/passwd",
 ]
 
 # Web-encoding vectors (from fuzzdb) — these use URL encoding, backslash
@@ -87,15 +85,7 @@ class TestPathTraversalRead:
 class TestPathTraversalList:
     """Path traversal attacks on list_files."""
 
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "../etc",
-            "../../",
-            "/etc",
-            "subdir/../../etc",
-        ],
-    )
+    @pytest.mark.parametrize("path", ["../etc", "/etc"])  # the full list: file_io.rs unit tests
     async def test_list_traversal_rejected(self, dual_scheduler: Scheduler, path: str) -> None:
         """list_files rejects path traversal attempts."""
         async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:

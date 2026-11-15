@@ -153,9 +153,14 @@ class TestWrapWithUlimit:
 
     @pytest.mark.parametrize("arg", ["$(whoami)", "; rm -rf /", "| cat", "value with spaces", "it's", ""])
     def test_each_argument_reaches_the_command_unchanged(self, arg: str):
-        """The shell runs the command with each argument as given: no expansion, no split."""
-        wrapped = wrap_with_ulimit(["printf", "%s|", arg, "end"], cgroup_memory_mb=256)
-        run = subprocess.run(wrapped, capture_output=True, text=True, timeout=10, check=True)
+        """The shell runs the command with each argument as given: no expansion, no split. The
+        Linux wrap (its quoting) on any host: bash runs its command part, without the limits
+        (macOS refuses ulimit -v)."""
+        with patch("exec_sandbox.cgroup.detect_host_os", return_value=HostOS.LINUX):
+            wrapped = wrap_with_ulimit(["printf", "%s|", arg, "end"], cgroup_memory_mb=256)
+        assert wrapped[:2] == ["bash", "-c"]
+        command = wrapped[2].split(" && exec ", 1)[1]
+        run = subprocess.run(["bash", "-c", f"exec {command}"], capture_output=True, text=True, timeout=10, check=True)
         assert run.stdout == f"{arg}|end|"
 
     @skip_unless_linux
@@ -284,23 +289,41 @@ class TestCanContainProcesses:
         assert await can_contain_processes() is False  # the fake root has no cgroup.kill
         assert len(ended) == 1
 
-    async def test_a_working_probe_attaches_and_ends(self, cgroup_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("refused", [False, True], ids=["moved", "move-refused"])
+    async def test_the_answer_is_the_move_of_the_child(
+        self, cgroup_root: Path, monkeypatch: pytest.MonkeyPatch, *, refused: bool
+    ) -> None:
+        """True only when the child's move into the probe cgroup lands (its pid in cgroup.procs,
+        with the real Cgroup.attach); a refused move (EACCES: outside the delegated subtree) is
+        False. The probe ends either way, and the child is gone."""
+        if refused and os.geteuid() == 0:
+            pytest.skip("root writes a read-only file")
         from exec_sandbox.cgroup import can_contain_processes
 
         ended = self._ends(monkeypatch)
-        attached: list[int] = []
-
-        async def attach(_self: Cgroup, pid: int) -> bool:
-            attached.append(pid)
-            return True
-
-        monkeypatch.setattr(Cgroup, "attach", attach)
         self._with_cgroup_kill(monkeypatch)
+        with_kill = Cgroup.create
+        made: list[Path] = []
 
-        assert await can_contain_processes() is True
-        assert len(attached) == 1 and len(ended) == 1
-        with pytest.raises(ProcessLookupError):
-            os.kill(attached[0], 0)  # the child is gone
+        async def create(**kwargs: Any) -> Cgroup | None:
+            cgroup = await with_kill(**kwargs)
+            assert cgroup is not None
+            made.append(cgroup.path)
+            if refused:
+                (cgroup.path / "cgroup.procs").touch()
+                (cgroup.path / "cgroup.procs").chmod(0o444)  # the kernel's EACCES
+            return cgroup
+
+        monkeypatch.setattr(Cgroup, "create", create)
+
+        assert await can_contain_processes() is (not refused)
+        assert len(ended) == 1
+        moved = (made[0] / "cgroup.procs").read_text()
+        if refused:
+            assert moved == ""
+        else:
+            with pytest.raises(ProcessLookupError):
+                os.kill(int(moved), 0)  # the child that moved is gone
 
 
 async def _created(*, memory_mb: int, cpu_cores: float) -> Path:
@@ -582,10 +605,11 @@ class TestStats:
         assert Cgroup(tmp_path).stats() == CgroupStats(cpu_time_ms=5000, peak_memory_mb=None, nr_throttled=0)
 
     def test_handles_malformed_files(self, tmp_path: Path):
-        """A value that is no number (its line is read, int() fails): no stat, no error."""
+        """A value that is no number (its line is read, int() fails): no such stat, no error; the
+        other stats of the file are still read."""
         (tmp_path / "cpu.stat").write_text("usage_usec abc\nnr_throttled 0")
         (tmp_path / "memory.peak").write_text("not_a_number")
-        assert Cgroup(tmp_path).stats() == NO_CGROUP_STATS
+        assert Cgroup(tmp_path).stats() == CgroupStats(cpu_time_ms=None, peak_memory_mb=None, nr_throttled=0)
 
     def test_handles_oserror_during_read(self, tmp_path: Path):
         (tmp_path / "cpu.stat").mkdir()  # exists, but reading it raises IsADirectoryError
@@ -898,9 +922,19 @@ class TestCgroupConstants:
 
 
 def _read_at(base: Path, read: Callable[[], float | None]) -> float | None:
-    """`read` with the cgroup v2 mount at `base`."""
-    with patch("exec_sandbox.cgroup.CGROUP_V2_BASE_PATH", str(base)):
+    """`read` with the cgroup v2 mount at `base` and the v1 mount at `base`/v1 (the host's own
+    cgroup files are never read)."""
+    with (
+        patch("exec_sandbox.cgroup.CGROUP_V2_BASE_PATH", str(base)),
+        patch("exec_sandbox.cgroup.CGROUP_V1_BASE_PATH", str(base / "v1")),
+    ):
         return read()
+
+
+def _v1_file(base: Path, controller: str, name: str, value: str) -> None:
+    """A cgroup v1 file at the v1 mount of _read_at (no cgroup v2 file: v1 decides)."""
+    (base / "v1" / controller).mkdir(parents=True, exist_ok=True)
+    (base / "v1" / controller / name).write_text(value)
 
 
 class TestDetectCgroupMemoryLimitMb:
@@ -929,6 +963,14 @@ class TestDetectCgroupMemoryLimitMb:
         result = _read_at(tmp_path / "nonexistent", detect_cgroup_memory_limit_mb)
         assert result is None
 
+    @pytest.mark.parametrize(
+        ("limit", "mb"), [("2147483648", 2048.0), ("9223372036854771712", None)], ids=["limit", "unlimited"]
+    )
+    def test_v1_limit(self, tmp_path: Path, limit: str, mb: float | None):
+        """cgroup v1 memory.limit_in_bytes; the kernel's unlimited value (page-rounded 2**63) is None."""
+        _v1_file(tmp_path, "memory", "memory.limit_in_bytes", limit)
+        assert _read_at(tmp_path, detect_cgroup_memory_limit_mb) == (None if mb is None else pytest.approx(mb))
+
 
 class TestDetectCgroupCpuLimit:
     """Test container cgroup CPU limit detection."""
@@ -955,6 +997,13 @@ class TestDetectCgroupCpuLimit:
         """No cgroup files → returns None."""
         result = _read_at(tmp_path / "nonexistent", detect_cgroup_cpu_limit)
         assert result is None
+
+    @pytest.mark.parametrize(("quota", "cpus"), [("150000", 1.5), ("-1", None)], ids=["quota", "unlimited"])
+    def test_v1_quota(self, tmp_path: Path, quota: str, cpus: float | None):
+        """cgroup v1 cpu.cfs_quota_us / cpu.cfs_period_us; a quota of -1 is no limit."""
+        _v1_file(tmp_path, "cpu", "cpu.cfs_quota_us", quota)
+        _v1_file(tmp_path, "cpu", "cpu.cfs_period_us", "100000")
+        assert _read_at(tmp_path, detect_cgroup_cpu_limit) == (None if cpus is None else pytest.approx(cpus))
 
 
 class TestReadContainerAvailableMemoryMb:
@@ -984,6 +1033,15 @@ class TestReadContainerAvailableMemoryMb:
         """No cgroup files → returns None."""
         result = _read_at(tmp_path / "nonexistent", read_container_available_memory_mb)
         assert result is None
+
+    @pytest.mark.parametrize(
+        ("usage", "available"), [("1073741824", 3072.0), ("8589934592", 0.0)], ids=["room-left", "over-the-limit"]
+    )
+    def test_v1_available(self, tmp_path: Path, usage: str, available: float):
+        """cgroup v1 memory.limit_in_bytes - memory.usage_in_bytes, never below 0."""
+        _v1_file(tmp_path, "memory", "memory.limit_in_bytes", "4294967296")  # 4 GB
+        _v1_file(tmp_path, "memory", "memory.usage_in_bytes", usage)
+        assert _read_at(tmp_path, read_container_available_memory_mb) == pytest.approx(available)
 
 
 # =============================================================================

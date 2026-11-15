@@ -6,12 +6,13 @@ Integration tests: Test real VM execution (requires QEMU + images).
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import platform
 import shutil
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, NamedTuple
@@ -21,17 +22,20 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from exec_sandbox import package_validator
+from exec_sandbox import __version__, package_validator
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorAction,
     ErrorCode,
+    InstanceGoneError,
     InternalError,
     InvalidInputError,
     RouteError,
+    RouteKey,
     TransientError,
+    host_mismatch,
 )
 from exec_sandbox.files.locks import CacheEntry, EntryLease
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
@@ -45,6 +49,7 @@ from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_timing import VmTiming
 from exec_sandbox.vm_types import VmState
 from tests.conftest import (
+    LoopClock,
     create_test_qcow2,
     l1_hit,
     make_destroy_mock,
@@ -68,12 +73,6 @@ class TestSchedulerInit:
         """Without a config, the Scheduler has the default SchedulerConfig."""
         scheduler = Scheduler()
         assert scheduler.config == SchedulerConfig()
-
-    def test_init_custom_config(self) -> None:
-        """Scheduler accepts custom config."""
-        config = SchedulerConfig(default_timeout_seconds=60)
-        scheduler = Scheduler(config)
-        assert scheduler.config.default_timeout_seconds == 60
 
 
 class TestCreateSettings:
@@ -252,6 +251,79 @@ async def _running(
             yield scheduler, fakes
 
 
+class TestDescribeWorker:
+    """describe_worker: the route facts of this worker, from the start's cached probes."""
+
+    async def test_not_started(self) -> None:
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE):
+            await Scheduler().describe_worker()
+
+    @pytest.mark.parametrize("with_store", [True, False], ids=["instance-store", "no-store"])
+    async def test_facts_images_budget_and_keys(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_store: bool
+    ) -> None:
+        """Host facts without the ones that do not apply; the base images on disk (by digest),
+        the L2 images of its cache (a load uses one whose digest matches) and the downloaded
+        instance assets; the budget (None: no limit); the key ids."""
+        base = tmp_path / "python-base.qcow2"
+        base.write_bytes(b"base image bytes")
+        layer = tmp_path / "l2.qcow2"
+        layer.write_bytes(b"l2 layer bytes")
+
+        async def machine_facts(*, force_emulation: bool) -> dict[RouteKey, str | None]:
+            assert force_emulation is False
+            return {
+                RouteKey.ARCH: "aarch64",
+                RouteKey.ACCELERATOR: "hvf",
+                RouteKey.CPU_VENDOR: None,
+                RouteKey.CPU_MODEL: "host",
+            }
+
+        async def qemu_version_fact() -> str:
+            return "11.1.3"
+
+        monkeypatch.setattr("exec_sandbox.scheduler.machine_facts", machine_facts)
+        monkeypatch.setattr("exec_sandbox.scheduler.qemu_version_fact", qemu_version_fact)
+
+        async def machine_types() -> dict[str, str]:
+            return {"virt": "virt-11.1", "virt-11.1": "virt-11.1"}
+
+        monkeypatch.setattr("exec_sandbox.scheduler.require_qemu_machine_types", machine_types)
+        manager = _fake_manager()
+        manager.settings.force_emulation = False
+        manager.images.present_base_images.return_value = [base, tmp_path / "gone.qcow2"]
+        manager.budget_facts.return_value = (21600.0, 1.26)
+        downloaded = "d" * 64
+        store = (
+            _store(asset_digests=MagicMock(return_value=frozenset({downloaded})), keyring=MagicMock(keys=[]))
+            if with_store
+            else None
+        )
+        if store is not None:
+            store.keyring.keys = [MagicMock(id="1" * 64), MagicMock(id="2" * 64)]
+        config = SchedulerConfig(auto_download_assets=False)
+        async with _running(config, tmp_path, manager=manager, instances=store) as (scheduler, fakes):
+            fakes.disk.entry_paths.return_value = [layer]
+            facts = await scheduler.describe_worker()
+
+        own = hashlib.sha256(b"base image bytes").hexdigest()
+        own_layer = hashlib.sha256(b"l2 layer bytes").hexdigest()
+        assert facts.values == {
+            RouteKey.ARCH: "aarch64",
+            RouteKey.ACCELERATOR: "hvf",
+            RouteKey.CPU_MODEL: "host",
+            RouteKey.QEMU_VERSION: "11.1.3",
+            RouteKey.MACHINE_TYPE: {"virt", "virt-11.1"},
+            RouteKey.BASE_IMAGE: {own, downloaded} if with_store else {own},
+            RouteKey.PACKAGES_IMAGE: {own_layer, downloaded} if with_store else {own_layer},
+            RouteKey.MEMORY_MB: "21600",
+            RouteKey.CPU: "1.26",
+        }
+        assert facts.key_ids == (("1" * 64, "2" * 64) if with_store else ())
+        assert facts.satisfies({RouteKey.ARCH: "aarch64", RouteKey.BASE_IMAGE: own, RouteKey.CPU: "1.26"})
+        assert not facts.satisfies({RouteKey.CPU: "1.27"})
+
+
 class _LoadReachedError(Exception):
     """The instance store's load was called: reuse() got past its argument checks."""
 
@@ -395,15 +467,19 @@ class TestIdleTimeoutArgument:
     Out of range (0 included) is InvalidInputError ARGUMENT_INVALID before any VM or store call."""
 
     @pytest.mark.parametrize(("argument", "used"), [(None, 77), (10, 10), (3600, 3600)])
-    async def test_new_session_gets_the_timeout(self, tmp_path: Path, argument: int | None, used: int) -> None:
-        """The session gets the argument, else the config's value. The value is read from the
-        session: the public effect (a close after that many idle seconds, 10 s or more) is
-        too slow for a unit test; tests/test_session.py tests that the timer fires."""
+    async def test_new_session_gets_the_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argument: int | None, used: int
+    ) -> None:
+        """The session closes after the argument's idle seconds, else the config's (the idle
+        deadline on a test clock: LoopClock, no real wait)."""
+        clock = LoopClock(monkeypatch)
         async with _running(SchedulerConfig(session_idle_timeout_seconds=77), tmp_path) as (scheduler, fakes):
             fakes.manager.create_vm.return_value = _fake_vm("idle-timeout")
             session = await scheduler.new(VmSpec(language=Language.PYTHON), idle_timeout_seconds=argument)
-            await session.close()
-        assert session._idle_timeout_seconds == used
+            await clock.advance(used - 1)
+            assert not session.closed
+            await clock.advance(2)
+            assert session.closed
 
     @pytest.mark.parametrize("argument", [0, 9, 3601, -1])
     async def test_new_out_of_range(self, tmp_path: Path, argument: int) -> None:
@@ -449,6 +525,93 @@ class TestInstanceCallsNeedAStart:
         assert str(exc.value) == "Scheduler not started. Use: async with Scheduler() as scheduler:"
 
 
+class TestReusePackagesLookup:
+    """The local L2 image reuse() offers the load for a packages instance."""
+
+    async def test_no_own_base_image_is_an_l2_miss(self, tmp_path: Path) -> None:
+        """A worker without its own base image has no L2 key (it needs the image), so no L2 of
+        its own: a miss, and the load downloads the L2 image by digest. Other errors stay."""
+        found: list[Path | None] = []
+
+        async def load(_instance_id: str, *, packages_image: Callable[[VmSpec], Awaitable[Path | None]]) -> None:
+            found.append(await packages_image(VmSpec(language=Language.PYTHON, packages=["pandas==2.2.3"])))
+            raise RuntimeError("stop after the lookup")
+
+        instances = _store(load=load, release=AsyncMock())
+        async with _running(SchedulerConfig(), tmp_path, instances=instances) as (scheduler, fakes):
+            fakes.disk.check_cache = AsyncMock(
+                side_effect=ConfigError(
+                    "no base image", code=ErrorCode.ASSET_NOT_FOUND, context=None, hint=None, instance_id=None
+                )
+            )
+            with pytest.raises(RuntimeError, match="stop after the lookup"):
+                await scheduler.reuse("my-vm")
+            assert found == [None]
+
+            fakes.disk.check_cache.side_effect = ConfigError(
+                "no qemu-img", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None
+            )
+            with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY):
+                await scheduler.reuse("my-vm")
+
+
+class TestCheckReuse:
+    async def test_the_store_checks_with_this_workers_l2_lookup(self, tmp_path: Path) -> None:
+        """check_reuse: the instance store's check with the L2 lookup of reuse() (a miss when
+        this worker has no base image of its own), no VM and no reservation; its errors pass
+        through, named."""
+        seen: list[Path | None] = []
+
+        async def check(instance_id: str, *, packages_image: Callable[[VmSpec], Awaitable[Path | None]]) -> None:
+            seen.append(await packages_image(VmSpec(language=Language.PYTHON, packages=["pandas==2.2.3"])))
+            if instance_id == "gone":
+                raise InstanceGoneError(
+                    "No instance.", code=ErrorCode.INSTANCE_NOT_FOUND, context=None, hint=None, instance_id=instance_id
+                )
+
+        instances = _store(check=check)
+        async with _running(SchedulerConfig(), tmp_path, instances=instances) as (scheduler, fakes):
+            fakes.disk.check_cache = AsyncMock(
+                side_effect=ConfigError(
+                    "no base", code=ErrorCode.ASSET_NOT_FOUND, context=None, hint=None, instance_id=None
+                )
+            )
+            await scheduler.check_reuse("my-vm")
+            with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_NOT_FOUND):
+                await scheduler.check_reuse("gone")
+
+        assert seen == [None, None]
+        fakes.manager.reservation_context.assert_not_called()
+        fakes.manager.restore_vm.assert_not_called()
+
+    async def test_the_l2_lease_goes_after_the_check(self, tmp_path: Path) -> None:
+        """This worker's L2 image is leased while the check reads its digest, then released,
+        also when the check fails."""
+        lease = MagicMock(path=Path("/l2/entry.qcow2"))
+
+        async def check(instance_id: str, *, packages_image: Callable[[VmSpec], Awaitable[Path | None]]) -> None:
+            assert await packages_image(VmSpec(language=Language.PYTHON, packages=["pandas==2.2.3"])) == lease.path
+            lease.release.assert_not_called()
+            raise InstanceGoneError(
+                "No instance.", code=ErrorCode.INSTANCE_NOT_FOUND, context=None, hint=None, instance_id=instance_id
+            )
+
+        async with _running(SchedulerConfig(), tmp_path, instances=_store(check=check)) as (scheduler, fakes):
+            fakes.disk.check_cache = AsyncMock(return_value=lease)
+            with pytest.raises(InstanceGoneError):
+                await scheduler.check_reuse("my-vm")
+        lease.release.assert_called_once_with()
+
+
+async def test_the_instance_asset_cache_is_under_eviction(tmp_path: Path) -> None:
+    """With an instance store, admission also evicts the images that loads fetched (oldest
+    first, never one in use: InstanceManager.assets), with the L1 and L2 caches."""
+    instances = _store()
+    async with _running(SchedulerConfig(), tmp_path, instances=instances) as (_scheduler, fakes):
+        caches = [call.args[0] for call in fakes.manager.add_cache.call_args_list]
+    assert caches == [fakes.disk, fakes.memory, instances.assets]
+
+
 class TestReuseRestoreFailure:
     """reuse() after its load: a VM that does not start from the saved state releases the
     loaded files; a state QEMU refuses routes to a worker with the QEMU that wrote it."""
@@ -458,14 +621,63 @@ class TestReuseRestoreFailure:
         """An instance store whose load gives a saved state that QEMU 11.0.2 wrote; returns
         (the store, the state)."""
         state = SimpleNamespace(
-            body=SimpleNamespace(spec=VmSpec(language=Language.PYTHON), host=SimpleNamespace(qemu_version="11.0.2")),
-            header=SimpleNamespace(generation=3),
+            body=SimpleNamespace(
+                spec=VmSpec(language=Language.PYTHON),
+                host=SimpleNamespace(qemu_version="11.0.2", machine_type="virt-11.0", release="1.0.0"),
+                egress_domains=("pypi.org",),
+                guest=SimpleNamespace(kernel="1" * 64, initramfs="2" * 64),
+            ),
+            header=SimpleNamespace(generation=3, instance_id="my-vm"),
+            instance_id="my-vm",
             vmstate=Path("/saved/c.vmstate"),
             base_image=Path("/saved/base.img"),
             packages_image=None,
             folder=Path("/saved"),
+            asset_leases=(MagicMock(path=Path("/assets/base.img")),),  # an image of the asset cache
         )
         return _store(load=AsyncMock(return_value=state), release=AsyncMock()), state
+
+    async def test_the_loaded_image_leases_go_after_the_start(self, tmp_path: Path) -> None:
+        """After the restore (its VM holds its own shares), reuse() releases the state's leases on
+        the asset cache."""
+        instances, state = self._loaded()
+        async with _running(SchedulerConfig(), tmp_path, instances=instances) as (scheduler, fakes):
+            fakes.manager.restore_vm.return_value = _fake_vm("vm-1")
+            await scheduler.reuse("my-vm")
+        (asset_lease,) = state.asset_leases
+        asset_lease.release.assert_called_once_with()
+
+    async def test_a_reuse_logs_both_releases(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One INFO record per load, the values in its text: the generation, the release and
+        QEMU that saved it, the ones that load it, and the VM it runs in."""
+        instances, _state = self._loaded()
+        monkeypatch.setattr("exec_sandbox.scheduler.qemu_version_fact", AsyncMock(return_value="11.1.3"))
+
+        async with _running(SchedulerConfig(), tmp_path, instances=instances) as (scheduler, fakes):
+            fakes.manager.restore_vm.return_value = _fake_vm("vm-1")
+            with caplog.at_level(logging.INFO, logger="exec_sandbox.scheduler"):
+                await scheduler.reuse("my-vm")
+
+        assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("Instance my-vm")] == [
+            'Instance my-vm reused: generation 3, saved by release "1.0.0" with QEMU "11.0.2", loaded by release '
+            f'"{__version__}" with QEMU "11.1.3" in VM vm-1.'
+        ]
+
+    async def test_no_qemu_version_starts_no_vm(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The QEMU version (the outcome record names it) is read before the restore: when it
+        cannot be read, no VM starts, and the loaded files go."""
+        instances, state = self._loaded()
+        error = ConfigError("no version", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None)
+        monkeypatch.setattr("exec_sandbox.scheduler.qemu_version_fact", AsyncMock(side_effect=error))
+
+        async with _running(SchedulerConfig(), tmp_path, instances=instances) as (scheduler, fakes):
+            with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY):
+                await scheduler.reuse("my-vm")
+
+        fakes.manager.restore_vm.assert_not_called()
+        instances.release.assert_awaited_once_with(state)
 
     async def test_state_qemu_refuses_routes(self, tmp_path: Path) -> None:
         error = TransientError(
@@ -481,23 +693,31 @@ class TestReuseRestoreFailure:
             instance_id=None,
         )
         instances, state = self._loaded()
+        routed = host_mismatch(
+            instance_id="my-vm",
+            required={RouteKey.QEMU_VERSION: "11.0.2"},
+            found={RouteKey.QEMU_VERSION: "11.1.3"},
+            reason="this worker's QEMU refused the saved state",
+        )
+        instances.refused_by_qemu = AsyncMock(return_value=routed)
 
         async with _running(SchedulerConfig(), tmp_path, instances=instances) as (scheduler, fakes):
             fakes.manager.restore_vm.side_effect = error
             with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
                 await scheduler.reuse("my-vm")
 
-        assert (exc.value.action, exc.value.instance_id) == (ErrorAction.ROUTE, "my-vm")
-        assert (exc.value.required, exc.value.found) == (
-            {"qemu_version": "11.0.2"},
-            {"qemu_version": "this worker's QEMU refused the saved state"},
-        )
+        assert exc.value is routed  # the instance store names the target: it knows the saver's facts
+        instances.refused_by_qemu.assert_awaited_once_with(state, qemu_error="Migration failed: incompatible stream")
         assert exc.value.__cause__ is error
         instances.release.assert_awaited_once_with(state)
         # Admission leaves out the loaded state's files: they stay while the request waits
-        assert fakes.manager.reservation_context.call_args.kwargs["held"] == {Path("/saved")}
+        assert fakes.manager.reservation_context.call_args.kwargs["held"] == {Path("/saved"), Path("/assets/base.img")}
 
-    async def test_other_restore_failure_is_raised_as_it_is(self, tmp_path: Path) -> None:
+    async def test_other_restore_failure_is_raised_as_it_is(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A VM error names no instance: reuse() names it, and writes one WARNING record with
+        the values in its text (the CLI log format shows no extra fields)."""
         error = TransientError(
             "guest did not answer", code=ErrorCode.GUEST_SILENT_AFTER_RESTORE, context=None, hint=None, instance_id=None
         )
@@ -505,11 +725,27 @@ class TestReuseRestoreFailure:
 
         async with _running(SchedulerConfig(), tmp_path, instances=instances) as (scheduler, fakes):
             fakes.manager.restore_vm.side_effect = error
-            with pytest.raises(TransientError) as exc:
+            with (
+                caplog.at_level(logging.WARNING, logger="exec_sandbox.scheduler"),
+                pytest.raises(TransientError) as exc,
+            ):
                 await scheduler.reuse("my-vm")
 
         assert exc.value is error
+        assert exc.value.instance_id == "my-vm"
         instances.release.assert_awaited_once_with(state)
+        records = [r.getMessage() for r in caplog.records if r.name == "exec_sandbox.scheduler"]
+        assert records == ["Instance my-vm not reused: GUEST_SILENT_AFTER_RESTORE (RETRY): guest did not answer"]
+        # The restore starts QEMU with the saved machine type, not this QEMU's alias, and the
+        # egress policy of the save
+        assert fakes.manager.restore_vm.call_args.kwargs["machine_type"] == "virt-11.0"
+        assert fakes.manager.restore_vm.call_args.kwargs["egress_domains"] == ("pypi.org",)
+        assert fakes.manager.restore_vm.call_args.kwargs["boot"] == ("1" * 64, "2" * 64)  # its first boot
+        assert fakes.manager.restore_vm.call_args.kwargs["use_template"] is False  # its RAM is in the vmstate
+        # The asset cache's image: the restore's VM takes its own share, kept while it waits
+        (asset_lease,) = state.asset_leases
+        assert fakes.manager.restore_vm.call_args.kwargs["cache_leases"] == (asset_lease,)
+        assert Path("/assets/base.img") in fakes.manager.reservation_context.call_args.kwargs["held"]
 
 
 def _fake_vm(vm_id: str) -> MagicMock:
@@ -521,10 +757,12 @@ def _fake_vm(vm_id: str) -> MagicMock:
     vm.state = VmState.READY
     vm.process = MagicMock()
     vm.process.returncode = None
-    # `timing` is an instance attribute, invisible to spec=QemuVM.
+    # `timing` and `exposed_ports` (VmManager sets them at the spawn) are instance
+    # attributes, invisible to spec=QemuVM.
     vm.timing = VmTiming(
         boot_ms=0, overlay_ms=0, qemu_cmd_build_ms=0, gvproxy_start_ms=0, qemu_fork_ms=0, guest_wait_ms=0
     )
+    vm.exposed_ports = []
     return vm
 
 
@@ -645,7 +883,7 @@ class TestL1FallbackOwnership:
         fakes.manager.create_vm.assert_not_awaited()
 
     async def test_template_qemu_refused_is_removed(self, tmp_path: Path) -> None:
-        """A template QEMU refused is dropped (every file), then the request cold boots."""
+        """A template QEMU refused is dropped (its vmstate here), then the request cold boots."""
         error = TransientError(
             "L1 restore failed", code=ErrorCode.MIGRATION_FAILED, context=None, hint=None, instance_id=None
         )
@@ -700,7 +938,7 @@ class TestL1FallbackOwnership:
         )
         async with self._running_l1(None, tmp_path) as (scheduler, fakes):
             session = await self._new(scheduler, spec)
-        ports = session.exposed_ports
+        ports = fakes.manager.restore_vm.await_args.kwargs["expose_ports"]  # VmManager forwards them
 
         assert session.vm_id == "l1-restored"
         assert all(isinstance(p, ExposedPort) for p in ports)
@@ -708,7 +946,6 @@ class TestL1FallbackOwnership:
         assert ports[0].external == 3000  # explicit: kept
         assert isinstance(ports[1].external, int)  # none given: a host port is allocated
         assert ports[1].external > 0
-        assert fakes.manager.restore_vm.await_args.kwargs["expose_ports"] == ports
 
     async def test_post_create_snapshot_schedule_failure_destroys_unreturned_vm(self, tmp_path: Path) -> None:
         error = TransientError(
@@ -1720,11 +1957,13 @@ class TestSchedulerShutdownOrdering:
     # ------------------------------------------------------------------
 
     async def test_shutdown_warm_pool_error_continues(self, tmp_path: Path) -> None:
-        """WarmVMPool.stop() error does not prevent other managers from stopping."""
+        """A WarmVMPool.stop() error does not prevent other managers from stopping; it comes
+        out once every step ran (as each shutdown step's error)."""
         scheduler, fakes = await self._make_scheduler(tmp_path)
         fakes.warm.stop.side_effect = OSError("pool drain failed")
 
-        await scheduler.__aexit__(None, None, None)
+        with pytest.raises(OSError, match="pool drain failed"):
+            await scheduler.__aexit__(None, None, None)
 
         fakes.memory.stop.assert_awaited_once()
         fakes.manager.stop.assert_awaited_once()
@@ -1744,11 +1983,13 @@ class TestSchedulerShutdownOrdering:
         fakes.manager.stop.assert_awaited_once()
 
     async def test_shutdown_memory_snapshot_error_continues(self, tmp_path: Path) -> None:
-        """MemorySnapshotManager.stop() error does not prevent VM cleanup."""
+        """A MemorySnapshotManager.stop() error does not prevent VM cleanup; it comes out once
+        every step ran."""
         scheduler, fakes = await self._make_scheduler(tmp_path)
         fakes.memory.stop.side_effect = RuntimeError("snapshot save failed")
 
-        await scheduler.__aexit__(None, None, None)
+        with pytest.raises(RuntimeError, match="snapshot save failed"):
+            await scheduler.__aexit__(None, None, None)
 
         fakes.manager.stop.assert_awaited_once()
 
@@ -2479,33 +2720,48 @@ class TestPackageInstallation:
             assert expected in result.stdout
 
     async def test_python_snapshot_cache_hit(self, scheduler: Scheduler) -> None:
-        """Second run with same packages uses cached snapshot."""
+        """Second run with same packages uses the cached L2 snapshot: it builds nothing (the
+        first run builds it, or finds it from an earlier test of this user)."""
         packages = ["requests==2.31.0"]
+        real_build = DiskSnapshotManager._create_snapshot  # pyright: ignore[reportPrivateUsage]
+        builds: list[int] = []  # one per top-level build (an ENOSPC retry calls itself)
+        depth = 0
 
-        # First run: creates snapshot
-        r1 = await run_once(
-            scheduler, VmSpec(language=Language.PYTHON, packages=packages), 'import requests; print("first")'
-        )
-        assert r1.exit_code == 0, f"First run failed: {r1.stderr}"
+        async def counted_build(self: DiskSnapshotManager, *args: object, **kwargs: object) -> object:
+            nonlocal depth
+            if depth == 0:
+                builds.append(1)
+            depth += 1
+            try:
+                return await real_build(self, *args, **kwargs)  # type: ignore[arg-type]
+            finally:
+                depth -= 1
 
-        # Second run: should use cached snapshot (much faster)
-        r2 = await run_once(
-            scheduler, VmSpec(language=Language.PYTHON, packages=packages), 'import requests; print("second")'
-        )
+        with patch.object(DiskSnapshotManager, "_create_snapshot", counted_build):
+            r1 = await run_once(
+                scheduler, VmSpec(language=Language.PYTHON, packages=packages), 'import requests; print("first")'
+            )
+            assert r1.exit_code == 0, f"First run failed: {r1.stderr}"
+            first = len(builds)
+            r2 = await run_once(
+                scheduler, VmSpec(language=Language.PYTHON, packages=packages), 'import requests; print("second")'
+            )
         assert r2.exit_code == 0, f"Second run failed: {r2.stderr}"
         assert "second" in r2.stdout
+        assert len(builds) == first <= 1  # the second run built nothing
 
     async def test_python_packages_work_without_network(self, scheduler: Scheduler) -> None:
         """Packages from cached snapshot work without network access.
 
         This is a critical test that proves:
         1. Snapshot correctly persists installed packages
-        2. Packages don't require network at runtime
+        2. Packages don't require network at runtime (the VM that installs them has the
+           network, whatever the spec: disk_snapshot_manager; the user VMs here have none)
         3. The filesystem sync of the build VM wrote them (cache=unsafe)
         """
         packages = ["requests==2.31.0"]
 
-        # First run: creates snapshot (needs network for pip install)
+        # First run: builds the snapshot if it is not cached
         r1 = await run_once(
             scheduler, VmSpec(language=Language.PYTHON, packages=packages), 'import requests; print("setup")'
         )
@@ -2528,7 +2784,7 @@ class TestPackageInstallation:
         """JavaScript packages from cached snapshot work without network."""
         packages = ["lodash@4.17.21"]
 
-        # First run: creates snapshot
+        # First run: builds the snapshot if it is not cached (the build VM has the network)
         r1 = await run_once(
             scheduler,
             VmSpec(language=Language.JAVASCRIPT, packages=packages),

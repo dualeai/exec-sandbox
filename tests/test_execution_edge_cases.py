@@ -104,6 +104,28 @@ print("Unicode: café ñ 你好 🎉")
             'Tab:\there\nNewline in string: line1\nline2\nBackslash: \\\nQuote: "hello"\nUnicode: café ñ 你好 🎉\n'
         )
 
+    async def test_long_multibyte_output_comes_out_whole(self, scheduler: Scheduler) -> None:
+        """Output many pipe reads long, all 3-byte characters: a read that ends inside a
+        character does not cut it (no U+FFFD), on stdout and on stderr."""
+        code = "import sys; print('中' * 100_000); print('文' * 30_000, file=sys.stderr)"
+
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
+
+        assert result.exit_code == 0, result.stderr[:200]
+        assert result.stdout == "中" * 100_000 + "\n"
+        assert result.stderr == "文" * 30_000 + "\n"
+
+    async def test_a_long_line_of_control_characters_comes_out_whole(self, scheduler: Scheduler) -> None:
+        """90000 control characters on one stderr line (no newline before the end): each is
+        6 bytes in JSON, so one frame of it would pass the host's line limit; the guest sends
+        frames of at most 64 KB of text, and the line comes out whole."""
+        code = "import sys; sys.stderr.write('\\x01' * 90_000 + '\\n')"
+
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
+
+        assert result.exit_code == 0
+        assert result.stderr == "\x01" * 90_000 + "\n"
+
     async def test_ansi_escape_codes(self, scheduler: Scheduler) -> None:
         """ANSI escape codes pass through unchanged."""
         code = r"""
@@ -300,7 +322,6 @@ os._exit(42)
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
         try:
             killed = await vm.execute(
@@ -987,11 +1008,13 @@ class TestRawEdgeCases:
         assert result.stdout == 'quotes "double" $dollar `backtick`\n'
 
     async def test_raw_shebang_sentinel_in_code(self, scheduler: Scheduler) -> None:
-        """Sentinel collision in code is handled."""
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), '#!/bin/sh\necho "_EXEC_SANDBOX_EOF_"')
+        """A script line that is the heredoc sentinel alone (here a heredoc of its own): the
+        sentinel grows until no line of the code is it, so the whole script runs."""
+        script = "#!/bin/sh\ncat <<'X'\n_EXEC_SANDBOX_EOF_\nX\necho done"
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), script)
 
         assert result.exit_code == 0
-        assert result.stdout == "_EXEC_SANDBOX_EOF_\n"
+        assert result.stdout == "_EXEC_SANDBOX_EOF_\ndone\n"
 
     async def test_raw_shebang_nonexistent_interpreter(self, scheduler: Scheduler) -> None:
         """Non-existent interpreter fails with non-zero exit."""

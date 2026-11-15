@@ -12,7 +12,7 @@ is a clone of it (the same bytes): 0.3 ms, and 1.4 ms for 10 at once, where QMP 
 31 ms for 10 at once.
 
 Architecture:
-- Single persistent daemon process per OverlayPool
+- Single persistent daemon process per VmManager
 - QMP socket: <tempfile.gettempdir()>/qsd-{pid namespace}-{pid}-{random}.sock
 - Templates: <tempfile.gettempdir()>/qsd-{pid namespace}-{pid}-{random}.templates/ (0700)
 - Job completion: _wait_for_job() polls query-jobs (the job's status and error) from
@@ -52,7 +52,7 @@ import psutil
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.aio_utils import await_settled
+from exec_sandbox.aio_utils import await_cancellation_safe, run_to_end
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError, spawn_error
 from exec_sandbox.files.disk import clone_sparse
 from exec_sandbox.process_registry import unregister_process
@@ -168,8 +168,9 @@ def _qcow2_virtual_size(image_path: Path) -> int:
 class QemuStorageDaemon:
     """Manages qemu-storage-daemon lifecycle and QMP communication.
 
-    The daemon process handles qcow2 overlay creation via QMP blockdev-create
-    commands, avoiding fork/exec overhead of spawning qemu-img processes.
+    The daemon makes the first overlay of each base image version via QMP blockdev-create
+    (kept as its template); each later one is a clone of that template, made in this
+    process. No qemu-img process starts per overlay.
 
     Safe for concurrent coroutines of one event loop: an asyncio.Lock serializes QMP commands.
 
@@ -310,14 +311,8 @@ class QemuStorageDaemon:
         self._template_dir = template_dir
         # A cancel waits for the mkdir thread: else the folder could come after the removal
         # of a stop() that runs at once
-        made = asyncio.create_task(asyncio.to_thread(template_dir.mkdir, mode=0o700))
         try:
-            await asyncio.shield(made)
-        except asyncio.CancelledError:
-            await await_settled(made)
-            if not made.cancelled():
-                made.exception()  # retrieved: the cancel wins
-            raise
+            await run_to_end(lambda: template_dir.mkdir(mode=0o700))
         except OSError:
             self._template_dir = None
             logger.debug("No overlay template folder: each overlay is made through QMP", exc_info=True)
@@ -409,7 +404,7 @@ class QemuStorageDaemon:
         if not self._started:
             raise _overlay_failed("Daemon not started", context=None)
         # The backing path is stored in the overlay as given and read relative to the
-        # overlay's folder: an absolute path keeps it valid after the pool moves the file
+        # overlay's folder: an absolute path keeps it valid wherever the overlay is cloned
         base_image = base_image.absolute()
         identity = await asyncio.to_thread(_file_identity, base_image)
         template_dir = self._template_dir
@@ -587,14 +582,7 @@ class QemuStorageDaemon:
 
         # Once a command is written, consume its identified response before
         # propagating caller cancellation. This preserves stream alignment.
-        exchange_task = asyncio.create_task(exchange())
-        try:
-            return await asyncio.shield(exchange_task)
-        except asyncio.CancelledError:
-            await await_settled(exchange_task)
-            if not exchange_task.cancelled():
-                exchange_task.exception()
-            raise
+        return await await_cancellation_safe(exchange())
 
     async def _exchange(self, request_id: str, command: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         """Write one identified QMP command and consume its matching response.
@@ -824,11 +812,8 @@ class QemuStorageDaemon:
         """Retry bounded termination attempts until process death is confirmed."""
         delay = 1.0
         while self._process is not None:
-            try:
-                if await self._cleanup_process():
-                    break
-            except Exception:
-                logger.exception("QEMU storage daemon cleanup attempt failed")
+            if await self._cleanup_process():  # never raises: cleanup_process logs its errors
+                break
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30.0)
 

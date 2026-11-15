@@ -8,8 +8,8 @@ from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
 
+from exec_sandbox.exceptions import ErrorCode, OutcomeUnknownError
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     GuestAgentRequest,
@@ -89,15 +89,19 @@ def _complete(
     )
 
 
+async def _default_handling(_msg: StreamingErrorMessage) -> None:
+    """An on_error that returns: the default handling of the error runs."""
+
+
 async def _consume(messages: list[StreamingMessage], **callbacks: Any) -> StreamResult:
-    """Shorthand: build _MockChannel, call consume_stream with test defaults (no callback
-    but those in `callbacks`)."""
+    """Shorthand: build _MockChannel, call consume_stream with test defaults (no output
+    callback, _default_handling, but those in `callbacks`)."""
     return await consume_stream(
         _MockChannel(messages),  # type: ignore[arg-type]
         PingRequest(),
         timeout=10,
         vm_id="test-vm",
-        **({"on_stdout": None, "on_stderr": None, "on_error": None} | callbacks),
+        **({"on_stdout": None, "on_stderr": None, "on_error": _default_handling} | callbacks),
     )
 
 
@@ -117,7 +121,7 @@ async def _consume_error(
         vm_id="test-vm",
         on_stdout=None,
         on_stderr=None,
-        on_error=None,
+        on_error=_default_handling,
     )
 
 
@@ -247,8 +251,8 @@ class TestConsumeStreamCallbackFailures:
 class TestConsumeStreamErrors:
     """StreamingErrorMessage handling tests."""
 
-    async def test_error_without_callback_uses_default(self) -> None:
-        """StreamingErrorMessage with no on_error: appends to stderr, exit_code=-1."""
+    async def test_error_with_default_handling(self) -> None:
+        """StreamingErrorMessage, on_error returns: appends to stderr, exit_code=-1."""
         result = await _consume(
             [
                 OutputChunkMessage(type="stdout", chunk="partial"),
@@ -320,19 +324,22 @@ class TestConsumeStreamErrors:
 # ---------------------------------------------------------------------------
 
 
-def _validation_error() -> ValidationError:
-    """A real ValidationError: the guest sent JSON that is not a message."""
-    try:
-        ExecutionCompleteMessage.model_validate({"bad": "data"})
-    except ValidationError as error:
-        return error
-    raise AssertionError("the bad message validated")
+def _unreadable_frame() -> OutcomeUnknownError:
+    """What the channel raises when the guest answers an exec with a frame this release cannot
+    read (OperationInbox.fail_unreadable on a request that changes state)."""
+    return OutcomeUnknownError(
+        "The guest agent sent a reply this release cannot read ('bad': extra_forbidden).",
+        code=ErrorCode.GUEST_OUTCOME_UNKNOWN,
+        context=None,
+        hint=None,
+        instance_id=None,
+    )
 
 
 class TestConsumeStreamTransportErrors:
     """Transport and protocol errors propagate for retry by the caller.
 
-    When QEMU dies, the socket breaks, or the guest sends garbage,
+    When QEMU dies, the socket breaks, or the guest sends a frame this release cannot read,
     the exception must propagate through consume_stream() so execute()
     can wrap it as TransientError GUEST_UNAVAILABLE and the retry infrastructure can act.
     TimeoutError and CancelledError propagate too: execute() turns a timeout into a
@@ -347,7 +354,7 @@ class TestConsumeStreamTransportErrors:
             pytest.param(lambda: BrokenPipeError("Broken pipe"), id="write-to-dead-socket"),
             pytest.param(lambda: OSError(22, "Invalid argument"), id="os-error"),
             pytest.param(lambda: asyncio.LimitOverrunError("Separator not found, buffer full", 524288), id="oversized"),
-            pytest.param(_validation_error, id="garbage-json"),
+            pytest.param(_unreadable_frame, id="unreadable-frame"),
             pytest.param(lambda: TimeoutError("hard timeout"), id="timeout"),
             pytest.param(asyncio.CancelledError, id="cancelled"),
         ],

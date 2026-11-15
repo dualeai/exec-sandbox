@@ -109,8 +109,6 @@ class Session:
         self._instance = instance
         # Id the first save gives a new instance (Scheduler.new(instance_id=...)); None: a new random id
         self._new_instance_id = new_instance_id
-        # Readable after close (the state's local files are removed then)
-        self._instance_ref = _ref(instance)
         # exec()/write_file() succeeded since the last save (InstanceNotSavedWarning at a clean close)
         self._unsaved = False
         # A save in flight owns the instance files: close() leaves them to it (see save()).
@@ -157,7 +155,7 @@ class Session:
     def instance(self) -> InstanceRef | None:
         """The saved instance this session continues: set by reuse() and by each
         successful save(); None for a session from new() that was never saved."""
-        return self._instance_ref
+        return _ref(self._instance)  # the header stays in memory after close removes the files
 
     @property
     def exec_count(self) -> int:
@@ -328,8 +326,10 @@ class Session:
         Args:
             code: Source code to execute.
             timeout_seconds: Execution timeout. Default: scheduler's default_timeout_seconds.
-            env_vars: Environment variables for this execution: at most 100; a name up to
-                256 bytes, a value up to 4096 bytes; no control characters except tab.
+            env_vars: Environment variables for this execution: at most 100; a name of 1 to
+                256 bytes, a value up to 4096 bytes; no control characters except tab. The
+                guest refuses names that change how programs load or start, in any case (for
+                example PATH, LD_PRELOAD, LD_LIBRARY_PATH, PYTHONPATH, NODE_OPTIONS, BASH_ENV).
             on_stdout: Callback for stdout chunks (streaming).
             on_stderr: Callback for stderr chunks (streaming).
 
@@ -351,8 +351,8 @@ class Session:
             SessionClosedError: The session is closed (checked first, whatever the arguments).
             InvalidInputError: The session stays open. ARGUMENT_INVALID (timeout
                 out of range), CODE_INVALID (code empty, only spaces, too large, or
-                with null bytes), ENV_VAR_INVALID (control characters, size
-                limits), OUTPUT_LIMIT (stdout or stderr went above the guest
+                with null bytes), ENV_VAR_INVALID (a refused name, control characters,
+                size limits), OUTPUT_LIMIT (stdout or stderr went above the guest
                 limit).
             InternalError: Protocol failure (the session closes).
         """
@@ -557,7 +557,8 @@ class Session:
                 instance_keyring; checked first, so a closed session without a store
                 raises this, not SessionClosedError), or the store refused this worker or
                 has no conditional writes (S3 HTTP 501); the session is still open.
-                HOST_DEPENDENCY: qemu-vm could not get access to the migration file; the
+                HOST_DEPENDENCY: qemu-vm could not get access to the migration file, or this
+                QEMU does not list the machine type the VM runs; nothing was saved; the
                 session is still open.
                 IMAGE_DAMAGED: a guest image does not match its digest; nothing was saved.
                 MIGRATION_UNSUPPORTED: this QEMU cannot save the VM; the session closes
@@ -592,10 +593,8 @@ class Session:
             if self._closed:  # close() ran during the save: these files are the save's to release
                 await self._instances.release(state)
             self._instance = state
-            self._instance_ref = _ref(self._instance)
             self._unsaved = False
-        assert self._instance_ref is not None  # noqa: S101 - set just above
-        return self._instance_ref
+        return InstanceRef(instance_id=state.instance_id, generation=state.header.generation)
 
     async def close(self) -> None:
         """Close the session and destroy the VM. Never saves, never deletes the stored instance.
@@ -605,10 +604,10 @@ class Session:
         starts no new cleanup: it raises the error of the first one again, if any.
         Raises InternalError (CLEANUP_UNCONFIRMED) when the end of the QEMU process is not confirmed.
         """
-        if not self._closed and self._unsaved and self._instance_ref is not None:
+        if not self._closed and self._unsaved and self._instance is not None:
             warnings.warn(
-                f"Session closed with changes since the last save of instance {self._instance_ref.instance_id} "
-                f"(generation {self._instance_ref.generation}); call save() to keep them.",
+                f"Session closed with changes since the last save of instance {self._instance.instance_id} "
+                f"(generation {self._instance.header.generation}); call save() to keep them.",
                 InstanceNotSavedWarning,
                 stacklevel=2,
             )
@@ -712,10 +711,10 @@ class Session:
         Session outlives it — close() publishes _close_task before any await).
         """
         self._idle_timer_handle = None
-        if self._unsaved and self._instance_ref is not None:
+        if self._unsaved and self._instance is not None:
             logger.warning(
                 "Idle timeout closes a session with changes since the last save",
-                extra={"instance_id": self._instance_ref.instance_id, "generation": self._instance_ref.generation},
+                extra={"instance_id": self._instance.instance_id, "generation": self._instance.header.generation},
             )
         logger.info(
             "Session idle timeout",

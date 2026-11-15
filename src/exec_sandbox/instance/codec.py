@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING
 
 from cryptography.exceptions import InvalidTag
 
-from exec_sandbox._version import __version__
 from exec_sandbox.exceptions import RouteError, damaged_instance_data, host_mismatch
 from exec_sandbox.instance.ids import is_commit_id, is_instance_id
+from exec_sandbox.instance.models import BLOCK_BYTES
 
 if sys.version_info >= (3, 14):
     from compression import zstd
@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-BLOCK_BYTES = 64 * 1024
 NONCE_BYTES = 12
 ZSTD_LEVEL = 3
 
@@ -89,17 +88,14 @@ def open_block(cipher: AESGCM, record: bytes, aad: bytes, *, instance_id: str) -
 
 
 def other_release(instance_id: str, *, what: str) -> RouteError:
-    """Authenticated data this release cannot read: ROUTE to a release that reads it.
+    """Authenticated data this release cannot read: ROUTE to another release.
 
     The data key authenticated it, so a release of this library wrote it and the
     data is good: never RECREATE, a client would delete it. No format number is
     needed here: authentication already tells "ours, other release" from "damaged".
+    No fact names the release that reads it: `required` is empty.
     """
-    return host_mismatch(
-        instance_id=instance_id,
-        required={"release": f"one that reads this {what}"},
-        found={"release": __version__},
-    )
+    return host_mismatch(instance_id=instance_id, required={}, found={}, reason=f"this release cannot read its {what}")
 
 
 def _ids(instance_id: str, commit_id: str) -> bytes:

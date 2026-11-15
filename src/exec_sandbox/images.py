@@ -130,8 +130,8 @@ class GuestImages:
         return image
 
     def present_base_images(self) -> list[Path]:
-        """The base image of each language that is on disk, as base_image finds it (what the
-        overlay pool fills for)."""
+        """The base image of each language that is on disk, as base_image finds it (VmManager.start
+        makes the overlay template of each)."""
         images = (self._base_image_or_none(image.file_name(self.arch)) for image in BASE_IMAGES.values())
         return [image for image in images if image is not None]
 

@@ -5,6 +5,7 @@ new -> exec -> save -> close -> reuse: the Python state and /home/user come back
 
 import asyncio
 import errno
+import hashlib
 import shutil
 import tempfile
 import threading
@@ -29,6 +30,8 @@ from exec_sandbox.exceptions import (
 from exec_sandbox.instance import manager as instance_manager
 from exec_sandbox.instance.keyring import Keyring
 from exec_sandbox.models import Language
+from exec_sandbox.platform_utils import detect_host_arch
+from exec_sandbox.qemu_cmd import resolve_machine_type
 from tests.conftest import skip_unless_hwaccel
 from tests.instance_support import await_until, disk_full_once, new_keyring
 from tests.s3_faults import BUCKET, After, Bucket, DropAfter, Edit, Fail, Hold, Request, Response, S3Proxy
@@ -391,11 +394,11 @@ class TestLoadFailures:
             await scheduler.reuse(ref.instance_id)
         assert exc.value.action == "RECREATE"
 
-    async def test_describe_reports_only_what_it_verified(
+    async def test_describe_reports_only_what_it_authenticated(
         self, store: tuple[Scheduler, str, object], s3_proxy: S3Proxy
     ) -> None:
         """A forged head on one read (generation 1 changed to 9): describe() raises
-        INSTANCE_INTEGRITY and never gives the forged fields as verified."""
+        INSTANCE_INTEGRITY and never gives the forged fields as authenticated."""
         scheduler, _, _ = store
         async with await scheduler.new(_PY) as vm:
             ref = await vm.save()
@@ -480,7 +483,7 @@ class TestChain:
 
         async with Scheduler(_config(scheduler_config, endpoint_url, prefix, new_key)) as worker:
             info = await worker.describe_instance(ref.instance_id)
-            assert (info.key_id, info.verified) == (Keyring.parse(new_key).latest.id, True)
+            assert (info.key_id, info.access) == (Keyring.parse(new_key).latest.id, "full")
             async with await worker.reuse(ref.instance_id) as vm:
                 assert (await vm.exec("print(x)")).stdout.strip() == "kept across the rotation"
 
@@ -510,10 +513,20 @@ class TestAdmin:
         async with await scheduler.new(_PY) as vm:
             ref = await vm.save()
         info = await scheduler.describe_instance(ref.instance_id)
-        assert (info.instance_id, info.generation, info.verified) == (ref.instance_id, 1, True)
+        assert (info.instance_id, info.generation, info.access) == (ref.instance_id, 1, "full")
         assert info.spec == _PY
-        assert info.host is not None
-        assert info.host.packages_image is None  # no packages: only the base image
+        assert info.host is not None and info.guest is not None
+        assert info.guest.packages_image is None  # no packages: only the base image
+        # The kernel and initramfs this worker booted the VM with, by digest (provenance): the
+        # SHA-256 of their bytes, read here, not through the digest cache the VM manager uses
+        images = scheduler._vm_manager.images  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage]
+        assert (info.guest.kernel, info.guest.initramfs) == (
+            hashlib.sha256(Path(images.kernel).read_bytes()).hexdigest(),
+            hashlib.sha256(Path(images.initramfs).read_bytes()).hexdigest(),
+        )
+        # The machine type this QEMU resolved for the new VM (virt-11.1 for QEMU 11.1 on arm64)
+        assert info.host.machine_type == await resolve_machine_type(detect_host_arch(), None)
+        assert info.host.machine_type not in {None, "virt"}
         assert [iid async for iid in scheduler.list_instances()] == [ref.instance_id]
 
         assert await scheduler.delete_instance(ref.instance_id) is True
@@ -523,7 +536,7 @@ class TestAdmin:
         assert await scheduler.delete_instance(ref.instance_id) is False  # idempotent
         assert [iid async for iid in scheduler.list_instances()] == []
 
-    async def test_describe_without_the_key_is_not_verified(
+    async def test_describe_without_the_key_has_no_access(
         self, store: tuple[Scheduler, str, object], scheduler_config: SchedulerConfig, moto_s3_server
     ) -> None:
         scheduler, prefix, _ = store
@@ -532,7 +545,13 @@ class TestAdmin:
         endpoint_url, _ = moto_s3_server
         async with Scheduler(_config(scheduler_config, endpoint_url, prefix, new_keyring())) as stranger:
             info = await stranger.describe_instance(ref.instance_id)
-        assert (info.generation, info.verified, info.spec, info.host) == (1, False, None, None)
+        assert (info.generation, info.access, info.writer_release, info.spec, info.host) == (
+            1,
+            "no_key",
+            None,
+            None,
+            None,
+        )
 
 
 class TestNotSavedWarning:
@@ -573,9 +592,9 @@ class TestAssets:
             ref = await vm.save()
         saved = await scheduler.describe_instance(ref.instance_id)
         assert saved.host is not None
-        key = f"{prefix}assets/sha256/{saved.host.base_image}"
+        key = f"{prefix}assets/sha256/{saved.guest.base_image}"
         assert s3.head_object(Bucket=BUCKET, Key=key)["ContentLength"] > 0  # type: ignore[attr-defined]
-        downloaded = asset_dir / f"{saved.host.base_image}.img"
+        downloaded = asset_dir / f"{saved.guest.base_image}.img"
         assert not downloaded.exists()
 
         other = _worker_config(scheduler, scheduler_config, s3_proxy, images_dir=images_without_python_base)
@@ -586,7 +605,7 @@ class TestAssets:
             assert downloaded.exists()
             again = await worker.describe_instance(ref.instance_id)
         assert again.host is not None
-        assert again.host.base_image == saved.host.base_image
+        assert again.guest.base_image == saved.guest.base_image
 
     async def test_image_deleted_from_the_store_comes_back_at_the_next_save(
         self, store: tuple[Scheduler, str, object]
@@ -596,7 +615,7 @@ class TestAssets:
             ref = await vm.save()
             info = await scheduler.describe_instance(ref.instance_id)
             assert info.host is not None
-            key = f"{prefix}assets/sha256/{info.host.base_image}"
+            key = f"{prefix}assets/sha256/{info.guest.base_image}"
             s3.delete_object(Bucket=BUCKET, Key=key)  # type: ignore[attr-defined]
             await vm.save()
         assert s3.head_object(Bucket=BUCKET, Key=key)["ContentLength"] > 0  # type: ignore[attr-defined]
@@ -613,7 +632,7 @@ class TestAssets:
             ref = await vm.save()
         info = await scheduler.describe_instance(ref.instance_id)
         assert info.host is not None
-        s3.put_object(Bucket=BUCKET, Key=f"{prefix}assets/sha256/{info.host.base_image}", Body=b"x")  # type: ignore[attr-defined]
+        s3.put_object(Bucket=BUCKET, Key=f"{prefix}assets/sha256/{info.guest.base_image}", Body=b"x")  # type: ignore[attr-defined]
         other = _worker_config(scheduler, scheduler_config, s3_proxy, images_dir=images_without_python_base)
         async with Scheduler(other) as worker:
             with pytest.raises(

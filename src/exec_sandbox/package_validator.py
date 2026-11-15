@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from typing import Final
 
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language  # noqa: TC001 - Used at runtime (language.value)
@@ -25,6 +26,12 @@ def _load_allow_lists(paths: dict[str, Path]) -> dict[str, set[str]]:
     """The allow-list of each language value from its JSON file (a list of package names),
     lowercase for case-insensitive matching. Blocking: create() runs it in a worker thread."""
     return {language: {pkg.lower() for pkg in json.loads(path.read_text())} for language, path in paths.items()}
+
+
+BUNDLED_PYPI_ALLOW_LIST: Final = Path(__file__).parent / "resources" / "pypi_top_10k.json"
+"""The PyPI allow-list shipped in the package (make build-catalogs)."""
+BUNDLED_NPM_ALLOW_LIST: Final = Path(__file__).parent / "resources" / "npm_top_10k.json"
+"""The npm allow-list shipped in the package (make build-catalogs)."""
 
 
 class PackageValidator:
@@ -51,28 +58,22 @@ class PackageValidator:
         self._allow_lists = allow_lists
 
     @classmethod
-    async def create(
-        cls,
-        pypi_allow_list_path: Path | None = None,
-        npm_allow_list_path: Path | None = None,
-    ) -> PackageValidator:
+    async def create(cls, *, pypi_allow_list_path: Path, npm_allow_list_path: Path) -> PackageValidator:
         """Async factory method to create a PackageValidator.
 
         Args:
-            pypi_allow_list_path: Path to JSON file with PyPI package names (bundled).
-                Defaults to bundled resources/pypi_top_10k.json
-            npm_allow_list_path: Path to JSON file with npm package names (bundled).
-                Defaults to bundled resources/npm_top_10k.json
+            pypi_allow_list_path: Path to JSON file with PyPI package names (BUNDLED_PYPI_ALLOW_LIST)
+            npm_allow_list_path: Path to JSON file with npm package names (BUNDLED_NPM_ALLOW_LIST)
 
         Returns:
             Initialized PackageValidator instance
         """
-        catalogs_dir = Path(__file__).parent / "resources"
-        pypi_path = pypi_allow_list_path or catalogs_dir / "pypi_top_10k.json"
-        npm_path = npm_allow_list_path or catalogs_dir / "npm_top_10k.json"
-
         # One worker-thread job: reading and parsing both files takes about 2 ms
-        return cls(await asyncio.to_thread(_load_allow_lists, {"python": pypi_path, "javascript": npm_path}))
+        return cls(
+            await asyncio.to_thread(
+                _load_allow_lists, {"python": pypi_allow_list_path, "javascript": npm_allow_list_path}
+            )
+        )
 
     def validate(self, packages: list[str], language: Language) -> None:
         """Validate packages against allow-list.

@@ -15,7 +15,7 @@ import contextlib
 import dataclasses
 import logging
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -23,6 +23,7 @@ from exec_sandbox import constants
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import ErrorCode, TransientError
 from exec_sandbox.models import Language
+from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.settings import Settings
 from exec_sandbox.vm_manager import VmManager
@@ -60,8 +61,12 @@ def capacity_settings(images_dir: Path) -> Settings:
 @pytest.fixture
 async def capacity_vm_manager(capacity_settings: Settings) -> AsyncGenerator[VmManager, None]:
     """VmManager with tight CPU budget (2 VMs max) for capacity testing."""
-    async with VmManager(capacity_settings) as manager:
+    manager = VmManager(capacity_settings)
+    try:
+        await manager.start()
         yield manager
+    finally:
+        await manager.stop()
 
 
 # ============================================================================
@@ -123,7 +128,6 @@ async def test_create_vm_blocks_at_capacity(capacity_vm_manager: VmManager) -> N
         reservation=None,
         retry_profile=constants.RETRY_USER_FACING,
         mem_path=None,
-        mem_path_share=False,
     )
     vm2 = await capacity_vm_manager.create_vm(
         VmSpec(language=Language.PYTHON),
@@ -137,7 +141,6 @@ async def test_create_vm_blocks_at_capacity(capacity_vm_manager: VmManager) -> N
         reservation=None,
         retry_profile=constants.RETRY_USER_FACING,
         mem_path=None,
-        mem_path_share=False,
     )
 
     with _admission_log("test-task-3") as admission:
@@ -154,7 +157,6 @@ async def test_create_vm_blocks_at_capacity(capacity_vm_manager: VmManager) -> N
                 reservation=None,
                 retry_profile=constants.RETRY_USER_FACING,
                 mem_path=None,
-                mem_path_share=False,
             )
         )
         try:
@@ -223,7 +225,6 @@ async def test_destroy_gives_the_slot_back(capacity_vm_manager: VmManager) -> No
         reservation=None,
         retry_profile=constants.RETRY_USER_FACING,
         mem_path=None,
-        mem_path_share=False,
     )
     assert vm.resource_reservation is not None
     assert await _vms_admitted_now(capacity_vm_manager, most=3) == 1
@@ -235,11 +236,12 @@ async def test_destroy_gives_the_slot_back(capacity_vm_manager: VmManager) -> No
 
 async def test_admission_released_on_create_failure(capacity_vm_manager: VmManager) -> None:
     """A create_vm that fails after admission, at each boot attempt, gives its slot back. The
-    fault replaces _create_vm_impl, the step between admission and the VM: no public input
-    fails there. The attempts follow each other with no pause."""
+    fault is the overlay of each attempt (QemuStorageDaemon.create_overlay, OVERLAY_FAILED: retried), after
+    the attempt published its pending owner: each attempt's cleanup runs, and the slot comes
+    back once. The attempts follow each other with no pause."""
     failure = TransientError("mock failure", code=ErrorCode.OVERLAY_FAILED, context=None, hint=None, instance_id=None)
     no_pause = dataclasses.replace(constants.RETRY_USER_FACING, retry_min_seconds=0.0, retry_max_seconds=0.0)
-    with patch.object(capacity_vm_manager, "_create_vm_impl", side_effect=failure) as attempt:
+    with patch.object(QemuStorageDaemon, "create_overlay", AsyncMock(side_effect=failure)) as attempt:
         with pytest.raises(TransientError, check=lambda e: e is failure):
             await capacity_vm_manager.create_vm(
                 VmSpec(language=Language.PYTHON),
@@ -253,11 +255,11 @@ async def test_admission_released_on_create_failure(capacity_vm_manager: VmManag
                 snapshot_drive=None,
                 reservation=None,
                 mem_path=None,
-                mem_path_share=False,
             )
     assert attempt.call_count == constants.RETRY_USER_FACING.max_attempts > 1
 
     assert await _vms_admitted_now(capacity_vm_manager, most=3) == 2
+    assert not capacity_vm_manager._pending_launches  # pyright: ignore[reportPrivateUsage]  # no owner left
 
 
 async def test_double_destroy_does_not_double_release(capacity_vm_manager: VmManager) -> None:
@@ -274,7 +276,6 @@ async def test_double_destroy_does_not_double_release(capacity_vm_manager: VmMan
         reservation=None,
         retry_profile=constants.RETRY_USER_FACING,
         mem_path=None,
-        mem_path_share=False,
     )
 
     assert await capacity_vm_manager.destroy_vm(vm) is True
@@ -327,7 +328,6 @@ async def test_many_sequential_create_destroy_cycles(capacity_vm_manager: VmMana
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
         assert await capacity_vm_manager.destroy_vm(vm) is True
 

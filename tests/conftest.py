@@ -23,12 +23,11 @@ from exec_sandbox import subprocess_utils
 from exec_sandbox._logging import LIBRARY_LOGGER_NAME
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
-from exec_sandbox.exceptions import ErrorCode, TransientError
+from exec_sandbox.exceptions import ErrorCode, SandboxError, TransientError
 from exec_sandbox.files.disk import file_stamp, make_private_dir, memory_filesystem
 from exec_sandbox.images import kernel_dir_of
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import ExecutionResult, ExposedPort, StartupTiming
-from exec_sandbox.permission_utils import _probe_cache as permission_probe_cache  # pyright: ignore[reportPrivateUsage]
 from exec_sandbox.permission_utils import get_qemu_vm_uid
 from exec_sandbox.platform_utils import (
     HostArch,
@@ -58,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.hookimpl(tryfirst=True)
-def pytest_configure(config: pytest.Config) -> None:
+def pytest_configure() -> None:
     # TMPDIR moves even with --basetemp: fixtures and children (QEMU) make files through it
     if memory_filesystem(Path(tempfile.gettempdir())) is None:
         return
@@ -202,8 +201,19 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
 # Hardware Probe, Timeout Constants, and Skip Markers
 # ============================================================================
 
+
+def _probe_hwaccel() -> bool:
+    """Whether this host runs VMs with KVM or HVF. A host whose QEMU gives no answer to the
+    accelerator probe counts as TCG (the hardware tests skip, the timeouts are TCG's): the
+    test session still starts, and the tests that start a VM probe again."""
+    try:
+        return asyncio.run(detect_accel_type(force_emulation=False)) is not AccelType.TCG
+    except SandboxError:
+        return False
+
+
 # Probed once at import time; used for skip markers and timeout scaling.
-_hwaccel_available: bool = asyncio.run(detect_accel_type()) is not AccelType.TCG
+_hwaccel_available: bool = _probe_hwaccel()
 
 # Central test-execution timeout (seconds).
 # TCG software emulation under ``pytest -n auto`` contention can inflate
@@ -412,22 +422,30 @@ async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
     fixture should pass ``execute_timeout`` to ``vm.execute()`` instead
     of hardcoding a timeout — see ``_DEFAULT_TEST_TIMEOUT``.
 
-    Automatically calls start() to start the overlay pool daemon,
+    Automatically calls start() to start the overlay daemon,
     and stop() for cleanup.
     """
-    async with VmManager(vm_settings) as manager:  # type: ignore[arg-type]
+    manager = VmManager(vm_settings)  # type: ignore[arg-type]
+    try:
+        await manager.start()
         yield manager
+    finally:
+        await manager.stop()
 
 
 @pytest.fixture
 async def emulation_vm_manager(make_vm_settings) -> AsyncGenerator[VmManager, None]:
     """VmManager with forced software emulation (no KVM/HVF), started.
 
-    Automatically calls start() to start the overlay pool daemon,
+    Automatically calls start() to start the overlay daemon,
     and stop() for cleanup.
     """
-    async with VmManager(make_vm_settings(force_emulation=True)) as manager:
+    manager = VmManager(make_vm_settings(force_emulation=True))
+    try:
+        await manager.start()
         yield manager
+    finally:
+        await manager.stop()
 
 
 @pytest.fixture
@@ -474,7 +492,7 @@ def make_vm_settings(images_dir: Path):
 async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
     """Factory to create started VmManager with optional Settings overrides.
 
-    Each VmManager is automatically started (overlay pool daemon, system probes)
+    Each VmManager is automatically started (overlay daemon, system probes)
     and stopped on fixture teardown via AsyncExitStack.
 
     Usage:
@@ -486,7 +504,8 @@ async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
         async def _make(**settings_overrides: Any) -> VmManager:
             settings = make_vm_settings(**settings_overrides)
             manager = VmManager(settings)  # type: ignore[arg-type]
-            await stack.enter_async_context(manager)
+            stack.push_async_callback(manager.stop)  # first: a start that fails is stopped too
+            await manager.start()
             return manager
 
         yield _make
@@ -614,7 +633,7 @@ def _reset_probe_caches() -> Iterator[None]:
     """Reset all system-probe caches before and after every test.
 
     Tests that mock QEMU subprocess output (version, accelerators, sandbox)
-    populate ``probe_cache`` via the ``@_async_cached_probe`` decorator.
+    populate ``probe_cache`` via the ``@async_cached_probe`` decorator.
     Without a post-test reset, a subsequent test on the same pytest-xdist
     worker inherits the stale value — e.g. ``qemu_version=(8,2,0)`` from a
     mock causes real integration tests to raise ``ConfigError`` HOST_DEPENDENCY, or
@@ -628,7 +647,6 @@ def _reset_probe_caches() -> Iterator[None]:
     """
     resets = (
         probe_cache.reset,
-        permission_probe_cache.reset,
         get_qemu_vm_uid.cache_clear,
         subprocess_utils._runnable.clear,  # pyright: ignore[reportPrivateUsage]
     )
@@ -729,7 +747,7 @@ def worker_moto_server() -> Iterator[MotoWorker]:
     modules = tuple(backends.list_of_moto_modules())
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(backends, "list_of_moto_modules", lambda: modules)
-        with moto_server("127.0.0.1") as server:
+        with moto_server() as server:
             endpoint_url = f"http://127.0.0.1:{server.server_port}"
             s3_sync = boto3.client(
                 "s3",
@@ -804,7 +822,7 @@ async def s3_proxy(moto_s3_server, worker_moto_server: MotoWorker) -> AsyncGener
 def host_accelerator():
     """This host's accelerator (AccelType), probed once for each xdist worker. The autouse
     probe-cache reset would make every save and load of a test probe it again (two process spawns)."""
-    return asyncio.run(detect_accel_type())
+    return asyncio.run(detect_accel_type(force_emulation=False))
 
 
 @pytest.fixture
@@ -815,10 +833,12 @@ async def instance_env(
     InstanceManager on a store behind `s3_proxy`, fake VMs whose QMP sockets live under a short
     path, and the bytes each commit saved. The host probes of the manager are replaced: the QEMU
     version (no binary needed) and the accelerator (probed once for the worker)."""
-    from tests.instance_support import InstanceEnv, accelerator_probe, qemu_floor
+    from tests.instance_support import InstanceEnv, accelerator_probe, fake_machine_types, qemu_floor
 
-    monkeypatch.setattr("exec_sandbox.instance.manager.probe_qemu_version", qemu_floor)
-    monkeypatch.setattr("exec_sandbox.instance.manager.detect_accel_type", accelerator_probe(host_accelerator))
+    monkeypatch.setattr("exec_sandbox.instance.manager.require_qemu_version", qemu_floor)
+    monkeypatch.setattr("exec_sandbox.worker_facts.require_qemu_version", qemu_floor)
+    monkeypatch.setattr("exec_sandbox.instance.manager.require_qemu_machine_types", fake_machine_types)
+    monkeypatch.setattr("exec_sandbox.worker_facts.detect_accel_type", accelerator_probe(host_accelerator))
     async with InstanceEnv.open(proxy=s3_proxy, root=short_tmp_dir, tmp=tmp_path) as env:
         yield env
 
@@ -828,6 +848,57 @@ def asyncio_with(**overrides: Any) -> SimpleNamespace:
     "exec_sandbox.<module>.asyncio" with it. Patching "exec_sandbox.<module>.asyncio.sleep"
     replaces asyncio.sleep for the whole process (the event loop, pytest-asyncio)."""
     return SimpleNamespace(**{**vars(asyncio), **overrides})
+
+
+class LoopTimer:
+    """A call_later handle on LoopClock's clock: the session only cancels it."""
+
+    def __init__(self, when: float, callback: Callable[..., object], args: tuple[object, ...]) -> None:
+        self.when, self._callback, self._args = when, callback, args
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def run(self) -> None:
+        if not self.cancelled:
+            self._callback(*self._args)
+
+
+class LoopClock:
+    """The session's loop timers on a test clock, with no real wait: session.py's own
+    `asyncio` name gives a loop whose call_later (the idle deadline) runs on this clock, and
+    every other call goes to the real loop. The loop itself is not patched: its clock and
+    timers stay those of every other task (tests/test_patch_targets.py). Create it before
+    the session: the session arms its deadline at creation."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        real = asyncio.get_running_loop()
+        self._now = 0.0
+        self._timers: list[LoopTimer] = []
+        clock = self
+
+        class _SessionLoop:
+            def call_later(self, delay: float, callback: Callable[..., object], *args: object) -> LoopTimer:
+                timer = LoopTimer(clock._now + delay, callback, args)
+                clock._timers.append(timer)
+                return timer
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(real, name)
+
+        loop = _SessionLoop()
+        monkeypatch.setattr("exec_sandbox.session.asyncio", asyncio_with(get_running_loop=lambda: loop))
+
+    async def advance(self, seconds: float) -> None:
+        """Move the clock `seconds` forward and run the timers that fell due, then give the
+        loop the turns to run the first steps of the task that a timer starts."""
+        self._now += seconds
+        for timer in [t for t in self._timers if t.when <= self._now]:
+            self._timers.remove(timer)
+            timer.run()
+        for _ in range(5):
+            await asyncio.sleep(0)
 
 
 def time_with(**overrides: Any) -> SimpleNamespace:

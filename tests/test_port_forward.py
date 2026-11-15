@@ -13,11 +13,12 @@ from unittest.mock import patch
 
 import pytest
 
+from exec_sandbox import constants
 from exec_sandbox.asset_downloader import get_gvproxy_suffix
 from exec_sandbox.exceptions import ErrorCode, TransientError
 from exec_sandbox.gvproxy import start_gvproxy
 from exec_sandbox.models import ExposedPort, Language, PortMapping
-from exec_sandbox.platform_utils import get_arch_name
+from exec_sandbox.platform_utils import ProcessWrapper, get_arch_name
 from exec_sandbox.port_forward import allocate_ephemeral_ports, resolve_port_mappings
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.scheduler import Scheduler
@@ -339,23 +340,27 @@ class TestGvproxyPortForwardArguments:
         )
         fake.chmod(0o755)
         workdir = SimpleNamespace(gvproxy_socket=short_tmp_dir / "gv.sock")
-        proc, log_task, wait_ready = await start_gvproxy(
-            "vm-ports",
-            allowed_domains=[],
-            language="raw",
-            workdir=workdir,  # type: ignore[arg-type]
-            images_dir=tmp_path,
-            expose_ports=ports,
-            block_outbound=block_outbound,
-            on_process_started=None,
-        )
+        owned: list[tuple[ProcessWrapper, asyncio.Task[None] | None]] = []  # this test owns them from the spawn
         try:
+            _, _, wait_ready = await start_gvproxy(
+                "vm-ports",
+                allowed_domains=[],
+                workdir=workdir,  # type: ignore[arg-type]
+                images_dir=tmp_path,
+                expose_ports=ports,
+                block_outbound=block_outbound,
+                on_process_started=lambda proc, drain: owned.append((proc, drain)),
+            )
             await wait_ready()  # the fake wrote its arguments before its ready line
             return (tmp_path / "args").read_text().splitlines()
         finally:
-            await cleanup_process(proc, "gvproxy", "vm-ports", term_timeout=3.0, kill_timeout=2.0, kill_first=False)
-            log_task.cancel()
-            await asyncio.gather(log_task, return_exceptions=True)
+            if owned:
+                proc, _ = owned[0]
+                await cleanup_process(proc, "gvproxy", "vm-ports", term_timeout=3.0, kill_timeout=2.0, kill_first=False)
+            for _, drain in owned[1:]:
+                if drain is not None:
+                    drain.cancel()
+                    await asyncio.gather(drain, return_exceptions=True)
 
     async def test_forwards_from_the_host_to_the_guest_ip(self, tmp_path: Path, short_tmp_dir: Path) -> None:
         """Each exposed port: host:external to 192.168.127.2:internal (gvproxy's fixed guest IP)."""
@@ -398,6 +403,21 @@ class TestGvproxyPortForwardArguments:
         args = await self._arguments(tmp_path, short_tmp_dir, ports=ports, block_outbound=block_outbound)
 
         assert ("-block-outbound" in args) is block_outbound
+
+    async def test_the_network_constants_are_passed(self, tmp_path: Path, short_tmp_dir: Path) -> None:
+        """gvproxy-wrapper has no network default (its flags are required): the host passes its
+        constants (constants.py), and a forward targets the guest IP among them."""
+        ports = [ExposedPort(internal=8080, external=3000, host="127.0.0.1", protocol="tcp")]
+        args = await self._arguments(tmp_path, short_tmp_dir, ports=ports, block_outbound=False)
+
+        given = {flag: args[args.index(flag) + 1] for flag in ("-subnet", "-gateway-ip", "-gateway-mac", "-mtu")}
+        assert given == {
+            "-subnet": constants.GUEST_NETWORK_SUBNET,
+            "-gateway-ip": constants.GUEST_GATEWAY_IP,
+            "-gateway-mac": constants.GUEST_GATEWAY_MAC,
+            "-mtu": str(constants.GUEST_MTU),
+        }
+        assert json.loads(args[args.index("-port-forward") + 1]) == {"127.0.0.1:3000": f"{constants.GUEST_IP}:8080"}
 
     async def test_no_ports_no_forward(self, tmp_path: Path, short_tmp_dir: Path) -> None:
         """No exposed port: no -port-forward argument."""
@@ -605,7 +625,7 @@ class TestSessionExposedPorts:
         async with await scheduler.new(
             VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)])
         ) as session:
-            ports_before = session.exposed_ports
+            ports_before = list(session.exposed_ports)  # a copy: the property returns the VM's list
             await session.exec("x = 1")
             await session.exec("x = 2")
             await session.exec("x = 3")
@@ -637,7 +657,7 @@ class TestSessionExposedPorts:
         """Exposed ports are still readable after session is closed."""
         session = await scheduler.new(VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)]))
         try:
-            ports_before_close = session.exposed_ports
+            ports_before_close = list(session.exposed_ports)  # a copy: the property returns the VM's list
             assert len(ports_before_close) == 1
             await session.close()
             assert session.exposed_ports == ports_before_close

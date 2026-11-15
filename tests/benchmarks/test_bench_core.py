@@ -171,7 +171,7 @@ async def test_bench_probe_accel_type() -> None:
     probe_cache.reset("kvm")
     probe_cache.reset("hvf")
     probe_cache.reset("qemu_accels")
-    await detect_accel_type()  # always an AccelType (TCG at worst): only its cost is measured
+    await detect_accel_type(force_emulation=False)  # always an AccelType (TCG at worst): only its cost is measured
 
 
 async def test_bench_probe_io_uring() -> None:

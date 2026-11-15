@@ -44,32 +44,13 @@ from exec_sandbox.cgroup import can_contain_processes
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.files.disk import make_private_dir
 from exec_sandbox.platform_utils import HostOS, ProcessWrapper, child_env, detect_host_os
-from exec_sandbox.system_probes import posix_acl_xattr, run_probe
+from exec_sandbox.system_probes import async_cached_probe, posix_acl_xattr, run_probe
 
 # macOS <sys/acl.h>
 _ACL_TYPE_EXTENDED = 0x00000100
 _ACL_FIRST_ENTRY = 0
 
 logger = get_logger(__name__)
-
-# =============================================================================
-# Cache for probes
-# =============================================================================
-
-
-class _ProbeCache:
-    """Container for probe results to avoid global statements."""
-
-    qemu_vm_user: bool | None = None
-    qemu_as_qemu_vm: bool | None = None  # The QEMU identity of this process (one decision)
-
-    def reset(self) -> None:
-        """Forget every result (tests: a probe a test mocked must not stay for the next test)."""
-        self.qemu_vm_user = None
-        self.qemu_as_qemu_vm = None
-
-
-_probe_cache = _ProbeCache()
 
 _AS_QEMU_VM: tuple[str, ...] = ("-u", "qemu-vm", "/bin/sh", "-c", 'umask 007 && exec "$@"', "qemu-vm")
 
@@ -121,19 +102,19 @@ def make_owned_dir(path: Path, *, setting: str) -> None:
         )
 
 
-_CACHE_DIR_SETUP_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOTDIR, errno.ELOOP, errno.EEXIST})
-"""Errors of a cache folder that the same call gets again: no access, a read-only disk, a file
-in its path or in its place, a symlink loop."""
+_FOLDER_SETUP_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOTDIR, errno.ELOOP, errno.EEXIST})
+"""Errors of a folder that the same call gets again: no access, a read-only disk, a file in its
+path or in its place, a symlink loop."""
 
 
-def cache_dir_error(e: OSError, *, path: Path, failure: str, setting: str) -> ConfigError | TransientError:
-    """The error of cache folder `path` (chosen by `setting`) that `failure` names. One the
-    setting fixes (_CACHE_DIR_SETUP_ERRNOS) is ConfigError SETTING_INVALID. Any other is this
-    host's and can pass later (disk full, quota, I/O error, out of file handles):
-    TransientError LOCAL_DISK."""
-    message = f"Cache folder {path} {failure}: {e.strerror or type(e).__name__}"
-    context = {"cache_dir": str(path), "errno": e.errno}
-    if e.errno in _CACHE_DIR_SETUP_ERRNOS:
+def setting_folder_error(e: OSError, *, path: Path, failure: str, setting: str) -> ConfigError | TransientError:
+    """The error of folder `path` (chosen by `setting`: a cache folder, the home disk folder)
+    that `failure` names. One the setting fixes (_FOLDER_SETUP_ERRNOS) is ConfigError
+    SETTING_INVALID. Any other is this host's and can pass later (disk full, quota, I/O error,
+    out of file handles): TransientError LOCAL_DISK."""
+    message = f"Folder {path} {failure}: {e.strerror or type(e).__name__}"
+    context = {"folder": str(path), "errno": e.errno}
+    if e.errno in _FOLDER_SETUP_ERRNOS:
         return ConfigError(
             message,
             code=ErrorCode.SETTING_INVALID,
@@ -156,7 +137,7 @@ def make_cache_dir(path: Path, *, setting: str) -> None:
     try:
         make_owned_dir(path, setting=setting)
     except OSError as e:
-        raise cache_dir_error(e, path=path, failure="cannot be made", setting=setting) from e
+        raise setting_folder_error(e, path=path, failure="cannot be made", setting=setting) from e
 
 
 def private_dir_problem(root: Path, st: os.stat_result, *, forbidden: int) -> tuple[str, str] | None:
@@ -426,22 +407,22 @@ def get_expected_socket_uid(use_qemu_vm_user: bool) -> int:
     return os.getuid()
 
 
+@async_cached_probe("qemu_vm_user", per_qemu_binary=False)
 async def probe_qemu_vm_user() -> bool:
     """Whether the qemu-vm user exists for process isolation (Linux only; cached).
 
     The first call reads the user database (get_qemu_vm_uid) in a worker thread: for a
     missing user, NSS may ask LDAP or SSSD over the network.
     """
-    if _probe_cache.qemu_vm_user is None:
-        exists = detect_host_os() == HostOS.LINUX and await asyncio.to_thread(get_qemu_vm_uid) is not None
-        if exists:
-            logger.info("qemu-vm user available (process isolation enabled)")
-        else:
-            logger.debug("qemu-vm user not found (process isolation disabled)")
-        _probe_cache.qemu_vm_user = exists
-    return _probe_cache.qemu_vm_user
+    exists = detect_host_os() == HostOS.LINUX and await asyncio.to_thread(get_qemu_vm_uid) is not None
+    if exists:
+        logger.info("qemu-vm user available (process isolation enabled)")
+    else:
+        logger.debug("qemu-vm user not found (process isolation disabled)")
+    return exists
 
 
+@async_cached_probe("qemu_as_qemu_vm", per_qemu_binary=False)
 async def probe_qemu_as_qemu_vm() -> bool:
     """Whether this process runs QEMU as qemu-vm: one decision per process, cached.
 
@@ -459,23 +440,15 @@ async def probe_qemu_as_qemu_vm() -> bool:
     Else every VM of this process runs QEMU as this user, with one warning when the
     qemu-vm user exists. A process never mixes the two identities.
     """
-    if _probe_cache.qemu_as_qemu_vm is not None:
-        return _probe_cache.qemu_as_qemu_vm
     if not await probe_qemu_vm_user():  # Linux only
-        decision, problem = False, None
-    elif os.geteuid() == get_qemu_vm_uid():
-        decision, problem = False, None  # QEMU already runs as qemu-vm: no sudo
-    else:
-        problem = await _qemu_vm_path_problem()
-        decision = problem is None
-    # First finished probe wins: concurrent callers get one answer and one log line.
-    if _probe_cache.qemu_as_qemu_vm is None:
-        _probe_cache.qemu_as_qemu_vm = decision
-        if decision:
-            logger.info("QEMU runs as qemu-vm")
-        elif problem is not None:
-            logger.warning(f"QEMU runs as this user, not as qemu-vm (less isolation): {problem}")
-    return _probe_cache.qemu_as_qemu_vm
+        return False
+    if os.geteuid() == get_qemu_vm_uid():
+        return False  # QEMU already runs as qemu-vm: no sudo
+    if (problem := await _qemu_vm_path_problem()) is not None:
+        logger.warning(f"QEMU runs as this user, not as qemu-vm (less isolation): {problem}")
+        return False
+    logger.info("QEMU runs as qemu-vm")
+    return True
 
 
 def _read_passwd() -> str:
@@ -595,7 +568,7 @@ async def _qemu_vm_path_problem() -> str | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-    except (OSError, TimeoutError) as e:
+    except OSError as e:  # TimeoutError too
         return f"`sudo -n -u qemu-vm` could not run ({e}); add `<user> ALL=(qemu-vm) NOPASSWD: ALL` to sudoers"
     lines = stdout.decode(errors="replace").split()
     if returncode != 0 or len(lines) != 2 or not all(line.isdigit() for line in lines):  # noqa: PLR2004
@@ -622,7 +595,7 @@ async def _qemu_vm_path_problem() -> str | None:
                 returncode, _, _ = await run_probe(
                     ("sudo", "-n", *run), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
                 )
-            except (OSError, TimeoutError):
+            except OSError:  # TimeoutError too
                 returncode = None
             if returncode != 0:
                 return f"`sudo -n {command}` as root does not work; add the sudoers lines of the README"
@@ -632,7 +605,7 @@ async def _qemu_vm_path_problem() -> str | None:
 
 
 # =============================================================================
-# ACL Operations (Linux only, no-op on macOS)
+# ACL Operations (Linux; on macOS setfacl is missing and they return False)
 # =============================================================================
 
 
@@ -708,7 +681,8 @@ def get_mode(path: Path) -> int | None:
         path: File or directory path
 
     Returns:
-        Mode bits as integer, or None if file doesn't exist
+        st_mode of `path` (file type and mode bits; links followed), or None when it cannot
+        be read (missing, no access)
     """
     try:
         return path.stat().st_mode
@@ -821,7 +795,8 @@ _ERRORS_KEPT_BYTES: Final = 1024
 @dataclass(frozen=True)
 class SudoErrors:
     """Where a sudo rm writes its stderr (sudo_errors_file): `file`, or None when none could
-    be made; `problem`, why its text may be missing ("" when its first KiB is reserved)."""
+    be made; `problem`, why its text may be missing ("" when its first KiB is reserved, or off
+    Linux, where no reserve is tried)."""
 
     file: BinaryIO | None
     problem: str
@@ -906,7 +881,7 @@ def _keep(path: str, processes: list[psutil.Process]) -> None:
     _left_rm.setdefault(path, []).extend(kept)
 
 
-def _sudo_children(pid: int | None) -> list[psutil.Process]:
+def _sudo_children(pid: int) -> list[psutil.Process]:
     """What sudo `pid` started, at every level (the root rm), or none when sudo ended or
     cannot be read."""
     try:
@@ -915,7 +890,7 @@ def _sudo_children(pid: int | None) -> list[psutil.Process]:
         return []
 
 
-def _sudo_and_children(pid: int | None) -> list[psutil.Process]:
+def _sudo_and_children(pid: int) -> list[psutil.Process]:
     """sudo and what it started, for a sudo_rm that was cancelled before its end."""
     try:
         return [psutil.Process(pid), *_sudo_children(pid)]

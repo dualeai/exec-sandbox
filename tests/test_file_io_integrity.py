@@ -210,14 +210,15 @@ class TestFileIoBasicOperations:
         assert sorted((e.name, e.is_dir, e.size) for e in entries) == [("a.txt", False, 3), ("b.txt", False, 2)]
 
     async def test_overwrite_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Overwriting a file replaces its content entirely."""
+        """Overwriting a file replaces its content entirely: a shorter new content leaves no
+        byte of the old one (no in-place write without truncation)."""
         dest = tmp_path / "overwrite.txt"
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("overwrite.txt", b"first version")
-            await session.write_file("overwrite.txt", b"second version")
+            await session.write_file("overwrite.txt", b"first, longer version")
+            await session.write_file("overwrite.txt", b"second")
             await session.read_file("overwrite.txt", destination=dest)
 
-        assert dest.read_bytes() == b"second version"
+        assert dest.read_bytes() == b"second"
 
     async def test_make_executable(self, scheduler: Scheduler) -> None:
         """File written with make_executable=True can be executed."""

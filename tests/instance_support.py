@@ -32,16 +32,28 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import exec_sandbox.instance.manager as instance_manager
 from exec_sandbox import constants
+from exec_sandbox.admission import budget_need
+from exec_sandbox.dns_filter import resolved_domains
+from exec_sandbox.exceptions import ConfigError, ErrorCode, RouteKey
 from exec_sandbox.images import image_digest
-from exec_sandbox.instance.codec import BLOCK_BYTES
-from exec_sandbox.instance.head import seal_head
+from exec_sandbox.instance.codec import BLOCK_BYTES, NONCE_BYTES
+from exec_sandbox.instance.head import MAGIC, canonical_json, seal_head
 from exec_sandbox.instance.ids import new_id
 from exec_sandbox.instance.keyring import KEY_BYTES, Key, Keyring, wrap_data_key
-from exec_sandbox.instance.manager import InstanceManager
-from exec_sandbox.instance.models import RECENT_COMMITS, ChainEntry, HeadBody, HeadHeader, HostFacts, RecentCommit
+from exec_sandbox.instance.manager import AssetCache, InstanceManager
+from exec_sandbox.instance.models import (
+    RECENT_COMMITS,
+    ChainEntry,
+    GuestFacts,
+    HeadBody,
+    HeadHeader,
+    HostFacts,
+    RecentCommit,
+)
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import Applied
 from exec_sandbox.models import ExecutionResult, Language, StartupTiming, TimingBreakdown
@@ -51,11 +63,21 @@ from exec_sandbox.vm_types import AccelType, VmState
 
 if TYPE_CHECKING:
     import random
-    from collections.abc import AsyncGenerator, Awaitable, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 
+    from exec_sandbox.admission import ResourceAdmissionController
     from exec_sandbox.instance.manager import InstanceState
     from exec_sandbox.instance.store import InstanceStore
     from tests.s3_faults import Bucket, S3Proxy
+
+FAKE_MACHINE_TYPE = "virt-11.0"
+"""The machine type the fake QEMU of a test runs (FakeVm.machine_type)."""
+FAKE_LAYOUT = "-M virt memory-backend=mem0\n-device virtio-blk-device drive=hd0 serial=base"
+"""Device layout of a fake VM's QEMU command (HostFacts.device_layout; FakeVmManager.restore_layout)."""
+FAKE_KERNEL = "1" * 64
+"""Digest of the kernel a fake VM booted (GuestFacts.kernel)."""
+FAKE_INITRAMFS = "2" * 64
+"""Digest of the initramfs a fake VM booted (GuestFacts.initramfs)."""
 
 BLOCK = BLOCK_BYTES
 """Block size of instance streams (64 KiB): the unit a pack stores."""
@@ -293,9 +315,14 @@ class FakeVm:
         self.spec = spec
         self.base_image = base_image
         self.packages_image: Path | None = None
-        # The digests VmManager records when QEMU opens the images (InstanceManager._host_facts)
+        # The digests VmManager records when QEMU opens the images (InstanceManager._guest_facts)
         self.base_image_digest: str | None = image_digest(base_image)
         self.packages_image_digest: str | None = None
+        self.device_layout: str | None = FAKE_LAYOUT  # QemuVM.device_layout
+        self.kernel_digest: str | None = FAKE_KERNEL  # the files of its (fake) boot
+        self.initramfs_digest: str | None = FAKE_INITRAMFS
+        self.machine_type: str | None = FAKE_MACHINE_TYPE  # QemuVM.machine_type: the type the fake QEMU runs
+        self.egress_domains = resolved_domains(spec.allowed_domains, spec.language)  # as VmManager sets it
         self.use_qemu_vm_user = False
         self.cgroup = None  # no memory cgroup (QemuVM.cgroup)
         self.workdir = SimpleNamespace(home_disk=root / "home.img")
@@ -347,18 +374,47 @@ class FakeVm:
         )
 
 
+BUDGET_KEYS = (RouteKey.MEMORY_MB, RouteKey.CPU)
+"""The route keys of a worker's budget: FakeVmManager without a budget has no limit (None)."""
+
+
 class FakeVmManager:
-    """What InstanceManager and Session use of VmManager: settings, the local base image, destroy_vm."""
+    """What InstanceManager and Session use of VmManager: settings, the local base image, the
+    budget check, destroy_vm."""
 
     def __init__(self, *, base_image: Path | None) -> None:
         self.settings = SimpleNamespace(force_emulation=False)
         self.base_image = base_image
         """The worker's own base image; None: this worker lacks it (a load fetches it by digest)."""
         self.images = SimpleNamespace(base_image=self._base_image)  # VmManager.images (GuestImages)
+        self.budget: ResourceAdmissionController | None = None
+        """The admission budget check_fits compares with; None: no limit."""
+        self.layout = FAKE_LAYOUT
+        """The device layout a restore would run here (restore_layout)."""
+        self.layout_calls: list[tuple[VmSpec, str | None, bool]] = []
+        """The arguments of each restore_layout call."""
+
+    async def restore_layout(self, spec: VmSpec, *, machine_type: str | None, packages: bool) -> str:
+        self.layout_calls.append((spec, machine_type, packages))
+        return self.layout
+
+    async def check_fits(
+        self, spec: VmSpec, *, vm_id: str, target: Mapping[RouteKey, str]
+    ) -> tuple[dict[RouteKey, str], dict[RouteKey, str | None]]:
+        use_tcg = self.settings.force_emulation  # as VmManager.check_fits: TCG adds its translation cache
+        if self.budget is not None:
+            return self.budget.check_fits(vm_id, spec.memory_mb, spec.cpu_cores, use_tcg=use_tcg, target=target)
+        return budget_need(spec.memory_mb, spec.cpu_cores, use_tcg=use_tcg), dict.fromkeys(BUDGET_KEYS)
 
     def _base_image(self, language: object) -> Path:
-        if self.base_image is None:
-            raise FileNotFoundError(f"no base image for {language} on this worker")
+        if self.base_image is None:  # as GuestImages.base_image: ASSET_NOT_FOUND
+            raise ConfigError(
+                f"no base image for {language} on this worker",
+                code=ErrorCode.ASSET_NOT_FOUND,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
         return self.base_image
 
     async def destroy_vm(self, vm: FakeVm) -> bool:
@@ -410,6 +466,21 @@ async def no_packages(_spec: VmSpec) -> Path | None:
     return None
 
 
+async def fake_machine_types() -> dict[str, str]:
+    """Stand-in for the machine-type probe: the type the fake QEMU runs, and its alias."""
+    return {FAKE_MACHINE_TYPE: FAKE_MACHINE_TYPE, "virt": FAKE_MACHINE_TYPE}
+
+
+def qemu_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A file at the QEMU path of both variables: an error that names this worker's QEMU sees
+    a binary, on a host without QEMU too."""
+    binary = tmp_path / "qemu-system"
+    binary.write_bytes(b"")
+    for variable in ("EXEC_SANDBOX_QEMU_BIN_X86", "EXEC_SANDBOX_QEMU_BIN_ARM"):
+        monkeypatch.setenv(variable, str(binary))
+    return binary
+
+
 async def qemu_floor() -> tuple[int, int, int]:
     """Stand-in for the QEMU version probe: the fake VM needs no QEMU binary."""
     return constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION
@@ -452,7 +523,14 @@ def head_header(
 
 
 async def seed_instance(
-    store: InstanceStore, scratch: Path, *, instance_id: str, keyring: str, spec: VmSpec, host: HostFacts
+    store: InstanceStore,
+    scratch: Path,
+    *,
+    instance_id: str,
+    keyring: str,
+    spec: VmSpec,
+    host: HostFacts,
+    guest: GuestFacts,
 ) -> None:
     """What a first save stores: one full copy and a head sealed with the newest key of `keyring`.
     The key layout is written out here, not taken from store.py."""
@@ -472,10 +550,29 @@ async def seed_instance(
     body = HeadBody(
         spec=spec,
         host=host,
-        chain=(ChainEntry(commit_id=commit_id, kind="full", size=1000, stream_sizes=(0, 0), etag=etag),),
+        guest=guest,
+        egress_domains=resolved_domains(spec.allowed_domains, spec.language),
+        chain=(
+            ChainEntry(
+                commit_id=commit_id, kind="full", size=1000, stream_sizes=(0, 0), etag=etag, block_bytes=BLOCK_BYTES
+            ),
+        ),
     )
     head = seal_head(header=header, body=body, data_key=data_key)
     assert isinstance(await store.put_if_absent(f"s/{instance_id}/head", data=head), Applied)
+
+
+def seal_foreign_head(*, kek: Key, instance_id: str, header_fields: dict[str, object], body_json: bytes) -> bytes:
+    """Head bytes as another release could write them: the real envelope and sealing, with
+    header fields and a body this release may not parse."""
+    data_key = os.urandom(KEY_BYTES)
+    header = head_header(
+        instance_id=instance_id, generation=1, commit_id=new_id(), older=(), kek=kek, data_key=data_key
+    )
+    header_bytes = canonical_json({**header.model_dump(mode="json"), **header_fields})
+    prefix = MAGIC + len(header_bytes).to_bytes(4, "big") + header_bytes
+    nonce = os.urandom(NONCE_BYTES)
+    return prefix + nonce + AESGCM(data_key).encrypt(nonce, body_json, prefix)
 
 
 _DISK_FULL_SEAMS = {"clone": "clone_sparse", "seal": "write_object"}
@@ -578,7 +675,7 @@ class InstanceEnv:
             store=self.store,
             keyring=Keyring.parse(keyring),
             work_dir=work_dir,
-            asset_dir=asset_dir,
+            assets=AssetCache(asset_dir, setting="instance_asset_dir"),
             vm_manager=vm_manager,  # type: ignore[arg-type]
         )
         self.managers.append(manager)
@@ -631,8 +728,9 @@ class InstanceEnv:
         return state
 
     def work_files(self) -> set[Path]:
-        """Every file and folder in the managers' work and asset folders."""
-        return set(self.work_dir.rglob("*")) | set(self.asset_dir.rglob("*"))
+        """Every file and folder in the managers' work and asset folders, but the lock files of
+        the asset cache (files.locks: made at the first use of an entry, never deleted)."""
+        return set(self.work_dir.rglob("*")) | {path for path in self.asset_dir.rglob("*") if path.suffix != ".lock"}
 
 
 class Saver:
