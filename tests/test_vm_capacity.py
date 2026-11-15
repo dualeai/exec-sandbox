@@ -241,6 +241,10 @@ async def test_admission_released_on_create_failure(capacity_vm_manager: VmManag
     back once. The attempts follow each other with no pause."""
     failure = TransientError("mock failure", code=ErrorCode.OVERLAY_FAILED, context=None, hint=None, instance_id=None)
     no_pause = dataclasses.replace(constants.RETRY_USER_FACING, retry_min_seconds=0.0, retry_max_seconds=0.0)
+    # start() makes the overlay templates in the background, through the same method: they
+    # end first, so the patch counts the boot attempts only
+    if (templates := capacity_vm_manager._templates_task) is not None:  # pyright: ignore[reportPrivateUsage]
+        await templates
     with patch.object(QemuStorageDaemon, "create_overlay", AsyncMock(side_effect=failure)) as attempt:
         with pytest.raises(TransientError, check=lambda e: e is failure):
             await capacity_vm_manager.create_vm(
