@@ -12,7 +12,8 @@ use std::collections::HashMap;
 
 /// A host request, tagged by `action`. The host models are in
 /// src/exec_sandbox/guest_agent_protocol.py. connection.rs reads the top-level
-/// `op_id` and `host_time_ns` from the raw JSON before this parse.
+/// `op_id` and `host_time_ns` from the raw JSON before this parse. The host
+/// sends every field that is not null (request_line), so none has a default here.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
 pub(crate) enum GuestCommand {
@@ -32,9 +33,7 @@ pub(crate) enum GuestCommand {
         language: Language,
         code: String,
         /// Seconds, at most MAX_TIMEOUT_SECONDS; 0 means MAX_TIMEOUT_SECONDS.
-        #[serde(default)]
         timeout: u64,
-        #[serde(default)]
         env_vars: HashMap<String, String>,
     },
 
@@ -42,7 +41,6 @@ pub(crate) enum GuestCommand {
     WriteFile {
         op_id: String,
         path: String,
-        #[serde(default)]
         make_executable: bool,
     },
 
@@ -59,10 +57,7 @@ pub(crate) enum GuestCommand {
     FileEnd { op_id: String },
 
     #[serde(rename = "list_files")]
-    ListFiles {
-        #[serde(default)]
-        path: String,
-    },
+    ListFiles { path: String },
 
     #[serde(rename = "warm_repl")]
     WarmRepl { language: Language },
@@ -113,7 +108,6 @@ pub(crate) enum GuestResponse {
 
     #[serde(rename = "warm_repl_ack")]
     WarmReplAck {
-        language: Language,
         status: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
@@ -226,16 +220,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_list_files_default_path() {
-        let json = r#"{"action":"list_files"}"#;
-        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            GuestCommand::ListFiles { path } => assert_eq!(path, ""),
-            _ => panic!("Expected ListFiles"),
-        }
-    }
-
-    #[test]
     fn test_deserialize_write_file_executable() {
         let json =
             r#"{"action":"write_file","op_id":"xyz","path":"run.sh","make_executable":true}"#;
@@ -297,15 +281,18 @@ mod tests {
     // Response serialization
     // -------------------------------------------------------------------------
 
+    // Each response as a whole JSON value (field names and values): the host's models read
+    // these names (src/exec_sandbox/guest_agent_protocol.py)
     #[test]
     fn test_serialize_file_write_ack() {
         let ack = GuestResponse::FileWriteAck {
             path: "test.txt".to_string(),
             bytes_written: 42,
         };
-        let json = serde_json::to_string(&ack).unwrap();
-        assert!(json.contains("\"type\":\"file_write_ack\""));
-        assert!(json.contains("\"bytes_written\":42"));
+        assert_eq!(
+            serde_json::to_value(&ack).unwrap(),
+            serde_json::json!({"type": "file_write_ack", "path": "test.txt", "bytes_written": 42})
+        );
     }
 
     #[test]
@@ -313,8 +300,10 @@ mod tests {
         let chunk = GuestResponse::FileChunk {
             data: "SGVsbG8=".to_string(),
         };
-        let json = serde_json::to_string(&chunk).unwrap();
-        assert!(json.contains("\"type\":\"file_chunk\""));
+        assert_eq!(
+            serde_json::to_value(&chunk).unwrap(),
+            serde_json::json!({"type": "file_chunk", "data": "SGVsbG8="})
+        );
     }
 
     #[test]
@@ -323,9 +312,10 @@ mod tests {
             path: "data.csv".to_string(),
             size: 1024,
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"file_read_complete\""));
-        assert!(json.contains("\"size\":1024"));
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap(),
+            serde_json::json!({"type": "file_read_complete", "path": "data.csv", "size": 1024})
+        );
     }
 
     #[test]
@@ -344,8 +334,12 @@ mod tests {
                 },
             ],
         };
-        let json = serde_json::to_string(&list).unwrap();
-        assert!(json.contains("\"type\":\"file_list\""));
-        assert!(json.contains("\"file.txt\""));
+        assert_eq!(
+            serde_json::to_value(&list).unwrap(),
+            serde_json::json!({"type": "file_list", "entries": [
+                {"name": "file.txt", "is_dir": false, "size": 100},
+                {"name": "subdir", "is_dir": true, "size": 0},
+            ]})
+        );
     }
 }

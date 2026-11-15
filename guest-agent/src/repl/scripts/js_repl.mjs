@@ -65,9 +65,11 @@ Bun.write = function write(dest, ...args) {
 // native console writes directly to fd 1 via syscall, outside the Node.js
 // stream layer, with no order against the marker.
 const sandboxConsole = new Console({ stdout: process.stdout, stderr: process.stderr });
-// Proxy intercepts stdin access on process, forwarding everything else.
-// set trap prevents user code from corrupting the real process object.
-const sandboxProcess = new Proxy(process, {
+// One Proxy handler for process and Bun: it intercepts stdin access, forwarding
+// everything else; its set trap keeps user code from replacing the real stdin.
+// Bun needs it too: else user code could bypass the process.stdin redirect via
+// Bun.stdin.stream().
+const noStdin = {
     get(target, prop) {
         if (prop === 'stdin') return nullStdin;
         const val = target[prop];
@@ -78,21 +80,9 @@ const sandboxProcess = new Proxy(process, {
         target[prop] = value;
         return true;
     }
-});
-// Also proxy Bun to intercept Bun.stdin — without this, user code could
-// bypass the process.stdin redirect via Bun.stdin.stream().
-const sandboxBun = new Proxy(Bun, {
-    get(target, prop) {
-        if (prop === 'stdin') return nullStdin;
-        const val = target[prop];
-        return typeof val === 'function' ? val.bind(target) : val;
-    },
-    set(target, prop, value) {
-        if (prop === 'stdin') return true;
-        target[prop] = value;
-        return true;
-    }
-});
+};
+const sandboxProcess = new Proxy(process, noStdin);
+const sandboxBun = new Proxy(Bun, noStdin);
 // VM context globals: createContext() only provides ECMAScript built-ins
 // (Object, Array, Math, Promise, etc.). All Web API and Node/Bun globals
 // must be passed explicitly — they are NOT auto-injected.

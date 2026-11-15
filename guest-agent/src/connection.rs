@@ -207,15 +207,14 @@ enum WriteFinish {
 
 /// Send the end marker of a pipelined write and wait for its writer task, at
 /// most `limit`. Past it, the write is abandoned, unless the task claimed the
-/// commit first: then its rename is on its way, and its result is
-/// awaited at most `commit_limit` more, so a stalled disk never stops the
-/// agent, which reads one command at a time.
+/// commit first: then its rename is on its way, and its result is awaited at
+/// most `limit` more, so a stalled disk never stops the agent, which reads one
+/// command at a time.
 async fn finish_write(
     chunk_tx: mpsc::Sender<Vec<u8>>,
     mut task: tokio::task::JoinHandle<Result<usize, String>>,
     end: &WriteEnd,
     limit: Duration,
-    commit_limit: Duration,
 ) -> WriteFinish {
     let finish = async {
         let _ = chunk_tx.send(vec![]).await;
@@ -225,11 +224,27 @@ async fn finish_write(
     match tokio::time::timeout(limit, finish).await {
         Ok(finished) => WriteFinish::Done(finished),
         Err(_) if end.try_abandon() => WriteFinish::Abandoned,
-        Err(_) => match tokio::time::timeout(commit_limit, task).await {
+        Err(_) => match tokio::time::timeout(limit, task).await {
             Ok(finished) => WriteFinish::Done(finished),
             Err(_) => WriteFinish::CommitStalled,
         },
     }
+}
+
+/// The io_error message of a write whose task ended without its file
+/// (`ended`, logged): the task's message, or its join error.
+fn write_error(
+    ended: Result<Result<usize, String>, tokio::task::JoinError>,
+    path_display: &str,
+    op_id: &str,
+) -> String {
+    let message = match ended {
+        Ok(Err(message)) => message,
+        Ok(Ok(_)) => format!("Write pipeline unexpectedly closed for '{path_display}'"),
+        Err(join_err) => format!("Internal error writing '{path_display}': {join_err}"),
+    };
+    log_error!("Write pipeline error for '{path_display}' (op_id={op_id}): {message}");
+    message
 }
 
 /// Report a command-handler outcome on the dispatch loop.
@@ -352,10 +367,13 @@ pub(crate) async fn handle_connection(
         // Step the wall clock forward to the host's before any user code reads it.
         crate::clock::sync(host_time_ns);
 
-        // Reseed kernel CRNG before every command dispatch (~11μs).
+        // Reseed kernel CRNG before each command dispatch (~11μs).
         // After L1 snapshot restore the VM resumes mid-loop with cloned CRNG;
-        // this forces divergence before any user code calls getrandom().
-        crate::reseed_crng();
+        // this forces divergence before any user code calls getrandom(). A
+        // file chunk is never first: its write_file reseeded already.
+        if !matches!(cmd, GuestCommand::FileChunk { .. }) {
+            crate::reseed_crng();
+        }
 
         let writer = ResponseWriter::new(write_tx.clone(), op_id);
 
@@ -385,7 +403,6 @@ pub(crate) async fn handle_connection(
                 };
                 if writer
                     .send(&GuestResponse::WarmReplAck {
-                        language,
                         status: status.to_string(),
                         message,
                     })
@@ -501,7 +518,7 @@ pub(crate) async fn handle_connection(
                 }
             }
             GuestCommand::FileChunk { op_id, data } => {
-                if !active_writes.contains_key(&op_id) {
+                let Some(handle) = active_writes.get(&op_id) else {
                     let _ = writer
                         .send_error(
                             format!("No active write for op_id '{op_id}'"),
@@ -509,20 +526,18 @@ pub(crate) async fn handle_connection(
                         )
                         .await;
                     continue;
-                }
+                };
                 let decoded = match BASE64.decode(&data) {
                     Ok(d) => d,
                     Err(e) => {
-                        let handle = active_writes.remove(&op_id).unwrap();
-                        drop(handle.chunk_tx);
+                        let message = format!(
+                            "Invalid base64 in chunk for '{}': {}",
+                            handle.path_display, e
+                        );
+                        // Its chunk_tx goes: the task ends, and removes its temporary file
+                        active_writes.remove(&op_id);
                         let _ = writer
-                            .send_error(
-                                format!(
-                                    "Invalid base64 in chunk for '{}': {}",
-                                    handle.path_display, e
-                                ),
-                                ErrorType::Protocol.as_str(),
-                            )
+                            .send_error(message, ErrorType::Protocol.as_str())
                             .await;
                         continue;
                     }
@@ -534,15 +549,12 @@ pub(crate) async fn handle_connection(
                 }
                 // Bounded: a writer stuck on the disk must not stop the agent,
                 // which reads one command at a time.
-                let sent = {
-                    let handle = active_writes.get(&op_id).unwrap();
-                    tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.chunk_tx.send(decoded)).await
-                };
-                if sent.is_err() {
+                let sent =
+                    tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.chunk_tx.send(decoded)).await;
+                let Ok(sent) = sent else {
+                    // No end marker went to the task: it never commits, and
+                    // the drop of its chunk_tx ends it
                     let handle = active_writes.remove(&op_id).unwrap();
-                    // No end marker went to the task: it cannot be committing
-                    let abandoned = handle.end.try_abandon();
-                    debug_assert!(abandoned, "a write with no end marker cannot commit");
                     log_error!(
                         "Write of '{}' (op_id={op_id}) took no chunk in {FILE_WRITE_STALL_TIMEOUT_SECONDS}s, abandoned",
                         handle.path_display
@@ -557,59 +569,26 @@ pub(crate) async fn handle_connection(
                         )
                         .await;
                     continue;
-                }
-                if let Ok(Err(_closed)) = sent {
+                };
+                if sent.is_err() {
                     // The writer task ended early (an I/O error): it holds the reason.
                     let handle = active_writes.remove(&op_id).unwrap();
                     drop(handle.chunk_tx);
                     // Bounded: its end removes the temporary file, which a stalled disk
                     // can hold; the write failed either way (no end marker)
-                    let Ok(ended) = tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.task).await
-                    else {
-                        log_error!(
-                            "Write of '{}' (op_id={op_id}) failed, and its cleanup did not end in {FILE_WRITE_STALL_TIMEOUT_SECONDS}s",
-                            handle.path_display
-                        );
-                        let _ = writer
-                            .send_error(
-                                format!("Write of '{}' failed", handle.path_display),
-                                ErrorType::Io.as_str(),
-                            )
-                            .await;
-                        continue;
-                    };
-                    match ended {
-                        Ok(Err(message)) => {
+                    let message = match tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.task).await
+                    {
+                        // With no end marker, the task ends with an error only
+                        Ok(ended) => write_error(ended, &handle.path_display, &op_id),
+                        Err(_) => {
                             log_error!(
-                                "Write pipeline error for '{}' (op_id={op_id}): {message}",
+                                "Write of '{}' (op_id={op_id}) failed, and its cleanup did not end in {FILE_WRITE_STALL_TIMEOUT_SECONDS}s",
                                 handle.path_display
                             );
-                            let _ = writer.send_error(message, ErrorType::Io.as_str()).await;
+                            format!("Write of '{}' failed", handle.path_display)
                         }
-                        Ok(Ok(_)) => {
-                            let _ = writer
-                                .send_error(
-                                    format!(
-                                        "Write pipeline unexpectedly closed for '{}'",
-                                        handle.path_display
-                                    ),
-                                    ErrorType::Io.as_str(),
-                                )
-                                .await;
-                        }
-                        Err(join_err) => {
-                            let _ = writer
-                                .send_error(
-                                    format!(
-                                        "Internal error writing '{}': {}",
-                                        handle.path_display, join_err
-                                    ),
-                                    ErrorType::Io.as_str(),
-                                )
-                                .await;
-                        }
-                    }
-                    continue;
+                    };
+                    let _ = writer.send_error(message, ErrorType::Io.as_str()).await;
                 }
             }
             GuestCommand::FileEnd { op_id } => {
@@ -630,15 +609,7 @@ pub(crate) async fn handle_connection(
                         continue;
                     }
                 };
-                let finished = match finish_write(
-                    chunk_tx,
-                    task,
-                    &end,
-                    WRITE_STALL_TIMEOUT,
-                    WRITE_STALL_TIMEOUT,
-                )
-                .await
-                {
+                let finished = match finish_write(chunk_tx, task, &end, WRITE_STALL_TIMEOUT).await {
                     WriteFinish::Done(finished) => finished,
                     WriteFinish::Abandoned => {
                         log_error!(
@@ -664,33 +635,20 @@ pub(crate) async fn handle_connection(
                         continue;
                     }
                 };
-                match finished {
-                    Ok(Ok(bytes_written)) => {
-                        if writer
-                            .send(&GuestResponse::FileWriteAck {
-                                path: path_display,
-                                bytes_written,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break Err("write queue closed".into());
-                        }
+                if let Ok(Ok(bytes_written)) = finished {
+                    if writer
+                        .send(&GuestResponse::FileWriteAck {
+                            path: path_display,
+                            bytes_written,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break Err("write queue closed".into());
                     }
-                    Ok(Err(message)) => {
-                        log_error!(
-                            "Write pipeline error for '{path_display}' (op_id={op_id}): {message}"
-                        );
-                        let _ = writer.send_error(message, ErrorType::Io.as_str()).await;
-                    }
-                    Err(join_err) => {
-                        let _ = writer
-                            .send_error(
-                                format!("Internal error writing '{}': {}", path_display, join_err),
-                                ErrorType::Io.as_str(),
-                            )
-                            .await;
-                    }
+                } else {
+                    let message = write_error(finished, &path_display, &op_id);
+                    let _ = writer.send_error(message, ErrorType::Io.as_str()).await;
                 }
             }
             GuestCommand::ReadFile { op_id, path } => {
@@ -892,13 +850,7 @@ mod tests {
 
         let finished = tokio::time::timeout(
             Duration::from_secs(2),
-            finish_write(
-                chunk_tx,
-                task,
-                &end,
-                Duration::from_millis(50),
-                Duration::from_millis(50),
-            ),
+            finish_write(chunk_tx, task, &end, Duration::from_millis(50)),
         )
         .await
         .expect("finish_write must give up at its limit");
@@ -916,19 +868,13 @@ mod tests {
         let (chunk_tx, _chunk_rx) = mpsc::channel::<Vec<u8>>(16);
         let end = WriteEnd::new();
         assert!(end.try_commit());
+        // Done in the second wait: 750 ms, between the limit (500 ms) and twice it
         let task = tokio::task::spawn_blocking(move || {
-            std::thread::sleep(Duration::from_millis(200)); // the rename, slow
+            std::thread::sleep(Duration::from_millis(750)); // the rename, slow
             Ok(2)
         });
 
-        let finished = finish_write(
-            chunk_tx,
-            task,
-            &end,
-            Duration::from_millis(50),
-            Duration::from_secs(10),
-        )
-        .await;
+        let finished = finish_write(chunk_tx, task, &end, Duration::from_millis(500)).await;
 
         let WriteFinish::Done(Ok(Ok(bytes_written))) = finished else {
             panic!("a committed write is not abandoned");
@@ -939,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn finish_write_gives_up_on_a_commit_that_stalls() {
         // The task claimed the commit, then its rename never ends (a stalled disk):
-        // past both limits the agent goes on and says the write may still land.
+        // past both waits the agent goes on and says the write may still land.
         let (chunk_tx, _chunk_rx) = mpsc::channel::<Vec<u8>>(16);
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let end = WriteEnd::new();
@@ -951,16 +897,10 @@ mod tests {
 
         let finished = tokio::time::timeout(
             Duration::from_secs(2),
-            finish_write(
-                chunk_tx,
-                task,
-                &end,
-                Duration::from_millis(50),
-                Duration::from_millis(50),
-            ),
+            finish_write(chunk_tx, task, &end, Duration::from_millis(50)),
         )
         .await
-        .expect("finish_write must give up at its second limit");
+        .expect("finish_write must give up at the end of its second wait");
 
         assert!(matches!(finished, WriteFinish::CommitStalled));
         release_tx.send(()).unwrap();
@@ -975,14 +915,7 @@ mod tests {
         });
         let end = WriteEnd::new();
 
-        let finished = finish_write(
-            chunk_tx,
-            task,
-            &end,
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-        )
-        .await;
+        let finished = finish_write(chunk_tx, task, &end, Duration::from_secs(2)).await;
 
         let WriteFinish::Done(Ok(Ok(bytes_written))) = finished else {
             panic!("the task finished");
@@ -1030,8 +963,10 @@ mod tests {
 
     #[test]
     fn op_id_from_file_command() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"action":"write_file","op_id":"abc","path":"x"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"action":"write_file","op_id":"abc","path":"x","make_executable":false}"#,
+        )
+        .unwrap();
         assert_eq!(extract_op_id(&v), Some("abc".into()));
         // Also verify the command still deserializes correctly
         let cmd: GuestCommand = serde_json::from_value(v).unwrap();

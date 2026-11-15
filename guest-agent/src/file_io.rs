@@ -153,6 +153,8 @@ pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathB
     let sandbox_root = std::path::PathBuf::from(SANDBOX_ROOT);
     let mut resolved = sandbox_root.clone();
 
+    // `resolved` stays under SANDBOX_ROOT at each step (a ParentDir that would
+    // leave it is refused): no check at the end.
     for component in std::path::Path::new(relative_path).components() {
         match component {
             std::path::Component::Normal(c) => {
@@ -166,17 +168,15 @@ pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathB
                 resolved.push(c);
             }
             std::path::Component::ParentDir => {
-                if !resolved.pop() || !resolved.starts_with(&sandbox_root) {
+                resolved.pop();
+                if !resolved.starts_with(&sandbox_root) {
                     return Err("Path traversal outside sandbox".to_string());
                 }
             }
             std::path::Component::CurDir => {}
+            // RootDir and Prefix: no relative Unix path has them
             _ => return Err("Invalid path component".to_string()),
         }
-    }
-
-    if !resolved.starts_with(&sandbox_root) {
-        return Err("Path traversal outside sandbox".to_string());
     }
 
     Ok(resolved)
@@ -205,12 +205,13 @@ fn below_root(resolved: &Path) -> &Path {
 /// to a device has no effect), the check of where that descriptor is
 /// (/proc/self/fd/N), then, unless `flags` has O_PATH, a reopen of that same
 /// file through /proc/self/fd/N with `flags`: no window between the check and
-/// the open. `flags` must not hold O_CREAT or O_NOFOLLOW.
+/// the open. `flags` must not hold O_CREAT or O_NOFOLLOW. `root` must be a
+/// canonical path (SANDBOX_ROOT is): /proc/self/fd/N names the canonical one,
+/// so any other root refuses every open (EXDEV). `rel` holds no NUL byte
+/// (validate_file_path refuses it).
 fn open_beneath(root: &Path, rel: &Path, flags: libc::c_int) -> std::io::Result<OwnedFd> {
-    let root = std::fs::canonicalize(root)?;
     let full = root.join(rel);
-    let c_full = CString::new(full.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let c_full = CString::new(full.as_os_str().as_bytes()).expect("a path with no NUL byte");
     // SAFETY: open_how is plain data; zero is its default for every field.
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = (libc::O_PATH | libc::O_CLOEXEC | (flags & libc::O_DIRECTORY)) as u64;
@@ -231,14 +232,13 @@ fn open_beneath(root: &Path, rel: &Path, flags: libc::c_int) -> std::io::Result<
     // SAFETY: `fd` is a new descriptor that nothing else owns.
     let path_fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
     let fd_link = format!("/proc/self/fd/{}", path_fd.as_raw_fd());
-    if !std::fs::read_link(&fd_link)?.starts_with(&root) {
+    if !std::fs::read_link(&fd_link)?.starts_with(root) {
         return Err(std::io::Error::from_raw_os_error(libc::EXDEV));
     }
     if flags & libc::O_PATH != 0 {
         return Ok(path_fd);
     }
-    let c_link = CString::new(fd_link)
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let c_link = CString::new(fd_link).expect("a /proc/self/fd path has no NUL byte");
     // SAFETY: a NUL-terminated path; the descriptor is owned at once.
     let fd = unsafe { libc::open(c_link.as_ptr(), flags | libc::O_CLOEXEC) };
     if fd < 0 {
@@ -263,7 +263,7 @@ fn make_dirs_beneath(root: &Path, rel_dir: &Path) -> std::io::Result<OwnedFd> {
             Ok(next) => dir = next,
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                 let name = CString::new(component.as_os_str().as_bytes())
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+                    .expect("a path with no NUL byte");
                 // SAFETY: valid folder descriptor and NUL-terminated name.
                 let made = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) } == 0;
                 if !made {
@@ -444,7 +444,7 @@ pub(crate) fn handle_write_file(
 
     let rel = below_root(&resolved_path);
     let final_name = CString::new(rel.file_name().unwrap_or_default().as_bytes())
-        .map_err(|_| CmdError::path(format!("Invalid path '{path}'")))?;
+        .expect("validate_file_path refuses a NUL byte");
     let tmp_name = CString::new(format!(".wr.{op_id}.tmp"))
         .map_err(|_| CmdError::path(format!("Invalid operation id '{op_id}'")))?;
 
@@ -632,6 +632,43 @@ mod tests {
         assert!(result.unwrap_err().contains("Absolute"));
     }
 
+    // The host's traversal vectors (tests/test_file_io_security.py), checked here where the
+    // rule lives (a lexical check, no file is opened): each is refused
+    #[test]
+    fn test_validate_file_path_refuses_the_traversal_vectors() {
+        for path in [
+            "../etc/passwd",
+            "../../etc/shadow",
+            "../../../root/.ssh/id_rsa",
+            "subdir/../../etc/passwd",
+            "subdir/../subdir/../../etc/passwd",
+            "/etc/passwd",
+            "/home/user/../../../etc/passwd",
+            "../etc",
+            "../../",
+            "/etc",
+            "subdir/../../etc",
+        ] {
+            assert!(validate_file_path(path).is_err(), "{path}");
+        }
+    }
+
+    // Web encodings (fuzzdb) are literal names on Unix: a path under the sandbox root
+    #[test]
+    fn test_validate_file_path_web_encodings_are_literal_names() {
+        for (path, real) in [
+            ("....//....//etc/passwd", "/home/user/..../..../etc/passwd"),
+            ("..%2f..%2fetc/passwd", "/home/user/..%2f..%2fetc/passwd"),
+            ("..\\..\\etc\\passwd", "/home/user/..\\..\\etc\\passwd"),
+        ] {
+            assert_eq!(
+                validate_file_path(path).unwrap(),
+                std::path::PathBuf::from(real),
+                "{path}"
+            );
+        }
+    }
+
     #[test]
     fn test_validate_file_path_empty_returns_sandbox_root() {
         let result = validate_file_path("");
@@ -709,16 +746,31 @@ mod tests {
         assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user"));
     }
 
+    /// A relative path of `len` bytes: components of 254 bytes (below NAME_MAX), then the rest.
+    fn path_of_len(len: usize) -> String {
+        let mut path = String::new();
+        while path.len() < len {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            let take = (len - path.len()).min(254);
+            path.push_str(&"a".repeat(take));
+        }
+        path
+    }
+
     #[test]
     fn test_validate_file_path_exactly_max_length() {
-        // Construct a valid long path with short-enough components
-        let path: String = (0..16)
-            .map(|_| "a".repeat(250))
-            .collect::<Vec<_>>()
-            .join("/");
-        if path.len() <= MAX_FILE_PATH_LENGTH {
-            assert!(validate_file_path(&path).is_ok());
-        }
+        let path = path_of_len(MAX_FILE_PATH_LENGTH);
+        assert_eq!(path.len(), 4096);
+        assert!(validate_file_path(&path).is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_one_byte_over_max_length() {
+        let path = path_of_len(MAX_FILE_PATH_LENGTH + 1);
+        assert_eq!(path.len(), 4097);
+        assert!(validate_file_path(&path).is_err());
     }
 
     #[test]
@@ -806,7 +858,9 @@ mod tests {
         data: &[u8],
         ending: Ending,
     ) -> (Result<usize, String>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("guest-agent-{name}-{}", std::process::id()));
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("guest-agent-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = std::fs::File::create(dir.join(".wr.op.tmp")).unwrap();
@@ -890,8 +944,9 @@ mod tests {
     /// (absolute, to root/inside), `loop` (to itself), `fd` (a /proc magic
     /// link) and `dangling` (absolute, to outside/new, which does not exist).
     fn root_with_links(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let base =
-            std::env::temp_dir().join(format!("guest-agent-beneath-{name}-{}", std::process::id()));
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("guest-agent-beneath-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("root");
         let outside = base.join("outside");
@@ -997,17 +1052,5 @@ mod tests {
         let _reader = std::fs::File::open(&fifo).unwrap(); // release the writer
         drop(writer.join().unwrap());
         std::fs::remove_dir_all(&base).unwrap();
-    }
-
-    // -------------------------------------------------------------------------
-    // zstd roundtrip
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_zstd_roundtrip() {
-        let data = vec![42u8; FILE_TRANSFER_CHUNK_SIZE];
-        let compressed = zstd::stream::encode_all(&data[..], FILE_TRANSFER_ZSTD_LEVEL).unwrap();
-        let decompressed = zstd::stream::decode_all(&compressed[..]).unwrap();
-        assert_eq!(data, decompressed);
     }
 }

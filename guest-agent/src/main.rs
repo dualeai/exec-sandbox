@@ -74,8 +74,8 @@ pub(crate) fn monotonic_ms() -> u64 {
 ///
 /// Called at two points for defense-in-depth:
 /// 1. `listen_virtio_serial()` — each time the ports open (covers cold boot)
-/// 2. `handle_connection()` — before every command dispatch (covers L1 restore,
-///    where the VM resumes mid-loop with the ports already open)
+/// 2. `handle_connection()` — before each command dispatch but a file chunk
+///    (covers L1 restore, where the VM resumes mid-loop with the ports already open)
 ///
 /// Cost: ~11μs per call, negligible vs connection/exec overhead.
 fn reseed_crng() {

@@ -34,6 +34,7 @@ from exec_sandbox.guest_agent_protocol import (
     WarmReplAckMessage,
     WarmReplRequest,
     WriteFileRequest,
+    request_line,
 )
 from exec_sandbox.models import FileInfo, Language
 
@@ -47,9 +48,11 @@ _GUEST_LINE: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)  # ty
 
 
 def wire(request: GuestAgentRequest) -> dict[str, object]:
-    """The JSON object GuestChannel sends for `request` (its JSON with no null field), without
+    """The JSON object the host sends for `request` (request_line, every send site), without
     host_time_ns (the clock: test_host_time_stamped_at_serialization)."""
-    sent = json.loads(request.model_dump_json(by_alias=False, exclude_none=True))
+    line = request_line(request)
+    assert line.endswith(b"\n") and line.count(b"\n") == 1  # one line: the guest reads line by line
+    sent = json.loads(line)
     del sent["host_time_ns"]
     return sent
 
@@ -230,7 +233,7 @@ class TestEnvVarValidation:
             ({"FOO": "delete\x7f"}, "Env var 'FOO' value contains forbidden control character: 0x7F"),
             ({"A" * 257: "value"}, "Invalid env var name length: 257 (must be 1-256)"),
             ({"": "value"}, "Invalid env var name length: 0 (must be 1-256)"),
-            ({"FOO": "x" * 4097}, "Env var 'FOO' value too large: 4097 bytes (max 4096)"),
+            ({"FOO": "x" * 4097}, "Env var 'FOO' value too large: 4097 characters (max 4096)"),
             ({f"VAR_{i}": "value" for i in range(101)}, "Too many environment variables: 101 (max 100)"),
         ],
         ids=[
@@ -400,13 +403,13 @@ RESPONSE_WIRE_CASES = [
         '{"type":"pong","version":"1.0","op_id":"abc"}', PongMessage(version="1.0", op_id="abc"), id="pong-op-id"
     ),
     pytest.param(
-        '{"type":"warm_repl_ack","language":"python","status":"ok"}',
-        WarmReplAckMessage(language="python", status="ok", message=None, op_id=None),
+        '{"type":"warm_repl_ack","status":"ok"}',
+        WarmReplAckMessage(status="ok", message=None, op_id=None),
         id="warm-repl-ack",
     ),
     pytest.param(
-        '{"type":"warm_repl_ack","language":"javascript","status":"error","message":"spawn failed","op_id":"abc"}',
-        WarmReplAckMessage(language="javascript", status="error", message="spawn failed", op_id="abc"),
+        '{"type":"warm_repl_ack","status":"error","message":"spawn failed","op_id":"abc"}',
+        WarmReplAckMessage(status="error", message="spawn failed", op_id="abc"),
         id="warm-repl-ack-error",
     ),
     pytest.param(
@@ -428,6 +431,11 @@ RESPONSE_WIRE_CASES = [
         '{"type":"file_chunk","op_id":"abc123","data":"SGVsbG8="}',
         FileChunkResponseMessage(op_id="abc123", data=b"Hello"),
         id="file-chunk-base64",
+    ),
+    pytest.param(  # the guest writes the standard alphabet (Rust base64 STANDARD): + and /, not - and _
+        '{"type":"file_chunk","op_id":"abc123","data":"+/+/"}',
+        FileChunkResponseMessage(op_id="abc123", data=b"\xfb\xff\xbf"),
+        id="file-chunk-standard-alphabet",
     ),
     pytest.param(
         '{"type":"file_read_complete","op_id":"test","path":"out.bin","size":65536}',
@@ -472,7 +480,7 @@ class TestResponseValidation:
     def test_wrong_type_rejected(self) -> None:
         """A type literal that is not the model's is rejected."""
         with pytest.raises(ValidationError):
-            WarmReplAckMessage(type="pong", language="python", status="ok")  # type: ignore[arg-type]
+            WarmReplAckMessage(type="pong", status="ok")  # type: ignore[arg-type]
 
     def test_invalid_output_stream(self) -> None:
         """An output chunk is stdout or stderr only."""

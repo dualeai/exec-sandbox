@@ -54,9 +54,7 @@ pub(crate) const MAX_PACKAGE_NAME_LENGTH: usize = 214;
 // Streaming configuration. Exec output is sent every FLUSH_INTERVAL_MS, and at
 // once when a buffer reaches MAX_BUFFER_SIZE_BYTES or when no output was sent
 // in the last FLUSH_INTERVAL_MS (execute.rs).
-// DRAIN_TIMEOUT_MS bounds each read of the drain after a timeout SIGTERM.
 pub(crate) const FLUSH_INTERVAL_MS: u64 = 50;
-pub(crate) const DRAIN_TIMEOUT_MS: u64 = 5;
 pub(crate) const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB
 
 // Output size limits (guest-enforced). Exceeding either raises CmdError::output_limit
@@ -96,13 +94,15 @@ pub(crate) const INSTALLER_OUTPUT_GRACE_MS: u64 = 1000;
 // (EXECUTION_TIMEOUT_MARGIN_SECONDS = 10) with TERM_GRACE_PERIOD_SECONDS.
 pub(crate) const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-// Longest wait for the writer task of a pipelined file write: for a free slot
-// for each chunk, at file_end for the end of the write, and for a task that
-// ended early. A writer stuck on the disk would else stop the agent, which reads
-// one command at a time. Below the host's ack wait (FILE_IO_TIMEOUT_SECONDS =
-// 120), so a write that failed gets an error reply, not a deadline. A write
-// whose rename stalls after its commit claim gets no reply: the host's deadline
-// then gives an unknown outcome, the truth.
+// Bound of each wait for the writer task of a pipelined file write: for a free
+// slot for each chunk, at file_end for the end of the write (twice when the task
+// claimed the commit: its rename gets one more wait), and for a task that ended
+// early. A writer stuck on the disk would else stop the agent, which reads one
+// command at a time. A write that fails before its commit claim gets an error
+// reply within this bound, below the host's ack wait (FILE_IO_TIMEOUT_SECONDS =
+// 120). After the claim, a reply can come up to twice this bound later, or not
+// at all when the rename stalls: the host's deadline then gives an unknown
+// outcome, the truth.
 pub(crate) const FILE_WRITE_STALL_TIMEOUT_SECONDS: u64 = 60;
 
 /// Quiet mode — suppress non-essential log_info! on the boot critical path.

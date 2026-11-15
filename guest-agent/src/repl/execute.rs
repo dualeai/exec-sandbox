@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{Duration, interval};
 
 use crate::constants::*;
@@ -19,8 +18,17 @@ use crate::types::{GuestResponse, Language};
 use crate::validation::{prepend_env_vars, validate_code_params, validate_env_vars};
 
 /// The idle REPL of each language, between execs. Persists across host connections.
-static REPL_STATES: LazyLock<TokioMutex<HashMap<Language, ReplState>>> =
-    LazyLock::new(|| TokioMutex::new(HashMap::new()));
+/// The agent serves one command at a time: a REPL is out of it while one runs.
+static REPL_STATES: LazyLock<std::sync::Mutex<HashMap<Language, ReplState>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// REPL_STATES, held for one statement (never across an await).
+fn idle_repls() -> std::sync::MutexGuard<'static, HashMap<Language, ReplState>> {
+    // A panic while held cannot leave the map half written: use it as it is.
+    REPL_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Monotonic counter for sentinel IDs. Combined with a nanosecond timestamp,
 /// it makes each ID unique without the uuid crate.
@@ -131,21 +139,61 @@ fn group_member(stat: &str, pgid: u32) -> Option<(String, &str)> {
     (pgrp == pgid).then_some((comm, state))
 }
 
-/// Helper to flush a buffer as a Stdout/Stderr response message.
+/// The frame of a piece of stdout.
+fn stdout_frame(chunk: String) -> GuestResponse {
+    GuestResponse::Stdout { chunk }
+}
+
+/// The frame of a piece of stderr.
+fn stderr_frame(chunk: String) -> GuestResponse {
+    GuestResponse::Stderr { chunk }
+}
+
+/// Send `buffer` (emptied) in `frame` messages.
 async fn flush_output_buffer(
     writer: &ResponseWriter,
     buffer: &mut String,
-    chunk_type: &str,
+    frame: fn(String) -> GuestResponse,
 ) -> Result<(), CmdError> {
     if buffer.is_empty() {
         return Ok(());
     }
     let data = std::mem::take(buffer);
-    let msg = match chunk_type {
-        "stderr" => GuestResponse::Stderr { chunk: data },
-        _ => GuestResponse::Stdout { chunk: data },
-    };
-    writer.send(&msg).await
+    // At most MAX_BUFFER_SIZE_BYTES of text per frame, cut on a character boundary: JSON
+    // writes a control character as \u00XX (6 bytes), so each frame stays below the host's
+    // line limit (guest_channel.STREAM_BUFFER_LIMIT, 512 KB) whatever the output holds. A
+    // buffer can pass that size: a stderr line before the sentinel, the stdout drained after it.
+    if data.len() <= MAX_BUFFER_SIZE_BYTES {
+        return writer.send(&frame(data)).await; // one frame: no copy
+    }
+    let mut rest = data.as_str();
+    while !rest.is_empty() {
+        let mut end = rest.len().min(MAX_BUFFER_SIZE_BYTES);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let (piece, tail) = rest.split_at(end);
+        writer.send(&frame(piece.to_string())).await?;
+        rest = tail;
+    }
+    Ok(())
+}
+
+/// Send both output buffers, stdout first, but a capped stream's (it sends
+/// nothing more). A send error is left to the next send, which meets it too.
+async fn flush_both(
+    writer: &ResponseWriter,
+    stdout_buffer: &mut String,
+    stdout_capped: bool,
+    stderr_buffer: &mut String,
+    stderr_capped: bool,
+) {
+    if !stdout_capped {
+        let _ = flush_output_buffer(writer, stdout_buffer, stdout_frame).await;
+    }
+    if !stderr_capped {
+        let _ = flush_output_buffer(writer, stderr_buffer, stderr_frame).await;
+    }
 }
 
 /// True when nothing was sent in the last FLUSH_INTERVAL_MS: the first output
@@ -184,25 +232,26 @@ fn parse_stderr_line_for_sentinel(
 /// Returns the sentinel exit code if found in any line.
 fn process_stderr_chunk(
     chunk: &[u8],
-    stderr_line_buf: &mut String,
+    stderr_line_buf: &mut Vec<u8>,
     sentinel_prefix: &str,
     stderr_buffer: &mut String,
 ) -> Option<i32> {
-    stderr_line_buf.push_str(&String::from_utf8_lossy(chunk));
+    // Bytes until a line ends, decoded line by line: '\n' is never inside a multi-byte
+    // UTF-8 character, so a character that a pipe read split stays whole in the partial line
+    stderr_line_buf.extend_from_slice(chunk);
 
     // Single linear pass: scan complete lines in place, then drain them all at
     // once. A drain per line would cost O(remaining) each time — quadratic on
     // newline-dense chunks.
     let mut sentinel_exit_code: Option<i32> = None;
     let mut consumed = 0;
-    for line in stderr_line_buf.split_inclusive('\n') {
-        if !line.ends_with('\n') {
+    for line in stderr_line_buf.split_inclusive(|&byte| byte == b'\n') {
+        if line.last() != Some(&b'\n') {
             break; // trailing partial line stays buffered for the next chunk
         }
         consumed += line.len();
-        if let Some(code) =
-            parse_stderr_line_for_sentinel(&line[..line.len() - 1], sentinel_prefix, stderr_buffer)
-        {
+        let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+        if let Some(code) = parse_stderr_line_for_sentinel(&text, sentinel_prefix, stderr_buffer) {
             // Last sentinel wins if multiple appear in one chunk
             sentinel_exit_code = Some(code);
         }
@@ -217,10 +266,9 @@ fn process_stderr_chunk(
     let max_tail = MAX_STDERR_BYTES + sentinel_prefix.len();
     if stderr_line_buf.len() > max_tail {
         let cut = stderr_line_buf.len() - max_tail;
-        let boundary = stderr_line_buf
-            .char_indices()
-            .map(|(i, _)| i)
-            .find(|&i| i >= cut)
+        // From the next character start: no continuation byte begins the kept window
+        let boundary = (cut..stderr_line_buf.len())
+            .find(|&i| stderr_line_buf[i] & 0b1100_0000 != 0b1000_0000)
             .unwrap_or(stderr_line_buf.len());
         stderr_line_buf.drain(..boundary);
     }
@@ -232,11 +280,14 @@ fn process_stderr_chunk(
 /// stdout after flushing it and before the stderr sentinel, so the agent stops
 /// reading stdout at the marker instead of waiting for the pipe to go idle.
 /// The marker is removed from the output. A tail that may be the start of a
-/// marker split across reads is held back until the next chunk shows it is not.
+/// marker split across reads is held back until the next chunk shows it is not,
+/// and so is an incomplete UTF-8 character at the end of the output (a pipe read
+/// can end inside one): each output decodes alone.
 struct StdoutEnd {
     marker: Vec<u8>,
     pending: Vec<u8>,
     seen: bool,
+    utf8_tail: Vec<u8>,
 }
 
 impl StdoutEnd {
@@ -245,12 +296,22 @@ impl StdoutEnd {
             marker: format!("__STDOUT_END_{sentinel_id}__\n").into_bytes(),
             pending: Vec::new(),
             seen: false,
+            utf8_tail: Vec::new(),
         }
     }
 
-    /// The output bytes of `chunk` that are known not to be part of the marker.
-    /// Bytes after the marker (a background child of the exec) stay output.
+    /// The output bytes of `chunk` that are known not to be part of the marker, up to
+    /// the last whole UTF-8 character. Bytes after the marker (a background child of the
+    /// exec) stay output.
     fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let output = self.marker_free(chunk);
+        let mut bytes = std::mem::take(&mut self.utf8_tail);
+        bytes.extend_from_slice(&output);
+        self.utf8_tail = bytes.split_off(bytes.len() - incomplete_utf8_tail(&bytes));
+        bytes
+    }
+
+    fn marker_free(&mut self, chunk: &[u8]) -> Vec<u8> {
         if self.seen {
             return chunk.to_vec();
         }
@@ -274,10 +335,32 @@ impl StdoutEnd {
         std::mem::replace(&mut self.pending, rest)
     }
 
-    /// The held-back tail when no marker came (user code closed or redirected fd 1).
+    /// The held-back bytes: an incomplete character, then a tail when no marker came
+    /// (user code closed or redirected fd 1).
     fn finish(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.pending)
+        let mut rest = std::mem::take(&mut self.utf8_tail);
+        rest.append(&mut self.pending);
+        rest
     }
+}
+
+/// Length of an incomplete UTF-8 character at the end of `bytes` (0 to 3): a lead byte whose
+/// continuation bytes have not come yet.
+fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let byte = bytes[bytes.len() - back];
+        if byte & 0b1100_0000 == 0b1000_0000 {
+            continue; // a continuation byte: its lead byte is further back
+        }
+        let width = match byte {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => return 0, // ASCII or a byte no character starts with: nothing to wait for
+        };
+        return if width > back { back } else { 0 };
+    }
+    0
 }
 
 /// Fallback after the sentinel when the stdout marker has not come: stop once
@@ -316,80 +399,40 @@ async fn drain_stdout(
     }
 }
 
-/// Drain both stdout and stderr after SIGTERM, parsing stderr for sentinel.
-/// Returns the sentinel exit code if found, or None.
-///
-/// Once the sentinel is found on stderr, immediately switches to stdout-only
-/// drain (same pattern as the normal execution path) to minimize latency.
+/// Read the output left after a timeout's graceful_terminate_process_group, at
+/// most 200 ms: stdout to its end, stderr to its end or the sentinel (a REPL
+/// that handled SIGTERM writes it). The group has ended, so both pipes end at
+/// once, unless a process that left the group holds one. Returns the sentinel
+/// exit code if found.
 async fn drain_after_sigterm(
     stdout: &mut tokio::process::ChildStdout,
     stderr: &mut tokio::process::ChildStderr,
     stdout_end: &mut StdoutEnd,
     stdout_buffer: &mut String,
     stderr_buffer: &mut String,
-    stderr_line_buf: &mut String,
+    stderr_line_buf: &mut Vec<u8>,
     sentinel_prefix: &str,
 ) -> Option<i32> {
-    let drain_deadline = Instant::now() + Duration::from_millis(200);
-    let mut stdout_buf = [0u8; 8192];
-    let mut stderr_buf = [0u8; 8192];
     let mut sentinel_exit_code: Option<i32> = None;
-    let mut stdout_done = false;
-    let mut stderr_done = false;
-
-    loop {
-        let remaining = drain_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || (stdout_done && stderr_done) {
-            break;
+    let stdout_part = async {
+        let mut buf = [0u8; 8192];
+        while let Ok(n @ 1..) = stdout.read(&mut buf).await {
+            stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.feed(&buf[..n])));
         }
-
-        // Sentinel found — switch to stdout-only drain (stderr no longer needed)
-        if sentinel_exit_code.is_some() {
-            drain_stdout(
-                stdout,
-                stdout_end,
-                stdout_buffer,
-                remaining.as_millis() as u64,
-            )
-            .await;
-            break;
+    };
+    let stderr_part = async {
+        let mut buf = [0u8; 8192];
+        while sentinel_exit_code.is_none()
+            && let Ok(n @ 1..) = stderr.read(&mut buf).await
+        {
+            sentinel_exit_code =
+                process_stderr_chunk(&buf[..n], stderr_line_buf, sentinel_prefix, stderr_buffer);
         }
-
-        let per_read = remaining.min(Duration::from_millis(DRAIN_TIMEOUT_MS));
-
-        // Branch preconditions disable a stream once it is done; the
-        // `Err(_) if !other_done` arm makes reads asymmetric: while both
-        // streams are active a timeout retries, but once only one remains the
-        // first timeout terminates it. (At least one branch is always enabled —
-        // the loop guard breaks when both are done.)
-        tokio::select! {
-            r = tokio::time::timeout(per_read, stdout.read(&mut stdout_buf)), if !stdout_done => {
-                match r {
-                    Ok(Ok(n)) if n > 0 => {
-                        stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.feed(&stdout_buf[..n])));
-                    }
-                    Err(_) if !stderr_done => {} // both active: timeout retries
-                    _ => stdout_done = true,      // EOF/error always; timeout in single-stream mode
-                }
-            }
-            r = tokio::time::timeout(per_read, stderr.read(&mut stderr_buf)), if !stderr_done => {
-                match r {
-                    Ok(Ok(n)) if n > 0 => {
-                        if let Some(code) = process_stderr_chunk(
-                            &stderr_buf[..n],
-                            stderr_line_buf,
-                            sentinel_prefix,
-                            stderr_buffer,
-                        ) {
-                            sentinel_exit_code = Some(code);
-                        }
-                    }
-                    Err(_) if !stdout_done => {}
-                    _ => stderr_done = true,
-                }
-            }
-        }
-    }
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(200), async {
+        tokio::join!(stdout_part, stderr_part)
+    })
+    .await;
 
     stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.finish()));
     sentinel_exit_code
@@ -423,13 +466,13 @@ async fn submit_code_to_repl(
 /// runs or it died while idle (true: new). A new REPL is returned once it has written its
 /// ready line, within `ready_timeout`; one that exits or stalls before is killed, and the
 /// error says the REPL did not start (the caller's code never ran). The caller puts it
-/// back when done. The lock is held across the spawn: two callers never start two REPLs.
+/// back when done. The agent serves one command at a time: two callers never start two REPLs.
 async fn take_or_spawn_repl(
     language: Language,
     ready_timeout: Duration,
 ) -> Result<(ReplState, bool), Box<dyn std::error::Error>> {
-    let mut states = REPL_STATES.lock().await;
-    let alive = match states.remove(&language) {
+    let idle = idle_repls().remove(&language);
+    let alive = match idle {
         Some(mut existing) => match existing.child.try_wait() {
             Ok(None) => Some(existing),
             Ok(Some(status)) => {
@@ -493,7 +536,7 @@ pub(crate) async fn warm_repl(language: Language) -> Result<(), String> {
     match warm_exercise_repl(&mut repl, language).await {
         Ok(()) => {
             let warm_ms = warm_start.elapsed().as_millis();
-            REPL_STATES.lock().await.insert(language, repl);
+            idle_repls().insert(language, repl);
             log_info!("REPL pre-warmed for {} ({warm_ms}ms)", language.as_str());
             Ok(())
         }
@@ -586,7 +629,7 @@ async fn warm_exercise_repl(
     );
 
     // Wait for sentinel on stderr (this is where the interpreter startup time is spent)
-    let mut stderr_line_buf = String::new();
+    let mut stderr_line_buf = Vec::new();
     let mut stderr_discard = String::new();
     let mut buf = [0u8; 4096];
     let result = tokio::time::timeout(WARM_UP_TIMEOUT, async {
@@ -713,7 +756,7 @@ pub(crate) async fn execute_code_streaming(
     // Stream output until sentinel, REPL death, or timeout
     let mut stdout_buffer = String::new();
     let mut stderr_buffer = String::new();
-    let mut stderr_line_buf = String::new();
+    let mut stderr_line_buf = Vec::new();
     let mut stdout_bytes = [0u8; 8192];
     let mut stderr_bytes = [0u8; 8192];
     let mut flush_timer = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
@@ -744,12 +787,7 @@ pub(crate) async fn execute_code_streaming(
                     {
                         last_flush = Some(Instant::now());
                     }
-                    if !stdout_capped {
-                        let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
-                    }
-                    if !stderr_capped {
-                        let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
-                    }
+                    flush_both(writer, &mut stdout_buffer, stdout_capped, &mut stderr_buffer, stderr_capped).await;
                 }
 
                 result = repl.stdout.read(&mut stdout_bytes), if !stdout_done => {
@@ -770,7 +808,7 @@ pub(crate) async fn execute_code_streaming(
                             stdout_total += output.len();
                             if stdout_total > MAX_STDOUT_BYTES {
                                 if !stdout_capped {
-                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, stdout_frame).await;
                                     stdout_capped = true;
                                 }
                                 // Keep reading pipe (prevent child blocking) but discard
@@ -778,15 +816,12 @@ pub(crate) async fn execute_code_streaming(
                                 stdout_buffer.push_str(&String::from_utf8_lossy(&output));
                                 if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
                                     last_flush = Some(Instant::now());
-                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, stdout_frame).await;
                                 } else if !stdout_buffer.is_empty() && flush_due(last_flush) {
                                     // Both buffers, as the tick does: stderr output that waits
                                     // for the tick goes out with this stdout
                                     last_flush = Some(Instant::now());
-                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
-                                    if !stderr_capped {
-                                        let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
-                                    }
+                                    flush_both(writer, &mut stdout_buffer, stdout_capped, &mut stderr_buffer, stderr_capped).await;
                                 }
                             }
                         }
@@ -822,20 +857,17 @@ pub(crate) async fn execute_code_streaming(
                             stderr_total += n;
                             if stderr_total > MAX_STDERR_BYTES {
                                 if !stderr_capped {
-                                    let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                                    let _ = flush_output_buffer(writer, &mut stderr_buffer, stderr_frame).await;
                                     stderr_capped = true;
                                 }
                                 stderr_buffer.clear(); // discard parsed-but-over-limit data
                             } else if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
                                 last_flush = Some(Instant::now());
-                                let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                                let _ = flush_output_buffer(writer, &mut stderr_buffer, stderr_frame).await;
                             } else if !stderr_buffer.is_empty() && flush_due(last_flush) {
                                 // Both buffers, in the tick's order
                                 last_flush = Some(Instant::now());
-                                if !stdout_capped {
-                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
-                                }
-                                let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                                flush_both(writer, &mut stdout_buffer, stdout_capped, &mut stderr_buffer, stderr_capped).await;
                             }
                         }
                         Err(_) => stderr_done = true,
@@ -870,14 +902,18 @@ pub(crate) async fn execute_code_streaming(
     // Taken, not copied: after a timeout, the drain below adds to the line
     // buffer, and the partial line sent here must not go out a second time.
     if !stderr_capped {
-        stderr_buffer.push_str(&std::mem::take(&mut stderr_line_buf));
+        stderr_buffer.push_str(&String::from_utf8_lossy(&std::mem::take(
+            &mut stderr_line_buf,
+        )));
     }
-    if !stdout_capped {
-        let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
-    }
-    if !stderr_capped {
-        let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
-    }
+    flush_both(
+        writer,
+        &mut stdout_buffer,
+        stdout_capped,
+        &mut stderr_buffer,
+        stderr_capped,
+    )
+    .await;
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let process_ms = Some(process_start.elapsed().as_millis() as u64);
@@ -901,7 +937,7 @@ pub(crate) async fn execute_code_streaming(
                 return Ok(());
             }
 
-            REPL_STATES.lock().await.insert(language, repl);
+            idle_repls().insert(language, repl);
 
             if stdout_capped || stderr_capped {
                 let mut parts = Vec::new();
@@ -969,14 +1005,16 @@ pub(crate) async fn execute_code_streaming(
             // If sentinel was found during post-SIGTERM drain, treat as graceful exit
             if let Some(exit_code) = sigterm_exit_code {
                 if !stderr_line_buf.is_empty() && !stderr_capped {
-                    stderr_buffer.push_str(&stderr_line_buf);
+                    stderr_buffer.push_str(&String::from_utf8_lossy(&stderr_line_buf));
                 }
-                if !stdout_capped {
-                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
-                }
-                if !stderr_capped {
-                    let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
-                }
+                flush_both(
+                    writer,
+                    &mut stdout_buffer,
+                    stdout_capped,
+                    &mut stderr_buffer,
+                    stderr_capped,
+                )
+                .await;
                 // No output-limit error here: the REPL got SIGTERM and is not
                 // pooled, so the sentinel code is the result.
                 let exit_code = crate::oom_guard::reconcile_retirement_exit(exit_code);
@@ -1021,7 +1059,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn group_members_shows_where_a_member_waits() {
         // A leader that waits for its member, as a REPL waits for the command of an exec
@@ -1250,7 +1287,7 @@ mod tests {
 
     #[test]
     fn chunk_single_complete_line_with_sentinel() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let chunk = b"__SENTINEL_1_0_0__\n";
         let result = process_stderr_chunk(chunk, &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
@@ -1261,7 +1298,7 @@ mod tests {
 
     #[test]
     fn chunk_single_plain_line() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let chunk = b"hello world\n";
         let result = process_stderr_chunk(chunk, &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
@@ -1272,7 +1309,7 @@ mod tests {
 
     #[test]
     fn chunk_multiple_lines_sentinel_on_last() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let chunk = b"line1\nline2\n__SENTINEL_1_0_5__\n";
         let result = process_stderr_chunk(chunk, &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
@@ -1282,7 +1319,7 @@ mod tests {
 
     #[test]
     fn chunk_multiple_lines_sentinel_in_middle() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         // Lines after sentinel are still processed (they become regular stderr)
         let chunk = b"before\n__SENTINEL_1_0_0__\nafter\n";
@@ -1297,25 +1334,25 @@ mod tests {
 
     #[test]
     fn chunk_partial_line_buffered() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let chunk = b"partial data no newline";
         let result = process_stderr_chunk(chunk, &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
         assert_eq!(result, None);
-        assert_eq!(line_buf, "partial data no newline");
+        assert_eq!(line_buf, b"partial data no newline");
         assert!(stderr_buf.is_empty(), "no complete lines yet");
     }
 
     #[test]
     fn chunk_split_across_two_deliveries() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let prefix = "__SENTINEL_1_0_";
 
         // First chunk: partial line
         let r1 = process_stderr_chunk(b"__SENTINEL_1", &mut line_buf, prefix, &mut stderr_buf);
         assert_eq!(r1, None);
-        assert_eq!(line_buf, "__SENTINEL_1");
+        assert_eq!(line_buf, b"__SENTINEL_1");
 
         // Second chunk: completes the line
         let r2 = process_stderr_chunk(b"_0_0__\n", &mut line_buf, prefix, &mut stderr_buf);
@@ -1325,7 +1362,7 @@ mod tests {
 
     #[test]
     fn chunk_sentinel_split_across_three_deliveries() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let prefix = "__SENTINEL_1_0_";
 
@@ -1345,7 +1382,7 @@ mod tests {
 
     #[test]
     fn chunk_empty() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let result = process_stderr_chunk(b"", &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
         assert_eq!(result, None);
@@ -1355,7 +1392,7 @@ mod tests {
 
     #[test]
     fn chunk_only_newlines() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let result =
             process_stderr_chunk(b"\n\n\n", &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
@@ -1365,7 +1402,7 @@ mod tests {
 
     #[test]
     fn chunk_invalid_utf8_lossy() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         // 0xFF is invalid UTF-8, should be replaced with U+FFFD
         let chunk: &[u8] = &[0xFF, b'\n'];
@@ -1376,7 +1413,7 @@ mod tests {
 
     #[test]
     fn chunk_very_long_line() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let long_line = "x".repeat(100_000);
         let mut chunk = long_line.clone().into_bytes();
@@ -1389,7 +1426,7 @@ mod tests {
 
     #[test]
     fn chunk_sentinel_embedded_in_long_output() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let prefix = "__SENTINEL_1_0_";
         let mut chunk = Vec::new();
@@ -1408,7 +1445,7 @@ mod tests {
 
     #[test]
     fn chunk_preserves_line_buf_across_calls() {
-        let mut line_buf = String::from("leftover");
+        let mut line_buf = b"leftover".to_vec();
         let mut stderr_buf = String::new();
         let result = process_stderr_chunk(
             b" data\n",
@@ -1423,13 +1460,13 @@ mod tests {
 
     #[test]
     fn chunk_mixed_complete_and_partial() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let chunk = b"complete\npartial";
         let result = process_stderr_chunk(chunk, &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
         assert_eq!(result, None);
         assert_eq!(stderr_buf, "complete\n");
-        assert_eq!(line_buf, "partial");
+        assert_eq!(line_buf, b"partial");
     }
 
     // -------------------------------------------------------------------------
@@ -1438,7 +1475,7 @@ mod tests {
 
     #[test]
     fn chunk_fake_sentinel_wrong_id() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let chunk = b"__SENTINEL_999_999_0__\n";
         let result = process_stderr_chunk(chunk, &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
@@ -1448,7 +1485,7 @@ mod tests {
 
     #[test]
     fn chunk_sentinel_like_pattern_incomplete() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         // Looks like sentinel but missing trailing __
         let chunk = b"__SENTINEL_1_0_42\n";
@@ -1459,7 +1496,7 @@ mod tests {
 
     #[test]
     fn chunk_multiple_sentinels_last_wins() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let chunk = b"__SENTINEL_1_0_1__\n__SENTINEL_1_0_2__\n";
         let result = process_stderr_chunk(chunk, &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
@@ -1469,7 +1506,7 @@ mod tests {
 
     #[test]
     fn chunk_sentinel_with_binary_noise_before() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let mut chunk: Vec<u8> = vec![0x00, 0x01, 0x02];
         chunk.extend_from_slice(b"__SENTINEL_1_0_7__\n");
@@ -1479,21 +1516,21 @@ mod tests {
     }
 
     #[rstest]
-    #[case(i32::MAX)]
-    #[case(i32::MIN)]
-    fn chunk_sentinel_boundary_exit_codes(#[case] code: i32) {
-        let mut line_buf = String::new();
+    #[case(i32::MAX, 255)]
+    #[case(i32::MIN, 0)]
+    fn chunk_sentinel_boundary_exit_codes(#[case] code: i32, #[case] kept: i32) {
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let prefix = "__SENTINEL_1_0_";
         let line = format!("{prefix}{code}__\n");
         let result = process_stderr_chunk(line.as_bytes(), &mut line_buf, prefix, &mut stderr_buf);
         // Kept like a process exit status: i32::MAX is 255, i32::MIN is 0.
-        assert_eq!(result, Some(code & 0xFF));
+        assert_eq!(result, Some(kept));
     }
 
     #[test]
     fn newline_free_flood_keeps_line_buffer_bounded() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let prefix = "__SENTINEL_1_0_";
         let chunk = vec![b'x'; 256 * 1024];
@@ -1509,7 +1546,7 @@ mod tests {
 
     #[test]
     fn sentinel_survives_after_newline_free_flood() {
-        let mut line_buf = String::new();
+        let mut line_buf = Vec::new();
         let mut stderr_buf = String::new();
         let prefix = "__SENTINEL_1_0_";
         let flood = vec![b'x'; 2 * 1024 * 1024];
@@ -1592,5 +1629,86 @@ mod tests {
         assert_eq!(end.feed(b"__STD"), Vec::<u8>::new());
         // No marker came (fd 1 closed by user code): the tail is still output.
         assert_eq!(end.finish(), b"__STD".to_vec());
+    }
+
+    // A UTF-8 character that a pipe read split (here "中", 3 bytes, in two reads) comes out
+    // whole, not as U+FFFD
+    #[test]
+    fn stderr_character_split_across_reads_stays_whole() {
+        let mut line_buf = Vec::new();
+        let mut stderr_buf = String::new();
+        let bytes = "中".as_bytes();
+        assert_eq!(
+            process_stderr_chunk(
+                &bytes[..2],
+                &mut line_buf,
+                "__SENTINEL_1_0_",
+                &mut stderr_buf
+            ),
+            None
+        );
+        assert_eq!(
+            process_stderr_chunk(
+                &[bytes[2], b'\n'],
+                &mut line_buf,
+                "__SENTINEL_1_0_",
+                &mut stderr_buf
+            ),
+            None
+        );
+        assert_eq!(stderr_buf, "中\n");
+    }
+
+    #[test]
+    fn stdout_character_split_across_reads_stays_whole() {
+        let mut end = StdoutEnd::new("1_0");
+        let bytes = "a中".as_bytes();
+        let first = end.feed(&bytes[..2]); // "a" and the first byte of "中"
+        assert_eq!(first, b"a");
+        let mut second = end.feed(&bytes[2..]);
+        second.extend(end.finish());
+        assert_eq!(String::from_utf8(second).unwrap(), "中");
+    }
+
+    #[rstest]
+    #[case(b"abc".as_slice(), 0)]
+    #[case(&[0xE4, 0xB8], 2)] // 2 of the 3 bytes of a character
+    #[case(&[0xE4], 1)]
+    #[case("中".as_bytes(), 0)]
+    #[case(&[0xF0, 0x9F, 0x98], 3)] // 3 of the 4 bytes of an emoji
+    #[case(&[0xFF], 0)] // no character starts with it: nothing to wait for
+    fn incomplete_utf8_tail_counts_the_missing_character(
+        #[case] bytes: &[u8],
+        #[case] tail: usize,
+    ) {
+        assert_eq!(incomplete_utf8_tail(bytes), tail);
+    }
+
+    // 100000 bytes of a control character with no newline (a stderr line before the
+    // sentinel can hold that much): frames of at most 64 KB of text, each line below the
+    // host's 512 KB limit, the text whole and in order
+    #[tokio::test]
+    async fn a_large_buffer_goes_out_in_frames_below_the_host_limit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let writer = ResponseWriter::new(tx, Some("op".into()));
+        let mut buffer = format!("{}中", "\u{1}".repeat(100_000));
+        flush_output_buffer(&writer, &mut buffer, stderr_frame)
+            .await
+            .unwrap();
+        drop(writer);
+        assert!(buffer.is_empty());
+        let mut text = String::new();
+        let mut frames = 0;
+        while let Some(line) = rx.recv().await {
+            assert!(line.len() < 512 * 1024, "a frame of {} bytes", line.len());
+            let value: serde_json::Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
+            assert_eq!(value["type"], "stderr");
+            let chunk = value["chunk"].as_str().unwrap();
+            assert!(chunk.len() <= MAX_BUFFER_SIZE_BYTES);
+            text.push_str(chunk);
+            frames += 1;
+        }
+        assert_eq!(frames, 2);
+        assert_eq!(text, format!("{}中", "\u{1}".repeat(100_000)));
     }
 }

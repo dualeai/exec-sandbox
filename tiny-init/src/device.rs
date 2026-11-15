@@ -52,10 +52,7 @@ pub(crate) fn redirect_to_console() {
 pub(crate) fn wait_for_block_device(path: &str) -> bool {
     // Wait for block device by attempting to open it (avoids TOCTOU race)
     // O_RDONLY | O_NONBLOCK: non-blocking open to check device availability
-    let path_cstr = match CString::new(path) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
+    let path_cstr = CString::new(path).unwrap();
 
     // Exponential backoff: 0.1+0.2+0.5+1+2+4+8 = 15.8 ms of sleep at most
     poll_backoff(&[100, 200, 500, 1000, 2000, 4000, 8000], || {
@@ -300,14 +297,23 @@ mod tests {
         assert!(saved >= 0, "dup(1) failed");
 
         let result = open_console(&[path_str], libc::O_WRONLY, &[1]);
+        // fd 1 is the console now: a write through it lands in the file
+        let written = unsafe { libc::write(1, b"through fd 1".as_ptr().cast(), 12) };
 
         // Restore stdout and clean up BEFORE asserting (prevents fd/file leak on panic)
         unsafe {
             libc::dup2(saved, 1);
             libc::close(saved);
         }
+        let content = std::fs::read(&tmp).unwrap_or_default();
         let _ = std::fs::remove_file(&tmp);
         assert!(result);
+        // Contains, not equals: the test harness may print to fd 1 meanwhile (other tests)
+        assert_eq!(written, 12);
+        assert!(
+            content.windows(12).any(|w| w == b"through fd 1"),
+            "{content:?}"
+        );
     }
 
     #[test]
