@@ -14,15 +14,10 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 
 fn mount_virtual_filesystems() {
+    // No /dev/mem or /dev/port: the kernel has no DEVMEM and no DEVPORT
+    // (images/kernel/exec-sandbox.config; its build fails if either comes
+    // back), and /dev/kmem left Linux in 5.13.
     sys::mount("devtmpfs", "/dev", "devtmpfs", 0, "");
-
-    // Security: remove dangerous device nodes auto-created by devtmpfs.
-    // /dev/mem exposes raw physical memory, /dev/kmem kernel virtual memory,
-    // /dev/port raw I/O ports (x86). Even with CONFIG_STRICT_DEVMEM, the nodes
-    // exist and leak kernel config info. Removing them is defense-in-depth.
-    for path in ["/dev/mem", "/dev/kmem", "/dev/port"] {
-        device::remove_device_node(path);
-    }
 
     // Security: restrict /dev/urandom and /dev/random to owner-write (0644).
     // devtmpfs creates these as 0666, allowing any user to inject entropy via
@@ -167,7 +162,7 @@ fn mount_rootfs() {
     // Discover drives by serial number (set in QEMU -device virtio-blk serial=).
     // "base" = EROFS rootfs, "snap" = ext4 snapshot overlay.
     // Cannot rely on /dev/vda ordering: ARM MMIO enumerates in reverse.
-    let base_dev = find_block_device_by_serial("base").unwrap_or_else(|| "/dev/vda".to_string());
+    let base_dev = require_block_device_by_serial("base");
     let snap_dev = sys::cmdline_has("init.snap=1").then(|| require_block_device_by_serial("snap"));
 
     let erofs_flags = libc::MS_RDONLY | libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV;
@@ -247,14 +242,11 @@ fn mount_rootfs() {
     // Security: remove block device nodes after mount. The kernel references the
     // device internally via bdevfs (indexed by major:minor), not the /dev path.
     // Prevents raw disk reads that bypass filesystem permissions.
+    // devtmpfs makes no /dev/block links (udev does): the node is the only path.
     device::remove_device_node(&base_dev);
     if let Some(ref snap) = snap_dev {
         device::remove_device_node(snap);
     }
-
-    // Security: remove /dev/block/ directory (devtmpfs-created symlinks like 253:0 -> ../vda).
-    // Eliminates alternative path to block device nodes.
-    let _ = fs::remove_dir_all("/dev/block");
 }
 
 /// Format the VM's home disk (serial=home) and mount it on /home/user.

@@ -84,9 +84,9 @@ class MotoServer(ThreadedWSGIServer):
 
 
 @contextlib.contextmanager
-def moto_server(host: str) -> Iterator[MotoServer]:
-    """moto's S3 API on `host` and a free port, served by a thread until the block ends."""
-    server = MotoServer(host, 0, DomainDispatcherApplication(create_backend_app), handler=MotoRequestHandler)
+def moto_server() -> Iterator[MotoServer]:
+    """moto's S3 API on 127.0.0.1 and a free port, served by a thread until the block ends."""
+    server = MotoServer("127.0.0.1", 0, DomainDispatcherApplication(create_backend_app), handler=MotoRequestHandler)
     thread = threading.Thread(target=server.serve_forever, name="moto-server", daemon=True)
     thread.start()
     try:
@@ -114,7 +114,6 @@ class Request:
     op: str
     key: str
     method: str
-    path: str
     query: MultiDict[str]
     headers: CIMultiDict[str]
     body: bytes
@@ -321,7 +320,7 @@ class S3Proxy:
         headers = CIMultiDict(http.headers)
         query: MultiDict[str] = MultiDict(http.query)
         op, key = self._classify(http.method, http.path, query, headers, body)
-        req = Request(op=op, key=key, method=http.method, path=http.path, query=query, headers=headers, body=body)
+        req = Request(op=op, key=key, method=http.method, query=query, headers=headers, body=body)
         original_query = MultiDict(query)
         fired = [rule for rule in list(self.rules) if rule._take(req)]
 

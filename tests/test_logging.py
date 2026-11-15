@@ -1,10 +1,14 @@
-"""configure_logging: the stderr handler it adds to the library logger, after close."""
+"""configure_logging: the stderr handler it adds to the library logger, after close; the
+ExtrasFormatter of its lines and of the test logs."""
 
 import logging
 import logging.handlers
+import sys
+
+import pytest
 
 from exec_sandbox import configure_logging
-from exec_sandbox._logging import LIBRARY_LOGGER_NAME
+from exec_sandbox._logging import LIBRARY_LOGGER_NAME, ExtrasFormatter
 
 
 def _configured() -> logging.handlers.QueueHandler:
@@ -31,3 +35,41 @@ def test_closed_handler_keeps_no_record() -> None:
     handler.close()
     logging.getLogger(LIBRARY_LOGGER_NAME).error("after close")
     assert handler.queue.qsize() == 0
+
+
+def _record(*, extra: dict[str, object], exc_info: bool) -> logging.LogRecord:
+    """A WARNING record of the library logger with `extra`, as logger.warning(..., extra=) makes it."""
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        info = sys.exc_info() if exc_info else None
+    return logging.getLogger(LIBRARY_LOGGER_NAME).makeRecord(
+        LIBRARY_LOGGER_NAME, logging.WARNING, "f.py", 1, "L1 restore failed", None, info, extra=extra
+    )
+
+
+class TestExtrasFormatter:
+    """The library logs its details as extra fields: a log line shows them after the message."""
+
+    def test_extra_fields_follow_the_message(self) -> None:
+        record = _record(extra={"error": "TransientError: no answer", "vm_id": "vm-1"}, exc_info=False)
+        line = ExtrasFormatter(fmt="%(levelname)s %(message)s").format(record)
+        assert line == "WARNING L1 restore failed error='TransientError: no answer' vm_id='vm-1'"
+
+    def test_no_extra_field_is_the_plain_line(self) -> None:
+        record = _record(extra={}, exc_info=False)
+        assert ExtrasFormatter(fmt="%(levelname)s %(message)s").format(record) == "WARNING L1 restore failed"
+
+    def test_the_traceback_comes_after_the_fields(self) -> None:
+        record = _record(extra={"vm_id": "vm-1"}, exc_info=True)
+        first, *rest = ExtrasFormatter(fmt="%(message)s").format(record).splitlines()
+        assert first == "L1 restore failed vm_id='vm-1'"
+        assert rest[-1] == "ValueError: boom"
+
+
+def test_captured_logs_show_the_extra_fields(caplog: pytest.LogCaptureFixture) -> None:
+    """tests/conftest.py gives pytest's log handlers the ExtrasFormatter: a failed test's
+    captured log (and caplog.text) names the error that an extra field holds."""
+    with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER_NAME):
+        logging.getLogger(LIBRARY_LOGGER_NAME).warning("L1 restore failed", extra={"error": "MIGRATION_FAILED"})
+    assert "L1 restore failed error='MIGRATION_FAILED'" in caplog.text

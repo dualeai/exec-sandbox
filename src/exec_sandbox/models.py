@@ -13,7 +13,9 @@ class FileInfo(BaseModel):
 
     name: str = Field(description="File or folder name")
     is_dir: bool = Field(description="True if the entry is a folder")
-    size: int = Field(description="File size in bytes (0 for folders)")
+    size: int = Field(
+        description="Bytes of the file: its length, or its allocated bytes when less (a sparse file); 0 for folders"
+    )
 
 
 class PortMapping(BaseModel):
@@ -27,7 +29,7 @@ class PortMapping(BaseModel):
         PortMapping(internal=5000)
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     internal: int = Field(ge=1, le=65535, description="Port that the guest listens on")
     external: int | None = Field(
@@ -137,17 +139,19 @@ class ExecutionResult(BaseModel):
     )
     process_ms: int | None = Field(
         default=None,
-        description="Time from spawn to process exit in milliseconds (guest-reported)",
+        description=(
+            "Time from the code's write to the REPL to the end of its output, in milliseconds (guest-reported)"
+        ),
     )
 
 
 class InstanceRef(BaseModel):
     """A saved instance and its generation, returned by Session.save(). Keep the id and pass it to Scheduler.reuse()."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     instance_id: str = Field(
-        description="The id given to Scheduler.new(instance_id=...), else one the library made at the "
-        "first save (32 lowercase hex characters)"
+        description="The id given to Scheduler.new(instance_id=...) or Session.save(instance_id=...), else "
+        "one the library made at the first save (32 lowercase hex characters)"
     )
     generation: int = Field(description="1 after the first save; +1 for each later save by any caller")

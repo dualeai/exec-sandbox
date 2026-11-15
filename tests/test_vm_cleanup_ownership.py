@@ -97,7 +97,6 @@ class TestFailedAttemptOwnership:
         await manager._cleanup_failed_owner(vm.vm_id, operation="boot_failure_cleanup", error=RuntimeError("boot"))  # pyright: ignore[reportPrivateUsage]
 
         assert vm.resource_reservation is None
-        assert not manager._reservation_is_retained(reservation)  # pyright: ignore[reportPrivateUsage]
         assert manager._vms[vm.vm_id] is vm  # pyright: ignore[reportPrivateUsage]  # the reaper owns the files
         manager.reapers[0].assert_called_once_with(vm)  # type: ignore[attr-defined]
         manager.release.assert_not_awaited()  # type: ignore[attr-defined]
@@ -124,7 +123,6 @@ class TestFailedAttemptOwnership:
         await manager._cleanup_failed_owner("pending-vm", operation="pre_boot_cleanup", error=RuntimeError("x"))  # pyright: ignore[reportPrivateUsage]
 
         assert pending.reservation is None
-        assert not manager._reservation_is_retained(reservation)  # pyright: ignore[reportPrivateUsage]
         manager.reapers[1].assert_called_once_with(pending)  # type: ignore[attr-defined]
 
         cleanup_results.update(_ALL_DONE)
@@ -177,7 +175,6 @@ class TestEphemeralVm:
                     snapshot_drive=None,
                     cache_leases=(),
                     mem_path=None,
-                    mem_path_share=False,
                 ):
                     pass
 
@@ -275,17 +272,16 @@ class TestRestoreGrants:
     """A qemu-vm restore reads the saved state and RAM template by ACL ("r"), whoever saved them."""
 
     @staticmethod
-    def _entry(tmp_path: Path, *, use_template: bool) -> Path:
+    def _entry(tmp_path: Path) -> Path:
         vmstate = tmp_path / "l1.vmstate"
         vmstate.write_bytes(b"state")
         vmstate.with_suffix(".home").write_bytes(b"home")
         vmstate.with_suffix(".ram").write_bytes(b"ram")
-        vmstate.with_suffix(".vmstate.meta").write_text(f'{{"use_template": {str(use_template).lower()}}}')
         return vmstate
 
     @staticmethod
     async def _restore(
-        manager: VmManager, vmstate: Path, *, granted: bool
+        manager: VmManager, vmstate: Path, *, granted: bool, use_template: bool
     ) -> tuple[list[tuple[list[Path], str]], AsyncMock, BaseException]:
         """restore_vm as a qemu-vm QEMU, up to the QEMU command build (it raises there).
         Returns (the ACL grants asked, the build, the error restore_vm raised)."""
@@ -317,6 +313,10 @@ class TestRestoreGrants:
                 cache_leases=(),
                 expose_ports=None,
                 reservation=MagicMock(),
+                machine_type=None,
+                egress_domains=None,
+                boot=None,
+                use_template=use_template,
             )
         return grants, build, exc_info.value
 
@@ -324,8 +324,10 @@ class TestRestoreGrants:
     async def test_state_files_get_read_before_qemu_starts(
         self, unit_test_vm_manager: VmManager, tmp_path: Path, use_template: bool
     ) -> None:
-        vmstate = self._entry(tmp_path, use_template=use_template)
-        grants, build, error = await self._restore(unit_test_vm_manager, vmstate, granted=True)
+        vmstate = self._entry(tmp_path)
+        grants, build, error = await self._restore(
+            unit_test_vm_manager, vmstate, granted=True, use_template=use_template
+        )
         files = [vmstate, vmstate.with_suffix(".ram")] if use_template else [vmstate]
         assert grants == [(files, "r")]
         build.assert_awaited_once()
@@ -336,8 +338,8 @@ class TestRestoreGrants:
     ) -> None:
         """No QEMU that dies at `migrate-incoming` with EACCES: the restore stops before it
         (the L1 layer then cold boots and keeps the entry)."""
-        vmstate = self._entry(tmp_path, use_template=True)
-        grants, build, error = await self._restore(unit_test_vm_manager, vmstate, granted=False)
+        vmstate = self._entry(tmp_path)
+        grants, build, error = await self._restore(unit_test_vm_manager, vmstate, granted=False, use_template=True)
         assert grants == [([vmstate, vmstate.with_suffix(".ram")], "r")]
         assert isinstance(error, ConfigError)
         assert error.code is ErrorCode.HOST_DEPENDENCY

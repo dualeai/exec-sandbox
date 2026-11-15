@@ -27,7 +27,7 @@ from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.files.disk import create_file
 from exec_sandbox.files.locks import CacheEntry
 from exec_sandbox.hash_utils import file_hash, parse_hash_spec
-from exec_sandbox.permission_utils import cache_dir_error, make_cache_dir
+from exec_sandbox.permission_utils import make_cache_dir, setting_folder_error
 from exec_sandbox.platform_utils import get_os_name
 
 logger = get_logger(__name__)
@@ -83,7 +83,7 @@ async def retrieve(url: str, known_hash: str, *, path: Path, setting: str, decom
             LOCAL_DISK: a host error on the files of `path` (disk full, quota, I/O error), at
             once (no retry)
         ConfigError: SETTING_INVALID: `path` is not a private folder of this user, or this
-            user cannot make it or write its files (cache_dir_error); it names `setting`
+            user cannot make it or write its files (setting_folder_error); it names `setting`
 
     Example:
         fname = await retrieve(
@@ -98,7 +98,7 @@ async def retrieve(url: str, known_hash: str, *, path: Path, setting: str, decom
     try:
         return await _retrieve_into(url, known_hash, path=path, decompress=decompress)
     except OSError as e:  # an existing folder this user cannot write, a full disk
-        raise cache_dir_error(e, path=path, failure="cannot hold the download", setting=setting) from e
+        raise setting_folder_error(e, path=path, failure="cannot hold the download", setting=setting) from e
 
 
 async def _retrieve_into(url: str, known_hash: str, *, path: Path, decompress: bool) -> Path:

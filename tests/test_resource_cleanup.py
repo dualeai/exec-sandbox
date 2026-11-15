@@ -1,16 +1,13 @@
-"""resource_cleanup.cleanup_process: SIGTERM, then SIGKILL, then a kept reap task."""
+"""resource_cleanup.cleanup_process: SIGTERM, then SIGKILL."""
 
 import asyncio
-import logging
 import shlex
 import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
-import pytest
-
 from exec_sandbox.platform_utils import ProcessWrapper
-from exec_sandbox.resource_cleanup import _zombie_reap_tasks, cleanup_process
+from exec_sandbox.resource_cleanup import cleanup_process
 
 
 async def _spawn(script: str) -> ProcessWrapper:
@@ -108,7 +105,6 @@ class TestResourceCleanupProcess:
             is True
         )
         assert proc.returncode == 0
-        await asyncio.gather(*_zombie_reap_tasks)  # its background reap ends with the test
 
     async def test_cleanup_process_none(self) -> None:
         """None process returns True (no-op)."""
@@ -160,6 +156,22 @@ class TestResourceCleanupProcess:
 
         assert result is True
 
+    async def test_process_that_sigkill_does_not_end_in_time(self) -> None:
+        """SIGKILL that does not end the process within kill_timeout (D state): False."""
+        proc = _stuck_process()
+        proc.wait_with_timeout = AsyncMock(side_effect=TimeoutError)
+
+        result = await cleanup_process(
+            proc=proc,
+            name="stubborn-process",
+            context_id="test-ctx",
+            term_timeout=0.01,
+            kill_timeout=0.01,
+            kill_first=False,
+        )
+
+        assert (result, proc.kill.await_count) == (False, 1)
+
     async def test_cleanup_process_unexpected_exception(self) -> None:
         """An unexpected error of the OS call: False, never raised (cleanup paths go on)."""
         proc = _stuck_process()
@@ -176,131 +188,3 @@ class TestResourceCleanupProcess:
             )
             is False
         )
-
-
-class TestZombieTaskTracking:
-    """The background reap of a process that cleanup_process gave up on, or that had already
-    exited. The module keeps a reference to each reap task until it ends: asyncio keeps only a
-    weak one, and the garbage collector can drop a task that runs. The tests read that set
-    (_zombie_reap_tasks), as a collected task cannot be made to happen on demand."""
-
-    @pytest.fixture(autouse=True)
-    def clear_zombie_tasks(self):
-        """Clear zombie task set before and after each test."""
-        _zombie_reap_tasks.clear()
-        yield
-        _zombie_reap_tasks.clear()
-
-    async def test_already_dead_process_is_reaped_in_a_kept_task(self) -> None:
-        """The reap task is kept while it runs, and released when it ends."""
-        reaped = asyncio.Event()
-        proc = _stuck_process()
-        proc.returncode = 0
-
-        async def wait() -> int:
-            await reaped.wait()
-            return 0
-
-        proc.wait = wait
-
-        assert (
-            await cleanup_process(
-                proc=proc,
-                name="dead-process",
-                context_id="test-ctx",
-                term_timeout=3.0,
-                kill_timeout=2.0,
-                kill_first=False,
-            )
-            is True
-        )
-        assert len(_zombie_reap_tasks) == 1
-        (task,) = _zombie_reap_tasks
-        reaped.set()
-        await task
-        await asyncio.sleep(0)  # the done callback runs after the task ends
-        assert not _zombie_reap_tasks
-
-    async def test_reap_after_sigkill_timeout_waits_again(self) -> None:
-        """After a SIGKILL that does not end the process in time, a kept task waits for it
-        again (a zombie is reaped once the kernel lets it go); a timeout of that wait is no
-        error."""
-        proc = _stuck_process()
-        proc.wait_with_timeout = AsyncMock(side_effect=TimeoutError)
-
-        result = await cleanup_process(
-            proc=proc,
-            name="stubborn-process",
-            context_id="test-ctx",
-            term_timeout=0.01,
-            kill_timeout=0.01,
-            kill_first=False,
-        )
-
-        assert result is False
-        assert len(_zombie_reap_tasks) == 1
-        (task,) = _zombie_reap_tasks
-        await task
-        await asyncio.sleep(0)
-        assert proc.wait_with_timeout.await_count == 3  # SIGTERM wait, SIGKILL wait, reap
-        assert not _zombie_reap_tasks
-
-    async def test_failed_reap_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A reap that fails is logged as a warning and released."""
-        proc = _stuck_process()
-        proc.returncode = 0
-        proc.wait = AsyncMock(side_effect=OSError("wait failed"))
-
-        with caplog.at_level(logging.WARNING, logger="exec_sandbox"):
-            assert (
-                await cleanup_process(
-                    proc=proc,
-                    name="dead-process",
-                    context_id="test-ctx",
-                    term_timeout=3.0,
-                    kill_timeout=2.0,
-                    kill_first=False,
-                )
-                is True
-            )
-            (task,) = _zombie_reap_tasks
-            with pytest.raises(OSError, match="wait failed"):
-                await task
-            await asyncio.sleep(0)
-
-        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
-            "Zombie reaping task failed"
-        ]
-        assert not _zombie_reap_tasks
-
-    async def test_cancelled_reap_is_not_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A reap cancelled (at shutdown) logs nothing, and is released."""
-        proc = _stuck_process()
-        proc.returncode = 0
-
-        async def wait() -> int:
-            await asyncio.Event().wait()
-            return 0
-
-        proc.wait = wait
-
-        with caplog.at_level(logging.WARNING, logger="exec_sandbox"):
-            assert (
-                await cleanup_process(
-                    proc=proc,
-                    name="dead-process",
-                    context_id="test-ctx",
-                    term_timeout=3.0,
-                    kill_timeout=2.0,
-                    kill_first=False,
-                )
-                is True
-            )
-            (task,) = _zombie_reap_tasks
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            await asyncio.sleep(0)
-
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
-        assert not _zombie_reap_tasks

@@ -150,7 +150,8 @@ async def channel() -> AsyncIterator[UnixSocketChannel]:
 
 async def _start_worker(ch: UnixSocketChannel) -> asyncio.Task[None]:
     """Start the write worker as a background task, held by the channel (as connect() holds it)."""
-    ch._write_task = asyncio.create_task(ch._write_worker())  # pyright: ignore[reportPrivateUsage]
+    assert ch._writer is not None
+    ch._write_task = asyncio.create_task(ch._write_worker(ch._writer))  # pyright: ignore[reportPrivateUsage]
     return ch._write_task
 
 

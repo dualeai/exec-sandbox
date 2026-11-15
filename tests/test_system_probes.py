@@ -13,7 +13,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from exec_sandbox import system_probes
-from exec_sandbox.platform_utils import HostOS
+from exec_sandbox.exceptions import ErrorCode, TransientError
+from exec_sandbox.platform_utils import HostArch, HostOS
 from exec_sandbox.system_probes import check_kvm_available, probe_setpriv_pdeathsig
 
 
@@ -28,14 +29,18 @@ class TestKvmAccess:
         real_exists = Path.exists
         monkeypatch.setattr(Path, "exists", lambda self: str(self) == "/dev/kvm" or real_exists(self))
         monkeypatch.setattr(system_probes, "can_access", lambda _path, _mode: accessible)
-        monkeypatch.setattr(system_probes.asyncio, "create_subprocess_exec", _no_subprocess)
+        spawns = AsyncMock(side_effect=_no_subprocess)
+        monkeypatch.setattr(system_probes.asyncio, "create_subprocess_exec", spawns)
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox"):
             first = await check_kvm_available()
             second = await check_kvm_available()
 
-        assert first is second is False
+        # With access, it goes on to its ioctl check: here that check cannot run, which is no
+        # answer (None), never kept, so each call asks again; without access a kept False
+        assert first is second is (None if accessible else False)
         warnings = [r for r in caplog.records if "kvm group" in r.getMessage()]
+        assert spawns.await_count == (2 if accessible else 0)
         if accessible:
             assert warnings == []
         else:
@@ -301,11 +306,7 @@ class TestDriveDirectIoProbe:
 
 class TestPosixAclXattr:
     """system_probes.posix_acl_xattr: the OS and the filesystem say whether POSIX ACLs are
-    there (cached per device), not the name of the OS."""
-
-    @pytest.fixture(autouse=True)
-    def _fresh_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(system_probes.probe_cache, "posix_acls", {})
+    there, not the name of the OS."""
 
     @staticmethod
     def _getxattr(monkeypatch: pytest.MonkeyPatch, answer: bytes | int) -> list[str]:
@@ -325,21 +326,17 @@ class TestPosixAclXattr:
         monkeypatch.setattr(system_probes, "_GETXATTR", None)
         assert system_probes.posix_acl_xattr(tmp_path) is None
 
-    def test_a_filesystem_without_posix_acls_is_asked_once(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """EOPNOTSUPP (no ACL support, mounted noacl): None, and the device is not asked again."""
-        names = self._getxattr(monkeypatch, errno.EOPNOTSUPP)
-        assert system_probes.posix_acl_xattr(tmp_path) is None
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(errno.EOPNOTSUPP, id="no-acl-support"),  # no ACL support, mounted noacl
+            pytest.param(errno.ENODATA, id="no-acl-beyond-mode"),
+        ],
+    )
+    def test_no_acl_is_none(self, error: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        names = self._getxattr(monkeypatch, error)
         assert system_probes.posix_acl_xattr(tmp_path) is None
         assert names == [system_probes.POSIX_ACL_ACCESS_XATTR]
-
-    def test_a_file_with_no_acl_is_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """ENODATA: the filesystem keeps POSIX ACLs, this file has none beyond its mode."""
-        names = self._getxattr(monkeypatch, errno.ENODATA)
-        assert system_probes.posix_acl_xattr(tmp_path) is None
-        assert system_probes.posix_acl_xattr(tmp_path) is None
-        assert len(names) == 2  # each file is read: the device is not marked as without ACLs
 
     def test_a_file_with_an_acl_gives_it(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._getxattr(monkeypatch, b"\x02\x00\x00\x00")
@@ -354,19 +351,16 @@ class TestPosixAclXattr:
 class TestProbeCache:
     """The cache of probe results: its locks and its reset, as the probes and the tests use them."""
 
-    @pytest.mark.parametrize("attr", ["direct_io", "posix_acls"])
-    async def test_reset_of_a_per_device_cache_keeps_it_a_dict(self, attr: str, tmp_path: Path) -> None:
-        """reset(attr) of a per-device cache gives an empty dict, not the sentinel: the next
-        probe of that kind works."""
+    async def test_reset_of_a_per_device_cache_keeps_it_a_dict(self, tmp_path: Path) -> None:
+        """reset of a per-device cache gives an empty dict, not the sentinel: the next probe of
+        that kind works."""
         cache = system_probes.ProbeCache()
-        getattr(cache, attr)[1] = True
-        cache.reset(attr)
-        assert getattr(cache, attr) == {}
-        system_probes.probe_cache.reset(attr)
-        if attr == "direct_io":  # a disk folder takes O_DIRECT where the OS has it (macOS has none)
-            assert await system_probes.probe_direct_io(tmp_path) is hasattr(os, "O_DIRECT")
-        else:
-            assert system_probes.posix_acl_xattr(tmp_path) is None  # a new folder: no ACL beyond its mode
+        cache.direct_io[1] = True
+        cache.reset("direct_io")
+        assert cache.direct_io == {}
+        system_probes.probe_cache.reset("direct_io")
+        # a disk folder takes O_DIRECT where the OS has it (macOS has none)
+        assert await system_probes.probe_direct_io(tmp_path) is hasattr(os, "O_DIRECT")
 
     def test_a_contended_lock_works_in_a_later_event_loop(self) -> None:
         """Two probes contend for a lock in one asyncio.run, then again in a second one: an
@@ -382,3 +376,42 @@ class TestProbeCache:
 
         asyncio.run(contend())
         asyncio.run(contend())  # RuntimeError "bound to a different event loop" with one lock for all loops
+
+
+class TestTscDeadlineOnMacos:
+    """An Intel Mac: HVF never passes the TSC deadline timer to the guest, whatever the host
+    CPU lists (TSCTMR in sysctl machdep.cpu.features): no TSC deadline, and no probe runs.
+    With +tsc-deadline and enforce, QEMU would refuse every VM."""
+
+    async def test_hvf_never_has_the_deadline_timer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        probe = AsyncMock(side_effect=AssertionError("no probe on macOS"))
+        monkeypatch.setattr(system_probes, "run_probe", probe)
+        monkeypatch.setattr(system_probes, "detect_host_os", lambda: HostOS.MACOS)
+        monkeypatch.setattr(system_probes, "detect_host_arch", lambda: HostArch.X86_64)
+        assert await system_probes.check_tsc_deadline() is False
+        probe.assert_not_called()
+
+
+class TestKvmCheckWithNoAnswer:
+    """The /dev/kvm ioctl check that could not run (a fork limit) is no answer: no VM starts on
+    a guess (detect_accel_type raises TransientError, a kept False would pin every later VM to
+    TCG), and the next call checks again."""
+
+    async def test_a_fork_limit_is_transient_and_asked_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        real_exists = Path.exists
+        monkeypatch.setattr(Path, "exists", lambda self: str(self) == "/dev/kvm" or real_exists(self))
+        monkeypatch.setattr(system_probes, "can_access", lambda _path, _mode: True)
+        monkeypatch.setattr(system_probes, "detect_host_os", lambda: HostOS.LINUX)
+        answers: list[object] = [OSError(errno.EAGAIN, "Resource temporarily unavailable"), (1, b"", b"")]
+
+        async def probe(_cmd: object, **_kwargs: object) -> tuple[int, bytes, bytes]:
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer  # type: ignore[return-value]
+
+        monkeypatch.setattr(system_probes, "run_probe", probe)
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED):
+            await system_probes.detect_accel_type(force_emulation=False)
+        assert await system_probes.check_kvm_available() is False  # asked again: the ioctl failed, a final answer
+        assert answers == []

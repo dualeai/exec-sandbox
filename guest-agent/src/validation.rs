@@ -516,6 +516,30 @@ mod tests {
         assert!(result.contains("it\\'s"));
     }
 
+    // A key and a value that both hold ' and \ (both pass the env checks): the whole
+    // preamble, so a key that is not quoted (or a value quoted twice) fails here
+    #[test]
+    fn test_prepend_python_quotes_key_and_value() {
+        let env = HashMap::from([("a'b\\c".into(), "it's\\x".into())]);
+        let result = prepend_env_vars(Language::Python, "x=1", &env);
+        assert!(
+            result.starts_with(
+                "import os as __os__\n__os__.environ['a\\'b\\\\c']='it\\'s\\\\x'\ndel __os__\n"
+            ),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn test_prepend_js_quotes_key_and_value() {
+        let env = HashMap::from([("a'b\\c".into(), "it's\\x".into())]);
+        let result = prepend_env_vars(Language::Javascript, "x=1", &env);
+        assert!(
+            result.starts_with("process.env['a\\'b\\\\c']='it\\'s\\\\x';\n"),
+            "{result}"
+        );
+    }
+
     #[test]
     fn test_prepend_raw_single_quote_escape() {
         let env = HashMap::from([("KEY".into(), "it's".into())]);

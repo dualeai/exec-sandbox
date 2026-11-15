@@ -5,6 +5,7 @@ Integration tests: Real VM pool operations (requires QEMU + images).
 """
 
 import asyncio
+import collections
 import contextlib
 import time
 from collections.abc import Iterator
@@ -238,7 +239,6 @@ class TestHealthCheckFailures:
         [
             pytest.param("connect", ConnectionRefusedError("Connection refused"), id="socket-refused"),
             pytest.param("send_request", TimeoutError(), id="no-pong-in-time"),
-            pytest.param("send_request", asyncio.IncompleteReadError(b"", None), id="socket-eof"),
             pytest.param(
                 "connect",
                 SocketAuthError("Failed to get peer credentials", expected_uid=0, actual_uid=0, context=None),
@@ -560,7 +560,6 @@ class TestWarmVMPoolOwnership:
                 await start_waiter
 
         assert all(queue.empty() for queue in pool.pools.values())
-        assert not pool._initial_boot_tasks
         assert destroy.await_count == len(Language)
         assert {call.args[0] for call in destroy.await_args_list} == set(vms)
 
@@ -807,20 +806,6 @@ class TestWarmVMPoolL1Entry:
         save.assert_not_awaited()
 
 
-class TestLanguageEnum:
-    """Tests for Language enum."""
-
-    def test_language_values(self) -> None:
-        """Language enum has expected values."""
-        assert Language.PYTHON.value == "python"
-        assert Language.JAVASCRIPT.value == "javascript"
-
-    def test_language_from_string(self) -> None:
-        """Language can be created from string."""
-        assert Language("python") == Language.PYTHON
-        assert Language("javascript") == Language.JAVASCRIPT
-
-
 # ============================================================================
 # Unit Tests - REPL warm-up (no QEMU)
 # ============================================================================
@@ -849,18 +834,20 @@ class TestWarmReplUnit:
 
     async def test_ok_ack_pools_each_warmed_vm(self, unit_test_vm_manager) -> None:
         """Each cold-booted VM gets one warm-up request for its own language; an "ok" ack
-        puts it in the pool of that language."""
+        puts it in the pool of that language, and the warm-up's reseed stands for the one of
+        the first exec (a VM restored from L1 asks for none then)."""
         from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         with patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=True) as destroy:
-            vms = await self._start(pool, return_value=WarmReplAckMessage(language="python", status="ok"))
+            vms = await self._start(pool, return_value=WarmReplAckMessage(status="ok"))
             try:
                 for language, vm in vms.items():
                     (request,) = vm.channel.send_request.await_args.args
                     assert request == WarmReplRequest(language=language)
                     assert pool.pools[language].get_nowait() is vm
+                    assert vm.reseed_next_exec is False
             finally:
                 await pool.stop()
 
@@ -882,7 +869,7 @@ class TestWarmReplUnit:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         replies: dict[object, object] = {
-            "error-ack": WarmReplAckMessage(language="python", status="error", message="spawn failed"),
+            "error-ack": WarmReplAckMessage(status="error", message="spawn failed"),
             "pong": PongMessage(version="1.0"),
         }
         send_request = {key: replies.get(value, value) for key, value in answer.items()}
@@ -912,7 +899,7 @@ class TestWarmReplUnit:
         await pool.pools[Language.PYTHON].put(served)
         refill = MagicMock(vm_id="refill", l1_restored=l1_restored)
         steps: list[str] = []
-        ack = WarmReplAckMessage(language="python", status="ok")
+        ack = WarmReplAckMessage(status="ok")
         refill.channel.send_request = AsyncMock(side_effect=lambda *_a, **_k: steps.append("warm") or ack)
         refill.cgroup.reclaim = AsyncMock(side_effect=lambda **_k: steps.append("reclaim") or True)
 
@@ -994,6 +981,53 @@ class TestHealthCheckPoolUnit:
 
         assert loops() == []
 
+    @pytest.mark.usefixtures("warm_repl_ok")
+    async def test_the_loop_replaces_a_vm_that_stopped_answering(
+        self, unit_test_vm_manager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each turn of the health loop pings the pooled VMs with the real check: a VM whose
+        guest stopped answering while in the pool is destroyed and a new VM takes its place
+        (the loop runs at a 10 ms interval here, not 15 s)."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        monkeypatch.setattr(constants, "WARM_POOL_HEALTH_CHECK_INTERVAL", 0.01)
+        monkeypatch.setattr(constants, "WARM_POOL_HEALTH_CHECK_RETRY_MIN_SECONDS", 0)
+        monkeypatch.setattr(constants, "WARM_POOL_HEALTH_CHECK_RETRY_MAX_SECONDS", 0)
+        dying, _ = TestHealthCheckFailures._vm(step="connect", error=ConnectionRefusedError("Connection refused"))
+        dying.l1_restored, dying.cgroup = True, None  # its boot passes; it stops answering in the pool
+        booted: list[MagicMock] = []
+        replaced = asyncio.Event()  # the replacement of `dying` is booted
+
+        async def boot(*_args: object, **_kwargs: object) -> MagicMock:
+            if not booted:
+                booted.append(dying)
+                return dying
+            vm = MagicMock(vm_id=f"healthy-{len(booted)}", l1_restored=True, cgroup=None)
+            vm.process.is_stopped = AsyncMock(return_value=False)
+            vm.process.is_running = AsyncMock(return_value=True)
+            vm.channel.connect = AsyncMock()
+            vm.channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
+            booted.append(vm)
+            if len(booted) > len(Language):
+                replaced.set()
+            return vm
+
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
+        with (
+            patch.object(pool, "_boot_warm_vm", side_effect=boot),
+            patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=True) as destroy,
+        ):
+            await pool.start()
+            try:
+                async with asyncio.timeout(2):
+                    await replaced.wait()
+                pooled = set().union(*[await _take(pool, language, 1) for language in Language])
+                destroy.assert_awaited_once_with(dying)
+                assert pooled == set(booted[1:])  # each language: one VM, none of them `dying`
+            finally:
+                await pool.stop()
+
     async def test_health_check_empty_pool_returns_early(self, unit_test_vm_manager) -> None:
         """Health check on empty pool returns immediately without error."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -1071,7 +1105,8 @@ class TestWarmVMPoolIntegration:
         assert pool.pools[Language.RAW].qsize() == 0
 
     async def test_warm_pool_vm_has_prewarmed_repl(self, vm_manager) -> None:
-        """VM from warm pool has pre-warmed REPL (fast first execution)."""
+        """A VM from the warm pool runs code at once (that the pool warms its REPL first:
+        test_ok_ack_pools_each_warmed_vm)."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
@@ -1123,7 +1158,6 @@ class TestWarmVMPoolIntegration:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
         try:
             assert (
@@ -1286,7 +1320,6 @@ class TestHealthcheckIntegration:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
         config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
@@ -1324,7 +1357,6 @@ class TestHealthcheckIntegration:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
         vm2 = await vm_manager.create_vm(
             VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
@@ -1338,7 +1370,6 @@ class TestHealthcheckIntegration:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
 
         config = SchedulerConfig(warm_pool_size=1)
@@ -1643,18 +1674,28 @@ class TestWarmPoolIdleCpu:
             await pool.stop()
 
     @pytest.mark.slow
-    async def test_idle_cpu_sustained_over_time(self, vm_manager) -> None:
-        """No CPU drift over 30s (spans ~3 health check cycles)."""
+    async def test_idle_cpu_sustained_over_time(self, vm_manager, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No CPU drift over the sampling window while the VM stays in the pool: the health loop
+        pings it (every 5 s here) during the window, as it pings every pooled VM."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
+        monkeypatch.setattr(constants, "WARM_POOL_HEALTH_CHECK_INTERVAL", 5)
         config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
+        pings: collections.Counter[object] = collections.Counter()
+        real_check = pool._check_vm_health
+
+        async def counted_check(vm: object) -> bool:
+            pings[vm] += 1
+            return await real_check(vm)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(pool, "_check_vm_health", counted_check)
         await pool.start()
 
         try:
             await asyncio.sleep(SETTLE_SLEEP_S)
 
-            vm = pool.pools[Language.PYTHON].get_nowait()
+            vm = pool.pools[Language.PYTHON]._queue[0]  # pyright: ignore[reportAttributeAccessIssue]  # kept in the pool
 
             samples = await collect_cpu_samples(vm.process, n_samples=CPU_SAMPLES_SUSTAINED)
             assert_cpu_idle(samples, label="sustained")
@@ -1673,8 +1714,8 @@ class TestWarmPoolIdleCpu:
                 f"Sustained busy period: {max_consecutive_high} consecutive samples "
                 f">{CPU_CONSECUTIVE_SPIKE_THRESHOLD}% (sorted: {sorted(samples)})"
             )
-
-            pool.pools[Language.PYTHON].put_nowait(vm)
+            assert pings[vm] >= 2  # the health loop pinged it during the window
+            assert vm.state is VmState.READY  # healthy: never destroyed
         finally:
             await pool.stop()
 

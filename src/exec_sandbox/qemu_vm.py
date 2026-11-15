@@ -16,7 +16,7 @@ from collections.abc import Callable, Coroutine
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, NoReturn, cast
+from typing import IO, TYPE_CHECKING, Any, Final, NoReturn, cast
 from uuid import uuid4
 
 import psutil
@@ -51,6 +51,7 @@ from exec_sandbox.guest_agent_protocol import (
     ReadFileRequest,
     StreamingErrorMessage,
     WriteFileRequest,
+    request_line,
 )
 from exec_sandbox.guest_channel import (
     DualPortChannel,
@@ -195,8 +196,9 @@ def guest_error_to_exception(
     Returns:
         The error (not raised, caller raises): TransientError GUEST_UNAVAILABLE
         when the code never ran, InvalidInputError for bad input, a path or a
-        guest I/O failure, InternalError GUEST_PROTOCOL for request, protocol
-        and unknown errors.
+        guest I/O failure, or a command the guest agent does not know (another
+        release's agent), InternalError GUEST_PROTOCOL for the other request,
+        protocol and unknown errors.
     """
     context: dict[str, object] = {
         "vm_id": vm_id,
@@ -222,16 +224,28 @@ def guest_error_to_exception(
             cls, code = InvalidInputError, ErrorCode.PATH_INVALID
         case constants.GuestErrorType.IO:
             cls, code = InvalidInputError, ErrorCode.GUEST_IO
+        case constants.GuestErrorType.REQUEST if msg.message.startswith(_UNKNOWN_COMMAND):
+            # The guest agent of another release (a VM it saved): this VM cannot take the call
+            cls, code = InvalidInputError, ErrorCode.ARGUMENT_INVALID
+            formatted = (
+                f"{operation}: the guest agent of this VM does not know this command (another "
+                f"exec-sandbox release started the VM): {msg.message}"
+            )
         case _:  # REQUEST, PROTOCOL, unknown
             cls, code = InternalError, ErrorCode.GUEST_PROTOCOL
     return cls(formatted, code=code, context=context, hint=None, instance_id=None)
 
 
+_UNKNOWN_COMMAND: Final = "Invalid command: unknown variant"
+"""Start of the guest agent's request_error for a command it does not know (serde's
+"unknown variant" text, as every release of the agent writes it)."""
+
+
 # Use native zstd module (Python 3.14+) or backports.zstd
 if sys.version_info >= (3, 14):
-    from compression import zstd  # type: ignore[import-not-found]
+    from compression import zstd
 else:
-    from backports import zstd  # type: ignore[import-untyped,no-redef]
+    from backports import zstd
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,7 +276,7 @@ class QemuVM:
         process: QEMU subprocess handle
         cgroup: the VM's cgroup v2 (limits, stats, the end of its processes); None without one
         workdir: Working directory containing all VM temp files
-        gvproxy_proc: Optional gvproxy-wrapper process for outbound filtering
+        gvproxy_proc: gvproxy-wrapper process (network access or exposed ports), or None
         gvproxy_log_task: Optional background task draining gvproxy stdout/stderr
     """
 
@@ -282,6 +296,7 @@ class QemuVM:
         gvproxy_proc: "ProcessWrapper | None",
         qemu_log_task: asyncio.Task[None] | None,
         gvproxy_log_task: asyncio.Task[None] | None,
+        device_layout: str,
     ):
         """Initialize VM handle.
 
@@ -300,6 +315,8 @@ class QemuVM:
             gvproxy_proc: Optional gvproxy-wrapper process (ProcessWrapper)
             qemu_log_task: Background task draining QEMU stdout/stderr (prevents pipe deadlock)
             gvproxy_log_task: Background task draining gvproxy stdout/stderr (prevents pipe deadlock)
+            device_layout: The guest-visible devices of its QEMU command (qemu_cmd.device_layout):
+                a save records it, a load compares it with the command it would run
         """
         self.vm_id = vm_id
         self.process = process
@@ -314,8 +331,8 @@ class QemuVM:
         self.gvproxy_proc = gvproxy_proc
         self.qemu_log_task = qemu_log_task
         self.gvproxy_log_task = gvproxy_log_task
+        self.device_layout = device_layout
         self._state = VmState.CREATING
-        self._state_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._process_exit_task: asyncio.Task[int] | None = None
         # Timing instrumentation (set by VmManager.create_vm and restore_vm)
@@ -323,11 +340,14 @@ class QemuVM:
         # Resource reservation from admission controller (set by VmManager at the launch; None:
         # the VM holds no admission slot, which prevents a double release in destroy_vm)
         self.resource_reservation: ResourceReservation | None = None
-        # Port forwarding - set by VmManager after boot, and by the Scheduler
-        # Stores the resolved port mappings for result reporting
+        # Port forwarding: the resolved port mappings, set by VmManager at create and
+        # restore (Session.exposed_ports reports them)
         self.exposed_ports: list[ExposedPort] = []
-        # L1 memory snapshot restore flag
+        # Restored from a saved state (VmManager.restore_vm: L1 template or saved instance), not cold booted
         self.l1_restored: bool = False
+        # The next exec asks the REPL to reseed its random generators (set by VmManager.restore_vm:
+        # every copy of one saved state starts with the same generator state)
+        self.reseed_next_exec: bool = False
         # Previous nr_throttled from cgroup cpu.stat (for delta-based warning)
         self._prev_nr_throttled: int = 0
         # Reads the QEMU events (start_event_watch); ends with QEMU
@@ -353,6 +373,17 @@ class QemuVM:
         # now: a file rebuilt there since holds other bytes than the VM runs on.
         self.base_image_digest: str | None = None
         self.packages_image_digest: str | None = None
+        # The kernel and initramfs the guest booted (a restore: the saved ones), as a save
+        # records them (GuestFacts)
+        self.kernel_digest: str | None = None
+        self.initramfs_digest: str | None = None
+        # The machine type QEMU runs, as it resolves the -M value (set by VmManager at the
+        # spawn from the cached machine type probe; None: unknown): a save records it
+        self.machine_type: str | None = None
+        # The domains its gvproxy lets it reach with the network on (empty: all), set at the
+        # spawn: the spec's resolved at its boot, a saved instance's from its save. A save
+        # records it: the policy at save stays the policy of every load
+        self.egress_domains: tuple[str, ...] = ()
 
     @property
     def use_qemu_vm_user(self) -> bool:
@@ -386,33 +417,33 @@ class QemuVM:
         Raises:
             InternalError: INTERNAL if the transition is invalid for the current state
         """
-        async with self._state_lock:
-            allowed_transitions = VALID_STATE_TRANSITIONS[self._state]
-            if new_state not in allowed_transitions:
-                raise InternalError(
-                    f"Invalid state transition: {self._state.value} -> {new_state.value}",
-                    code=ErrorCode.INTERNAL,
-                    context={
-                        "vm_id": self.vm_id,
-                        "current_state": self._state.value,
-                        "target_state": new_state.value,
-                        "allowed_transitions": [s.value for s in allowed_transitions],
-                    },
-                    hint=None,
-                    instance_id=None,
-                )
-
-            old_state = self._state
-            self._state = new_state
-            logger.debug(
-                "VM state transition",
-                extra={
-                    "debug_category": "lifecycle",
+        # No await from the check to the set: no other coroutine sees a half-made move
+        allowed_transitions = VALID_STATE_TRANSITIONS[self._state]
+        if new_state not in allowed_transitions:
+            raise InternalError(
+                f"Invalid state transition: {self._state.value} -> {new_state.value}",
+                code=ErrorCode.INTERNAL,
+                context={
                     "vm_id": self.vm_id,
-                    "old_state": old_state.value,
-                    "new_state": new_state.value,
+                    "current_state": self._state.value,
+                    "target_state": new_state.value,
+                    "allowed_transitions": [s.value for s in allowed_transitions],
                 },
+                hint=None,
+                instance_id=None,
             )
+
+        old_state = self._state
+        self._state = new_state
+        logger.debug(
+            "VM state transition",
+            extra={
+                "debug_category": "lifecycle",
+                "vm_id": self.vm_id,
+                "old_state": old_state.value,
+                "new_state": new_state.value,
+            },
+        )
 
     async def execute(  # noqa: PLR0912, PLR0915
         self,
@@ -491,33 +522,20 @@ class QemuVM:
                 - exit_code=-1: execution timeout (code ran too long)
         """
         await self._check_host_disk()
-        # Validate VM is in READY state before execution (atomic check-and-set)
-        async with self._state_lock:
-            if self._state != VmState.READY:
-                raise InternalError(
-                    f"Cannot execute in state {self._state.value}, must be READY",
-                    code=ErrorCode.INTERNAL,
-                    context={
-                        "vm_id": self.vm_id,
-                        "current_state": self._state.value,
-                        "language": self.spec.language,
-                    },
-                    hint=None,
-                    instance_id=None,
-                )
-
-            # Transition to EXECUTING inside same lock (READY -> EXECUTING is in VALID_STATE_TRANSITIONS)
-            old_state = self._state
-            self._state = VmState.EXECUTING
-            logger.debug(
-                "VM state transition",
-                extra={
-                    "debug_category": "lifecycle",
+        # READY, then EXECUTING with no await between (transition_state does not yield)
+        if self._state != VmState.READY:
+            raise InternalError(
+                f"Cannot execute in state {self._state.value}, must be READY",
+                code=ErrorCode.INTERNAL,
+                context={
                     "vm_id": self.vm_id,
-                    "old_state": old_state.value,
-                    "new_state": self._state.value,
+                    "current_state": self._state.value,
+                    "language": self.spec.language,
                 },
+                hint=None,
+                instance_id=None,
             )
+        await self.transition_state(VmState.EXECUTING)
 
         # Prepare execution request
         timeout_phase = "connect"
@@ -527,6 +545,7 @@ class QemuVM:
             request = ExecuteCodeRequest(
                 language=self.spec.language,
                 code=code,
+                reseed=self.reseed_next_exec,
                 timeout=timeout_seconds,
                 env_vars=env_vars or {},
             )
@@ -570,6 +589,8 @@ class QemuVM:
                 exc = guest_error_to_exception(msg, self.vm_id, operation="execute")
                 # Recoverable input errors: VM is fine, restore READY for session reuse
                 if isinstance(exc, InvalidInputError):
+                    if msg.error_type == constants.GuestErrorType.OUTPUT_LIMIT:
+                        self.reseed_next_exec = False  # the REPL ran the code, after its reseed
                     with contextlib.suppress(InternalError):
                         await self.transition_state(VmState.READY)
                     raise exc
@@ -605,6 +626,11 @@ class QemuVM:
                 soft_timeout_seconds=timeout_seconds,
                 hard_timeout_seconds=hard_timeout,
             )
+            # A result (or OUTPUT_LIMIT, above): the REPL reseeded before the code, or it ended (it
+            # died, or the guest killed it at the timeout) and the next exec gets a new REPL with
+            # new seeds. A refusal of the code or the env vars (host or guest, before the REPL
+            # reads the request) or a failure keeps the flag: one more reseed is harmless
+            self.reseed_next_exec = False
 
             # Measure external resources from host (cgroup v2)
             stats = NO_CGROUP_STATS if self.cgroup is None else self.cgroup.stats()
@@ -715,15 +741,7 @@ class QemuVM:
                     **deadline,
                 },
             ) from e
-        except (
-            OSError,
-            json.JSONDecodeError,
-            asyncio.IncompleteReadError,
-            asyncio.LimitOverrunError,
-            ValidationError,
-            RuntimeError,
-            CommunicationError,
-        ) as e:
+        except (OSError, ValidationError, RuntimeError, CommunicationError) as e:
             raise await self._guest_unavailable(
                 f"VM {self.vm_id} communication failed: {e}",
                 context={
@@ -892,10 +910,9 @@ class QemuVM:
 
         try:
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-            op_queue = self.channel.register_op(op_id)
+            op_queue = self.channel.register_op(op_id, changes_state=True)  # write_file
             header = WriteFileRequest(op_id=op_id, path=path, make_executable=make_executable)
-            header_bytes = header.model_dump_json(by_alias=False, exclude_none=True).encode() + b"\n"
-            await self.channel.enqueue_registered(op_queue, header_bytes)
+            await self.channel.enqueue_registered(op_queue, request_line(header))
 
             # Stream-compress content chunk by chunk.  Each 128 KB slice is
             # read from the stream, compressed, and sent immediately.
@@ -1018,7 +1035,7 @@ class QemuVM:
                     f"VM {self.vm_id} write_file timed out before dispatch for '{path}'",
                     context={"vm_id": self.vm_id, "path": path, **deadline},
                 ) from error
-            if isinstance(error, (OSError, json.JSONDecodeError, CommunicationError)):
+            if isinstance(error, (OSError, CommunicationError)):
                 raise await self._guest_unavailable(
                     f"VM {self.vm_id} write_file communication failed before dispatch: {error}",
                     context={"vm_id": self.vm_id, "path": path},
@@ -1074,7 +1091,7 @@ class QemuVM:
                 f"VM {self.vm_id} read_file timed out for '{path}'",
                 context={"vm_id": self.vm_id, "path": path, **await self.deadline_diagnostics(operation="read_file")},
             ) from e
-        except (OSError, json.JSONDecodeError, CommunicationError) as e:
+        except (OSError, CommunicationError) as e:
             raise await self._guest_unavailable(
                 f"VM {self.vm_id} read_file communication failed: {e}", context={"vm_id": self.vm_id, "path": path}
             ) from e
@@ -1088,11 +1105,10 @@ class QemuVM:
         The caller is responsible for op unregistration and sink lifecycle.
         """
         await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-        op_queue = self.channel.register_op(op_id)
+        op_queue = self.channel.register_op(op_id, changes_state=False)  # read_file
 
         request = ReadFileRequest(op_id=op_id, path=path)
-        request_bytes = request.model_dump_json(by_alias=False, exclude_none=True).encode() + b"\n"
-        await self.channel.enqueue_registered(op_queue, request_bytes)
+        await self.channel.enqueue_registered(op_queue, request_line(request))
 
         decompressor = zstd.ZstdDecompressor()
         received_size = 0
@@ -1190,7 +1206,7 @@ class QemuVM:
                 f"VM {self.vm_id} list_files timed out for '{path}'",
                 context={"vm_id": self.vm_id, "path": path, **await self.deadline_diagnostics(operation="list_files")},
             ) from e
-        except (OSError, json.JSONDecodeError, CommunicationError) as e:
+        except (OSError, CommunicationError) as e:
             # OutcomeUnknownError is a SandboxError, not a CommunicationError,
             # so post-dispatch unknown outcomes still propagate as themselves.
             raise await self._guest_unavailable(
@@ -1214,9 +1230,8 @@ class QemuVM:
     async def begin_destroy(self) -> None:
         """Make the VM non-reusable while allowing cleanup retries (every state before
         DESTROYING may go to it: VALID_STATE_TRANSITIONS)."""
-        async with self._state_lock:
-            if self._state not in (VmState.DESTROYING, VmState.DESTROYED):
-                self._state = VmState.DESTROYING
+        if self._state not in (VmState.DESTROYING, VmState.DESTROYED):
+            self._state = VmState.DESTROYING
 
     def release_cache_leases(self) -> None:
         """Release this VM's cache leases: call it only once QEMU's death is confirmed."""
@@ -1237,8 +1252,7 @@ class QemuVM:
             cancellation = await await_settled(self._process_exit_task)
         # QEMU is gone: its event socket is closed or soon
         cancellation = await self._event_watch.stop() or cancellation
-        async with self._state_lock:
-            self._state = VmState.DESTROYED
+        self._state = VmState.DESTROYED
         if cancellation is not None:
             raise cancellation
 
@@ -1460,7 +1474,7 @@ class QemuVM:
                 ) as qmp,
             ):
                 response = await qmp.execute("query-status", arguments=None, timeout=timeout, on_event=None)
-        except (OSError, TimeoutError, ValueError, CommunicationError) as error:
+        except (OSError, ValueError, CommunicationError) as error:  # TimeoutError too
             return f"unavailable ({type(error).__name__}: {error})"
         result = response.get("return")
         if not isinstance(result, dict):
@@ -1548,7 +1562,9 @@ class QemuVM:
             # once, not a retry until the boot deadline (TransientError is not retried here)
             await self._check_host_disk()
             await self.channel.connect(timeout_seconds=1)
-            response = await self.channel.send_request(PingRequest(), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS)
+            response = await self.channel.send_request(
+                PingRequest(host_entropy=None), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS
+            )
             if not isinstance(response, PongMessage):
                 raise RuntimeError(f"Guest ping returned unexpected type: {type(response)}")
 
@@ -1577,7 +1593,7 @@ class QemuVM:
                 try:
                     await self.channel.connect(timeout_seconds=0.005)
                     logger.debug("Pre-connected to guest channel sockets", extra={"vm_id": self.vm_id})
-                except (TimeoutError, OSError, CommunicationError, OutcomeUnknownError) as e:
+                except (OSError, CommunicationError, OutcomeUnknownError) as e:  # TimeoutError too
                     # Expected - sockets may not be ready yet, retry loop will handle
                     logger.debug("Pre-connect to sockets deferred", extra={"vm_id": self.vm_id, "reason": str(e)})
 
@@ -1585,11 +1601,8 @@ class QemuVM:
                 async for attempt in AsyncRetrying(
                     retry=retry_if_exception_type(
                         (
-                            TimeoutError,
-                            OSError,
-                            json.JSONDecodeError,
+                            OSError,  # TimeoutError too
                             RuntimeError,
-                            asyncio.IncompleteReadError,
                             CommunicationError,
                             OutcomeUnknownError,
                         )

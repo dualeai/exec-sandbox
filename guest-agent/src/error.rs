@@ -11,9 +11,11 @@ use crate::types::GuestResponse;
 
 /// Domain-specific error types sent to the host as the `error_type` wire field.
 ///
-/// Each variant maps to a distinct wire string, so the host can dispatch
-/// without parsing messages. The host enum is `GuestErrorType` in
-/// src/exec_sandbox/constants.py; keep the two in sync.
+/// Each variant maps to a distinct wire string, and the host dispatches on it.
+/// One case also reads the message: a request_error that starts with "Invalid
+/// command: unknown variant" (connection.rs) is a command this agent does not
+/// know. The host enum is `GuestErrorType` in src/exec_sandbox/constants.py;
+/// keep the two in sync.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ErrorType {
     EnvVar,      // "env_var_error"
@@ -121,15 +123,6 @@ impl CmdError {
     }
 }
 
-impl std::fmt::Display for CmdError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Reply { message, .. } => write!(f, "{message}"),
-            Self::Fatal(e) => write!(f, "fatal: {e}"),
-        }
-    }
-}
-
 impl From<mpsc::error::SendError<Vec<u8>>> for CmdError {
     fn from(_: mpsc::error::SendError<Vec<u8>>) -> Self {
         Self::Fatal("Write queue closed".into())
@@ -139,6 +132,16 @@ impl From<mpsc::error::SendError<Vec<u8>>> for CmdError {
 // ============================================================================
 // ResponseWriter — op_id-aware response sender
 // ============================================================================
+
+/// The JSON of one message: its fields, then the `op_id` of the request (no
+/// field when the request has none). One serialization, no JSON tree.
+#[derive(serde::Serialize)]
+struct Frame<'a> {
+    #[serde(flatten)]
+    msg: &'a GuestResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    op_id: Option<&'a str>,
+}
 
 /// Wraps a write channel and the optional `op_id` of a request. Every message
 /// sent through this writer gets that `op_id` in its JSON.
@@ -152,17 +155,13 @@ impl ResponseWriter {
         Self { write_tx, op_id }
     }
 
-    /// Serialize `msg` to JSON, inject `op_id`, append newline, and queue for sending.
+    /// Serialize `msg` to JSON with the `op_id` field, append newline, and queue for sending.
     pub(crate) async fn send(&self, msg: &GuestResponse) -> Result<(), CmdError> {
-        let mut value = serde_json::to_value(msg).map_err(|e| CmdError::Fatal(e.into()))?;
-
-        if let Some(ref id) = self.op_id
-            && let Some(obj) = value.as_object_mut()
-        {
-            obj.insert("op_id".to_string(), serde_json::Value::String(id.clone()));
-        }
-
-        let mut bytes = serde_json::to_vec(&value).map_err(|e| CmdError::Fatal(e.into()))?;
+        let frame = Frame {
+            msg,
+            op_id: self.op_id.as_deref(),
+        };
+        let mut bytes = serde_json::to_vec(&frame).map_err(|e| CmdError::Fatal(e.into()))?;
         bytes.push(b'\n');
         self.write_tx.send(bytes).await?;
         Ok(())
@@ -199,59 +198,58 @@ pub(crate) fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(255)
 }
 
-/// Gracefully terminate a process group: SIGTERM → wait → SIGKILL.
+/// Gracefully terminate the process group that `child` leads: SIGTERM → wait → SIGKILL.
 ///
 /// Implements Kubernetes-style graceful shutdown:
 /// 1. Send SIGTERM to entire process group (allows cleanup)
 /// 2. Wait for the leader, at most the grace period
 /// 3. Send SIGKILL to the group: as when the init of a container ends, the
 ///    members that outlive the leader (one that ignores SIGTERM) end with it
+///
+/// A leader that was collected already skips to step 3: its members end too.
+/// The signals go through the child's pidfd (`WaitedChild::signal_group`), so
+/// they never reach another group with the same ID.
 pub(crate) async fn graceful_terminate_process_group(
     child: &mut crate::init::WaitedChild,
     grace_period_secs: u64,
 ) {
     use tokio::time::{Duration, timeout};
 
-    let pid = match child.id() {
-        Some(id) => id as i32,
-        None => return, // Process already exited (its PID may be another process now)
+    let leader_ended = match child.id() {
+        None => true,
+        Some(pid) => {
+            // Phase 1: SIGTERM to entire process group
+            if let Err(errno) = child.signal_group(libc::SIGTERM) {
+                if errno.raw_os_error() != Some(libc::ESRCH) {
+                    log_error!("SIGTERM to process group {pid} failed: {errno}");
+                }
+                let _ = wait_child_bounded(child, "a failed SIGTERM", KILL_WAIT).await;
+                return;
+            }
+
+            // Phase 2: Wait for the leader, at most the grace period
+            match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => {
+                    log_error!("Wait error after SIGTERM: {e}");
+                    false
+                }
+                Err(_) => {
+                    log_warn!(
+                        "Process {pid} didn't respond to SIGTERM within {grace_period_secs}s, sending SIGKILL"
+                    );
+                    false
+                }
+            }
+        }
     };
 
-    // Phase 1: SIGTERM to entire process group
-    let term_result = unsafe { libc::kill(-pid, libc::SIGTERM) };
-    if term_result == -1 {
-        let errno = std::io::Error::last_os_error();
-        if errno.raw_os_error() != Some(libc::ESRCH) {
-            log_error!("SIGTERM to process group {pid} failed: {errno}");
-        }
-        let _ = wait_child_bounded(child, "a failed SIGTERM", KILL_WAIT).await;
-        return;
-    }
-
-    // Phase 2: Wait for the leader, at most the grace period
-    let leader_ended = match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
-        Ok(Ok(_)) => true,
-        Ok(Err(e)) => {
-            log_error!("Wait error after SIGTERM: {e}");
-            false
-        }
-        Err(_) => {
-            log_warn!(
-                "Process {pid} didn't respond to SIGTERM within {grace_period_secs}s, sending SIGKILL"
-            );
-            false
-        }
-    };
-
-    // Phase 3: SIGKILL to the group, also after the leader ended. The group ID
-    // stays reserved while a member lives, so the signal reaches only the
-    // group (ESRCH when no member is left).
-    let kill_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
-    if kill_result == -1 {
-        let errno = std::io::Error::last_os_error();
-        if errno.raw_os_error() != Some(libc::ESRCH) {
-            log_error!("SIGKILL to process group {pid} failed: {errno}");
-        }
+    // Phase 3: SIGKILL to the group, also after the leader ended (ESRCH when
+    // no member is left).
+    if let Err(errno) = child.signal_group(libc::SIGKILL)
+        && errno.raw_os_error() != Some(libc::ESRCH)
+    {
+        log_error!("SIGKILL to the process group failed: {errno}");
     }
 
     if !leader_ended {
@@ -592,24 +590,9 @@ mod tests {
 
     #[test]
     fn test_cmd_error_from_send_error() {
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
-        drop(_rx);
-        // Simulate a send error
-        let _send_err = tx.try_send(vec![]).unwrap_err();
-        // We can't directly convert TrySendError, but test the From impl exists
-        let _: CmdError = mpsc::error::SendError(vec![]).into();
-    }
-
-    #[test]
-    fn test_cmd_error_display_reply() {
-        let err = CmdError::code("bad input");
-        assert_eq!(format!("{err}"), "bad input");
-    }
-
-    #[test]
-    fn test_cmd_error_display_fatal() {
-        let err = CmdError::Fatal("connection lost".into());
-        assert_eq!(format!("{err}"), "fatal: connection lost");
+        // A closed write queue ends the connection: Fatal, never a reply
+        let err: CmdError = mpsc::error::SendError(vec![]).into();
+        assert!(matches!(&err, CmdError::Fatal(e) if e.to_string() == "Write queue closed"));
     }
 
     // -------------------------------------------------------------------------
@@ -686,7 +669,6 @@ mod tests {
         let val = writer_send_json(
             Some("abc"),
             &GuestResponse::WarmReplAck {
-                language: crate::types::Language::Python,
                 status: "ok".into(),
                 message: None,
             },
@@ -787,7 +769,8 @@ mod tests {
                 .arg("30")
                 .spawn()
                 .unwrap(),
-        );
+        )
+        .unwrap();
         let start = std::time::Instant::now();
 
         let status = tokio::time::timeout(
@@ -814,7 +797,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut stdout = spawned.stdout.take().unwrap();
-        let mut child = crate::init::WaitedChild::register(spawned);
+        let mut child = crate::init::WaitedChild::register(spawned).unwrap();
         let mut ready = [0u8; 6];
         tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut ready)
             .await
@@ -842,7 +825,8 @@ mod tests {
                 .args(["-c", "exit 3"])
                 .spawn()
                 .unwrap(),
-        );
+        )
+        .unwrap();
 
         let status =
             wait_child_bounded(&mut child, "test", std::time::Duration::from_secs(2)).await;

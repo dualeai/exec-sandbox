@@ -81,7 +81,7 @@ pub(crate) fn mount(
     }
 }
 
-pub(crate) fn mount_move(source: &str, target: &str) -> i32 {
+pub(crate) fn mount_move(source: &str, target: &str) {
     let source = CString::new(source).unwrap();
     let target = CString::new(target).unwrap();
 
@@ -92,13 +92,13 @@ pub(crate) fn mount_move(source: &str, target: &str) -> i32 {
             std::ptr::null(),
             libc::MS_MOVE,
             std::ptr::null(),
-        )
+        );
     }
 }
 
-pub(crate) fn umount(target: &str) -> i32 {
+pub(crate) fn umount(target: &str) {
     let target = CString::new(target).unwrap();
-    unsafe { libc::umount(target.as_ptr()) }
+    unsafe { libc::umount(target.as_ptr()) };
 }
 
 fn parse_cmdline_has(cmdline: &str, flag: &str) -> bool {

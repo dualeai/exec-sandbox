@@ -5,29 +5,10 @@ Used by VmManager, DiskSnapshotManager (L2 builds), qemu-storage-daemon, gvproxy
 subprocess_utils to end their child processes.
 """
 
-import asyncio
-import contextlib
-from typing import Any
-
 from exec_sandbox._logging import get_logger
 from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
-
-# Module-level set to hold references to background zombie reaping tasks
-# Prevents garbage collection of fire-and-forget tasks
-# See: https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
-_zombie_reap_tasks: set[asyncio.Task[Any]] = set()
-
-
-def _cleanup_zombie_task(task: asyncio.Task[Any]) -> None:
-    """Remove completed task from tracking set and log any exceptions."""
-    _zombie_reap_tasks.discard(task)
-    if not task.cancelled() and task.exception() is not None:
-        logger.warning(
-            "Zombie reaping task failed",
-            extra={"error": str(task.exception())},
-        )
 
 
 async def cleanup_process(
@@ -41,11 +22,13 @@ async def cleanup_process(
 ) -> bool:
     """Force cleanup of subprocess (SIGTERM → SIGKILL).
 
-    - A process that already ended is reaped by a background task (no zombie)
+    - A process with a returncode is already reaped (asyncio sets it after waitpid)
     - SIGTERM, wait up to term_timeout, then SIGKILL, wait up to kill_timeout; with
       kill_first, SIGKILL at once (no clean exit needed)
-    - A process still alive after SIGKILL is reaped by a background task (up to 30 s)
-    - ProcessLookupError (the process ended meanwhile) counts as success
+    - A process still alive after SIGKILL: False; the event loop's child watcher reaps it
+      when it ends (every child of create_subprocess_exec), no task here waits for it
+    - ProcessLookupError (the process ended meanwhile, or ProcessWrapper.is_running can no
+      longer see it) counts as success
     - Never raises an exception (logs it and returns False); a cancellation propagates
     - Uses ProcessWrapper for PID-reuse safety and async-only operations
 
@@ -70,10 +53,6 @@ async def cleanup_process(
                 f"{name} already terminated",
                 extra={"context_id": context_id, "returncode": proc.returncode},
             )
-            # Ensure zombie is reaped - track task to prevent GC
-            task = asyncio.create_task(proc.wait())
-            _zombie_reap_tasks.add(task)
-            task.add_done_callback(_cleanup_zombie_task)
             return True
 
         if not kill_first:
@@ -106,19 +85,10 @@ async def cleanup_process(
             )
             return True
         except TimeoutError:
-            logger.error(
+            logger.error(  # the loop's child watcher reaps it when it ends
                 f"{name} didn't respond to SIGKILL within timeout",
                 extra={"context_id": context_id, "kill_timeout": kill_timeout, "pid": proc.pid},
             )
-
-            # Still try to reap in background to prevent zombie - track task to prevent GC
-            async def drain_and_wait() -> None:
-                with contextlib.suppress(OSError, TimeoutError, asyncio.CancelledError):
-                    await proc.wait_with_timeout(timeout=30)  # 30s timeout for zombie reaping
-
-            task = asyncio.create_task(drain_and_wait())
-            _zombie_reap_tasks.add(task)
-            task.add_done_callback(_cleanup_zombie_task)
             return False
 
     except ProcessLookupError:

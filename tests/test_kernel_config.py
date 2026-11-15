@@ -24,6 +24,7 @@ def test_fragment_disables_slow_probe_driver(option: str) -> None:
 
     assert re.search(rf"^{option}=[ym]$", base, re.MULTILINE)  # the base really builds it
     assert f"\n# {option} is not set\n" in fragment
+    assert not re.search(rf"^{option}=", fragment, re.MULTILINE)  # no later line turns it back on
 
 
 # Fragment directives whose symbol is in neither base config: symbols of the pinned kernel's

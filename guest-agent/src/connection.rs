@@ -207,15 +207,14 @@ enum WriteFinish {
 
 /// Send the end marker of a pipelined write and wait for its writer task, at
 /// most `limit`. Past it, the write is abandoned, unless the task claimed the
-/// commit first: then its rename is on its way, and its result is
-/// awaited at most `commit_limit` more, so a stalled disk never stops the
-/// agent, which reads one command at a time.
+/// commit first: then its rename is on its way, and its result is awaited at
+/// most `limit` more, so a stalled disk never stops the agent, which reads one
+/// command at a time.
 async fn finish_write(
     chunk_tx: mpsc::Sender<Vec<u8>>,
     mut task: tokio::task::JoinHandle<Result<usize, String>>,
     end: &WriteEnd,
     limit: Duration,
-    commit_limit: Duration,
 ) -> WriteFinish {
     let finish = async {
         let _ = chunk_tx.send(vec![]).await;
@@ -225,11 +224,27 @@ async fn finish_write(
     match tokio::time::timeout(limit, finish).await {
         Ok(finished) => WriteFinish::Done(finished),
         Err(_) if end.try_abandon() => WriteFinish::Abandoned,
-        Err(_) => match tokio::time::timeout(commit_limit, task).await {
+        Err(_) => match tokio::time::timeout(limit, task).await {
             Ok(finished) => WriteFinish::Done(finished),
             Err(_) => WriteFinish::CommitStalled,
         },
     }
+}
+
+/// The io_error message of a write whose task ended without its file
+/// (`ended`, logged): the task's message, or its join error.
+fn write_error(
+    ended: Result<Result<usize, String>, tokio::task::JoinError>,
+    path_display: &str,
+    op_id: &str,
+) -> String {
+    let message = match ended {
+        Ok(Err(message)) => message,
+        Ok(Ok(_)) => format!("Write pipeline unexpectedly closed for '{path_display}'"),
+        Err(join_err) => format!("Internal error writing '{path_display}': {join_err}"),
+    };
+    log_error!("Write pipeline error for '{path_display}' (op_id={op_id}): {message}");
+    message
 }
 
 /// Report a command-handler outcome on the dispatch loop.
@@ -253,6 +268,23 @@ async fn report(
             .map_err(|_| "write queue closed".into()),
         Err(CmdError::Fatal(e)) => Err(e.to_string().into()),
     }
+}
+
+/// Answer a Ping: a Pong. With host entropy, `mix` (entropy::mix_host_entropy) adds it to
+/// the kernel and reseeds first; when that fails, an error and no Pong.
+async fn answer_ping(
+    writer: &ResponseWriter,
+    host_entropy: Option<&str>,
+    mix: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), CmdError> {
+    if let Some(host_entropy) = host_entropy
+        && let Err(error) = mix(host_entropy)
+    {
+        let message = format!("kernel random reseed with the host entropy failed: {error}");
+        log_error!("{message}");
+        return writer.send_error(message, ErrorType::Io.as_str()).await;
+    }
+    writer.send(&GuestResponse::Pong { version: VERSION }).await
 }
 
 /// Serve one host connection: from the first byte to the host close.
@@ -352,20 +384,25 @@ pub(crate) async fn handle_connection(
         // Step the wall clock forward to the host's before any user code reads it.
         crate::clock::sync(host_time_ns);
 
-        // Reseed kernel CRNG before every command dispatch (~11μs).
-        // After L1 snapshot restore the VM resumes mid-loop with cloned CRNG;
-        // this forces divergence before any user code calls getrandom().
-        crate::reseed_crng();
+        // Reseed the kernel CRNG before each command (~11 µs; a failure only logs,
+        // entropy.rs), so no user code reads the CRNG with the key it had before this
+        // command. A file chunk is never first: its write_file reseeded already.
+        if !matches!(cmd, GuestCommand::FileChunk { .. }) {
+            crate::entropy::reseed();
+        }
 
         let writer = ResponseWriter::new(write_tx.clone(), op_id);
 
         match cmd {
-            GuestCommand::Ping => {
-                log_info!("Processing: ping");
-                if writer
-                    .send(&GuestResponse::Pong { version: VERSION })
-                    .await
-                    .is_err()
+            GuestCommand::Ping { host_entropy } => {
+                log_info!("Processing: ping (host_entropy={})", host_entropy.is_some());
+                if answer_ping(
+                    &writer,
+                    host_entropy.as_deref(),
+                    crate::entropy::mix_host_entropy,
+                )
+                .await
+                .is_err()
                 {
                     break Err("write queue closed".into());
                 }
@@ -385,7 +422,6 @@ pub(crate) async fn handle_connection(
                 };
                 if writer
                     .send(&GuestResponse::WarmReplAck {
-                        language,
                         status: status.to_string(),
                         message,
                     })
@@ -433,6 +469,7 @@ pub(crate) async fn handle_connection(
                 code,
                 timeout,
                 env_vars,
+                reseed,
             } => {
                 // Gate all process spawning on network and capped-zram safety.
                 let t_net = crate::monotonic_ms();
@@ -456,13 +493,14 @@ pub(crate) async fn handle_connection(
                     t_net_done
                 );
                 log_info!(
-                    "Processing: execute_code (language={}, code_size={}, timeout={timeout}s, env_vars={})",
+                    "Processing: execute_code (language={}, code_size={}, timeout={timeout}s, env_vars={}, reseed={reseed})",
                     language.as_str(),
                     code.len(),
                     env_vars.len()
                 );
                 let outcome =
-                    execute_code_streaming(language, &code, timeout, &env_vars, &writer).await;
+                    execute_code_streaming(language, &code, timeout, &env_vars, reseed, &writer)
+                        .await;
                 if let Err(e) = report(&writer, outcome).await {
                     break Err(e);
                 }
@@ -501,7 +539,7 @@ pub(crate) async fn handle_connection(
                 }
             }
             GuestCommand::FileChunk { op_id, data } => {
-                if !active_writes.contains_key(&op_id) {
+                let Some(handle) = active_writes.get(&op_id) else {
                     let _ = writer
                         .send_error(
                             format!("No active write for op_id '{op_id}'"),
@@ -509,20 +547,18 @@ pub(crate) async fn handle_connection(
                         )
                         .await;
                     continue;
-                }
+                };
                 let decoded = match BASE64.decode(&data) {
                     Ok(d) => d,
                     Err(e) => {
-                        let handle = active_writes.remove(&op_id).unwrap();
-                        drop(handle.chunk_tx);
+                        let message = format!(
+                            "Invalid base64 in chunk for '{}': {}",
+                            handle.path_display, e
+                        );
+                        // Its chunk_tx goes: the task ends, and removes its temporary file
+                        active_writes.remove(&op_id);
                         let _ = writer
-                            .send_error(
-                                format!(
-                                    "Invalid base64 in chunk for '{}': {}",
-                                    handle.path_display, e
-                                ),
-                                ErrorType::Protocol.as_str(),
-                            )
+                            .send_error(message, ErrorType::Protocol.as_str())
                             .await;
                         continue;
                     }
@@ -534,15 +570,12 @@ pub(crate) async fn handle_connection(
                 }
                 // Bounded: a writer stuck on the disk must not stop the agent,
                 // which reads one command at a time.
-                let sent = {
-                    let handle = active_writes.get(&op_id).unwrap();
-                    tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.chunk_tx.send(decoded)).await
-                };
-                if sent.is_err() {
+                let sent =
+                    tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.chunk_tx.send(decoded)).await;
+                let Ok(sent) = sent else {
+                    // No end marker went to the task: it never commits, and
+                    // the drop of its chunk_tx ends it
                     let handle = active_writes.remove(&op_id).unwrap();
-                    // No end marker went to the task: it cannot be committing
-                    let abandoned = handle.end.try_abandon();
-                    debug_assert!(abandoned, "a write with no end marker cannot commit");
                     log_error!(
                         "Write of '{}' (op_id={op_id}) took no chunk in {FILE_WRITE_STALL_TIMEOUT_SECONDS}s, abandoned",
                         handle.path_display
@@ -557,59 +590,26 @@ pub(crate) async fn handle_connection(
                         )
                         .await;
                     continue;
-                }
-                if let Ok(Err(_closed)) = sent {
+                };
+                if sent.is_err() {
                     // The writer task ended early (an I/O error): it holds the reason.
                     let handle = active_writes.remove(&op_id).unwrap();
                     drop(handle.chunk_tx);
                     // Bounded: its end removes the temporary file, which a stalled disk
                     // can hold; the write failed either way (no end marker)
-                    let Ok(ended) = tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.task).await
-                    else {
-                        log_error!(
-                            "Write of '{}' (op_id={op_id}) failed, and its cleanup did not end in {FILE_WRITE_STALL_TIMEOUT_SECONDS}s",
-                            handle.path_display
-                        );
-                        let _ = writer
-                            .send_error(
-                                format!("Write of '{}' failed", handle.path_display),
-                                ErrorType::Io.as_str(),
-                            )
-                            .await;
-                        continue;
-                    };
-                    match ended {
-                        Ok(Err(message)) => {
+                    let message = match tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.task).await
+                    {
+                        // With no end marker, the task ends with an error only
+                        Ok(ended) => write_error(ended, &handle.path_display, &op_id),
+                        Err(_) => {
                             log_error!(
-                                "Write pipeline error for '{}' (op_id={op_id}): {message}",
+                                "Write of '{}' (op_id={op_id}) failed, and its cleanup did not end in {FILE_WRITE_STALL_TIMEOUT_SECONDS}s",
                                 handle.path_display
                             );
-                            let _ = writer.send_error(message, ErrorType::Io.as_str()).await;
+                            format!("Write of '{}' failed", handle.path_display)
                         }
-                        Ok(Ok(_)) => {
-                            let _ = writer
-                                .send_error(
-                                    format!(
-                                        "Write pipeline unexpectedly closed for '{}'",
-                                        handle.path_display
-                                    ),
-                                    ErrorType::Io.as_str(),
-                                )
-                                .await;
-                        }
-                        Err(join_err) => {
-                            let _ = writer
-                                .send_error(
-                                    format!(
-                                        "Internal error writing '{}': {}",
-                                        handle.path_display, join_err
-                                    ),
-                                    ErrorType::Io.as_str(),
-                                )
-                                .await;
-                        }
-                    }
-                    continue;
+                    };
+                    let _ = writer.send_error(message, ErrorType::Io.as_str()).await;
                 }
             }
             GuestCommand::FileEnd { op_id } => {
@@ -630,15 +630,7 @@ pub(crate) async fn handle_connection(
                         continue;
                     }
                 };
-                let finished = match finish_write(
-                    chunk_tx,
-                    task,
-                    &end,
-                    WRITE_STALL_TIMEOUT,
-                    WRITE_STALL_TIMEOUT,
-                )
-                .await
-                {
+                let finished = match finish_write(chunk_tx, task, &end, WRITE_STALL_TIMEOUT).await {
                     WriteFinish::Done(finished) => finished,
                     WriteFinish::Abandoned => {
                         log_error!(
@@ -664,33 +656,20 @@ pub(crate) async fn handle_connection(
                         continue;
                     }
                 };
-                match finished {
-                    Ok(Ok(bytes_written)) => {
-                        if writer
-                            .send(&GuestResponse::FileWriteAck {
-                                path: path_display,
-                                bytes_written,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break Err("write queue closed".into());
-                        }
+                if let Ok(Ok(bytes_written)) = finished {
+                    if writer
+                        .send(&GuestResponse::FileWriteAck {
+                            path: path_display,
+                            bytes_written,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break Err("write queue closed".into());
                     }
-                    Ok(Err(message)) => {
-                        log_error!(
-                            "Write pipeline error for '{path_display}' (op_id={op_id}): {message}"
-                        );
-                        let _ = writer.send_error(message, ErrorType::Io.as_str()).await;
-                    }
-                    Err(join_err) => {
-                        let _ = writer
-                            .send_error(
-                                format!("Internal error writing '{}': {}", path_display, join_err),
-                                ErrorType::Io.as_str(),
-                            )
-                            .await;
-                    }
+                } else {
+                    let message = write_error(finished, &path_display, &op_id);
+                    let _ = writer.send_error(message, ErrorType::Io.as_str()).await;
                 }
             }
             GuestCommand::ReadFile { op_id, path } => {
@@ -876,6 +855,86 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // answer_ping
+    // -------------------------------------------------------------------------
+
+    /// The messages that answer_ping queues for `host_entropy`, and the host entropy its kernel
+    /// step got (the step returns `step_result`; entropy.rs tests the real step).
+    async fn ping_answers(
+        host_entropy: Option<&str>,
+        step_result: Result<(), String>,
+    ) -> (Vec<serde_json::Value>, Option<String>) {
+        let (tx, mut rx) = mpsc::channel(4);
+        let writer = ResponseWriter::new(tx, Some("op-1".to_string()));
+        let mut stepped = None;
+        answer_ping(&writer, host_entropy, |entropy| {
+            stepped = Some(entropy.to_string());
+            step_result
+        })
+        .await
+        .unwrap();
+        let mut answers = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            answers.push(serde_json::from_slice(&frame).unwrap());
+        }
+        (answers, stepped)
+    }
+
+    #[tokio::test]
+    async fn a_ping_without_host_entropy_gets_a_pong_and_no_kernel_step() {
+        let (answers, stepped) = ping_answers(None, Ok(())).await;
+
+        assert_eq!(
+            answers,
+            vec![serde_json::json!({"type": "pong", "version": VERSION, "op_id": "op-1"})]
+        );
+        assert_eq!(stepped, None);
+    }
+
+    #[tokio::test]
+    async fn a_ping_with_host_entropy_runs_the_kernel_step_before_its_pong() {
+        let (answers, stepped) = ping_answers(Some("AAEC"), Ok(())).await;
+
+        assert_eq!(
+            answers,
+            vec![serde_json::json!({"type": "pong", "version": VERSION, "op_id": "op-1"})]
+        );
+        assert_eq!(stepped.as_deref(), Some("AAEC"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_kernel_step_answers_the_ping_with_an_error_and_no_pong() {
+        let failure = Err("ioctl RNDRESEEDCRNG failed: no data".to_string());
+
+        let (answers, _) = ping_answers(Some("AAEC"), failure).await;
+
+        assert_eq!(
+            answers,
+            vec![serde_json::json!({
+                "type": "error",
+                "message": "kernel random reseed with the host entropy failed: ioctl RNDRESEEDCRNG failed: no data",
+                "error_type": "io_error",
+                "op_id": "op-1",
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_queue_fails_both_answers_of_a_ping() {
+        for host_entropy in [None, Some("AAEC")] {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+
+            let sent = answer_ping(&ResponseWriter::new(tx, None), host_entropy, |_| {
+                Err("no data".to_string())
+            })
+            .await;
+
+            assert!(sent.is_err(), "host_entropy={host_entropy:?}");
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // finish_write
     // -------------------------------------------------------------------------
 
@@ -892,13 +951,7 @@ mod tests {
 
         let finished = tokio::time::timeout(
             Duration::from_secs(2),
-            finish_write(
-                chunk_tx,
-                task,
-                &end,
-                Duration::from_millis(50),
-                Duration::from_millis(50),
-            ),
+            finish_write(chunk_tx, task, &end, Duration::from_millis(50)),
         )
         .await
         .expect("finish_write must give up at its limit");
@@ -916,19 +969,13 @@ mod tests {
         let (chunk_tx, _chunk_rx) = mpsc::channel::<Vec<u8>>(16);
         let end = WriteEnd::new();
         assert!(end.try_commit());
+        // Done in the second wait: 750 ms, between the limit (500 ms) and twice it
         let task = tokio::task::spawn_blocking(move || {
-            std::thread::sleep(Duration::from_millis(200)); // the rename, slow
+            std::thread::sleep(Duration::from_millis(750)); // the rename, slow
             Ok(2)
         });
 
-        let finished = finish_write(
-            chunk_tx,
-            task,
-            &end,
-            Duration::from_millis(50),
-            Duration::from_secs(10),
-        )
-        .await;
+        let finished = finish_write(chunk_tx, task, &end, Duration::from_millis(500)).await;
 
         let WriteFinish::Done(Ok(Ok(bytes_written))) = finished else {
             panic!("a committed write is not abandoned");
@@ -939,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn finish_write_gives_up_on_a_commit_that_stalls() {
         // The task claimed the commit, then its rename never ends (a stalled disk):
-        // past both limits the agent goes on and says the write may still land.
+        // past both waits the agent goes on and says the write may still land.
         let (chunk_tx, _chunk_rx) = mpsc::channel::<Vec<u8>>(16);
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let end = WriteEnd::new();
@@ -951,16 +998,10 @@ mod tests {
 
         let finished = tokio::time::timeout(
             Duration::from_secs(2),
-            finish_write(
-                chunk_tx,
-                task,
-                &end,
-                Duration::from_millis(50),
-                Duration::from_millis(50),
-            ),
+            finish_write(chunk_tx, task, &end, Duration::from_millis(50)),
         )
         .await
-        .expect("finish_write must give up at its second limit");
+        .expect("finish_write must give up at the end of its second wait");
 
         assert!(matches!(finished, WriteFinish::CommitStalled));
         release_tx.send(()).unwrap();
@@ -975,14 +1016,7 @@ mod tests {
         });
         let end = WriteEnd::new();
 
-        let finished = finish_write(
-            chunk_tx,
-            task,
-            &end,
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-        )
-        .await;
+        let finished = finish_write(chunk_tx, task, &end, Duration::from_secs(2)).await;
 
         let WriteFinish::Done(Ok(Ok(bytes_written))) = finished else {
             panic!("the task finished");
@@ -1030,8 +1064,10 @@ mod tests {
 
     #[test]
     fn op_id_from_file_command() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"action":"write_file","op_id":"abc","path":"x"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"action":"write_file","op_id":"abc","path":"x","make_executable":false}"#,
+        )
+        .unwrap();
         assert_eq!(extract_op_id(&v), Some("abc".into()));
         // Also verify the command still deserializes correctly
         let cmd: GuestCommand = serde_json::from_value(v).unwrap();

@@ -164,7 +164,7 @@ class TestStartManagedProcess:
                 steps=(),
                 end_with_this_process=False,
                 pass_fds=(),
-                on_process_started=None,
+                on_process_started=lambda _proc: None,
             )
         finally:
             os.dup2(saved, 0)
@@ -195,7 +195,7 @@ from exec_sandbox.subprocess_utils import start_managed_process
 
 
 async def main() -> None:
-    print((await start_managed_process(["sleep", "60"], steps=(), end_with_this_process=True, pass_fds=(), on_process_started=None)).pid, flush=True)
+    print((await start_managed_process(["sleep", "60"], steps=(), end_with_this_process=True, pass_fds=(), on_process_started=lambda _proc: None)).pid, flush=True)
     await asyncio.Event().wait()  # until the test kills this process
 
 
@@ -447,7 +447,7 @@ class TestExecFailedError:
         and the launch shell ends with 126 (dash and bash refuse a binary file as a script)."""
         binary = write_foreign_elf(tmp_path / "gvproxy-wrapper-test")
         proc = await start_managed_process(
-            [str(binary)], steps=(), end_with_this_process=True, pass_fds=(), on_process_started=None
+            [str(binary)], steps=(), end_with_this_process=True, pass_fds=(), on_process_started=lambda _proc: None
         )
         await proc.communicate()
         unregister_process(proc)
@@ -495,7 +495,7 @@ class TestEndWithThisProcess:
             assert cmd[0] == sys.executable
             assert preexec_fn is not None
             proc = await start_managed_process(
-                probe, steps=(), end_with_this_process=True, pass_fds=(), on_process_started=None
+                probe, steps=(), end_with_this_process=True, pass_fds=(), on_process_started=lambda _proc: None
             )
         out, _ = await proc.communicate()
         unregister_process(proc)

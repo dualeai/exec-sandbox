@@ -12,12 +12,21 @@ use std::collections::HashMap;
 
 /// A host request, tagged by `action`. The host models are in
 /// src/exec_sandbox/guest_agent_protocol.py. connection.rs reads the top-level
-/// `op_id` and `host_time_ns` from the raw JSON before this parse.
+/// `op_id` and `host_time_ns` from the raw JSON before this parse. The host
+/// sends every field that is not null (request_line), so none has a default here:
+/// an Option field is absent when the host has no value for it.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
 pub(crate) enum GuestCommand {
+    /// A health check.
     #[serde(rename = "ping")]
-    Ping,
+    Ping {
+        /// Base64 of 32 random bytes of the host. The agent mixes them into the kernel's
+        /// input pool (credited) and reseeds the CRNG before the Pong; it answers an
+        /// error instead when the value is not base64 of 32 bytes or one of these steps
+        /// fails (entropy.rs).
+        host_entropy: Option<String>,
+    },
 
     #[serde(rename = "install_packages")]
     InstallPackages {
@@ -32,17 +41,17 @@ pub(crate) enum GuestCommand {
         language: Language,
         code: String,
         /// Seconds, at most MAX_TIMEOUT_SECONDS; 0 means MAX_TIMEOUT_SECONDS.
-        #[serde(default)]
         timeout: u64,
-        #[serde(default)]
         env_vars: HashMap<String, String>,
+        /// True: the REPL reseeds its own random generators from the kernel before the
+        /// code runs (the third field of the REPL header, repl/wrappers.rs).
+        reseed: bool,
     },
 
     #[serde(rename = "write_file")]
     WriteFile {
         op_id: String,
         path: String,
-        #[serde(default)]
         make_executable: bool,
     },
 
@@ -59,10 +68,7 @@ pub(crate) enum GuestCommand {
     FileEnd { op_id: String },
 
     #[serde(rename = "list_files")]
-    ListFiles {
-        #[serde(default)]
-        path: String,
-    },
+    ListFiles { path: String },
 
     #[serde(rename = "warm_repl")]
     WarmRepl { language: Language },
@@ -113,7 +119,6 @@ pub(crate) enum GuestResponse {
 
     #[serde(rename = "warm_repl_ack")]
     WarmReplAck {
-        language: Language,
         status: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
@@ -226,16 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_list_files_default_path() {
-        let json = r#"{"action":"list_files"}"#;
-        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            GuestCommand::ListFiles { path } => assert_eq!(path, ""),
-            _ => panic!("Expected ListFiles"),
-        }
-    }
-
-    #[test]
     fn test_deserialize_write_file_executable() {
         let json =
             r#"{"action":"write_file","op_id":"xyz","path":"run.sh","make_executable":true}"#;
@@ -293,19 +288,94 @@ mod tests {
         assert!(serde_json::from_str::<GuestCommand>(json).is_err());
     }
 
+    /// The two-phase parse of connection.rs: JSON value first, then the command.
+    fn command_of(json: &str) -> Result<GuestCommand, serde_json::Error> {
+        serde_json::from_value(serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn test_deserialize_ping_with_host_entropy() {
+        let json = r#"{"action":"ping","op_id":"p1","host_time_ns":1,"host_entropy":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}"#;
+        match command_of(json).unwrap() {
+            GuestCommand::Ping { host_entropy } => assert_eq!(
+                host_entropy.as_deref(),
+                Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
+            ),
+            _ => panic!("Expected Ping"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_ping_without_host_entropy() {
+        match command_of(r#"{"action":"ping","op_id":"p1","host_time_ns":1}"#).unwrap() {
+            GuestCommand::Ping { host_entropy } => assert_eq!(host_entropy, None),
+            _ => panic!("Expected Ping"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_ping_with_host_entropy_of_another_type_is_refused() {
+        let error = command_of(r#"{"action":"ping","host_entropy":5}"#).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid type: integer `5`, expected a string"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_deserialize_exec(#[case] reseed: bool) {
+        let json = format!(
+            r#"{{"action":"exec","language":"python","code":"print(1)","timeout":0,"env_vars":{{}},"reseed":{reseed}}}"#
+        );
+        match command_of(&json).unwrap() {
+            GuestCommand::ExecuteCode {
+                language,
+                code,
+                reseed: parsed,
+                ..
+            } => {
+                assert_eq!(language, Language::Python);
+                assert_eq!(code, "print(1)");
+                assert_eq!(parsed, reseed);
+            }
+            _ => panic!("Expected ExecuteCode"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(
+        r#"{"action":"exec","language":"python","code":"print(1)","timeout":0,"env_vars":{}}"#,
+        "missing field `reseed`"
+    )]
+    #[case(
+        r#"{"action":"exec","language":"python","code":"print(1)","timeout":0,"env_vars":{},"reseed":"yes"}"#,
+        "invalid type: string \"yes\", expected a boolean"
+    )]
+    fn test_deserialize_exec_without_a_boolean_reseed_is_refused(
+        #[case] json: &str,
+        #[case] reason: &str,
+    ) {
+        assert_eq!(command_of(json).unwrap_err().to_string(), reason);
+    }
+
     // -------------------------------------------------------------------------
     // Response serialization
     // -------------------------------------------------------------------------
 
+    // Each response as a whole JSON value (field names and values): the host's models read
+    // these names (src/exec_sandbox/guest_agent_protocol.py)
     #[test]
     fn test_serialize_file_write_ack() {
         let ack = GuestResponse::FileWriteAck {
             path: "test.txt".to_string(),
             bytes_written: 42,
         };
-        let json = serde_json::to_string(&ack).unwrap();
-        assert!(json.contains("\"type\":\"file_write_ack\""));
-        assert!(json.contains("\"bytes_written\":42"));
+        assert_eq!(
+            serde_json::to_value(&ack).unwrap(),
+            serde_json::json!({"type": "file_write_ack", "path": "test.txt", "bytes_written": 42})
+        );
     }
 
     #[test]
@@ -313,8 +383,10 @@ mod tests {
         let chunk = GuestResponse::FileChunk {
             data: "SGVsbG8=".to_string(),
         };
-        let json = serde_json::to_string(&chunk).unwrap();
-        assert!(json.contains("\"type\":\"file_chunk\""));
+        assert_eq!(
+            serde_json::to_value(&chunk).unwrap(),
+            serde_json::json!({"type": "file_chunk", "data": "SGVsbG8="})
+        );
     }
 
     #[test]
@@ -323,9 +395,10 @@ mod tests {
             path: "data.csv".to_string(),
             size: 1024,
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"file_read_complete\""));
-        assert!(json.contains("\"size\":1024"));
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap(),
+            serde_json::json!({"type": "file_read_complete", "path": "data.csv", "size": 1024})
+        );
     }
 
     #[test]
@@ -344,8 +417,12 @@ mod tests {
                 },
             ],
         };
-        let json = serde_json::to_string(&list).unwrap();
-        assert!(json.contains("\"type\":\"file_list\""));
-        assert!(json.contains("\"file.txt\""));
+        assert_eq!(
+            serde_json::to_value(&list).unwrap(),
+            serde_json::json!({"type": "file_list", "entries": [
+                {"name": "file.txt", "is_dir": false, "size": 100},
+                {"name": "subdir", "is_dir": true, "size": 0},
+            ]})
+        );
     }
 }

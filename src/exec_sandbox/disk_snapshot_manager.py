@@ -54,6 +54,7 @@ from exec_sandbox._logging import get_logger
 from exec_sandbox._version import __version__
 from exec_sandbox.aio_utils import AsyncRetrying, run_stoppable, run_to_end
 from exec_sandbox.base_cache_manager import BaseCacheManager
+from exec_sandbox.dns_filter import resolved_domains
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
@@ -149,7 +150,7 @@ def _remove_parts(*parts: Path) -> None:
         part.unlink(missing_ok=True)
 
 
-async def _qemu_img(args: list[str], *, process_name: str, cache_key: str) -> tuple[int | None, bytes, bytes]:
+async def _qemu_img(args: list[str], *, process_name: str, cache_key: str) -> tuple[int, bytes, bytes]:
     """Run qemu-img with `args`. A missing binary, or one this user may not run, is
     ConfigError HOST_DEPENDENCY: a setup error that no retry fixes, never a local disk error;
     a fork that hits a process, memory or file-handle limit is TransientError OVERLAY_FAILED."""
@@ -254,9 +255,8 @@ class DiskSnapshotManager(BaseCacheManager):
     - L2 cache: Local qcow2 disk snapshots (cold boot with cached packages)
     - L3 cache: S3 with zstd compression (cross-host sharing)
 
-    Cache key format:
-    - "{language}-v{major.minor}-{img_sha256}-base" for base images (no packages)
-    - "{language}-v{major.minor}-{img_sha256}-{pkg_sha256}" for packages
+    Cache key format: "{language}-v{major.minor}-{img_sha256}-{pkg_sha256}" (a request with
+    no packages has no L2 layer: the scheduler boots it on the base image)
 
     Files only: one qcow2 file per snapshot, no metadata store (the cache key
     holds what the snapshot is). Eviction takes the entry with the oldest access
@@ -334,14 +334,15 @@ class DiskSnapshotManager(BaseCacheManager):
 
         Args:
             language: Programming language
-            packages: Package list (empty for base image)
+            packages: Package list with versions
 
         Returns:
             A lease on the cached qcow2 snapshot (lease.path), or None on a miss. The
             caller passes it to the VM launch (cache_leases) and releases it after.
 
         Raises:
-            OSError: the lease's lock file cannot be made (no write access to the cache folder)
+            OSError: the use lock cannot be opened (out of file handles, a disk error); without
+                write access to the cache folder the lease holds no lock (EntryLease)
             TransientError: LOCAL_DISK: the base image cannot be read (images.key_part)
             ConfigError: ASSET_NOT_FOUND (the base image is missing), HOST_DEPENDENCY
                 (qemu-img missing or not executable)
@@ -354,7 +355,7 @@ class DiskSnapshotManager(BaseCacheManager):
         is checked: no eviction removes it from then on. An entry evicted first is a miss.
 
         Raises:
-            OSError: the lease's lock file cannot be made
+            OSError: the use lock cannot be opened (out of file handles, a disk error)
             ConfigError: HOST_DEPENDENCY: qemu-img missing or not executable
         """
         lease = await CacheEntry(self._cache_path(cache_key)).lease()
@@ -407,7 +408,8 @@ class DiskSnapshotManager(BaseCacheManager):
             ConfigError: HOST_DEPENDENCY (qemu-img missing or not executable),
                 SETTING_INVALID (no write access to the build files, a read-only disk, a cache
                 folder that cannot be made again), ASSET_NOT_FOUND (the base image is missing)
-            InternalError: INTERNAL: unclassified creation failure
+            InternalError: INTERNAL: unclassified creation failure; GUEST_PROTOCOL: the guest
+                broke the protocol during the install
             SandboxError: an error of the build VM's start (VmManager.create_vm: VM_BOOT_TIMEOUT,
                 GVPROXY_FAILED, CAPACITY, CAPACITY_NEVER_FITS, ...), raised as it is
         """
@@ -436,9 +438,8 @@ class DiskSnapshotManager(BaseCacheManager):
                 logger.debug("L2 cache hit (after lock)", extra={"cache_key": cache_key})
                 return await self._lease_built(target_path, cache_key=cache_key, language=language, packages=packages)
 
-            # L3 cache check (S3) - only for images with packages
-            # Base images are already distributed via asset downloads, no need for S3
-            if packages and (snapshot_path := await self._download_from_s3(cache_key)) is not None:
+            # L3 cache check (S3)
+            if (snapshot_path := await self._download_from_s3(cache_key)) is not None:
                 logger.debug("L3 cache hit", extra={"cache_key": cache_key})
                 return await self._lease_built(snapshot_path, cache_key=cache_key, language=language, packages=packages)
 
@@ -455,10 +456,9 @@ class DiskSnapshotManager(BaseCacheManager):
             )
             lease = await self._lease_built(snapshot_path, cache_key=cache_key, language=language, packages=packages)
 
-            # Upload to S3 (async, fire-and-forget) - only for images with packages
-            # Base images don't need S3 - they're already globally distributed
-            if packages:
-                self._schedule_upload(cache_key, lease)
+            # Upload to S3 (async, fire-and-forget) when a bucket is set
+            if bucket := self.settings.s3_bucket:
+                self._schedule_upload(cache_key, lease, bucket=bucket)
 
             return lease
 
@@ -470,9 +470,7 @@ class DiskSnapshotManager(BaseCacheManager):
 
         Raises:
             TransientError: LOCAL_DISK: the image is gone all the same (removed by hand), or
-                another error of the lease's lock file (_file_error)
-            ConfigError: SETTING_INVALID: the lease's lock file cannot be made (no access, a
-                read-only disk)
+                the use lock cannot be opened (out of file handles, a disk error: _file_error)
         """
         try:
             lease = await CacheEntry(snapshot_path).lease()
@@ -506,9 +504,7 @@ class DiskSnapshotManager(BaseCacheManager):
         - Snapshots are always created with network (for pip/npm install)
         - User's allow_network setting only controls gvproxy at execution time
 
-        Format:
-        - "{language}-v{major.minor}-{img_sha256}-base" for base (no packages)
-        - "{language}-v{major.minor}-{img_sha256}-{pkg_sha256}" for packages
+        Format: "{language}-v{major.minor}-{img_sha256}-{pkg_sha256}"
 
         Args:
             language: Programming language
@@ -528,11 +524,7 @@ class DiskSnapshotManager(BaseCacheManager):
         # Base image content digest: a rebuilt image gets a new key
         img_hash = key_part(self.vm_manager.images.base_image(language))
 
-        base = f"{language.value}-v{version}-{img_hash}"
-
-        if not packages:
-            return f"{base}-base"
-        return f"{base}-{fingerprint(*sorted(packages))}"
+        return f"{language.value}-v{version}-{img_hash}-{fingerprint(*sorted(packages))}"
 
     async def _check_l2_cache(self, cache_key: str, *, lease: EntryLease) -> Path | None:
         """Check L2 local cache for qcow2 snapshot.
@@ -625,7 +617,8 @@ class DiskSnapshotManager(BaseCacheManager):
                 PACKAGE_INSTALL_FAILED
             ConfigError: HOST_DEPENDENCY (qemu-img missing or not executable),
                 SETTING_INVALID (no write access to the build files, a read-only disk)
-            InternalError: INTERNAL: any other failure
+            InternalError: INTERNAL: any other failure; GUEST_PROTOCOL: the guest broke the
+                protocol during the install
             SandboxError: an error of the build VM's start (VmManager.create_vm: VM_BOOT_TIMEOUT,
                 GVPROXY_FAILED, CAPACITY, CAPACITY_NEVER_FITS, ...), raised as it is
         """
@@ -663,25 +656,14 @@ class DiskSnapshotManager(BaseCacheManager):
                 # Step 1: Create standalone ext4 qcow2 for overlay (vdb)
                 await self._create_snapshot_image(build_path, cache_key, language, packages, tenant_id)
 
-                # Step 2: Determine network configuration for snapshot creation
-                # ALWAYS enable network during snapshot creation (pip/npm needs it)
-                # Restrict to package registries only for security
-                if packages:
-                    if language == "python":
-                        package_domains = list(constants.PYTHON_PACKAGE_DOMAINS)
-                    elif language == "javascript":
-                        package_domains = list(constants.NPM_PACKAGE_DOMAINS)
-                    else:
-                        package_domains = []
-                else:
-                    package_domains = None
-
-                # Step 3-5: Boot VM, install packages, shutdown — ephemeral_vm handles lifecycle
+                # Steps 2-5: Boot VM, install packages, shutdown — ephemeral_vm handles
+                # lifecycle. The network is on (pip/npm needs it), limited to the
+                # language's package registries
                 build_spec = VmSpec(
                     language=language,
                     memory_mb=effective_memory_mb,
                     allow_network=True,
-                    allowed_domains=tuple(package_domains) if package_domains is not None else None,
+                    allowed_domains=resolved_domains(None, language),
                 )
                 async with self.vm_manager.ephemeral_vm(
                     build_spec,
@@ -692,7 +674,6 @@ class DiskSnapshotManager(BaseCacheManager):
                     cache_leases=(),
                     retry_profile=constants.RETRY_BACKGROUND,
                     mem_path=None,
-                    mem_path_share=False,
                 ) as vm:
                     # Install packages with death monitoring (asyncio.wait)
                     death_task = asyncio.create_task(self._monitor_vm_death(vm, cache_key))
@@ -927,9 +908,6 @@ class DiskSnapshotManager(BaseCacheManager):
                 the package list: a language without packages, empty, too long, a bad name)
             InternalError: GUEST_PROTOCOL
         """
-        if not packages:
-            return
-
         request = InstallPackagesRequest(
             language=language,
             packages=packages,
@@ -1133,7 +1111,7 @@ class DiskSnapshotManager(BaseCacheManager):
 
         return snapshot_path
 
-    def _schedule_upload(self, cache_key: str, lease: EntryLease) -> None:
+    def _schedule_upload(self, cache_key: str, lease: EntryLease, *, bucket: str) -> None:
         """Upload the snapshot `lease` holds to S3 in a background task. The task holds its own
         share of the lease until it ends (also when cancelled before it starts): no eviction
         removes the image while the task waits for its turn or reads it."""
@@ -1141,11 +1119,11 @@ class DiskSnapshotManager(BaseCacheManager):
             logger.info("S3 upload skipped: the manager is stopping", extra={"cache_key": cache_key})
             return
         share = lease.share()
-        task = asyncio.create_task(self._upload_to_s3(cache_key, share.path))
+        task = asyncio.create_task(self._upload_to_s3(cache_key, share.path, bucket=bucket))
         task.add_done_callback(lambda _t: share.release())
         self._track_task(task, name=f"s3-upload-{cache_key}")
 
-    async def _upload_to_s3(self, cache_key: str, snapshot_path: Path) -> None:
+    async def _upload_to_s3(self, cache_key: str, snapshot_path: Path, *, bucket: str) -> None:
         """Upload compressed snapshot to S3 (async, fire-and-forget). The caller keeps the
         image leased until the upload ends (_schedule_upload).
 
@@ -1157,9 +1135,8 @@ class DiskSnapshotManager(BaseCacheManager):
         Args:
             cache_key: Snapshot cache key
             snapshot_path: Local qcow2 snapshot path
+            bucket: The L3 bucket (s3_bucket, set)
         """
-        if not self.settings.s3_bucket:
-            return  # S3 backup disabled
         compressed_path = _part_path(snapshot_path.with_suffix(".qcow2.zst"))
 
         # Acquire semaphore to limit concurrent uploads
@@ -1208,7 +1185,7 @@ class DiskSnapshotManager(BaseCacheManager):
                     # after the grace), and an incomplete upload would stay in the bucket
                     await upload_object(
                         s3,
-                        bucket=self.settings.s3_bucket,
+                        bucket=bucket,
                         key=s3_key,
                         src=compressed_path,
                         extra={

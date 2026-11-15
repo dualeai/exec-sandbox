@@ -88,7 +88,7 @@ class Folders:
 
 
 @pytest.fixture
-def folders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Folders:
+def folders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Folders:
     """Every search folder in tmp_path, and a new registry: empty, offline (no request to
     GitHub), its download cache in `cache` (EXEC_SANDBOX_CACHE_DIR). The source tree moves to
     tmp_path (assets.__file__): the images/dist and gvproxy-wrapper/bin of the repository
@@ -98,7 +98,8 @@ def folders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Folders:
     monkeypatch.setenv("EXEC_SANDBOX_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("EXEC_SANDBOX_OFFLINE", "1")
     monkeypatch.setenv("EXEC_SANDBOX_ASSET_VERSION", "1.2.3")
-    monkeypatch.setattr(assets, "_assets_singleton", None)  # get_assets makes a new registry from this env
+    assets.get_assets.cache_clear()  # get_assets makes a new registry from this env
+    request.addfinalizer(assets.get_assets.cache_clear)  # and no later test gets it
     return Folders(
         override=tmp_path / "override",
         repo_bin=tmp_path / "gvproxy-wrapper" / "bin",

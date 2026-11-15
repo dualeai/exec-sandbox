@@ -20,13 +20,14 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from exec_sandbox import s3_parts
+from exec_sandbox import __version__, s3_parts
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
     InstanceGoneError,
     OutcomeUnknownError,
     RouteError,
+    RouteKey,
     SandboxError,
     TransientError,
 )
@@ -35,12 +36,14 @@ from exec_sandbox.instance import ids
 from exec_sandbox.instance.head import MAX_HEAD_BYTES, open_head, seal_head
 from exec_sandbox.instance.keyring import Keyring
 from exec_sandbox.instance.manager import MAX_CHAIN_PACKS
-from exec_sandbox.instance.models import ChainEntry, HeadBody
+from exec_sandbox.instance.models import BLOCK_BYTES, ChainEntry, HeadBody
 from exec_sandbox.instance.pack import write_object
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import Applied, InstanceStore, NotApplied
+from exec_sandbox.models import InstanceRef
 from tests.instance_support import (
     BLOCK,
+    BUDGET_KEYS,
     GOLDEN_KEY,
     GOLDEN_KEY_ID,
     NO_VM_TIMEOUT,
@@ -170,7 +173,7 @@ def test_moto_server_binds_with_no_name_lookup(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(socket, "getfqdn", no_lookup)
     monkeypatch.setattr(socket, "gethostbyaddr", no_lookup)
-    with moto_server("127.0.0.1") as server:
+    with moto_server() as server:
         assert server.server_name == "127.0.0.1"
         connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
         try:
@@ -380,6 +383,21 @@ class TestChainShape:
             await env.check_load(state.instance_id, generation=generation, manager=env.manager, want=None)
             previous = state
 
+    async def test_recent_commits_are_the_last_16_saves(self, env: InstanceEnv) -> None:
+        """After 18 saves the head lists the last 16 (generation and commit id), newest first,
+        as the manager wrote them (describe), not as a test helper builds a head."""
+        ram, home = SparseImage(size=BLOCK), SparseImage(size=BLOCK)
+        saver = Saver(env, await env.new_vm(ram, home, spec=PYTHON), manager=env.manager, state=None)
+        commit_of: dict[int, str] = {}
+        for generation in range(1, 19):
+            saver.vm.ram.put(0, constant_block(generation))
+            state = await saver.save()
+            commit_of[generation] = state.header.commit_id
+        info = await env.manager.describe(saver.instance_id)
+        assert [(c.generation, c.commit_id) for c in info.recent_commits] == [
+            (generation, commit_of[generation]) for generation in range(18, 2, -1)
+        ]
+
     async def test_pack_cap_starts_a_full_copy(self, env: InstanceEnv) -> None:
         """MAX_CHAIN_PACKS packs, then a full copy; the longest chain loads with one GET per object."""
         assert MAX_CHAIN_PACKS == 64  # README: a full copy "after 64 packs"
@@ -468,7 +486,7 @@ class TestRollover:
             want = env.saved[state.header.commit_id]
             assert (file_digest(loaded.vmstate), file_digest(loaded.home)) == (digest(want[0]), digest(want[1]))
         finally:
-            await env.manager.release(loaded)
+            await env.manager.release(loaded, wait=True)
         assert env.proxy.entries("GET", _exact(old_pack), since=mark)[-1].status == 404
         assert env.proxy.count("GET", _exact(head_object(state.instance_id)), since=mark) == 2
 
@@ -623,10 +641,20 @@ class TestDamageAtLoad:
         await env.manager.drain()  # the last save's old files go in a worker thread
         files = env.work_files()
         mark = len(env.proxy.log)
+        no_body = (
+            env.proxy.add("GET", _exact(key), Truncate(0))  # the headers, no body bytes: a body read fails short
+            if damage in _SIZE_DAMAGE
+            else None
+        )
         expected = ErrorCode.INSTANCE_EXPIRED if damage == "delete" else ErrorCode.INSTANCE_INTEGRITY
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is expected) as exc:
             await env.load(saver.instance_id, manager=env.manager)
         assert (exc.value.action, exc.value.instance_id) == ("RECREATE", saver.instance_id)
+        if expected is ErrorCode.INSTANCE_INTEGRITY:  # the object and the commit that wrote it
+            assert key.endswith(exc.value.context["key"])
+            name = exc.value.context["key"].split("/")[-1]
+            assert name in {f"{exc.value.context['commit_id']}.f", f"{exc.value.context['commit_id']}.p"}
+            assert len(exc.value.context["commit_id"]) == 32
         await env.manager.drain()  # the failed load's folder goes in a worker thread
         assert env.work_files() == files
         if damage == "delete":
@@ -634,6 +662,8 @@ class TestDamageAtLoad:
         if damage == "delete" or damage in _SIZE_DAMAGE:
             asked = {op: env.proxy.count(op, _exact(key), since=mark) for op in ("GET", "HEAD", "GET_RANGE")}
             assert asked == {"GET": 1, "HEAD": 1, "GET_RANGE": 0}
+        if no_body is not None:
+            assert no_body.hits == 1
 
     @pytest.mark.parametrize("damage", ["delete", "flip", "truncate", "oversized", "other-instance"])
     async def test_head_damage(self, env: InstanceEnv, damage: str) -> None:
@@ -658,6 +688,11 @@ class TestDamageAtLoad:
             await env.load(saver.instance_id, manager=env.manager)
         assert (exc.value.action, exc.value.instance_id) == ("RECREATE", saver.instance_id)
         assert env.proxy.count(("HEAD", "GET", "GET_RANGE"), "/b/", since=mark) == 0
+        # Where it looked: a wrong bucket, prefix or folder gives the same codes
+        named = {"store": env.store.location} if damage == "delete" else {}
+        assert {k: exc.value.context[k] for k in ("key", *named)} == {"key": head_object(saver.instance_id), **named}
+        if damage == "delete":
+            assert f"in the store {env.store.location} " in str(exc.value)
 
     async def test_older_head_with_its_chain_loads_the_older_generation(self, env: InstanceEnv) -> None:
         """Accepted limit: an authentic older head put back while its chain is stored loads that generation."""
@@ -711,7 +746,7 @@ class TestDamageAtLoad:
         """A worker with the base image never reads the store's copy; a worker without it loads
         an intact copy by digest, and ROUTEs on a missing or changed one."""
         saver = await _chain(env, packs=1, seed=12, manager=env.manager)
-        asset = f"assets/sha256/{saver.state.body.host.base_image}"  # type: ignore[union-attr]
+        asset = f"assets/sha256/{saver.state.body.guest.base_image}"  # type: ignore[union-attr]
         match damage:
             case "delete":
                 env.bucket.delete(asset)
@@ -728,6 +763,22 @@ class TestDamageAtLoad:
         with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
             await env.load(saver.instance_id, manager=env.manager)
         assert (exc.value.action, exc.value.instance_id) == ("ROUTE", saver.instance_id)
+        guest = saver.state.body.guest  # type: ignore[union-attr]
+        host = saver.state.body.host  # type: ignore[union-attr]
+        # The whole target: the checked facts (this worker has them) and the image it lacks.
+        assert exc.value.required[RouteKey.BASE_IMAGE] == guest.base_image
+        assert exc.value.required[RouteKey.MACHINE_TYPE] == host.machine_type
+        assert exc.value.required[RouteKey.MEMORY_MB] == "272"  # the budget checked before (192 MB + 80 MB)
+        assert exc.value.found == {**exc.value.required, RouteKey.BASE_IMAGE: None, **dict.fromkeys(BUDGET_KEYS)}
+        # The message names only the value that does not hold (the budget and the host pass)
+        assert str(exc.value).startswith(
+            f'Instance {saver.instance_id} needs base_image="{guest.base_image}"; this worker has base_image=null: '
+        )
+        assert exc.value.context["reason"] == (
+            "the image is not on this worker and not in the store"
+            if damage == "delete"
+            else "the store's copy of the image does not match its digest"
+        )
         await env.manager.drain()  # the failed load's asset .part goes in a worker thread
         assert env.work_files() == files
 
@@ -751,9 +802,11 @@ class TestDamageAtLoad:
         assert exc.value.hint == "Download or rebuild the guest images."
         assert env.bucket.listing() == []
 
-    async def test_authenticated_unreadable_object_routes(self, env: InstanceEnv, tmp_path: Path) -> None:
-        """A pack that authenticates but holds a stream this release does not know was written by
-        another release: ROUTE (never RECREATE, which would delete good data)."""
+    @pytest.mark.parametrize("release", ["9.9.9", __version__], ids=["other-release", "this-release"])
+    async def test_authenticated_unreadable_object_routes(self, env: InstanceEnv, tmp_path: Path, release: str) -> None:
+        """A pack that authenticates but holds a stream this release does not know: ROUTE to another
+        release (empty `required`), never RECREATE (which would delete good data), whatever
+        release the head names: the release is no load condition and no route key."""
         saver = await _chain(env, packs=0, seed=13, manager=env.manager)
         state = saver.state
         assert state is not None
@@ -775,6 +828,7 @@ class TestDamageAtLoad:
             size=obj.stat().st_size,
             stream_sizes=state.body.chain[0].stream_sizes,
             etag=etag,
+            block_bytes=BLOCK_BYTES,
         )
         header = head_header(
             instance_id=iid,
@@ -784,11 +838,18 @@ class TestDamageAtLoad:
             kek=Keyring.parse(env.keyring).latest,
             data_key=state.data_key,
         )
-        body = HeadBody(spec=state.body.spec, host=state.body.host, chain=(*state.body.chain, entry))
+        host = state.body.host.model_copy(update={"release": release})
+        body = HeadBody(
+            spec=state.body.spec,
+            host=host,
+            guest=state.body.guest,
+            egress_domains=state.body.egress_domains,
+            chain=(*state.body.chain, entry),
+        )
         env.bucket.write(head_object(iid), seal_head(header=header, body=body, data_key=state.data_key))
         with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
             await env.load(iid, manager=env.manager)
-        assert (exc.value.action, exc.value.instance_id) == ("ROUTE", iid)
+        assert (exc.value.action, exc.value.instance_id, exc.value.required) == ("ROUTE", iid, {})
 
     async def test_object_deleted_during_load_is_expired(self, env: InstanceEnv) -> None:
         saver = await _chain(env, packs=1, seed=14, manager=env.manager)
@@ -1212,7 +1273,7 @@ class TestSupersededSave:
     async def test_next_save_after_a_superseded_commit_conflicts(self, env: InstanceEnv) -> None:
         """A's head write lands but its answer is lost, and B commits on top before A reads the
         head back: A's save is stored (generation 2), but A has no base left. A's next save is
-        refused before any upload (VERIFY), closes A, and leaves B's head."""
+        refused before any upload (VERIFY), A stays open, and B's head stays."""
         first = await _chain(env, packs=0, seed=191, manager=env.manager)
         iid = first.instance_id
         a_state = await env.load(iid, manager=env.manager)
@@ -1232,6 +1293,8 @@ class TestSupersededSave:
         _small_change(a_vm, 10)
         assert (await a.save()).generation == 2
         b_head = env.bucket.read(head_object(iid))
+        await env.manager.drain()
+        assert not a_state.folder.exists()  # a plain save keeps its folder: superseded at once, it goes
 
         _small_change(a_vm, 11)
         mark = len(env.proxy.log)
@@ -1244,9 +1307,46 @@ class TestSupersededSave:
         assert exc.value.context is not None
         assert exc.value.context["generation"] == 3  # the generation this save would have made
         assert ids.is_commit_id(exc.value.context["commit_id"])
-        assert a.closed
+        assert not a.closed
         assert env.proxy.count(("PUT", "MPU_CREATE", "PUT_IF"), since=mark) == 0
         assert env.bucket.read(head_object(iid)) == b_head
+        await a.close()
+
+    async def test_a_save_under_a_new_id_superseded_at_once_releases_its_files(self, env: InstanceEnv) -> None:
+        """save(instance_id=Y): Y's head lands but its answer is lost, and B commits Y@2 on top
+        before A reads the head back. A moves to Y (Y@1, with no base left), and A's local files of
+        Y and of X go at once (no later save reads them)."""
+        first = await _chain(env, packs=0, seed=193, manager=env.manager)
+        a_state = await env.load(first.instance_id, manager=env.manager)
+        a_vm = await env.vm_from(a_state)
+        a = fake_session(vm=a_vm, vm_manager=env.vm_manager, instances=env.manager, state=a_state, new_instance_id=None)
+        head = _exact(head_object("y-193"))
+        others: list[Saver] = []
+
+        async def b_commits_on_top(req: Request, resp: Response) -> None:
+            assert resp.status == 200  # A's head of Y landed
+            b = await _reuse(env, "y-193", manager=env.manager)
+            others.append(b)
+            _small_change(b.vm, 9)
+            assert (await b.save()).header.generation == 2
+
+        env.proxy.add("PUT_IF", head, After(b_commits_on_top))
+        env.proxy.add("PUT_IF", head, DropAfter())
+        _small_change(a_vm, 10)
+        assert (await a.save(instance_id="y-193")).generation == 1
+        assert a.instance == InstanceRef(instance_id="y-193", generation=1)
+        (b,) = others
+        for saver in (b, first):  # the files that the other session and the chain's own saver keep
+            assert saver.state is not None
+            await env.manager.release(saver.state, wait=True)
+        await env.manager.drain()
+        assert env.work_files() == set()  # A's files of Y and of X are gone
+        _small_change(a_vm, 11)
+        mark = len(env.proxy.log)
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
+            await a.save()  # no base left: B's Y@2 is on top of A's Y@1
+        assert env.proxy.count(("PUT", "MPU_CREATE", "PUT_IF"), since=mark) == 0
+        await a.close()
 
 
 class TestErrorsNameTheInstance:
@@ -1287,7 +1387,7 @@ class TestLoadLocalFiles:
         saver = await _chain(env, packs=1, seed=53, manager=env.manager)
         assert saver.state is not None
         worker = worker_without_base_image(env, root=tmp_path / "worker-b")
-        cached = worker.asset_dir / f"{saver.state.body.host.base_image}.img"
+        cached = worker.asset_dir / f"{saver.state.body.guest.base_image}.img"
         match step:
             case "asset":
                 disk_full_at_download(monkeypatch, env.store, under=worker.asset_dir)
@@ -1302,14 +1402,20 @@ class TestLoadLocalFiles:
         failed = errno.ENOENT if step == "folder" else errno.ENOSPC
         assert exc.value.context == {"instance_id": saver.instance_id, "errno": failed}
         await worker.drain()  # the partial files go in a worker thread
-        # The partial files are removed; an image whose digest was checked stays in the cache.
-        assert set(worker.asset_dir.iterdir()) == (set() if step == "asset" else {cached})
+        # The partial files are removed; an image whose digest was checked stays in the cache
+        # (the lock files of its entry stay: files.locks never deletes them).
+        assert {path for path in worker.asset_dir.iterdir() if path.suffix != ".lock"} == (
+            set() if step == "asset" else {cached}
+        )
         if step == "folder":
             worker.work_dir.mkdir(mode=0o700)
         assert list(worker.work_dir.iterdir()) == []
 
         mark = len(env.proxy.log)
         await env.check_load(saver.instance_id, generation=2, manager=worker, want=None)
-        assert set(worker.asset_dir.iterdir()) == {cached}
+        assert {path for path in worker.asset_dir.iterdir() if path.suffix != ".lock"} == {cached}
         assert bool(env.proxy.count("GET_RANGE", "^assets/", since=mark)) == (step == "asset")
         assert list(worker.work_dir.iterdir()) == []
+        # No load holds the image any more (the failed one released its lease): eviction takes it
+        assert (await worker.assets.eviction_order().evict_next() or 0) > 0
+        assert not cached.exists()

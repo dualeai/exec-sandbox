@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from exec_sandbox.instance import manager as instance_manager
 from exec_sandbox.instance.keyring import Keyring
-from exec_sandbox.instance.manager import InstanceManager
+from exec_sandbox.instance.manager import AssetCache, InstanceManager
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from tests.instance_support import BLOCK, NO_VM_TIMEOUT, PYTHON, Saver, SparseImage, no_packages, random_block
 
@@ -76,7 +76,7 @@ async def test_loop_shutdown_during_apply_keeps_the_stream_files_open(
                 store=store,
                 keyring=Keyring.parse(env.keyring),
                 work_dir=work_dir,
-                asset_dir=asset_dir,
+                assets=AssetCache(asset_dir, setting="instance_asset_dir"),
                 vm_manager=env.vm_manager,  # type: ignore[arg-type]
             )
             task = asyncio.ensure_future(manager.load(instance_id, packages_image=no_packages))

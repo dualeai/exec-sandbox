@@ -62,6 +62,7 @@ async def test_a_cancel_after_the_deadline_is_raised_not_lost() -> None:
         gvproxy_proc=None,
         qemu_log_task=None,
         gvproxy_log_task=None,
+        device_layout="",
     )
     waiting = asyncio.create_task(vm.wait_for_guest(timeout=0.05))
     try:

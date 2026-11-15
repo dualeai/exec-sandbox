@@ -1,8 +1,9 @@
-"""Base class for snapshot cache managers.
+"""Base class for the cache managers.
 
-Shared lifecycle, background task tracking, file locking and eviction patterns
-used by both L2 disk cache (DiskSnapshotManager) and L1 memory cache
-(MemorySnapshotManager). Image digests live in images.py.
+Shared lifecycle, background task tracking, file locking and eviction patterns of the L2
+disk cache (DiskSnapshotManager), the L1 memory cache (MemorySnapshotManager) and the guest
+images loads fetch from the instance store (instance.manager.AssetCache). Image digests live
+in images.py.
 """
 
 from __future__ import annotations
@@ -73,7 +74,7 @@ class EvictionOrder:
 
 
 class BaseCacheManager:
-    """Base for snapshot cache managers (L1 memory + L2 disk).
+    """Base for the cache managers (L1 memory, L2 disk, instance assets).
 
     Provides:
     - Cache directory initialization
@@ -174,11 +175,11 @@ class BaseCacheManager:
         for file in self._entry_files(path):
             file.unlink(missing_ok=True)
 
-    def _remove_unused(self, path: Path, *, stamp: str | None) -> int | None:
+    def _remove_unused(self, path: Path, *, stamp: str) -> int | None:
         """Remove the entry whose primary file is `path` under its use lock and its save lock,
         both without wait: the bytes its files took, or None when a lease of it is open (in
         any process: a VM runs on it), a save or another removal holds it, it is gone, or
-        (with `stamp`) its primary file is no longer that version (a new save of the key).
+        its primary file is no longer the version `stamp` (a new save of the key).
 
         Raises:
             OSError: a lock file cannot be made or opened (a full or read-only disk, no
@@ -192,7 +193,7 @@ class BaseCacheManager:
                     current = file_stamp(path.stat())
                 except FileNotFoundError:
                     return None
-                if stamp is not None and current != stamp:
+                if current != stamp:
                     return None
                 size = self._entry_bytes(path)
                 self._remove_entry(path)
@@ -237,6 +238,11 @@ class BaseCacheManager:
                 st = path.stat()
                 entries.append((st.st_atime, path, file_stamp(st)))
         return [(path, stamp) for _, path, stamp in sorted(entries)]
+
+    def entry_paths(self) -> list[Path]:
+        """The primary file of each entry now in the cache folder, oldest access first.
+        Blocking: a listing."""
+        return [path for path, _ in self._oldest_first()]
 
     async def reclaimable_bytes(self, *, held: frozenset[Path]) -> int:
         """Bytes of the entries that evictions of this process can give back once its VMs are

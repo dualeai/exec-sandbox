@@ -6,7 +6,10 @@ QEMU / gvproxy processes stay idle using percentile-based sampling
 """
 
 import asyncio
+import contextlib
 from statistics import median as _median
+
+import psutil
 
 from exec_sandbox.platform_utils import ProcessWrapper
 
@@ -40,6 +43,37 @@ CPU_SAMPLES_MIN: int = 5
 # --- Helpers ---
 
 
+def sampled(proc: ProcessWrapper) -> psutil.Process:
+    """The process whose CPU a sample measures and whose life a test checks: `proc`, or, when
+    `proc` only starts QEMU (unshare, or sudo for a QEMU of qemu-vm), its qemu-system
+    descendant: the wrapper itself idles, and can outlive or die before QEMU."""
+    assert proc.psutil_proc is not None
+    with contextlib.suppress(psutil.Error):
+        if proc.psutil_proc.name().startswith("qemu-system"):
+            return proc.psutil_proc
+        for child in proc.psutil_proc.children(recursive=True):
+            with contextlib.suppress(psutil.Error):
+                if child.name().startswith("qemu-system"):
+                    return child
+        # A wrapper with no QEMU found under it (hidepid): measuring the idle wrapper would
+        # pass whatever QEMU does
+        assert proc.psutil_proc.name() not in _QEMU_WRAPPERS, f"no qemu-system under {proc.psutil_proc.name()}"
+    return proc.psutil_proc
+
+
+_QEMU_WRAPPERS = frozenset({"sudo", "unshare", "sh", "stdbuf"})
+"""The programs that start QEMU (qemu_cmd): a process of one of them is not QEMU itself."""
+
+
+def gone(process: psutil.Process) -> bool:
+    """`process` ended: no process, or a zombie (a QEMU under unshare dies before its reaper,
+    init or a subreaper, collects it)."""
+    try:
+        return not process.is_running() or process.status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
 def p95(samples: list[float]) -> float:
     """95th percentile (allows ~1 outlier per 15-20 samples)."""
     assert len(samples) >= CPU_SAMPLES_MIN, f"Need >= {CPU_SAMPLES_MIN} samples for meaningful p95, got {len(samples)}"
@@ -63,17 +97,15 @@ async def collect_cpu_samples_bulk(
     discarded), then samples all each CPU_SAMPLE_INTERVAL_S. Each sample is the average
     CPU over the interval before it.
     """
-    for proc in procs:
-        assert proc.psutil_proc is not None
-        proc.psutil_proc.cpu_percent(interval=None)  # Prime all
+    measured = [sampled(proc) for proc in procs]
+    for process in measured:
+        process.cpu_percent(interval=None)  # Prime all
     await asyncio.sleep(CPU_SAMPLE_INTERVAL_S)
 
     all_samples: list[list[float]] = [[] for _ in procs]
     for _ in range(n_samples):
-        for i, proc in enumerate(procs):
-            assert proc.psutil_proc is not None
-            cpu = proc.psutil_proc.cpu_percent(interval=None)
-            all_samples[i].append(cpu)
+        for i, process in enumerate(measured):
+            all_samples[i].append(process.cpu_percent(interval=None))
         await asyncio.sleep(CPU_SAMPLE_INTERVAL_S)
     return all_samples
 

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from aiobotocore.session import AioSession
     from botocore.loaders import Loader
 
+    from exec_sandbox.instance.keyring import Keyring
     from exec_sandbox.instance.manager import InstanceAdmin, InstanceManager
     from exec_sandbox.instance.s3_store import S3InstanceStore
     from exec_sandbox.settings import InstanceStoreKind, Settings
@@ -94,6 +95,16 @@ def require_instance_admin(
         from exec_sandbox.instance.manager import open_instance_admin  # noqa: PLC0415
 
         return open_instance_admin
+    except ImportError as e:
+        raise _instances_need_cryptography(store) from e
+
+
+def require_instance_keyring(*, store: InstanceStoreKind) -> Callable[[Settings], Keyring]:
+    """Import `instance_keyring` (parse the keyring, no store call), raise clear error if not installed."""
+    try:
+        from exec_sandbox.instance.manager import instance_keyring  # noqa: PLC0415
+
+        return instance_keyring
     except ImportError as e:
         raise _instances_need_cryptography(store) from e
 

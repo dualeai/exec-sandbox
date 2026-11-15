@@ -168,6 +168,7 @@ async def _fake_vm(
         gvproxy_proc=None,
         qemu_log_task=None,
         gvproxy_log_task=None,
+        device_layout="",
     )
     vm.start_event_watch()
     try:
@@ -501,6 +502,7 @@ class TestStopNotSeenByTheWatch:
             gvproxy_proc=None,
             qemu_log_task=None,
             gvproxy_log_task=None,
+            device_layout="",
         )
 
         async def stop_then_fail(*_args: object, **_kwargs: object) -> None:

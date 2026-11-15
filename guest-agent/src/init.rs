@@ -68,39 +68,85 @@ fn reaped_status(key: u64) -> Option<std::process::ExitStatus> {
         .map(std::process::ExitStatus::from_raw)
 }
 
+/// pidfd_send_signal flag: the signal goes to the process group of the pidfd's
+/// process (<linux/pidfd.h>, Linux 6.9).
+const PIDFD_SIGNAL_PROCESS_GROUP: libc::c_uint = 1 << 2;
+
 /// A child that agent code waits for, with its entry in WAITED_CHILDREN.
 ///
 /// Every wait reads the status that the reaper kept first, and no signal goes
 /// to a child that the reaper collected: its PID may belong to another process.
+/// The process group that the child leads gets signals through a pidfd: once
+/// the child is collected too (its members can outlive it), and never another
+/// group with the same ID.
 pub(crate) struct WaitedChild {
     child: tokio::process::Child,
-    /// Key in WAITED_CHILDREN; None for a child that tokio had collected at once.
-    key: Option<u64>,
+    /// Key in WAITED_CHILDREN.
+    key: u64,
+    /// A pidfd of the child, opened before any wait: the kernel keeps its group
+    /// while a member lives, whatever process gets the PID later.
+    pidfd: std::os::fd::OwnedFd,
 }
 
 impl WaitedChild {
     /// Register right after the spawn, with no await between: the runtime has
     /// one thread, so the reaper cannot collect the child before it is known.
-    pub(crate) fn register(child: tokio::process::Child) -> Self {
-        let key = child.id().map(register_waited);
-        Self { child, key }
+    /// A child whose pidfd does not open (a file limit) gets SIGKILL, and the
+    /// error comes back.
+    pub(crate) fn register(mut child: tokio::process::Child) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        // A child that no wait polled yet has its PID
+        let pid = child.id().expect("a child just spawned has its PID");
+        // SAFETY: a plain syscall; the result is checked before use.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = child.start_kill();
+            return Err(error);
+        }
+        // SAFETY: `fd` is a new descriptor that nothing else owns.
+        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as libc::c_int) };
+        Ok(Self {
+            child,
+            key: register_waited(pid),
+            pidfd,
+        })
     }
 
     fn reaped(&self) -> Option<std::process::ExitStatus> {
-        self.key.and_then(reaped_status)
+        reaped_status(self.key)
     }
 
     /// Keep the status that tokio collected in the entry: keep_waited_exit then
     /// skips it when the PID comes back as another process that PID 1 reaps.
     fn collected(&self, status: std::process::ExitStatus) -> std::process::ExitStatus {
         use std::os::unix::process::ExitStatusExt;
-        if let Some(key) = self.key
-            && let Some((_, slot)) = waited_children().get_mut(&key)
+        if let Some((_, slot)) = waited_children().get_mut(&self.key)
             && slot.is_none()
         {
             *slot = Some(status.into_raw());
         }
         status
+    }
+
+    /// Send `signal` to the process group that the child leads (ESRCH: no
+    /// member left), also once the child was collected.
+    pub(crate) fn signal_group(&self, signal: libc::c_int) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid pidfd, and no siginfo.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                PIDFD_SIGNAL_PROCESS_GROUP,
+            )
+        };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// The PID while the child can get a signal: None once tokio or the PID 1
@@ -143,9 +189,7 @@ impl WaitedChild {
 
 impl Drop for WaitedChild {
     fn drop(&mut self) {
-        if let Some(key) = self.key {
-            waited_children().remove(&key);
-        }
+        waited_children().remove(&self.key);
     }
 }
 
@@ -246,8 +290,8 @@ pub(crate) fn setup_phase2_core() {
 /// no-swap path.
 pub(crate) async fn setup_zram_and_seal_dev() {
     let zram_active = match tokio::task::spawn_blocking(setup_zram_swap).await {
-        Ok(ZramSetupOutcome::Active) => true,
-        Ok(ZramSetupOutcome::Failed) => {
+        Ok(true) => true,
+        Ok(false) => {
             log_warn!("[zram] setup failed; marking VM unavailable");
             false
         }
@@ -351,17 +395,14 @@ fn mount_readonly_paths() {
     // /dev is sealed by setup_zram_and_seal_dev() only after zram has removed its
     // setup-only block-device node. Untrusted execution remains gated until that
     // read-only remount succeeds.
-    for path in [
-        c"/etc/hosts",
-        c"/etc/resolv.conf",
-        c"/proc/sys",
-        c"/proc/sysrq-trigger",
-    ] {
+    // No /proc/sysrq-trigger to seal: the kernel has no MAGIC_SYSRQ.
+    for path in [c"/etc/hosts", c"/etc/resolv.conf", c"/proc/sys"] {
         let _ = mount_readonly(path);
     }
 
     // Mask sensitive /proc files (bind-mount /dev/null → reads return empty).
     // Safe to mask here: rw_mode and QUIET_MODE already read /proc/cmdline above.
+    // No /proc/keys to mask: the kernel has no KEYS (no keyring).
     for path in [
         // Boot params: rootfstype, init flags, console config (reconnaissance)
         c"/proc/cmdline",
@@ -370,8 +411,6 @@ fn mount_readonly_paths() {
         // Interrupt counters per CPU — thermal side-channel attack vector
         // (Docker masked this in Mar 2025, GHSA-6fw5-f8r9-fgfm)
         c"/proc/interrupts",
-        // Kernel keyring — NOT namespaced; mask even though currently empty
-        c"/proc/keys",
         // High-resolution timer internals — timing side-channel
         // (already EPERM via dmesg_restrict, mask as defense-in-depth)
         c"/proc/timer_list",
@@ -652,29 +691,23 @@ fn setup_dev_shm() {
     // 40% of RAM
     let shm_bytes = (read_mem_total_kb() * 2048 / 5) & page_mask;
     let opts = format!("size={shm_bytes},usrquota,usrquota_block_hardlimit={shm_bytes},noswap");
+    let data = std::ffi::CString::new(opts).unwrap();
 
-    fn try_mount_shm(opts: &str) -> libc::c_int {
-        unsafe {
-            let source = std::ffi::CString::new("tmpfs").unwrap();
-            let target = std::ffi::CString::new("/dev/shm").unwrap();
-            let fstype = std::ffi::CString::new("tmpfs").unwrap();
-            let data = std::ffi::CString::new(opts).unwrap();
-            libc::mount(
-                source.as_ptr(),
-                target.as_ptr(),
-                fstype.as_ptr(),
-                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-                data.as_ptr() as *const libc::c_void,
-            )
-        }
-    }
-
-    if try_mount_shm(&opts) != 0 {
-        // Non-fatal: only needed for multiprocessing. Retry after mkdir.
-        let _ = std::fs::create_dir_all("/dev/shm");
-        if try_mount_shm(&opts) != 0 {
-            log_warn!("/dev/shm mount failed: {}", std::io::Error::last_os_error());
-        }
+    // devtmpfs makes no /dev/shm: the mount point comes first
+    let _ = std::fs::create_dir("/dev/shm");
+    // SAFETY: NUL-terminated strings that outlive the call.
+    let mounted = unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            c"/dev/shm".as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            data.as_ptr() as *const libc::c_void,
+        )
+    };
+    // Non-fatal: only needed for multiprocessing.
+    if mounted != 0 {
+        log_warn!("/dev/shm mount failed: {}", std::io::Error::last_os_error());
     }
 }
 
@@ -691,13 +724,6 @@ pub(crate) fn ensure_repl_wrappers() {
     });
 }
 
-/// Terminal outcome of `setup_zram_swap`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ZramSetupOutcome {
-    Active,
-    Failed,
-}
-
 const ZRAM_DISK_PERCENT: u64 = 40;
 const ZRAM_MEM_PERCENT: u64 = 20;
 
@@ -710,7 +736,9 @@ fn zram_geometry(mem_kb: u64) -> (u64, u64) {
     )
 }
 
-fn setup_zram_swap() -> ZramSetupOutcome {
+/// Set up the capped zram swap and its pressure guard: true once both are
+/// active, false after a failure (cleaned up).
+fn setup_zram_swap() -> bool {
     use std::io::Write;
     use std::path::Path;
     use std::thread;
@@ -735,7 +763,7 @@ fn setup_zram_swap() -> ZramSetupOutcome {
     }
     if !found {
         log_warn!("[zram] setup failed: device not found");
-        return ZramSetupOutcome::Failed;
+        return false;
     }
 
     let requested_algorithm = "lz4";
@@ -797,7 +825,7 @@ fn setup_zram_swap() -> ZramSetupOutcome {
         Err(e) => {
             log_warn!("[zram] setup failed: {e}");
             reset_zram();
-            return ZramSetupOutcome::Failed;
+            return false;
         }
     };
 
@@ -812,7 +840,7 @@ fn setup_zram_swap() -> ZramSetupOutcome {
             log_warn!("[zram] cleanup after guard failure failed, powering off guest");
             crate::oom_guard::emergency_poweroff();
         }
-        return ZramSetupOutcome::Failed;
+        return false;
     }
 
     log_info!(
@@ -826,12 +854,12 @@ fn setup_zram_swap() -> ZramSetupOutcome {
     // before untrusted execution readiness is published.
     if let Err(e) = std::fs::remove_file("/dev/zram0") {
         log_warn!("[zram] failed to remove /dev/zram0: {e}");
-        return ZramSetupOutcome::Failed;
+        return false;
     }
 
     // VM tuning for zram is pre-applied in apply_zram_vm_tuning() before
     // /proc/sys is made read-only. No sysctl writes needed here.
-    ZramSetupOutcome::Active
+    true
 }
 
 /// Build a swap header for the given device size.
@@ -866,14 +894,12 @@ fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
 // Sysctl hardening
 // ============================================================================
 
-/// Critical sysctl — must be applied before any request handling.
-/// These block privilege escalation and info-leak vectors that sandbox
-/// code could exploit immediately.
-const SYSCTL_CRITICAL: &[(&str, &str)] = &[
-    // eBPF: CVE-2020-8835, CVE-2021-3490, CVE-2021-31440, CVE-2023-2163
-    ("/proc/sys/kernel/unprivileged_bpf_disabled", "2"),
+/// Sysctl hardening, applied in phase 2 core (before the ports open, so before
+/// any request). The kernel has no BPF syscall, no userfaultfd and no SysRq
+/// (images/kernel/exec-sandbox.config): their sysctls do not exist. Perf events
+/// stay on x86 only (its arch Kconfig selects them).
+const SYSCTLS: &[(&str, &str)] = &[
     // User namespaces: CVE-2022-0185, CVE-2023-0386
-    ("/proc/sys/kernel/unprivileged_userns_clone", "0"),
     ("/proc/sys/user/max_user_namespaces", "0"),
     // Kernel address exposure
     ("/proc/sys/kernel/kptr_restrict", "2"),
@@ -881,18 +907,10 @@ const SYSCTL_CRITICAL: &[(&str, &str)] = &[
     ("/proc/sys/kernel/dmesg_restrict", "1"),
     // Perf events
     ("/proc/sys/kernel/perf_event_paranoid", "3"),
-    // BPF JIT hardening
+    // BPF JIT hardening (cBPF: seccomp filters)
     ("/proc/sys/net/core/bpf_jit_harden", "2"),
-    // userfaultfd
-    ("/proc/sys/vm/unprivileged_userfaultfd", "0"),
     // YAMA ptrace_scope
     ("/proc/sys/kernel/yama/ptrace_scope", "2"),
-];
-
-/// Non-critical sysctl — defense-in-depth settings applied synchronously
-/// in phase 2 core (before port open). These harden filesystem and limit
-/// attack surface but aren't exploitable during early boot.
-const SYSCTL_NON_CRITICAL: &[(&str, &str)] = &[
     // Filesystem link protections
     ("/proc/sys/fs/protected_symlinks", "1"),
     ("/proc/sys/fs/protected_hardlinks", "1"),
@@ -900,14 +918,12 @@ const SYSCTL_NON_CRITICAL: &[(&str, &str)] = &[
     ("/proc/sys/fs/protected_regular", "2"),
     // suid_dumpable
     ("/proc/sys/fs/suid_dumpable", "0"),
-    // SysRq keyboard combos
-    ("/proc/sys/kernel/sysrq", "0"),
     // Thread bomb mitigation
     ("/proc/sys/kernel/threads-max", "1200"),
 ];
 
 fn apply_sysctls() {
-    for &(path, value) in SYSCTL_CRITICAL.iter().chain(SYSCTL_NON_CRITICAL) {
+    for &(path, value) in SYSCTLS {
         let _ = std::fs::write(path, value);
     }
 }
@@ -1130,7 +1146,7 @@ mod tests {
             .args(["-c", "kill -9 $$"])
             .spawn()
             .unwrap();
-        let mut child = WaitedChild::register(spawned);
+        let mut child = WaitedChild::register(spawned).unwrap();
         reap_first(&child);
 
         // tokio alone loses the status: the REPL would look alive-then-gone.
@@ -1147,25 +1163,24 @@ mod tests {
     async fn a_collected_child_whose_pid_came_back_gets_no_wait_and_no_signal() {
         // The REPL ended (exit 3) and the reaper kept its status; another process
         // now has its PID. The live `sleep` plays that process: waitpid on the
-        // PID finds it, and a signal to the PID would reach it.
+        // PID finds it, and a signal to the PID would reach it. (The group
+        // signals go through the pidfd: they never reach a later process.)
         let spawned = tokio::process::Command::new("sleep")
             .arg("30")
-            .process_group(0) // as a REPL: the group gets the signals of a timeout
             .spawn()
             .unwrap();
         let pid = spawned.id().unwrap();
-        let mut child = WaitedChild::register(spawned);
+        let mut child = WaitedChild::register(spawned).unwrap();
         keep_waited_exit(pid, 3 << 8);
 
         assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(3));
         assert_eq!(child.id(), None);
         child.start_kill().unwrap();
-        graceful_terminate_process_group(&mut child, 0).await;
         let status =
             wait_child_bounded(&mut child, "test", std::time::Duration::from_secs(2)).await;
         assert_eq!(status.and_then(|s| s.code()), Some(3));
         // The first fatal signal sets the exit status: SIGINT from here, unless the
-        // agent signalled first (SIGKILL from start_kill, SIGTERM from the group).
+        // agent signalled first (SIGKILL from start_kill).
         // SAFETY: the test's own child.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
         let mut status: libc::c_int = 0;
@@ -1177,6 +1192,35 @@ mod tests {
             libc::WTERMSIG(status),
             libc::SIGINT,
             "the agent signalled the PID"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_members_of_a_collected_leader_still_end() {
+        // The REPL (sh) ended and the reaper collected it; its member holds the
+        // stdout pipe, so the pipe ends only when the group SIGKILL reaches it.
+        let mut spawned = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30 & exit 0"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut stdout = spawned.stdout.take().unwrap();
+        let mut child = WaitedChild::register(spawned).unwrap();
+        reap_first(&child);
+        assert_eq!(child.id(), None);
+
+        graceful_terminate_process_group(&mut child, 5).await;
+
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut rest),
+        )
+        .await;
+        assert!(
+            matches!(ended, Ok(Ok(0))),
+            "a member of the group still holds the pipe: {ended:?}"
         );
     }
 
@@ -1205,7 +1249,7 @@ mod tests {
                 .spawn()
                 .unwrap()
         };
-        let mut by_try_wait = WaitedChild::register(spawn());
+        let mut by_try_wait = WaitedChild::register(spawn()).unwrap();
         let pid = by_try_wait.child.id().unwrap();
         wait_exit_uncollected(pid);
         assert_eq!(
@@ -1218,7 +1262,7 @@ mod tests {
             Some(3)
         );
 
-        let mut by_wait = WaitedChild::register(spawn());
+        let mut by_wait = WaitedChild::register(spawn()).unwrap();
         let pid = by_wait.child.id().unwrap();
         assert_eq!(by_wait.wait().await.unwrap().code(), Some(3));
         keep_waited_exit(pid, 7 << 8);

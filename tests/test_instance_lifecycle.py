@@ -1,4 +1,5 @@
-"""Session lifecycle of saved instances: generations, ordering, close, cancel, drain, disk full, forks.
+"""Session lifecycle of saved instances: generations, ordering, close, cancel, drain, disk full,
+forks, saves under a new id.
 
 M level: moto behind the fault proxy (tests/s3_faults.py), a fake VM and QMP
 peer (tests/instance_support.py), and the real Session, InstanceManager, commit,
@@ -26,7 +27,7 @@ import threading
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -41,9 +42,12 @@ from exec_sandbox.exceptions import (
     SessionClosedError,
     TransientError,
 )
-from exec_sandbox.instance.store import head_key
+from exec_sandbox.files.locks import CacheEntry
+from exec_sandbox.instance import manager as instance_manager
+from exec_sandbox.instance.store import asset_key, head_key
 from exec_sandbox.models import InstanceRef, StartupTiming
 from exec_sandbox.session import Session
+from tests.conftest import LoopClock
 from tests.instance_support import (
     BLOCK,
     NO_VM_TIMEOUT,
@@ -62,7 +66,8 @@ from tests.instance_support import (
     new_keyring,
     random_block,
 )
-from tests.s3_faults import After, Before, Fail, Hold, Request, Response
+from tests.s3_faults import After, Before, DropAfter, DropBefore, Fail, Hold, Request, Response
+from tests.test_files_locks import evictable
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -229,7 +234,7 @@ class Lab:
             assert (file_digest(state.vmstate), file_digest(state.home)) == (digest(want[0]), digest(want[1]))
             vm = await self.env.vm_from(state)
         except BaseException:
-            await self.env.manager.release(state)
+            await self.env.manager.release(state, wait=True)
             raise
         return self._fork(vm, state=state, new_instance_id=None)
 
@@ -246,6 +251,12 @@ class Lab:
     async def save(self, fork: Fork) -> InstanceRef:
         """session.save(); records the streams of its snapshot under the generation it committed."""
         ref = await fork.session.save()
+        self.want[(ref.instance_id, ref.generation)] = fork.guest.snapshots[-1]
+        return ref
+
+    async def save_as(self, fork: Fork, instance_id: str) -> InstanceRef:
+        """session.save(instance_id=...); records the streams of its snapshot as save() does."""
+        ref = await fork.session.save(instance_id=instance_id)
         self.want[(ref.instance_id, ref.generation)] = fork.guest.snapshots[-1]
         return ref
 
@@ -294,6 +305,7 @@ class TestGenerations:
         rollovers). After each save the stored generation is the session's; at seeded points an
         unsaved change is dropped (close warns) and reuse() gives back exactly the last save."""
         env = lab.env
+        mark = len(env.proxy.log)  # this example's requests only (examples share the env)
         rng = random.Random(seed)
         fork = await lab.new(seed, instance_id=None)
         instance_id = ""
@@ -320,15 +332,162 @@ class TestGenerations:
         head = await lab.check(instance_id, 100)
         assert env.bucket.body_keys(instance_id) == sorted(chain_keys(head))
         assert env.work_files() == set()
+        # The first save and the pack cap make two full copies: more come from the byte budget
+        assert env.proxy.count(("PUT", "MPU_CREATE"), rf"^s/{instance_id}/b/.*\.f$", since=mark) > 2
 
 
 # ----------------------------------------------------------------------------- one session, FIFO
 
 
+class TestOverlap:
+    """A save frees the session's calls once its VM runs again: it still returns only after its
+    commit."""
+
+    async def test_an_exec_runs_while_the_head_write_waits(self, lab: Lab) -> None:
+        """The head write is held: an exec of the same session runs and returns meanwhile; the
+        save holds the state of its pause, not the exec's change; close() warns about it."""
+        x, fork, gate, saving = await _held_save(lab, seed=41, phase="head-put", by_exec=True)
+        try:
+            result = await _within(fork.session.exec(_op("put", "ram", block=2, value=42, tag=2)))
+            assert result.exit_code == 0
+            assert not saving.done()
+        finally:
+            gate.release()
+        assert (await _within(saving)).generation == 2
+        assert lab.want[(x, 2)] != fork.vm.expected()  # the exec's change came after the pause
+        with pytest.warns(InstanceNotSavedWarning) as record:
+            await fork.session.close()
+        assert [str(w.message) for w in record] == [
+            f"Session closed with changes since the last save of instance {x} (generation 2); "
+            "call save(), or save(instance_id=...) under another id, to keep them."
+        ]
+        await lab.check(x, 2)
+
+    async def test_close_during_the_head_write_warns_for_an_exec_after_the_pause(self, lab: Lab) -> None:
+        """close() while the head write waits, after an exec made after the pause: one
+        InstanceNotSavedWarning (the save stores only the writes before its pause; with none
+        after it, no warning: test_close_during_save_warns_only_for_writes_the_save_cannot_store)."""
+        _, fork, gate, saving = await _held_save(lab, seed=55, phase="head-put", by_exec=True)
+        try:
+            await _within(fork.session.exec(_op("put", "ram", block=2, value=55, tag=2)))
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                await fork.session.close()
+        finally:
+            gate.release()
+        assert (await _within(saving)).generation == 2
+        warned = [w for w in caught if issubclass(w.category, InstanceNotSavedWarning)]
+        assert len(warned) == 1, [str(w.message) for w in warned]
+
+    async def test_close_during_the_upload_keeps_the_images_leased(self, lab: Lab) -> None:
+        """close() while the save uploads the VM's image (gone from the store, so the save stores
+        it again): the VM's cache leases go with its QEMU, and the save's own shares keep the image
+        from eviction until its uploads end."""
+        env = lab.env
+        x = await lab.base(seed=58)
+        fork = await lab.reuse(x)
+        await fork.session.exec(_op("put", "ram", block=1, value=58, tag=1))
+        image = fork.vm.base_image
+        lease = await CacheEntry(image).lease()
+        assert lease is not None
+        fork.vm.cache_leases = (lease,)
+        assert fork.vm.base_image_digest is not None
+        image_key = asset_key(fork.vm.base_image_digest)
+        env.bucket.delete(image_key)
+        gate = env.proxy.add(("PUT", "MPU_CREATE"), _exact(image_key), Hold())
+        saving = asyncio.create_task(lab.save(fork))
+        try:
+            await _within(gate.reached.wait())
+            await fork.session.close()
+            assert fork.vm.cache_leases == ()  # destroy_vm released the VM's own lease
+            assert not evictable(image)
+        finally:
+            gate.release()
+        assert (await _within(saving)).generation == 2
+        assert evictable(image)
+        await lab.check(x, 2)
+
+    @pytest.mark.parametrize("cancel", [False, True])
+    async def test_close_or_cancel_of_a_save_that_waits_for_an_earlier_save(self, lab: Lab, cancel: bool) -> None:
+        """s2 waits for s1's head write. close() then: s1 returns its commit, s2 raises
+        SessionClosedError once its wait ends. A cancel of s2 while it waits closes the session, s1
+        commits."""
+        x, fork, gate, s1 = await _held_save(lab, seed=56, phase="head-put", by_exec=False)
+        try:
+            s2 = asyncio.create_task(fork.session.save())
+            await asyncio.sleep(0)  # s2 takes the call lock, then waits for s1's save lock
+            await asyncio.sleep(0)
+            if cancel:
+                s2.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await s2
+            else:
+                await fork.session.close()
+        finally:
+            gate.release()
+        assert (await _within(s1)).generation == 2
+        if not cancel:
+            with pytest.raises(SessionClosedError, match="while waiting for an earlier save"):
+                await _within(s2)
+        assert fork.session.closed
+        await fork.session.close()
+        assert await lab.generation(x) == 2
+
+    async def test_an_exec_that_closes_the_session_during_the_head_write(self, lab: Lab) -> None:
+        """An exec during the head write fails and closes the session: the save still returns its
+        commit."""
+        env = lab.env
+
+        async def lost(_code: str) -> str:
+            raise OutcomeUnknownError(
+                "lost", code=ErrorCode.GUEST_OUTCOME_UNKNOWN, context={}, hint=None, instance_id=None
+            )
+
+        _, fork, gate, saving = await _held_save(lab, seed=58, phase="head-put", by_exec=False)
+        try:
+            fork.vm.on_execute = lost
+            with pytest.raises(OutcomeUnknownError):
+                await _within(fork.session.exec(_op("put", "ram", block=1, value=58, tag=1)))
+            assert fork.session.closed
+        finally:
+            gate.release()
+        assert (await _within(saving)).generation == 2
+        await _within(env.manager.drain())
+        assert env.work_files() == set()
+
+    async def test_the_idle_deadline_waits_for_the_commit(self, lab: Lab, monkeypatch: pytest.MonkeyPatch) -> None:
+        """While the head write waits, the idle deadline passes with no close; it is armed
+        again once the save returns."""
+        env = lab.env
+        x = await lab.base(seed=44)
+        clock = LoopClock(monkeypatch)
+        fork = await lab.reuse(x)  # the session arms its deadline (3600 s) at creation
+        gate = env.proxy.add("PUT_IF", _exact(head_key(x)), Hold())
+        saving = asyncio.create_task(lab.save(fork))
+        try:
+            await _within(gate.reached.wait())
+            # An exec during the head write ends first: its end must not arm the deadline while
+            # the save still runs (the busy count)
+            await _within(fork.session.exec(_op("put", "ram", block=1, value=44, tag=1)))
+            await clock.advance(4000)
+            assert not fork.session.closed
+        finally:
+            gate.release()
+        await _within(saving)
+        await clock.advance(3599)
+        assert not fork.session.closed
+        await clock.advance(2)
+        assert fork.session.closed
+        await fork.session.close()  # waits for the cleanup that the deadline started
+        await lab.check(x, 2)
+
+
 class TestOneSession:
     async def test_fifo_exec_save(self, lab: Lab) -> None:
-        """gather(e1, s1, e2, s2, e3): the lock runs them one at a time in call order; s1 holds e1
-        only, s2 e1 and e2; close() warns about e3."""
+        """gather(e1, s1, e2, s2, e3): the calls start in call order; a save holds exactly the
+        calls made before it (s1 e1 only, s2 e1 and e2); an exec queued after a save starts once
+        that save's VM runs again (it may start before that save's head write); s2 pauses its VM
+        only after s1's head write; close() warns about e3."""
         env = lab.env
         fork = await lab.new(seed=5, instance_id=None)
         fork.guest.yields = 10
@@ -347,18 +506,20 @@ class TestOneSession:
             fork.session.exec(_op("put", "ram", block=3, value=13, tag=3)),
         )
         vm_id = fork.vm.vm_id
-        assert lab.log == [
-            ("exec-start", 1),
-            ("exec-end", 1),
-            ("migrate", vm_id),
-            ("head", 200),
-            ("exec-start", 2),
-            ("exec-end", 2),
-            ("migrate", vm_id),
-            ("head", 200),
-            ("exec-start", 3),
-            ("exec-end", 3),
-        ]
+        log = lab.log
+        assert sorted(log, key=repr) == sorted(
+            [("exec-start", n) for n in (1, 2, 3)]
+            + [("exec-end", n) for n in (1, 2, 3)]
+            + [("migrate", vm_id)] * 2
+            + [("head", 200)] * 2,
+            key=repr,
+        )
+        start = {e[1]: i for i, e in enumerate(log) if e[0] == "exec-start"}
+        end = {e[1]: i for i, e in enumerate(log) if e[0] == "exec-end"}
+        m1, m2 = (i for i, e in enumerate(log) if e[0] == "migrate")
+        h1, h2 = (i for i, e in enumerate(log) if e[0] == "head")
+        assert start[1] < end[1] < m1 < start[2] < end[2] < m2 < start[3] < end[3], log
+        assert m1 < h1 < m2 < h2, log  # s2 pauses the VM only after s1's head write
         assert [r.exit_code for r in (e1, e2, e3)] == [0, 0, 0]
         assert (s1.generation, s2.generation, s2.instance_id) == (1, 2, s1.instance_id)
         assert fork.session.exec_count == 3
@@ -435,11 +596,17 @@ def _gate(env: InstanceEnv, fork: Fork, instance_id: str, phase: str) -> Gate:
     return Gate(reached=rule.reached.wait, release=rule.release)
 
 
-async def _held_save(lab: Lab, seed: int, phase: str) -> tuple[str, Fork, Gate, asyncio.Task[InstanceRef]]:
-    """A session of generation 1 with a change, saving, held at `phase`."""
+async def _held_save(
+    lab: Lab, seed: int, phase: str, *, by_exec: bool
+) -> tuple[str, Fork, Gate, asyncio.Task[InstanceRef]]:
+    """A session of generation 1 with a change, saving, held at `phase`. `by_exec`: the change is
+    an exec() (a write the session counts), else a change of the guest without exec()."""
     instance_id = await lab.base(seed)
     fork = await lab.reuse(instance_id)
-    _change(fork.vm, _op("put", "ram", block=1, value=seed % 255 + 1, tag=None))
+    if by_exec:
+        await fork.session.exec(_op("put", "ram", block=1, value=seed % 255 + 1, tag=1))
+    else:
+        _change(fork.vm, _op("put", "ram", block=1, value=seed % 255 + 1, tag=None))
     gate = _gate(lab.env, fork, instance_id, phase)
     saving = asyncio.create_task(lab.save(fork))
     await _within(gate.reached())
@@ -453,7 +620,7 @@ class TestCloseDuringSave:
         (SessionClosedError), the head stays. Body or head PUT: the snapshot was taken, the save
         lands (g+1). Either way the session is closed and no local file stays."""
         env = lab.env
-        instance_id, fork, gate, saving = await _held_save(lab, seed=7, phase=phase)
+        instance_id, fork, gate, saving = await _held_save(lab, seed=7, phase=phase, by_exec=False)
         before = env.bucket.body_keys(instance_id)
         mark = len(env.proxy.log)
         try:
@@ -473,6 +640,7 @@ class TestCloseDuringSave:
             assert fork.session.instance == ref
             assert await lab.generation(instance_id) == 2
             await lab.check(instance_id, 2)
+        await _within(env.manager.drain())  # the save releases its files in a worker thread
         assert env.work_files() == set()
         with pytest.raises(SessionClosedError):
             await fork.session.exec(_op("put", "ram", block=1, value=1, tag=None))
@@ -480,12 +648,33 @@ class TestCloseDuringSave:
             await fork.session.save()
 
     @pytest.mark.parametrize("phase", _PHASES)
+    async def test_close_during_save_warns_only_for_writes_the_save_cannot_store(self, lab: Lab, phase: str) -> None:
+        """An exec, then close() while the save is held. In the pause (migration), the save fails
+        with SessionClosedError: close() warns that the exec is not saved. Once the VM runs again
+        (body or head PUT), the save goes on and stores it: no warning."""
+        _, fork, gate, saving = await _held_save(lab, seed=9, phase=phase, by_exec=True)
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                await _within(fork.session.close())
+        finally:
+            gate.release()
+        if phase == "migrate":
+            with pytest.raises(SessionClosedError):
+                await _within(saving)
+        else:
+            assert (await _within(saving)).generation == 2
+        warned = [w for w in caught if issubclass(w.category, InstanceNotSavedWarning)]
+        assert len(warned) == (1 if phase == "migrate" else 0), [str(w.message) for w in warned]
+        await _within(lab.env.manager.drain())
+
+    @pytest.mark.parametrize("phase", _PHASES)
     async def test_cancel_during_save(self, lab: Lab, phase: str) -> None:
         """A cancelled save closes the session and leaves no local file. Migration or body PUT: the
         head stays (an orphan body object may land; delete_instance removes it). Head PUT: the head
         write runs on and lands g+1 once released."""
         env = lab.env
-        instance_id, fork, gate, saving = await _held_save(lab, seed=8, phase=phase)
+        instance_id, fork, gate, saving = await _held_save(lab, seed=8, phase=phase, by_exec=False)
         before = env.bucket.body_keys(instance_id)
         mark = len(env.proxy.log)
         try:
@@ -515,6 +704,62 @@ class TestCloseDuringSave:
                 head = await lab.check(instance_id, 2)
                 assert env.bucket.body_keys(instance_id) == sorted(chain_keys(head))
         assert env.work_files() == set()
+
+    async def test_cancelled_save_stops_the_home_copy_first(self, lab: Lab, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A save cancelled while the VM is stopped and its home disk is copied: the copy stops
+        (its stop event) and the cancel comes out once the copy ended, then the VM runs again
+        (QMP cont). The rule of test_instance_e2e, without a VM. The seam: the manager module's
+        name for files.disk.clone_sparse (disk_full_once)."""
+        copying, ended = threading.Event(), threading.Event()
+
+        def stoppable_copy(_source: Path, target: Path, *, stop: threading.Event | None) -> bool:
+            target.write_bytes(b"partial")
+            copying.set()
+            assert stop is not None
+            stop.wait(timeout=30)
+            target.unlink()
+            ended.set()
+            raise InterruptedError(errno.EINTR, "The copy was stopped")
+
+        instance_id = await lab.base(31)
+        fork = await lab.reuse(instance_id)
+        _change(fork.vm, _op("put", "ram", block=1, value=31, tag=None))
+        monkeypatch.setattr(instance_manager, "clone_sparse", stoppable_copy)
+        saving = asyncio.create_task(lab.save(fork))
+        assert await asyncio.to_thread(copying.wait, 10)
+        saving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await _within(saving)
+        assert ended.is_set()  # the copy ended before the cancel came out
+        assert "cont" in fork.vm.qmp.commands  # the stopped VM runs again
+        assert await lab.generation(instance_id) == 1
+
+    async def test_a_cancelled_save_that_loses_removes_its_object(self, lab: Lab) -> None:
+        """Two sessions of one instance: B's head write is held, A's save lands, B is cancelled,
+        then its head write is released and loses (CONFLICT). The uploaded body object of B is
+        removed all the same (the shielded commit), not left as an orphan."""
+        env = lab.env
+        instance_id = await lab.base(32)
+        a, b = await lab.reuse(instance_id), await lab.reuse(instance_id)
+        _change(b.vm, _op("put", "ram", block=1, value=7, tag=None))
+        gate = _gate(env, b, instance_id, "head-put")  # the first head write only: B's
+        before = set(env.bucket.body_keys(instance_id))
+        saving_b = asyncio.create_task(lab.save(b))
+        await _within(gate.reached())
+        uploaded_by_b = set(env.bucket.body_keys(instance_id)) - before
+        assert len(uploaded_by_b) == 1  # its body object landed before its head write
+        _change(a.vm, _op("put", "ram", block=1, value=9, tag=None))
+        await _within(lab.save(a))
+        saving_b.cancel()
+        gate.release()
+        with pytest.raises(asyncio.CancelledError):
+            await _within(saving_b)
+        await _within(env.manager.drain())
+        lab.want[(instance_id, 2)] = a.guest.snapshots[-1]
+        head = await lab.check(instance_id, 2)  # A's save
+        assert env.bucket.body_keys(instance_id) == sorted(chain_keys(head))  # no orphan of B
+        assert not uploaded_by_b & set(env.bucket.body_keys(instance_id))
+        await a.session.close()
 
     async def test_drain_waits_for_cancelled_commit(self, lab: Lab) -> None:
         """A save cancelled during its head write: drain() (what Scheduler exit awaits before the
@@ -569,7 +814,7 @@ class TestWorkFileRemoval:
             gate.release()
         await _within(draining)
         assert loading.done()
-        await env.manager.release(loading.result())
+        await env.manager.release(loading.result(), wait=True)
         assert env.work_files() == set()
 
     async def test_stop_refuses_a_save_that_starts_after_it(self, lab: Lab) -> None:
@@ -596,7 +841,7 @@ class TestWorkFileRemoval:
             gate.release()
         await _within(stopping)
         assert loading.done()
-        await env.manager.release(loading.result())
+        await env.manager.release(loading.result(), wait=True)
         await fork.session.close()
 
     async def test_drain_returns_when_only_ended_jobs_remain(self, lab: Lab) -> None:
@@ -834,6 +1079,82 @@ class TestIdleTimeout:
         assert session.exec_count == (1 if changed else 0)
         assert env.work_files() == set()
 
+    async def test_idle_close_of_a_dead_binding_logs_no_unsaved_warning(
+        self, lab: Lab, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A session whose plain save lost the race has changes no plain save can store: the idle
+        close logs no "changes since the last save" warning."""
+        x = await lab.base(seed=94)
+        clock = LoopClock(monkeypatch)
+        a, b = await lab.reuse(x), await lab.reuse(x)
+        assert (await lab.save(a)).generation == 2
+        await b.session.exec(_op("put", "ram", block=1, value=94, tag=1))
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
+            await b.session.save()
+        with caplog.at_level(logging.WARNING, logger="exec_sandbox.session"):
+            await clock.advance(3601)  # the fake sessions' idle timeout is 3600 s
+            assert b.session.closed
+            await b.session.close()
+        warnings_of_session = [
+            r.getMessage() for r in caplog.records if r.name == "exec_sandbox.session" and r.levelno >= logging.WARNING
+        ]
+        assert warnings_of_session == []  # the idle close itself logs at INFO
+        await a.session.close()
+
+
+# ----------------------------------------------------------------------------- QMP connection and release
+
+
+class TestQmpConnectFailure:
+    async def test_connect_failure_at_save_start_keeps_the_session_open(self, lab: Lab) -> None:
+        """The QMP connection fails at the start of a save (QEMU never paused the VM):
+        MIGRATION_FAILED with context["vm_resumed"] True, the session stays open, and the next
+        save stores the VM."""
+        fork = await lab.new(seed=91, instance_id=None)
+        await fork.vm.qmp.stop()
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED) as exc:
+            await fork.session.save()
+        assert exc.value.context["vm_resumed"] is True
+        assert not fork.session.closed
+        await fork.vm.qmp.start(fork.vm.qmp_socket)
+        ref = await lab.save(fork)
+        assert ref.generation == 1
+        await fork.session.close()
+        await lab.check(ref.instance_id, 1)
+
+    async def test_connect_failure_of_a_dead_qemu_closes_the_session(
+        self, lab: Lab, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """QEMU exits while the save connects to it: no vm_resumed, so the session closes."""
+        fork = await lab.new(seed=92, instance_id=None)
+        await fork.vm.qmp.stop()
+        real = instance_manager.MigrationClient
+
+        class DyingQemu(real):
+            async def __aenter__(self) -> Self:
+                fork.vm.process.returncode = -9  # QEMU exits as the save connects
+                return await super().__aenter__()
+
+        monkeypatch.setattr(instance_manager, "MigrationClient", DyingQemu)
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED) as exc:
+            await fork.session.save()
+        assert "vm_resumed" not in exc.value.context
+        assert fork.session.closed
+
+
+class TestRelease:
+    async def test_release_without_wait_never_suspends(self, lab: Lab) -> None:
+        """release(wait=False) runs to its end in one step (no cancel can land inside it); the
+        folder goes in a worker thread that drain() waits for."""
+        env = lab.env
+        x = await lab.base(seed=93)
+        state = await env.load(x, manager=env.manager)
+        coro = env.manager.release(state, wait=False)
+        with pytest.raises(StopIteration):
+            coro.send(None)
+        await _within(env.manager.drain())
+        assert not state.folder.exists()
+
 
 # ----------------------------------------------------------------------------- work files that will not go
 
@@ -940,10 +1261,10 @@ class TestCleanupFailure:
         await b.session.exec(_op("put", "home", block=1, value=120, tag=2))
         with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT) as exc:
             await b.session.save()
-        _assert_loser(b, exc.value, instance_id)
-        await _within(lab.env.manager.drain())  # the refused save's files go in a worker thread
+        await _assert_loser(lab.env, b, exc.value, instance_id)  # the refused save's files go in a worker thread
         assert sorted(path.suffix for path in refused) == [".home", ".vmstate"]
         assert not old & set(refused)
+        await b.session.close()
         await a.session.close()
         await lab.check(instance_id, 2)
 
@@ -951,19 +1272,33 @@ class TestCleanupFailure:
 # ----------------------------------------------------------------------------- forks and delete
 
 
-def _assert_loser(fork: Fork, error: BaseException, instance_id: str) -> None:
+async def _assert_loser(env: InstanceEnv, fork: Fork, error: BaseException, instance_id: str) -> None:
+    """A save that lost the race: INSTANCE_CONFLICT (VERIFY); the session stays open, its folder
+    goes in a worker thread, and its next plain save is refused before any write."""
     assert isinstance(error, OutcomeUnknownError), repr(error)
     assert (error.code, error.action, error.instance_id) == ("INSTANCE_CONFLICT", "VERIFY", instance_id)
-    assert fork.session.closed
+    assert error.hint == (
+        "If an earlier save of this session had an unknown outcome, look for its commit id in describe_instance(id).recent_commits first: it may be the save that is stored. "
+        "Else save this session under another id to keep its work, or load the instance again (it has the other "
+        "save) before you redo the work."
+    )
+    assert not fork.session.closed
     assert fork.state is not None
+    await _within(env.manager.drain())
     assert not fork.state.folder.exists()
+    mark, commands = len(env.proxy.log), len(fork.vm.qmp.commands)
+    with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
+        await fork.session.save()
+    assert env.proxy.count(("PUT", "MPU_CREATE", "PUT_IF"), f"^s/{instance_id}/", since=mark) == 0
+    assert fork.vm.qmp.commands[commands:] == []  # no stop, no migrate: the VM never paused
 
 
 class TestForks:
     @pytest.mark.parametrize("k", [1, 5, 20])
     async def test_fork_sequential(self, lab: Lab, k: int) -> None:
-        """A and B load g; A saves k times; B's save is refused (412): conflict (VERIFY), B closed,
-        its body object deleted, its folder gone, later calls SessionClosedError; A's chain stays."""
+        """A and B load g; A saves k times; B's save is refused (412): conflict (VERIFY), B stays
+        open, its body object deleted, its folder gone, its next save refused before any write, its
+        exec still runs; A's chain stays."""
         env = lab.env
         instance_id = await lab.base(seed=13)
         a, b = await lab.reuse(instance_id), await lab.reuse(instance_id)
@@ -974,14 +1309,11 @@ class TestForks:
         mark = len(env.proxy.log)
         with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT) as exc:
             await b.session.save()
-        _assert_loser(b, exc.value, instance_id)
+        await _assert_loser(env, b, exc.value, instance_id)
         assert [e.status for e in env.proxy.entries("PUT_IF", since=mark)] == [412]
         (upload,) = [e.key for e in env.proxy.entries(("PUT", "MPU_CREATE"), _body(instance_id), since=mark)]
         assert upload not in env.bucket.listing()
-        with pytest.raises(SessionClosedError):
-            await b.session.exec(_op("put", "home", block=1, value=201, tag=None))
-        with pytest.raises(SessionClosedError):
-            await b.session.save()
+        await b.session.exec(_op("put", "home", block=1, value=201, tag=None))  # the VM runs on
         await b.session.close()
         await a.session.close()
         head = await lab.check(instance_id, 1 + k)
@@ -991,7 +1323,7 @@ class TestForks:
     @pytest.mark.parametrize("n", [2, 8])
     async def test_fork_concurrent_saves(self, lab: Lab, n: int) -> None:
         """N forks of g save at once (head writes held until all wait): exactly one commits g+1,
-        N-1 conflict and close; the head is the winner's bytes; the store holds its chain only."""
+        N-1 conflict and stay open; the head is the winner's bytes; the store holds its chain only."""
         env = lab.env
         instance_id = await lab.base(seed=14)
         forks = [await lab.reuse(instance_id) for _ in range(n)]
@@ -1013,7 +1345,7 @@ class TestForks:
         for i, result in enumerate(results):
             if i != winner:
                 assert isinstance(result, BaseException)
-                _assert_loser(forks[i], result, instance_id)
+                await _assert_loser(env, forks[i], result, instance_id)
         assert sorted(e.status for e in env.proxy.entries("PUT_IF", since=mark)) == [200] + [412] * (n - 1)
         assert env.proxy.count(("PUT", "MPU_CREATE"), _body(instance_id), since=mark) == n
         await _close_quietly(forks)
@@ -1029,7 +1361,8 @@ class TestForks:
     async def test_fork_interleaved(self, lab: Lab, scripts: list[list[str]]) -> None:
         """Forks of one generation run exec/save scripts at once. The first commit wins: only that
         fork ever commits, its generations follow each other, every other fork's first save
-        conflicts and from then on gets only SessionClosedError; the head is the last commit."""
+        conflicts and from then on every save conflicts too, while the session stays open and its
+        exec runs; the head is the last commit."""
         env = lab.env
         instance_id = await lab.base(seed=15)
         forks = [await lab.reuse(instance_id) for _ in scripts]
@@ -1058,15 +1391,32 @@ class TestForks:
         for i, steps in enumerate(outcomes):
             kinds = [kind for kind, _ in steps]
             first = kinds.index("conflict") if "conflict" in kinds else len(kinds)
-            assert "closed" not in kinds[:first], outcomes
-            assert all(kind == "closed" for kind in kinds[first + 1 :]), outcomes
-            assert forks[i].session.closed == (first < len(kinds)), outcomes
+            assert "closed" not in kinds, outcomes
+            assert all(kind in {"exec", "conflict"} for kind in kinds[first:]), outcomes
+            assert not forks[i].session.closed, outcomes
         generation = max(committed, default=1)
         assert await lab.generation(instance_id) == generation
         await _close_quietly(forks)
         head = await lab.check(instance_id, generation)
         assert env.bucket.body_keys(instance_id) == sorted(chain_keys(head))
         assert env.work_files() == set()
+
+    async def test_fan_out_children_never_write_x(self, lab: Lab) -> None:
+        """8 sessions load X; each saves under its own new id: X is never written, and each child
+        loads its own state."""
+        env = lab.env
+        x = await lab.base(seed=53)
+        x_head, x_bodies = env.bucket.read(head_object(x)), env.bucket.body_keys(x)
+        children = [await lab.reuse(x) for _ in range(8)]
+        mark = len(env.proxy.log)
+        for i, child in enumerate(children):
+            await child.session.exec(_op("put", "ram", block=1, value=60 + i, tag=i))
+            assert await lab.save_as(child, f"x.c{i}") == InstanceRef(instance_id=f"x.c{i}", generation=1)
+        assert env.proxy.count(("PUT", "MPU_CREATE", "PUT_IF", "DELETE_MANY"), f"^s/{x}/", since=mark) == 0
+        assert (env.bucket.read(head_object(x)), env.bucket.body_keys(x)) == (x_head, x_bodies)
+        await _close_quietly(children)
+        for i in range(8):
+            await lab.check(f"x.c{i}", 1)
 
     async def test_fork_loaded_after_save(self, lab: Lab) -> None:
         """A commits g+1; C, loaded after that, commits g+2 (no false conflict); A and B, now stale, conflict."""
@@ -1082,15 +1432,16 @@ class TestForks:
             await stale.session.exec(_op("put", "ram", block=2, value=163, tag=2))
             with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT) as exc:
                 await stale.session.save()
-            assert (exc.value.action, stale.session.closed) == ("VERIFY", True)
-        await c.session.close()
+            assert (exc.value.action, stale.session.closed) == ("VERIFY", False)
+        await _close_quietly([a, b, c])
         head = await lab.check(instance_id, 3)
         assert env.bucket.body_keys(instance_id) == sorted(chain_keys(head))
         assert env.work_files() == set()
 
     async def test_save_after_delete(self, lab: Lab) -> None:
         """delete_instance during a session: its save is InstanceGoneError INSTANCE_NOT_FOUND (RECREATE), the
-        session closes, its upload is deleted, nothing of the instance stays (store or disk)."""
+        session stays open and its VM runs on, its upload is deleted, nothing of the instance stays in
+        the store, and its local files go at close."""
         env = lab.env
         instance_id = await lab.base(seed=17)
         fork = await lab.reuse(instance_id)
@@ -1100,14 +1451,320 @@ class TestForks:
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_NOT_FOUND) as exc:
             await fork.session.save()
         assert (exc.value.action, exc.value.instance_id) == ("RECREATE", instance_id)
-        assert fork.session.closed
+        assert not fork.session.closed
         assert env.proxy.count(("PUT", "MPU_CREATE"), _body(instance_id), since=mark) == 1
         assert env.bucket.listing(f"s/{instance_id}/") == []
+        await fork.session.exec(_op("put", "ram", block=1, value=18, tag=None))
+        with pytest.warns(InstanceNotSavedWarning):  # its changes are in no stored instance
+            await fork.session.close()
+        await _within(env.manager.drain())
         assert env.work_files() == set()
-        with pytest.raises(SessionClosedError):
-            await fork.session.exec(_op("put", "ram", block=1, value=18, tag=None))
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_NOT_FOUND):
             await env.manager.describe(instance_id)
+
+
+# ----------------------------------------------------------------------------- save under a new id
+
+
+class TestSaveUnderNewId:
+    """session.save(instance_id=...): generation 1 of a new id, then the session continues it."""
+
+    async def test_creates_the_new_id_and_moves_the_session(self, lab: Lab) -> None:
+        """The VM is stored as Y@1 (create-only); the session continues Y (its next plain save is
+        Y@2); X stays as its last save left it and its local folder goes."""
+        env = lab.env
+        x = await lab.base(seed=31)
+        x_head = env.bucket.read(head_object(x))
+        fork = await lab.reuse(x)
+        assert fork.state is not None
+        await fork.session.exec(_op("put", "ram", block=1, value=31, tag=1))
+        mark = len(env.proxy.log)
+        ref = await lab.save_as(fork, "y-31")
+        assert ref == InstanceRef(instance_id="y-31", generation=1)
+        assert fork.session.instance == ref
+        assert [e.status for e in env.proxy.entries("PUT_IF", since=mark)] == [200]
+        assert env.proxy.count(("PUT", "MPU_CREATE", "PUT_IF"), f"^s/{x}/", since=mark) == 0
+        assert env.bucket.read(head_object(x)) == x_head
+        await _within(env.manager.drain())
+        assert not fork.state.folder.exists()  # X's files: the session moved to Y
+        await fork.session.exec(_op("put", "home", block=1, value=32, tag=2))
+        assert (await lab.save(fork)).generation == 2
+        await fork.session.close()
+        await lab.check(x, 1)
+        await lab.check("y-31", 2)
+        assert env.work_files() == set()
+
+    async def test_own_id_is_a_plain_save(self, lab: Lab) -> None:
+        """save(instance_id=X) on a session of X: a plain save (X@2)."""
+        x = await lab.base(seed=33)
+        fork = await lab.reuse(x)
+        await fork.session.exec(_op("put", "ram", block=1, value=33, tag=1))
+        assert await lab.save_as(fork, x) == InstanceRef(instance_id=x, generation=2)
+        await fork.session.close()
+        await lab.check(x, 2)
+
+    async def test_first_save_takes_the_argument(self, lab: Lab) -> None:
+        """A new() session never saved: the argument wins over new(instance_id=...)."""
+        fork = await lab.new(seed=34, instance_id="from-new")
+        assert await lab.save_as(fork, "from-save") == InstanceRef(instance_id="from-save", generation=1)
+        await fork.session.close()
+        assert [i async for i in lab.env.manager.list_ids()] == ["from-save"]
+        await lab.check("from-save", 1)
+
+    async def test_taken_new_id_keeps_the_session_on_x(self, lab: Lab) -> None:
+        """Y exists: INSTANCE_CONFLICT (nothing overwritten); the session stays on X, whose next
+        plain save commits X@2."""
+        env = lab.env
+        x = await lab.base(seed=35)
+        taken = await lab.new(seed=36, instance_id="taken-35")
+        await lab.save(taken)
+        await taken.session.close()
+        taken_head = env.bucket.read(head_object("taken-35"))
+        fork = await lab.reuse(x)
+        await fork.session.exec(_op("put", "ram", block=1, value=35, tag=1))
+        with pytest.raises(
+            OutcomeUnknownError, match="already exists", check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT
+        ) as exc:
+            await fork.session.save(instance_id="taken-35")
+        assert (exc.value.action, exc.value.instance_id) == ("VERIFY", "taken-35")
+        assert (
+            exc.value.hint
+            == "If an earlier save of this session had an unknown outcome, look for its commit id in describe_instance(id).recent_commits first: it may be the save that is stored. Else this id is taken: save under another id."
+        )
+        assert not fork.session.closed
+        assert fork.session.instance == InstanceRef(instance_id=x, generation=1)
+        assert env.bucket.read(head_object("taken-35")) == taken_head
+        assert (await lab.save(fork)).generation == 2
+        await fork.session.close()
+        await lab.check(x, 2)
+        await lab.check("taken-35", 1)
+
+    async def test_unknown_outcome_stays_on_the_instance(self, lab: Lab) -> None:
+        """The head write of Y gets no answer and no read-back: INSTANCE_SAVE_OUTCOME_UNKNOWN; the
+        session still saves to X. A retry under Y is create-only: Y exists, so it conflicts,
+        and Y's recent commits hold the first try's commit (it landed)."""
+        env = lab.env
+        x = await lab.base(seed=37)
+        fork = await lab.reuse(x)
+        await fork.session.exec(_op("put", "ram", block=1, value=37, tag=1))
+        env.proxy.add("PUT_IF", _exact(head_key("y-37")), DropAfter())
+        env.proxy.add("GET", _exact(head_key("y-37")), Fail(503, "ServiceUnavailable"), times=None)
+        with pytest.raises(
+            OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN
+        ) as exc:
+            await fork.session.save(instance_id="y-37")
+        assert (exc.value.action, exc.value.instance_id) == ("VERIFY", "y-37")
+        assert not fork.session.closed
+        assert fork.session.instance == InstanceRef(instance_id=x, generation=1)
+        env.proxy.clear()
+        with pytest.raises(
+            OutcomeUnknownError, match="already exists", check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT
+        ):
+            await fork.session.save(instance_id="y-37")
+        info = await env.manager.describe("y-37")
+        assert info.recent_commits[0].commit_id == exc.value.context["commit_id"]
+        assert (await lab.save(fork)).generation == 2  # the session still saves to X
+        await fork.session.close()
+        await lab.check(x, 2)
+
+    async def test_the_loser_of_a_race_keeps_its_work_under_a_new_id(self, lab: Lab) -> None:
+        """A and B load X; A commits X@2; B's plain save conflicts and B's binding is dead; B's
+        save under a new id stores B's VM as B2@1, and B continues B2."""
+        x = await lab.base(seed=38)
+        a, b = await lab.reuse(x), await lab.reuse(x)
+        await a.session.exec(_op("put", "ram", block=1, value=38, tag=1))
+        assert (await lab.save(a)).generation == 2
+        await b.session.exec(_op("put", "home", block=1, value=39, tag=1))
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
+            await b.session.save()
+        assert await lab.save_as(b, "b2-38") == InstanceRef(instance_id="b2-38", generation=1)
+        assert b.session.instance == InstanceRef(instance_id="b2-38", generation=1)
+        assert (await lab.save(b)).generation == 2
+        await _close_quietly([a, b])
+        await lab.check(x, 2)
+        await lab.check("b2-38", 2)
+        assert lab.env.work_files() == set()
+
+    async def test_new_id_deleted_during_its_first_save(self, lab: Lab) -> None:
+        """Another worker deletes Y between the upload and Y's head write: INSTANCE_NOT_FOUND
+        (RECREATE); the session stays open on X, whose next plain save commits X@2."""
+        env = lab.env
+        x = await lab.base(seed=45)
+        fork = await lab.reuse(x)
+        await fork.session.exec(_op("put", "ram", block=1, value=45, tag=1))
+        remover = env.manager_for(env.keyring)
+
+        async def delete(_req: Request) -> None:
+            await remover.delete("y-45")
+
+        env.proxy.add("PUT_IF", _exact(head_key("y-45")), Before(delete))
+        with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_NOT_FOUND) as exc:
+            await fork.session.save(instance_id="y-45")
+        assert (exc.value.action, exc.value.instance_id) == ("RECREATE", "y-45")
+        assert not fork.session.closed
+        assert fork.session.instance == InstanceRef(instance_id=x, generation=1)
+        assert (await lab.save(fork)).generation == 2
+        await fork.session.close()
+        await lab.check(x, 2)
+
+    async def test_unknown_new_id_not_landed_retry_commits(self, lab: Lab) -> None:
+        """Y's head write never reaches the store and the read-back fails: unknown outcome; the
+        session stays on X; the same save(instance_id=Y) again commits Y@1."""
+        env = lab.env
+        x = await lab.base(seed=46)
+        fork = await lab.reuse(x)
+        env.proxy.add("PUT_IF", _exact(head_key("y-46")), DropBefore(), times=None)
+        env.proxy.add("GET", _exact(head_key("y-46")), Fail(503, "ServiceUnavailable"), times=None)
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN):
+            await fork.session.save(instance_id="y-46")
+        assert fork.session.instance == InstanceRef(instance_id=x, generation=1)
+        env.proxy.clear()
+        assert await lab.save_as(fork, "y-46") == InstanceRef(instance_id="y-46", generation=1)
+        await fork.session.close()
+        await lab.check("y-46", 1)
+
+    async def test_same_new_id_from_two_sessions(self, lab: Lab) -> None:
+        """Two sessions save under one new id at once: exactly one stores Y@1, the other gets
+        INSTANCE_CONFLICT and stays open on X."""
+        env = lab.env
+        x = await lab.base(seed=47)
+        a, b = await lab.reuse(x), await lab.reuse(x)
+        gate = env.proxy.add("PUT_IF", _exact(head_key("y-47")), Hold(), times=None)
+        tasks = [asyncio.create_task(lab.save_as(fork, "y-47")) for fork in (a, b)]
+        try:
+            await await_until(lambda: gate.hits == 2)
+        finally:
+            gate.release()
+        results = await _within(asyncio.gather(*tasks, return_exceptions=True))
+        winners = [i for i, r in enumerate(results) if isinstance(r, InstanceRef)]
+        assert len(winners) == 1, results
+        loser = (a, b)[1 - winners[0]]
+        result = results[1 - winners[0]]
+        assert isinstance(result, OutcomeUnknownError)
+        assert result.code is ErrorCode.INSTANCE_CONFLICT
+        assert loser.session.instance == InstanceRef(instance_id=x, generation=1)
+        assert (await lab.save(loser)).generation == 2
+        await _close_quietly([a, b])
+        await lab.check("y-47", 1)
+        await lab.check(x, 2)
+
+    async def test_close_warnings_after_failures(self, lab: Lab) -> None:
+        """A plain save that lost the race: close() gives no InstanceNotSavedWarning. The same
+        session saved under a new id, then changed: close() warns and names the new id."""
+        x = await lab.base(seed=48)
+        a, b = await lab.reuse(x), await lab.reuse(x)
+        assert (await lab.save(a)).generation == 2
+        await b.session.exec(_op("put", "ram", block=1, value=48, tag=1))
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
+            await b.session.save()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", InstanceNotSavedWarning)
+            await b.session.close()  # dead binding: no plain save of it can store the change
+        c = await lab.reuse(x)
+        await lab.save(a)  # X@3: c's plain save loses
+        await c.session.exec(_op("put", "ram", block=2, value=49, tag=2))
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
+            await c.session.save()
+        assert await lab.save_as(c, "c-48") == InstanceRef(instance_id="c-48", generation=1)
+        await c.session.exec(_op("put", "ram", block=3, value=50, tag=3))
+        with pytest.warns(InstanceNotSavedWarning, match="instance c-48 \\(generation 1\\)"):
+            await c.session.close()
+        await a.session.close()
+
+    async def test_new_id_keeps_the_vm_policy_and_guest(self, lab: Lab) -> None:
+        """Y records the egress policy and the guest images of the VM it saves: those that X
+        recorded (a policy that the spec does not give: no default of this release)."""
+        env = lab.env
+        first = await lab.new(49, instance_id=None)
+        first.vm.egress_domains = ("a.example",)
+        x = (await lab.save(first)).instance_id
+        await first.session.close()
+        fork = await lab.reuse(x)
+        await lab.save_as(fork, "y-49")
+        await fork.session.close()
+        x_info, y_info = await env.manager.describe(x), await env.manager.describe("y-49")
+        assert (x_info.egress_domains, y_info.egress_domains) == (("a.example",), ("a.example",))
+        assert y_info.guest == x_info.guest
+
+    async def test_close_during_a_save_under_a_new_id(self, lab: Lab) -> None:
+        """close() while Y's head write waits: the save returns Y@1, the session is closed, and no
+        local file stays."""
+        env = lab.env
+        x = await lab.base(seed=50)
+        fork = await lab.reuse(x)
+        gate = env.proxy.add("PUT_IF", _exact(head_key("y-50")), Hold())
+        saving = asyncio.create_task(lab.save_as(fork, "y-50"))
+        try:
+            await _within(gate.reached.wait())
+            await fork.session.close()
+        finally:
+            gate.release()
+        assert await _within(saving) == InstanceRef(instance_id="y-50", generation=1)
+        assert fork.session.closed
+        await _within(env.manager.drain())
+        assert env.work_files() == set()
+        await lab.check("y-50", 1)
+
+    async def test_cancel_during_a_save_under_a_new_id(self, lab: Lab) -> None:
+        """A cancel while Y's head write waits closes the session; the head write runs on and stores
+        Y@1."""
+        env = lab.env
+        x = await lab.base(seed=51)
+        fork = await lab.reuse(x)
+        gate = env.proxy.add("PUT_IF", _exact(head_key("y-51")), Hold())
+        saving = asyncio.create_task(fork.session.save(instance_id="y-51"))
+        await _within(gate.reached.wait())
+        saving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await saving
+        assert fork.session.closed
+        gate.release()
+        await _within(env.manager.drain())
+        assert (await env.manager.describe("y-51")).generation == 1
+        assert env.work_files() == set()
+
+    async def test_plain_retry_after_an_unknown_outcome_that_landed(self, lab: Lab) -> None:
+        """The head write of X@2 lands with no answer and no read-back: unknown outcome. A plain
+        retry finds that commit on top: INSTANCE_CONFLICT, and X's recent commits hold the first
+        try's commit (it is stored). The session stays open; its binding is dead."""
+        env = lab.env
+        x = await lab.base(seed=52)
+        fork = await lab.reuse(x)
+        await fork.session.exec(_op("put", "ram", block=1, value=52, tag=1))
+        env.proxy.add("PUT_IF", _exact(head_key(x)), DropAfter())
+        env.proxy.add("GET", _exact(head_key(x)), Fail(503, "ServiceUnavailable"), times=None)
+        with pytest.raises(
+            OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN
+        ) as first:
+            await fork.session.save()
+        env.proxy.clear()
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
+            await fork.session.save()
+        info = await env.manager.describe(x)
+        assert (info.generation, info.recent_commits[0].commit_id) == (2, first.value.context["commit_id"])
+        assert not fork.session.closed
+        mark = len(env.proxy.log)  # the binding is dead: a next plain save sends nothing
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT):
+            await fork.session.save()
+        assert env.proxy.count(("PUT", "MPU_CREATE", "PUT_IF"), since=mark) == 0
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", InstanceNotSavedWarning)  # no plain save can store the exec
+            await fork.session.close()
+
+    async def test_invalid_id_fails_before_any_request(self, lab: Lab) -> None:
+        """save(instance_id=...) with an id that breaks the id rule: INSTANCE_INVALID_ID before any
+        request, and the session stays open. On a closed session, SessionClosedError comes first."""
+        env = lab.env
+        x = await lab.base(seed=40)
+        fork = await lab.reuse(x)
+        mark = len(env.proxy.log)
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.INSTANCE_INVALID_ID):
+            await fork.session.save(instance_id="Not-Valid")
+        assert len(env.proxy.log) == mark
+        assert not fork.session.closed
+        await fork.session.close()
+        with pytest.raises(SessionClosedError):  # a closed session: SessionClosedError comes first
+            await fork.session.save(instance_id="Not-Valid")
 
 
 # ----------------------------------------------------------------------------- Scheduler.new(instance_id=...)
@@ -1129,12 +1786,13 @@ class TestForcedId:
     async def test_taken_id_conflicts_and_keeps_the_instance(self, lab: Lab, owner: str) -> None:
         """The id is taken (by this keyring, or by one this worker lacks, whose head it cannot
         open): the create-only head write is refused, so the save conflicts (VERIFY), the session
-        closes, its upload is deleted, and the first instance stays as it was."""
+        stays open, its upload is deleted, and the first instance stays as it was."""
         env = lab.env
         first_owner = env.manager if owner == "same-keyring" else env.manager_for(new_keyring())
         first_vm = await env.new_vm(*_layout(22), spec=PYTHON)
         want = first_vm.expected()
-        await first_owner.release(await first_owner.save(first_vm, None, new_instance_id="taken"))  # type: ignore[arg-type]
+        taken = await first_owner.save(first_vm, None, new_instance_id="taken", resumed=lambda: None)  # type: ignore[arg-type]
+        await first_owner.release(taken, wait=True)
         head, objects = env.bucket.read(head_object("taken")), env.bucket.listing("s/taken/")
 
         fork = await lab.new(seed=23, instance_id="taken")
@@ -1144,12 +1802,13 @@ class TestForcedId:
         ) as exc:
             await fork.session.save()
         assert (exc.value.action, exc.value.instance_id) == ("VERIFY", "taken")
-        assert fork.session.closed
+        assert not fork.session.closed
         assert [e.status for e in env.proxy.entries("PUT_IF", since=mark)] == [412]
         assert env.bucket.read(head_object("taken")) == head
         assert env.bucket.listing("s/taken/") == objects  # the loser's upload is deleted
         await env.manager.drain()  # the loser's folder goes in a worker thread
         assert env.work_files() == set()
+        await fork.session.close()
         await env.check_load("taken", generation=1, manager=first_owner, want=want)
 
 
@@ -1163,7 +1822,7 @@ class TestDeleteDuringFirstSave:
     async def test_delete_before_the_head_write(self, lab: Lab) -> None:
         """Another worker deletes the instance between the upload and the create-only head
         write. The head lands, the save finds its object gone, removes the head and raises
-        InstanceGoneError INSTANCE_NOT_FOUND (RECREATE); the session closes, nothing of the instance stays."""
+        InstanceGoneError INSTANCE_NOT_FOUND (RECREATE); the session stays open, nothing of the instance stays."""
         env = lab.env
         fork = await lab.new(seed=19, instance_id=None)
         remover = env.manager_for(env.keyring)
@@ -1181,12 +1840,13 @@ class TestDeleteDuringFirstSave:
         assert instance_id is not None
         assert (exc.value.action, deleted) == ("RECREATE", [False])
         assert [e.status for e in env.proxy.entries("PUT_IF")] == [200]  # the head landed
-        assert fork.session.closed
+        assert not fork.session.closed
         assert env.bucket.listing(f"s/{instance_id}/") == []
         await env.manager.drain()  # the failed save's folder goes in a worker thread
         assert env.work_files() == set()
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_NOT_FOUND):
             await env.manager.describe(instance_id)
+        await fork.session.close()
 
     async def test_delete_that_listed_the_object_before_the_head_write(self, lab: Lab) -> None:
         """Another worker's delete finds no head and lists the save's object; the head lands and
@@ -1216,7 +1876,8 @@ class TestDeleteDuringFirstSave:
 
     async def test_check_without_answer_is_unknown(self, lab: Lab) -> None:
         """The store does not answer the check after the head write: the outcome is unknown
-        (VERIFY), the session closes, and the head it wrote stays and loads."""
+        (VERIFY), the session stays open with the id the save made, so a retry is create-only on
+        that id (INSTANCE_CONFLICT: it exists; no second instance), and the head it wrote loads."""
         env = lab.env
         fork = await lab.new(seed=20, instance_id=None)
         env.proxy.add("HEAD", r"^s/[^/]+/b/", Fail(503, "ServiceUnavailable"), times=None)
@@ -1228,11 +1889,18 @@ class TestDeleteDuringFirstSave:
         assert instance_id is not None
         assert exc.value.action == "VERIFY"
         assert env.proxy.count("HEAD", r"^s/[^/]+/b/") == 1
-        assert fork.session.closed
+        assert not fork.session.closed
         env.proxy.clear()
+        with pytest.raises(
+            OutcomeUnknownError, match="already exists", check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT
+        ) as retry:
+            await fork.session.save()
+        assert retry.value.instance_id == instance_id
+        assert [i async for i in env.manager.list_ids()] == [instance_id]
         await env.check_load(instance_id, generation=1, want=fork.guest.snapshots[-1], manager=env.manager)
         # The error's context names the save, as recent_commits lists it: it landed
         info = await env.manager.describe(instance_id)
         assert exc.value.context == {"generation": 1, "commit_id": info.recent_commits[0].commit_id}
+        await fork.session.close()
         await env.manager.drain()  # the failed save's folder goes in a worker thread
         assert env.work_files() == set()

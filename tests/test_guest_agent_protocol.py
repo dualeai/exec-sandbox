@@ -5,6 +5,7 @@ Tests Pydantic serialization, validation, and discriminated unions.
 No mocks - pure model testing.
 """
 
+import base64
 import json
 import time
 
@@ -34,6 +35,8 @@ from exec_sandbox.guest_agent_protocol import (
     WarmReplAckMessage,
     WarmReplRequest,
     WriteFileRequest,
+    new_host_entropy,
+    request_line,
 )
 from exec_sandbox.models import FileInfo, Language
 
@@ -47,9 +50,11 @@ _GUEST_LINE: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)  # ty
 
 
 def wire(request: GuestAgentRequest) -> dict[str, object]:
-    """The JSON object GuestChannel sends for `request` (its JSON with no null field), without
+    """The JSON object the host sends for `request` (request_line, every send site), without
     host_time_ns (the clock: test_host_time_stamped_at_serialization)."""
-    sent = json.loads(request.model_dump_json(by_alias=False, exclude_none=True))
+    line = request_line(request)
+    assert line.endswith(b"\n") and line.count(b"\n") == 1  # one line: the guest reads line by line
+    sent = json.loads(line)
     del sent["host_time_ns"]
     return sent
 
@@ -62,8 +67,9 @@ _CONTROL_CHARS = sampled_from([chr(c) for c in range(0x09)] + [chr(c) for c in r
 # ============================================================================
 
 REQUEST_WIRE_CASES = [
-    pytest.param(PingRequest(), {"action": "ping"}, id="ping"),
-    pytest.param(PingRequest(op_id="abc"), {"action": "ping", "op_id": "abc"}, id="ping-op-id"),
+    pytest.param(PingRequest(host_entropy=None), {"action": "ping"}, id="ping"),
+    pytest.param(PingRequest(host_entropy="AAAA"), {"action": "ping", "host_entropy": "AAAA"}, id="ping-entropy"),
+    pytest.param(PingRequest(host_entropy=None, op_id="abc"), {"action": "ping", "op_id": "abc"}, id="ping-op-id"),
     pytest.param(
         WarmReplRequest(language=Language.PYTHON), {"action": "warm_repl", "language": "python"}, id="warm-repl"
     ),
@@ -73,14 +79,22 @@ REQUEST_WIRE_CASES = [
         id="warm-repl-javascript-op-id",
     ),
     pytest.param(
-        ExecuteCodeRequest(language=Language.PYTHON, code="print('hello')"),
-        {"action": "exec", "language": "python", "code": "print('hello')", "timeout": 0, "env_vars": {}},
+        ExecuteCodeRequest(language=Language.PYTHON, code="print('hello')", reseed=False),
+        {
+            "action": "exec",
+            "language": "python",
+            "code": "print('hello')",
+            "reseed": False,
+            "timeout": 0,
+            "env_vars": {},
+        },
         id="exec-defaults",
     ),
     pytest.param(
         ExecuteCodeRequest(
             language=Language.JAVASCRIPT,
             code="console.log('hello')",
+            reseed=True,
             timeout=60,
             env_vars={"FOO": "bar", "BAZ": "qux"},
             op_id="xyz",
@@ -89,6 +103,7 @@ REQUEST_WIRE_CASES = [
             "action": "exec",
             "language": "javascript",
             "code": "console.log('hello')",
+            "reseed": True,
             "timeout": 60,
             "env_vars": {"FOO": "bar", "BAZ": "qux"},
             "op_id": "xyz",
@@ -151,10 +166,21 @@ class TestPingRequest:
 
     def test_host_time_stamped_at_serialization(self) -> None:
         """Every request carries the host wall clock taken when it is serialized (sent)."""
-        req = PingRequest()
+        req = PingRequest(host_entropy=None)
         before = time.time_ns()
         wire_json = json.loads(req.model_dump_json(exclude_none=True))
         assert before <= wire_json["host_time_ns"] <= time.time_ns()
+
+    def test_new_host_entropy_is_32_new_bytes(self) -> None:
+        """new_host_entropy: 32 random bytes of the host, base64, new at each call."""
+        first, second = new_host_entropy(), new_host_entropy()
+        assert len(base64.b64decode(first, validate=True)) == 32
+        assert first != second
+
+    def test_host_entropy_is_required(self) -> None:
+        """No default: every send site says whether the guest reseeds (None: no reseed)."""
+        with pytest.raises(ValidationError):
+            PingRequest()  # type: ignore[call-arg]
 
 
 class TestWarmReplRequest:
@@ -172,38 +198,43 @@ class TestExecuteCodeRequest:
     def test_language_validation(self) -> None:
         """ExecuteCodeRequest rejects invalid languages."""
         with pytest.raises(ValidationError) as exc_info:
-            ExecuteCodeRequest(language="ruby", code="puts 'hello'")  # type: ignore[arg-type]
+            ExecuteCodeRequest(language="ruby", reseed=False, code="puts 'hello'")  # type: ignore[arg-type]
         assert [(e["loc"], e["type"]) for e in exc_info.value.errors()] == [(("language",), "enum")]
 
     def test_timeout_range(self) -> None:
         """ExecuteCodeRequest enforces timeout range 0-300."""
         # Valid: 0
-        req = ExecuteCodeRequest(language=Language.PYTHON, code="x", timeout=0)
+        req = ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=0)
         assert req.timeout == 0
 
         # Valid: 300
-        req = ExecuteCodeRequest(language=Language.PYTHON, code="x", timeout=300)
+        req = ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=300)
         assert req.timeout == 300
 
         # Invalid: negative
         with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="x", timeout=-1)
+            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=-1)
 
         # Invalid: > 300
         with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="x", timeout=301)
+            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=301)
 
     def test_code_max_length(self) -> None:
         """ExecuteCodeRequest enforces 1 MiB code limit."""
         # Valid: 1 MiB exactly
         large_code = "x" * _CODE_LIMIT
-        req = ExecuteCodeRequest(language=Language.PYTHON, code=large_code)
+        req = ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code=large_code)
         assert len(req.code) == _CODE_LIMIT
 
         # Invalid: > 1 MiB
         too_large = "x" * (_CODE_LIMIT + 1)
         with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code=too_large)
+            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code=too_large)
+
+    def test_reseed_is_required(self) -> None:
+        """No default: every exec says whether the REPL reseeds its random generators."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="x")  # type: ignore[call-arg]
 
 
 class TestEnvVarValidation:
@@ -213,6 +244,7 @@ class TestEnvVarValidation:
         """Valid env vars with printable ASCII and tabs."""
         req = ExecuteCodeRequest(
             language=Language.PYTHON,
+            reseed=False,
             code="print(1)",
             env_vars={"FOO": "bar", "WITH_TAB": "value\twith\ttabs"},
         )
@@ -230,7 +262,7 @@ class TestEnvVarValidation:
             ({"FOO": "delete\x7f"}, "Env var 'FOO' value contains forbidden control character: 0x7F"),
             ({"A" * 257: "value"}, "Invalid env var name length: 257 (must be 1-256)"),
             ({"": "value"}, "Invalid env var name length: 0 (must be 1-256)"),
-            ({"FOO": "x" * 4097}, "Env var 'FOO' value too large: 4097 bytes (max 4096)"),
+            ({"FOO": "x" * 4097}, "Env var 'FOO' value too large: 4097 characters (max 4096)"),
             ({f"VAR_{i}": "value" for i in range(101)}, "Too many environment variables: 101 (max 100)"),
         ],
         ids=[
@@ -251,14 +283,16 @@ class TestEnvVarValidation:
         """Each env var the guest must not get fails validation with an error that names the
         fault (the host maps it to ENV_VAR_INVALID by its field)."""
         with pytest.raises(ValidationError) as exc_info:
-            ExecuteCodeRequest(language=Language.PYTHON, code="x", env_vars=env_vars)
+            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", env_vars=env_vars)
         assert [(e["loc"], e["msg"]) for e in exc_info.value.errors()] == [(("env_vars",), f"Value error, {message}")]
 
     def test_error_names_the_first_forbidden_character(self) -> None:
         """Allowed characters that are not printable (tab, U+2028) come before the first
         forbidden one: the error names that one (ESC), not a later one (NUL)."""
         with pytest.raises(ValidationError, match="forbidden control character: 0x1B"):
-            ExecuteCodeRequest(language=Language.PYTHON, code="x", env_vars={"FOO": "a\t\u2028b\x1b\x00" * 100})
+            ExecuteCodeRequest(
+                language=Language.PYTHON, reseed=False, code="x", env_vars={"FOO": "a\t\u2028b\x1b\x00" * 100}
+            )
 
     def test_each_forbidden_character_is_not_printable(self) -> None:
         """The check skips printable text (str.isprintable): it is exact only while no
@@ -269,6 +303,7 @@ class TestEnvVarValidation:
         """UTF-8 characters (emoji, non-Latin) are allowed."""
         req = ExecuteCodeRequest(
             language=Language.PYTHON,
+            reseed=False,
             code="x",
             env_vars={"GREETING": "Hello 世界 🌍"},
         )
@@ -400,13 +435,13 @@ RESPONSE_WIRE_CASES = [
         '{"type":"pong","version":"1.0","op_id":"abc"}', PongMessage(version="1.0", op_id="abc"), id="pong-op-id"
     ),
     pytest.param(
-        '{"type":"warm_repl_ack","language":"python","status":"ok"}',
-        WarmReplAckMessage(language="python", status="ok", message=None, op_id=None),
+        '{"type":"warm_repl_ack","status":"ok"}',
+        WarmReplAckMessage(status="ok", message=None, op_id=None),
         id="warm-repl-ack",
     ),
     pytest.param(
-        '{"type":"warm_repl_ack","language":"javascript","status":"error","message":"spawn failed","op_id":"abc"}',
-        WarmReplAckMessage(language="javascript", status="error", message="spawn failed", op_id="abc"),
+        '{"type":"warm_repl_ack","status":"error","message":"spawn failed","op_id":"abc"}',
+        WarmReplAckMessage(status="error", message="spawn failed", op_id="abc"),
         id="warm-repl-ack-error",
     ),
     pytest.param(
@@ -428,6 +463,11 @@ RESPONSE_WIRE_CASES = [
         '{"type":"file_chunk","op_id":"abc123","data":"SGVsbG8="}',
         FileChunkResponseMessage(op_id="abc123", data=b"Hello"),
         id="file-chunk-base64",
+    ),
+    pytest.param(  # the guest writes the standard alphabet (Rust base64 STANDARD): + and /, not - and _
+        '{"type":"file_chunk","op_id":"abc123","data":"+/+/"}',
+        FileChunkResponseMessage(op_id="abc123", data=b"\xfb\xff\xbf"),
+        id="file-chunk-standard-alphabet",
     ),
     pytest.param(
         '{"type":"file_read_complete","op_id":"test","path":"out.bin","size":65536}',
@@ -472,7 +512,7 @@ class TestResponseValidation:
     def test_wrong_type_rejected(self) -> None:
         """A type literal that is not the model's is rejected."""
         with pytest.raises(ValidationError):
-            WarmReplAckMessage(type="pong", language="python", status="ok")  # type: ignore[arg-type]
+            WarmReplAckMessage(type="pong", status="ok")  # type: ignore[arg-type]
 
     def test_invalid_output_stream(self) -> None:
         """An output chunk is stdout or stderr only."""
@@ -554,6 +594,7 @@ class TestEnvVarValidationPropertyBased:
         """Property: Values with only safe characters should be accepted."""
         req = ExecuteCodeRequest(
             language=Language.PYTHON,
+            reseed=False,
             code="x",
             env_vars={name: safe_value},
         )
@@ -572,6 +613,7 @@ class TestEnvVarValidationPropertyBased:
         with pytest.raises(ValidationError):
             ExecuteCodeRequest(
                 language=Language.PYTHON,
+                reseed=False,
                 code="x",
                 env_vars={name: malicious_value},
             )
@@ -590,6 +632,7 @@ class TestEnvVarValidationPropertyBased:
         with pytest.raises(ValidationError):
             ExecuteCodeRequest(
                 language=Language.PYTHON,
+                reseed=False,
                 code="x",
                 env_vars={malicious_name: value},
             )
@@ -602,6 +645,7 @@ class TestEnvVarValidationPropertyBased:
         with pytest.raises(ValidationError):
             ExecuteCodeRequest(
                 language=Language.PYTHON,
+                reseed=False,
                 code="x",
                 env_vars=many_vars,
             )

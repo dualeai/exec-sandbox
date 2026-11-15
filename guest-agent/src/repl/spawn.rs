@@ -198,36 +198,32 @@ pub(crate) fn spawn_repl(language: Language) -> Result<ReplState, Box<dyn std::e
 
     let mut child = cmd.spawn()?;
 
-    // 5. RLIMIT_NPROC=1024 via prlimit64 from parent (root)
-    match child.id() {
-        None => log_warn!("REPL child exited before prlimit64(RLIMIT_NPROC)"),
-        Some(id) => {
-            let pid = id as libc::pid_t;
-            let nproc_limit = libc::rlimit {
-                rlim_cur: 1024,
-                rlim_max: 1024,
-            };
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_prlimit64,
-                    pid,
-                    libc::RLIMIT_NPROC,
-                    &nproc_limit as *const libc::rlimit,
-                    std::ptr::null_mut::<libc::rlimit>(),
-                )
-            };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                log_warn!("prlimit64(RLIMIT_NPROC) failed for pid {pid}: {err}");
-            }
-        }
+    // 5. RLIMIT_NPROC=1024 via prlimit64 from parent (root). A child that no
+    // wait polled yet has its PID (a zombie keeps it until it is collected).
+    let pid = child.id().expect("a child just spawned has its PID") as libc::pid_t;
+    let nproc_limit = libc::rlimit {
+        rlim_cur: 1024,
+        rlim_max: 1024,
+    };
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_prlimit64,
+            pid,
+            libc::RLIMIT_NPROC,
+            &nproc_limit as *const libc::rlimit,
+            std::ptr::null_mut::<libc::rlimit>(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        log_warn!("prlimit64(RLIMIT_NPROC) failed for pid {pid}: {err}");
     }
 
     let stdin = child.stdin.take().expect("stdin piped at spawn");
     let stdout = child.stdout.take().expect("stdout piped at spawn");
     let stderr = child.stderr.take().expect("stderr piped at spawn");
     // No await since the spawn: the PID 1 reaper cannot have collected it yet.
-    let child = crate::init::WaitedChild::register(child);
+    let child = crate::init::WaitedChild::register(child)?;
 
     log_info!("Spawned REPL for language={}", language.as_str());
 

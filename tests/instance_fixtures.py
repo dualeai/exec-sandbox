@@ -578,7 +578,7 @@ class GuestModel:
     items: list[int] = field(default_factory=list)
     files: dict[str, bytes] = field(default_factory=dict)
     ticker_pid: int = 0
-    """0: no ticker."""
+    """The pid of the ticker that start_guest starts."""
     rounds: int = 0
 
     def expected(self) -> GuestState:
@@ -611,12 +611,11 @@ async def _run_ok(session: Session, code: str) -> str:
     return result.stdout
 
 
-async def start_guest(session: Session, model: GuestModel, *, ticker: bool) -> None:
-    """Empty list; with `ticker`, start the ticker and record its pid."""
+async def start_guest(session: Session, model: GuestModel) -> None:
+    """Empty list; start the ticker and record its pid."""
     assert (await _run_ok(session, model.driver.init())).strip() == "ok"
-    if ticker:
-        model.ticker_pid = int((await _run_ok(session, model.driver.start_ticker())).strip())
-        assert model.ticker_pid > 1
+    model.ticker_pid = int((await _run_ok(session, model.driver.start_ticker())).strip())
+    assert model.ticker_pid > 1
 
 
 async def play_round(session: Session, model: GuestModel) -> None:
@@ -658,13 +657,12 @@ async def probe(session: Session, model: GuestModel, *, wait_ticks: int) -> Prob
 
 async def assert_restored(session: Session, model: GuestModel) -> Probe:
     """The guest equals the model; a ticker runs on under its pid, its lines still 1..n; no lost sleeper."""
-    got = await probe(session, model, wait_ticks=5 if model.ticker_pid else 0)
+    got = await probe(session, model, wait_ticks=5)
     assert got.state == model.expected()
     assert got.ticks_contiguous, got
     assert got.sleepers == 0, got
-    if model.ticker_pid:
-        assert got.ticker_alive, got
-        assert got.ticks >= got.ticks_at_start + 5, got
+    assert got.ticker_alive, got
+    assert got.ticks >= got.ticks_at_start + 5, got
     return got
 
 

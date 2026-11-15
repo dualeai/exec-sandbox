@@ -19,7 +19,7 @@ from exec_sandbox.process_registry import (
 class MockProcessWrapper:
     """Stand-in for ProcessWrapper: the registry reads its pid only."""
 
-    def __init__(self, pid: int | None):
+    def __init__(self, pid: int):
         self.pid = pid
 
 
@@ -46,12 +46,6 @@ class TestProcessRegistry:
         register_process(MockProcessWrapper(12346))  # type: ignore[arg-type]
         register_process(MockProcessWrapper(12345))  # type: ignore[arg-type]
         assert get_tracked_count() == 2
-
-    def test_register_process_none_pid_safe(self):
-        """A process without a pid is not tracked."""
-        proc = MockProcessWrapper(None)
-        register_process(proc)  # type: ignore[arg-type]
-        assert get_tracked_count() == 0
 
     def test_unregistered_process_is_not_killed(self):
         """A process removed from the registry stays alive at force_kill_all."""

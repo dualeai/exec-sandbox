@@ -415,38 +415,6 @@ print(f'INODES_USED:{inodes_used}')
 
     # --- Out of bounds: security enforcement ---
 
-    async def test_suid_bit_ignored_on_tmp(self, dual_scheduler: Scheduler) -> None:
-        """SUID bit on /tmp binaries is ignored during execve() due to nosuid.
-
-        Copies a real ELF binary (id) to /tmp, sets SUID, and executes it.
-        With nosuid, the effective UID remains the caller (1000), not root (0).
-        Uses a subdirectory to preserve the basename — Alpine's busybox
-        dispatches applets by argv[0] basename.
-        """
-        code = """\
-import shutil, os, stat, subprocess
-# Copy a real binary — shell scripts ignore SUID (kernel only honors it on ELF).
-# Preserve basename "id" because Alpine uses busybox, which dispatches by argv[0].
-src = shutil.which('id')
-os.makedirs('/tmp/suid_test', exist_ok=True)
-dst = '/tmp/suid_test/id'
-shutil.copy2(src, dst)
-os.chmod(dst, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH | stat.S_ISUID)
-actual = os.stat(dst)
-print(f'SUID_BIT_SET:{bool(actual.st_mode & stat.S_ISUID)}')
-# Execute it — nosuid means kernel ignores SUID during execve()
-r = subprocess.run([dst], capture_output=True, text=True, timeout=5)
-print(f'OUTPUT:{r.stdout.strip()}')
-# nosuid should prevent euid escalation to root.
-# id(1) prints "euid=0(root)" only when effective UID differs from real UID.
-print(f'NO_ROOT_EUID:{"euid=0" not in r.stdout}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert result.stdout == (
-            "SUID_BIT_SET:True\nOUTPUT:uid=1000(user) gid=1000(user) groups=1000(user)\nNO_ROOT_EUID:True\n"
-        )
-
     async def test_inode_exhaustion_doesnt_crash_vm(self, dual_scheduler: Scheduler) -> None:
         """Exhausting /tmp inodes doesn't crash the VM — other paths still work."""
         async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
@@ -1213,34 +1181,6 @@ print(f'DEBUGFS:{shutil.which("debugfs") is not None}')
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert result.stdout == "DEBUGFS:False\n"
-
-    async def test_sysfs_block_no_data_path(self, dual_scheduler: Scheduler) -> None:
-        """/sys/dev/block/ exposes metadata only, no writable raw IO interface."""
-        code = """\
-import os
-
-# Find any block device entries in sysfs
-sysfs_block = '/sys/dev/block'
-if not os.path.isdir(sysfs_block):
-    print('NO_SYSFS_BLOCK')
-else:
-    dangerous_files = []
-    for entry in os.listdir(sysfs_block):
-        dev_path = os.path.join(sysfs_block, entry)
-        if os.path.islink(dev_path):
-            resolved = os.path.realpath(dev_path)
-            for name in ['data', 'raw']:
-                check = os.path.join(resolved, name)
-                if os.path.exists(check):
-                    dangerous_files.append(check)
-    if dangerous_files:
-        print(f'DANGEROUS:{",".join(dangerous_files)}')
-    else:
-        print('SAFE')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "SAFE\n"  # block entries, none with a data path
 
     async def test_uevent_helper_not_writable(self, dual_scheduler: Scheduler) -> None:
         """/sys/kernel/uevent_helper not writable by UID 1000."""

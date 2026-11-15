@@ -2,11 +2,12 @@
 
 Commit ids are 32 lowercase hex characters (128 random bits), made by the library.
 An instance id is made the same way, unless the caller chooses one for a new
-instance (Scheduler.new(instance_id=...)): 1 to 64 lowercase letters, digits,
-".", "_" or "-", starting with a letter or digit. A guessable id is safe: a head
-is authenticated with the keyring, so nobody without the keyring can make a head
-that the caller's keyring opens. An id that is already taken makes the first
-save fail with OutcomeUnknownError INSTANCE_CONFLICT (nothing is overwritten).
+instance (Scheduler.new(instance_id=...), Session.save(instance_id=...)): 1 to 64
+lowercase letters, digits, ".", "_" or "-", starting with a letter or digit. A
+guessable id is safe: a head is authenticated with the keyring, so nobody without
+the keyring can make a head that the caller's keyring opens. An id that is already
+taken makes the first save fail with OutcomeUnknownError INSTANCE_CONFLICT (nothing
+is overwritten).
 """
 
 from __future__ import annotations
@@ -45,7 +46,10 @@ def check_instance_id(value: str) -> str:
             "An instance id is 1 to 64 lowercase letters, digits, '.', '_' or '-', starting with a letter or digit.",
             code=ErrorCode.INSTANCE_INVALID_ID,
             instance_id=None,
-            hint="Pass the id from InstanceRef.instance_id, or choose a valid one with Scheduler.new(instance_id=...).",
+            hint=(
+                "Pass the id from InstanceRef.instance_id, or choose a valid one with "
+                "Scheduler.new(instance_id=...) or Session.save(instance_id=...)."
+            ),
             context=None,
         )
     return value

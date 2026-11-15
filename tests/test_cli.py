@@ -16,13 +16,13 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import click
 import keyring.core
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 from keyring.backends import fail
 
 from exec_sandbox import (
@@ -46,6 +46,7 @@ from exec_sandbox import (
     TimingBreakdown,
     TransientError,
     VmSpec,
+    WorkerFacts,
     __version__,
 )
 from exec_sandbox._imports import require_instance_admin
@@ -66,15 +67,16 @@ from exec_sandbox.cli import (
     run_command,
     truncate_source,
 )
-from exec_sandbox.exceptions import SandboxError, host_mismatch
+from exec_sandbox.exceptions import RouteKey, SandboxError, host_mismatch
+from exec_sandbox.instance.keyring import Keyring
 from exec_sandbox.instance.local_store import LocalInstanceStore
 from exec_sandbox.instance.manager import InstanceAdmin, open_instance_admin
-from exec_sandbox.instance.models import HostFacts
+from exec_sandbox.instance.models import GuestFacts, HostFacts
 from exec_sandbox.instance.store import body_key
 from exec_sandbox.platform_utils import HostOS
 from exec_sandbox.scheduler import settings_from_config
 from exec_sandbox.session import Session
-from tests.instance_support import new_keyring, seed_instance
+from tests.instance_support import FAKE_LAYOUT, new_keyring, seed_instance
 from tests.keyring_support import KEYRING_ENTRY, Account, isolate_account
 
 _SEEDED_SPEC = VmSpec(language=Language.JAVASCRIPT, memory_mb=512)
@@ -84,10 +86,11 @@ _SEEDED_HOST = HostFacts(
     cpu_vendor=None,
     cpu_model="host",
     qemu_version="10.1.0",
-    base_image="0" * 64,
-    packages_image=None,
+    machine_type="virt-10.1",
     release=__version__,
+    device_layout=FAKE_LAYOUT,
 )
+_SEEDED_GUEST = GuestFacts(base_image="0" * 64, packages_image=None, kernel="1" * 64, initramfs="2" * 64)
 """An instance a test seals into a store itself (seed_instance)."""
 _LOCAL_KEY = new_keyring()
 """Key in the fake OS keyring at the start of each test (see account)."""
@@ -457,7 +460,7 @@ class TestCliCodeExecution:
             assert call_kwargs["env_vars"] == {"KEY": "value", "DEBUG": "1"}
 
     def test_timeout_and_memory(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Passes timeout and memory settings."""
+        """-t is the scheduler's default_timeout_seconds (the exec takes it), -m the VM memory."""
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = _mock_scheduler(scheduler_cls)
             _vm(mock_scheduler).exec.return_value = mock_result
@@ -465,9 +468,8 @@ class TestCliCodeExecution:
             result = runner.invoke(run_command, ["-t", "60", "-m", "512", "print(1)"])
 
             assert result.exit_code == 0
-            call_kwargs = _call(mock_scheduler)
-            assert call_kwargs["timeout_seconds"] == 60
-            assert call_kwargs["memory_mb"] == 512
+            assert scheduler_cls.call_args.args[0].default_timeout_seconds == 60
+            assert _call(mock_scheduler)["memory_mb"] == 512
 
     def test_network_options(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Passes network options to scheduler."""
@@ -531,7 +533,18 @@ class TestCliCodeExecution:
         printed = json.loads(result.stdout)
         assert isinstance(printed["total_ms"], int)
         assert printed == {
-            "result": executed.model_dump(mode="json"),
+            "result": {  # written out: a field the JSON drops fails here
+                "stdout": "hello\n",
+                "stderr": "",
+                "exit_code": 0,
+                "execution_time_ms": 42,
+                "external_cpu_time_ms": None,
+                "external_memory_peak_mb": 128,
+                "external_cpu_nr_throttled": None,
+                "timing": {"execute_ms": 70, "connect_ms": None},
+                "spawn_ms": None,
+                "process_ms": None,
+            },
             "startup": _STARTUP.model_dump(mode="json"),
             "exposed_ports": [],
             "instance": None,
@@ -2144,7 +2157,7 @@ class TestCliPrefetch:
         assert "--quiet" in result.output
 
     def test_prefetch_downloads_all(self, runner: CliRunner, tmp_path: Path) -> None:
-        """Prefetch downloads all assets."""
+        """Prefetch downloads all assets and prints each one, then the cache folder."""
         with patch("exec_sandbox.cli.prefetch_all_assets") as mock_prefetch:
             mock_prefetch.return_value = PrefetchResult(
                 success=True,
@@ -2157,6 +2170,9 @@ class TestCliPrefetch:
 
             assert result.exit_code == 0
             mock_prefetch.assert_called_once_with(arch=None)
+            assert result.stdout == (
+                f"Prefetching exec-sandbox assets for aarch64...\n  kernel: done\n  initramfs: done\n\nDone. Cache: {tmp_path}\n"
+            )
 
     def test_prefetch_with_arch(self, runner: CliRunner, tmp_path: Path) -> None:
         """Prefetch respects --arch flag."""
@@ -2222,13 +2238,14 @@ class TestCliGroup:
     """Tests for CLI group (top-level commands)."""
 
     def test_cli_help(self, runner: CliRunner) -> None:
-        """The group help ends with its three commands and their one-line help."""
+        """The group help ends with its four commands and their one-line help."""
         result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
         assert result.output.endswith(
             "Commands:\n"
             "  run       Run code in an isolated VM.\n"
             "  instance  List, describe and remove saved instances.\n"
+            "  worker    Show this worker's facts for a broker.\n"
             "  prefetch  Download the VM assets before use, for offline hosts.\n"
         )
 
@@ -2312,15 +2329,18 @@ def _result(exit_code: int) -> ExecutionResult:
 
 
 def _info(*, spec: VmSpec | None, generation: int) -> InstanceInfo:
-    """What describe_instance gives for _ID; spec None: this keyring lacks the key (not verified)."""
+    """What describe_instance gives for _ID; spec None: this keyring lacks the key (access no_key)."""
     return InstanceInfo(
         instance_id=_ID,
         generation=generation,
         recent_commits=(RecentCommit(generation=generation, commit_id="a" * 32),),
         key_id="b" * 64,
-        verified=spec is not None,
+        access="full" if spec is not None else "no_key",
+        writer_release=None if spec is None else "1.0.1",
         spec=spec,
-        host=None,
+        host=None if spec is None else _SEEDED_HOST,
+        guest=None if spec is None else _SEEDED_GUEST,
+        egress_domains=None if spec is None else (),
     )
 
 
@@ -2424,7 +2444,7 @@ class TestCliInstanceRun:
         assert f"Instance {_ID} not saved: the VM stopped; it stays at generation 3." in result.stderr
 
     def test_order_is_uploads_exec_downloads_save(self, runner: CliRunner, tmp_path: Path) -> None:
-        """Downloads come before the save: a save that fails closes the session."""
+        """Downloads come before the save: a save that fails can close the session."""
         upload = tmp_path / "in.txt"
         upload.write_text("in")
         download = tmp_path / "out.txt"
@@ -2786,7 +2806,9 @@ def _key_missing() -> SandboxError:
 
 
 def _host_mismatch() -> SandboxError:
-    return host_mismatch(instance_id=_ID, required={"arch": "x86_64"}, found={"arch": "aarch64"})
+    return host_mismatch(
+        instance_id=_ID, required={RouteKey.ARCH: "x86_64"}, found={RouteKey.ARCH: "aarch64"}, reason=None
+    )
 
 
 def _store_down() -> SandboxError:
@@ -2806,8 +2828,14 @@ def _expired() -> SandboxError:
 
 
 def _conflict() -> SandboxError:
+    """An INSTANCE_CONFLICT as the store raises it: with the generation and commit id of the save
+    that was not stored (save_context)."""
     return OutcomeUnknownError(
-        "Another save won.", code=ErrorCode.INSTANCE_CONFLICT, context=None, hint=None, instance_id=_ID
+        "Another save won.",
+        code=ErrorCode.INSTANCE_CONFLICT,
+        context={"generation": 4, "commit_id": "c" * 32},
+        hint=None,
+        instance_id=_ID,
     )
 
 
@@ -2843,7 +2871,7 @@ class TestCliInstanceErrors:
         ("error", "exit_code", "words"),
         [
             (_key_missing, 2, ["INSTANCE_KEY_MISSING (FIX_CONFIG)", "Add the key."]),
-            (_host_mismatch, 125, ["INSTANCE_HOST_MISMATCH (ROUTE)", "arch=x86_64", "Do not remove"]),
+            (_host_mismatch, 125, ["INSTANCE_HOST_MISMATCH (ROUTE)", 'arch="x86_64"', "Do not remove"]),
             (_store_down, 125, ["INSTANCE_STORE_UNAVAILABLE (RETRY)", "again later"]),
             (_expired, 125, ["INSTANCE_EXPIRED (RECREATE)", f"sbx instance rm {_ID}"]),
         ],
@@ -2871,8 +2899,26 @@ class TestCliInstanceErrors:
 
         assert result.exit_code == 125
         assert "INSTANCE_CONFLICT (VERIFY)" in result.stderr
-        assert f"sbx instance describe {_ID}" in result.stderr
+        assert "lists commit" not in result.stderr  # a conflict stored nothing
         assert "Created instance" not in result.stderr
+
+    def test_save_unknown_outcome_names_the_commit_to_look_for(self, runner: CliRunner) -> None:
+        """The store did not confirm the save: the advice names the command and the commit id."""
+        unknown = OutcomeUnknownError(
+            "No answer.",
+            code=ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN,
+            context={"generation": 2, "commit_id": "c" * 32},
+            hint=None,
+            instance_id=_ID,
+        )
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            vm = _new_instance(_mock_scheduler(scheduler_cls), exit_code=0)
+            vm.save.side_effect = unknown
+
+            result = runner.invoke(run_command, ["--instance", _ID, "-c", "pass"])
+
+        assert result.exit_code == 125
+        assert f"The save is stored if 'sbx instance describe {_ID}' lists commit {'c' * 32}." in result.stderr
 
     @pytest.mark.parametrize(
         ("error", "exit_code", "words"),
@@ -2931,6 +2977,145 @@ def local_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return root
 
 
+class _FakeCheckScheduler:
+    """A Scheduler for `sbx instance check`: its ids, and check_reuse raising `errors[id]`;
+    its start raises `start_error` when set."""
+
+    def __init__(self, ids: list[str], errors: dict[str, Exception]) -> None:
+        self.ids, self.errors, self.checked = ids, errors, list[str]()
+        self.start_error: Exception | None = None
+
+    def __call__(self, _config: object) -> Self:
+        return self
+
+    async def __aenter__(self) -> Self:
+        if self.start_error is not None:
+            raise self.start_error
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def list_instances(self) -> AsyncIterator[str]:
+        for instance_id in self.ids:
+            yield instance_id
+
+    async def check_reuse(self, instance_id: str) -> None:
+        self.checked.append(instance_id)
+        if (error := self.errors.get(instance_id)) is not None:
+            raise error
+
+
+class TestCliInstanceCheck:
+    """`sbx instance check`: a line for each instance, exit 1 when one cannot continue here,
+    125 when the store or this host fails (no answer)."""
+
+    @staticmethod
+    def _run(runner: CliRunner, monkeypatch: pytest.MonkeyPatch, fake: _FakeCheckScheduler, *args: str) -> Result:
+        monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", _ENV_KEY)
+        monkeypatch.setattr("exec_sandbox.cli.Scheduler", fake)
+        return runner.invoke(cli, ["instance", "check", *args])
+
+    def test_a_line_for_each_and_exit_1(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+        gone = InstanceGoneError(
+            "No instance b1.", code=ErrorCode.INSTANCE_NOT_FOUND, context=None, hint=None, instance_id="b1"
+        )
+        fake = _FakeCheckScheduler(["a1", "b1"], {"b1": gone})
+        result = self._run(runner, monkeypatch, fake)
+        assert result.exit_code == 1, result.output
+        assert result.stdout.splitlines() == ["a1 ok", "b1 INSTANCE_NOT_FOUND (RECREATE): No instance b1."]
+
+    def test_json_lines(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+        result = self._run(runner, monkeypatch, _FakeCheckScheduler(["a1"], {}), "--json")
+        assert result.exit_code == 0, result.output
+        assert [json.loads(line) for line in result.stdout.splitlines()] == [{"instance_id": "a1", "ok": True}]
+
+    def test_a_store_failure_stops_with_125(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A RETRY error is no answer about the instance: the check stops, exit 125."""
+        down = TransientError(
+            "store down", code=ErrorCode.INSTANCE_STORE_UNAVAILABLE, context=None, hint=None, instance_id=None
+        )
+        fake = _FakeCheckScheduler(["a1", "b1"], {"a1": down})
+        result = self._run(runner, monkeypatch, fake)
+        assert result.exit_code == 125, result.output
+        assert fake.checked == ["a1"]
+
+    def test_a_host_that_cannot_run_vms_stops_with_2(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A FIX_CONFIG error at the start (this host cannot run its QEMU): exit 2, and no
+        instance is checked (no line says that an instance failed)."""
+        fake = _FakeCheckScheduler(["a1"], {})
+        fake.start_error = ConfigError(
+            "QEMU cannot run.", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None
+        )
+        result = self._run(runner, monkeypatch, fake)
+        assert result.exit_code == 2, result.output
+        assert (fake.checked, result.stdout) == ([], "")
+        assert "HOST_DEPENDENCY (FIX_CONFIG)" in result.stderr
+
+    def test_sample_picks_from_the_store(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+        """K distinct instances of the store."""
+        fake = _FakeCheckScheduler([f"id{n}" for n in range(10)], {})
+        result = self._run(runner, monkeypatch, fake, "--sample", "3")
+        assert result.exit_code == 0, result.output
+        assert len(set(fake.checked)) == len(fake.checked) == 3 and set(fake.checked) <= set(fake.ids)
+
+    def test_sample_with_ids_is_a_usage_error(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = _FakeCheckScheduler([], {})
+        result = self._run(runner, monkeypatch, fake, "--sample", "3", _ID)
+        assert result.exit_code == 2
+        assert "--sample picks instances of the store" in result.output
+        assert fake.checked == []
+
+
+class TestCliCheckAndWorkerConfig:
+    """`sbx instance check` and `sbx worker describe` on the specced Scheduler mock: the config
+    each one starts (the local store, the keyring variable, no warm pool) and its output."""
+
+    def test_the_check_starts_on_the_instance_store_with_no_pool(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", _ENV_KEY)
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            scheduler = _mock_scheduler(scheduler_cls)
+            result = runner.invoke(cli, ["instance", "check", _ID])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"{_ID} ok\n"
+        scheduler.check_reuse.assert_awaited_once_with(_ID)
+        config = _config(scheduler_cls)
+        assert (config.instance_store, config.warm_pool_size) == ("local", 0)
+        assert config.instance_keyring is not None
+        assert config.instance_keyring.get_secret_value() == _ENV_KEY
+
+    def test_worker_describe_prints_the_facts(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", _ENV_KEY)
+        facts = WorkerFacts(values={RouteKey.ARCH: "aarch64", RouteKey.CPU: "1.26"}, key_ids=("1" * 64,))
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            _mock_scheduler(scheduler_cls).describe_worker.return_value = facts
+            result = runner.invoke(cli, ["worker", "describe"])
+
+        assert result.exit_code == 0, result.output
+        assert WorkerFacts.model_validate_json(result.stdout) == facts
+        config = _config(scheduler_cls)
+        assert (config.instance_store, config.warm_pool_size) == ("local", 0)
+        assert config.instance_keyring is not None
+        assert config.instance_keyring.get_secret_value() == _ENV_KEY
+
+    def test_worker_describe_on_a_host_that_cannot_run_vms_exits_2(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", _ENV_KEY)
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            _mock_scheduler(scheduler_cls).__aenter__.side_effect = ConfigError(
+                "QEMU cannot run.", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None
+            )
+            result = runner.invoke(cli, ["worker", "describe"])
+
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert "HOST_DEPENDENCY (FIX_CONFIG)" in result.stderr
+
+
 class TestCliInstanceCommands:
     """`sbx instance list | describe | rm` open the store and the keyring only: no Scheduler, no VM."""
 
@@ -2950,6 +3135,48 @@ class TestCliInstanceCommands:
 
         assert result.exit_code == 0, result.output
         assert json.loads(result.stdout) == ids
+
+    def test_keys_prints_the_id_of_each_key(
+        self, runner: CliRunner, local_store: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The id of each key of the keyring, newest first (the key_id that describe shows):
+        one on each line, or a JSON array. The store is not opened: its folder is not made."""
+        newer = new_keyring()
+        monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", f"{newer},{_ENV_KEY}")
+        expected = [Keyring.parse(newer).latest.id, Keyring.parse(_ENV_KEY).latest.id]
+
+        result = runner.invoke(cli, ["instance", "keys"])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == expected
+        as_json = runner.invoke(cli, ["instance", "keys", "--json"])
+        assert json.loads(as_json.stdout) == expected
+        assert not local_store.exists()
+
+    @pytest.mark.parametrize("as_array", [False, True], ids=["lines", "json"])
+    def test_list_long_describes_each_instance(
+        self, runner: CliRunner, admin_mocks: _AdminMocks, as_array: bool
+    ) -> None:
+        """--long: what describe shows for each id, one JSON object per line (--json: an
+        array); an id it cannot describe gives its error as data, and the listing goes on."""
+        info = _info(spec=_SIX, generation=3)
+        admin_mocks.admin.list_ids.return_value.__aiter__.return_value = ["a1", _ID]
+        gone = InstanceGoneError(
+            "No instance a1.", code=ErrorCode.INSTANCE_NOT_FOUND, context=None, hint=None, instance_id="a1"
+        )
+
+        async def describe(instance_id: str) -> InstanceInfo:
+            if instance_id == "a1":
+                raise gone
+            return info
+
+        admin_mocks.admin.describe.side_effect = describe
+        result = runner.invoke(cli, ["instance", "list", "--long", *(["--json"] if as_array else [])])
+
+        assert result.exit_code == 0, result.output
+        objects = json.loads(result.stdout) if as_array else [json.loads(line) for line in result.stdout.splitlines()]
+        error = {"code": "INSTANCE_NOT_FOUND", "action": "RECREATE", "message": "No instance a1."}
+        assert objects[0] == {"instance_id": "a1", "error": error}
+        assert InstanceInfo.model_validate(objects[1]) == info
 
     def test_describe_prints_the_info_as_json(self, runner: CliRunner, admin_mocks: _AdminMocks) -> None:
         info = _info(spec=_SIX, generation=3)
@@ -3047,18 +3274,24 @@ class TestCliInstanceCommandsStore:
         key = account.keyring.entries[KEYRING_ENTRY]
         assert key not in result.output
 
-        # The store opens with that key: a head sealed with it reads as verified.
+        # The store opens with that key: a head sealed with it reads with access full.
         async def seed() -> None:
             async with LocalInstanceStore.open(root=store) as opened:
                 await seed_instance(
-                    opened, tmp_path, instance_id=_ID, keyring=key, spec=_SEEDED_SPEC, host=_SEEDED_HOST
+                    opened,
+                    tmp_path,
+                    instance_id=_ID,
+                    keyring=key,
+                    spec=_SEEDED_SPEC,
+                    host=_SEEDED_HOST,
+                    guest=_SEEDED_GUEST,
                 )
 
         asyncio.run(seed())
         result = runner.invoke(cli, ["instance", "describe", _ID])
         assert result.exit_code == 0, result.output
         info = InstanceInfo.model_validate_json(result.stdout)
-        assert (info.verified, info.spec) == (True, _SEEDED_SPEC)
+        assert (info.access, info.spec) == ("full", _SEEDED_SPEC)
 
     def test_variables_win_over_the_defaults(
         self,

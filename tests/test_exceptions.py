@@ -18,6 +18,8 @@ from exec_sandbox.exceptions import (
     InvalidInputError,
     OutcomeUnknownError,
     RouteError,
+    RouteKey,
+    RouteRule,
     SandboxError,
     SessionClosedError,
     SocketAuthError,
@@ -43,6 +45,8 @@ PUBLIC_ERROR_NAMES = {
     "InvalidInputError",
     "ConfigError",
     "RouteError",
+    "RouteKey",
+    "RouteRule",
     "InstanceGoneError",
     "InternalError",
     "ErrorAction",
@@ -165,23 +169,103 @@ class TestHelpers:
     """The helpers build the right class and code."""
 
     def test_host_mismatch_names_required_values(self) -> None:
-        error = exceptions.host_mismatch(
-            instance_id="0" * 32,
-            required={"arch": "aarch64", "accelerator": "hvf"},
-            found={"arch": "x86_64", "accelerator": "kvm"},
-        )
-        assert (
-            str(error)
-            == f"Instance {'0' * 32} needs accelerator=hvf, arch=aarch64; this worker has accelerator=kvm, arch=x86_64."
+        """`required` keeps the whole target; the message names only the values that differ,
+        in JSON form (a cpu_model holds commas; None is null)."""
+        required = {RouteKey.ARCH: "x86_64", RouteKey.CPU_VENDOR: "GenuineIntel", RouteKey.CPU_MODEL: "m,+tsc-deadline"}
+        found: dict[RouteKey, str | None] = {
+            RouteKey.ARCH: "aarch64",
+            RouteKey.CPU_VENDOR: None,
+            RouteKey.CPU_MODEL: "host",
+        }
+        error = exceptions.host_mismatch(instance_id="0" * 32, required=required, found=found, reason=None)
+        assert str(error) == (
+            f'Instance {"0" * 32} needs arch="x86_64", cpu_vendor="GenuineIntel", cpu_model="m,+tsc-deadline"; '
+            'this worker has arch="aarch64", cpu_vendor=null, cpu_model="host".'
         )
         assert type(error) is RouteError
         assert error.code is ErrorCode.INSTANCE_HOST_MISMATCH
         assert error.action == "ROUTE"
-        assert error.required == {"arch": "aarch64", "accelerator": "hvf"}
-        assert error.found == {"arch": "x86_64", "accelerator": "kvm"}
+        assert (error.required, error.found, error.context) == (required, found, {})
+        assert error.hint == (
+            "Reuse it on a worker that satisfies the error's `required` field. Keep the instance: its data is intact."
+        )
+
+    def test_host_mismatch_names_only_what_differs_and_the_reason(self) -> None:
+        error = exceptions.host_mismatch(
+            instance_id="vm",
+            required={RouteKey.ARCH: "aarch64", RouteKey.BASE_IMAGE: "a" * 64},
+            found={RouteKey.ARCH: "aarch64", RouteKey.BASE_IMAGE: None},
+            reason="the image is not on this worker and not in the store",
+        )
+        assert str(error) == (
+            f'Instance vm needs base_image="{"a" * 64}"; this worker has base_image=null: '
+            "the image is not on this worker and not in the store."
+        )
+        assert error.context == {"reason": "the image is not on this worker and not in the store"}
+        nothing = exceptions.host_mismatch(
+            instance_id="vm",
+            required={},
+            found={},
+            reason="this release cannot read its block",
+        )
+        assert str(nothing) == "Instance vm: this release cannot read its block."
+        assert nothing.hint == (
+            "Reuse it on a worker of another exec-sandbox release. Keep the instance: its data is intact."
+        )
+
+    def test_host_mismatch_names_a_key_by_its_rule(self) -> None:
+        """A budget at or above the need, or with no limit (None), and a machine type this
+        worker has pass: the message names only the image it lacks."""
+        error = exceptions.host_mismatch(
+            instance_id="vm",
+            required={
+                RouteKey.MEMORY_MB: "272",
+                RouteKey.CPU: "1.25",
+                RouteKey.MACHINE_TYPE: "virt-11.1",
+                RouteKey.BASE_IMAGE: "a" * 64,
+            },
+            found={
+                RouteKey.MEMORY_MB: "8000",
+                RouteKey.CPU: None,
+                RouteKey.MACHINE_TYPE: "virt-11.1",
+                RouteKey.BASE_IMAGE: None,
+            },
+            reason=None,
+        )
+        assert str(error) == f'Instance vm needs base_image="{"a" * 64}"; this worker has base_image=null.'
+
+    @pytest.mark.parametrize(
+        ("key", "have", "need", "holds"),
+        [
+            pytest.param(RouteKey.MEMORY_MB, None, "272", True, id="no-memory-limit"),
+            pytest.param(RouteKey.QEMU_VERSION, None, "11.1.3", False, id="no-qemu-version"),
+            pytest.param(RouteKey.CPU, frozenset({"4.00"}), "1.25", False, id="at-least-with-a-set"),
+            pytest.param(RouteKey.BASE_IMAGE, None, "a" * 64, False, id="no-image"),
+            pytest.param(RouteKey.BASE_IMAGE, "a" * 64, "a" * 64, True, id="contains-the-value"),
+            pytest.param(RouteKey.ARCH, None, "aarch64", False, id="equal-no-value"),
+        ],
+    )
+    def test_holds_by_rule(self, key: RouteKey, have: str | frozenset[str] | None, need: str, holds: bool) -> None:
+        assert key.holds(have, need) is holds
+
+    def test_every_route_key_has_its_rule(self) -> None:
+        """The rule of each key is part of the contract: a broker compares by it."""
+        assert {key: key.rule for key in RouteKey} == {
+            RouteKey.ARCH: RouteRule.EQUAL,
+            RouteKey.ACCELERATOR: RouteRule.EQUAL,
+            RouteKey.CPU_VENDOR: RouteRule.EQUAL,
+            RouteKey.CPU_MODEL: RouteRule.EQUAL,
+            RouteKey.QEMU_VERSION: RouteRule.AT_LEAST,
+            RouteKey.MACHINE_TYPE: RouteRule.CONTAINS,
+            RouteKey.BASE_IMAGE: RouteRule.CONTAINS,
+            RouteKey.PACKAGES_IMAGE: RouteRule.CONTAINS,
+            RouteKey.MEMORY_MB: RouteRule.AT_LEAST,
+            RouteKey.CPU: RouteRule.AT_LEAST,
+        }
 
     def test_no_instance_store(self) -> None:
-        """The hint names both ways to set a store: the settings and their variables."""
+        """The hint names both ways to set a store, the settings and their variables, and that
+        instance_store=None in code wins over a variable that is set."""
         error = exceptions.no_instance_store(instance_id="abc")
         assert type(error) is ConfigError
         assert error.code is ErrorCode.INSTANCE_CONFIG
@@ -189,7 +273,8 @@ class TestHelpers:
         assert str(error) == "Saved instances need an instance store, and none is configured."
         assert error.hint == (
             "Set instance_store and instance_keyring "
-            "(or EXEC_SANDBOX_INSTANCE_STORE and EXEC_SANDBOX_INSTANCE_KEYRING)."
+            "(or EXEC_SANDBOX_INSTANCE_STORE and EXEC_SANDBOX_INSTANCE_KEYRING); "
+            "instance_store=None set in code turns saved instances off, whatever the variables say."
         )
 
     def test_damaged_instance_data(self) -> None:
@@ -260,7 +345,7 @@ class TestInternalClasses:
 
 
 class TestExports:
-    """The package exports exactly the 12 error names."""
+    """The package exports exactly the 14 error names (RouteKey and RouteRule included)."""
 
     def test_all_holds_exactly_the_error_names(self) -> None:
         from_exceptions = {

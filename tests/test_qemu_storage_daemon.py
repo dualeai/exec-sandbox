@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import errno
 import json
+import logging
 import os
 import secrets
 import select
@@ -24,6 +25,7 @@ import threading
 from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,7 +35,6 @@ import pytest
 from exec_sandbox import process_registry, qemu_storage_daemon
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.models import Language
-from exec_sandbox.overlay_pool import OverlayPool
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, _pid_namespace
 from exec_sandbox.vm_manager import VmManager
 from tests.conftest import asyncio_with, skip_unless_linux
@@ -138,7 +139,7 @@ class _ScriptedQmp:
 
 @pytest.fixture
 def base_image(vm_settings) -> Path:  # type: ignore[no-untyped-def]
-    """Resolve the Python base image path without starting the overlay pool."""
+    """Resolve the Python base image path without starting a VmManager."""
     return VmManager(vm_settings).images.base_image(Language.PYTHON)  # type: ignore[arg-type]
 
 
@@ -1014,6 +1015,9 @@ class TestOverlayTemplates:
             return real_reap(*args)
 
         monkeypatch.setattr(QemuStorageDaemon, "_reap_stale_daemons", staticmethod(held_reap))
+        own_folders = f"qsd-*-{os.getpid()}-*.templates"
+        folders_before = set(Path(tempfile.gettempdir()).glob(own_folders))
+        daemons_before = set(_daemon_sockets())
         daemon = QemuStorageDaemon()
         starting = asyncio.create_task(daemon.start())
         assert await asyncio.to_thread(entered.wait, 10)
@@ -1026,7 +1030,10 @@ class TestOverlayTemplates:
         release.set()
         await starting
         await asyncio.gather(*qemu_storage_daemon._cleanup_tasks)  # pyright: ignore[reportPrivateUsage]
-        assert (daemon.started, daemon._process, daemon._template_dir) == (False, None, None)  # pyright: ignore[reportPrivateUsage]
+        assert daemon.started is False
+        # The OS facts: no daemon process of this start runs, and no template folder stays
+        assert set(_daemon_sockets()) - daemons_before == set()
+        assert not set(Path(tempfile.gettempdir()).glob(own_folders)) - folders_before
 
     @pytest.mark.parametrize("held", ["reaper", "template-mkdir"])
     async def test_a_stop_during_start_stops_what_it_made(self, monkeypatch: pytest.MonkeyPatch, held: str) -> None:
@@ -1037,6 +1044,7 @@ class TestOverlayTemplates:
         entered, release = threading.Event(), threading.Event()
         own_folders = f"qsd-*-{os.getpid()}-*.templates"
         before = set(Path(tempfile.gettempdir()).glob(own_folders))
+        daemons_before = set(_daemon_sockets())
 
         def hold() -> None:
             entered.set()
@@ -1070,7 +1078,8 @@ class TestOverlayTemplates:
         await starting
         await stopping
         await asyncio.gather(*qemu_storage_daemon._cleanup_tasks)  # pyright: ignore[reportPrivateUsage]
-        assert (daemon.started, daemon._process, daemon._template_dir) == (False, None, None)  # pyright: ignore[reportPrivateUsage]
+        assert daemon.started is False
+        assert set(_daemon_sockets()) - daemons_before == set()  # no daemon of this start runs
         assert not set(Path(tempfile.gettempdir()).glob(own_folders)) - before
 
     async def test_start_removes_only_the_template_folders_of_dead_owners(
@@ -1101,54 +1110,53 @@ class TestOverlayTemplates:
 
 
 # ============================================================================
-# OverlayPool Integration with Daemon
+# Templates made at VmManager.start
 # ============================================================================
 
 
-class TestOverlayPoolWithDaemon:
-    """Integration tests for OverlayPool using QemuStorageDaemon.
+class TestOverlayTemplatesAtStart:
+    """VmManager.start makes the template of each base image on this host
+    (_make_overlay_templates): the first VM of each gets a clone, no QMP creation (~17 ms)."""
 
-    No hwaccel required: uses qemu-storage-daemon (host-side QMP tool)
-    for overlay creation — no VMs are booted.
-    """
+    @pytest.mark.parametrize("through_a_link", [False, True], ids=["path", "symlink"])
+    async def test_the_first_overlay_after_start_is_a_clone(
+        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path, through_a_link: bool
+    ) -> None:
+        """The template is keyed by the resolved path, as _setup_vm_infra resolves it: an images
+        folder reached through a symlink gets the clone too."""
+        listed = base_image
+        if through_a_link:
+            listed = tmp_path / "images" / base_image.name
+            listed.parent.mkdir()
+            listed.symlink_to(base_image)
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        manager = SimpleNamespace(
+            images=SimpleNamespace(present_base_images=lambda: [listed]),
+            _overlay_daemon=started_daemon,
+            _run_dir_path=run_dir,
+        )
+        await VmManager._make_overlay_templates(manager)  # type: ignore[arg-type]  # pyright: ignore[reportPrivateUsage]
+        assert list(run_dir.iterdir()) == []  # the template's overlay went
 
-    async def test_pool_uses_daemon_when_enabled(self, base_image: Path, tmp_path: Path) -> None:
-        """OverlayPool uses daemon for overlay creation."""
-        pool = OverlayPool(pool_size=2, pool_dir=tmp_path / "pool")
-        await pool.start([base_image])
+        with patch.object(QemuStorageDaemon, "_create_with_qmp", AsyncMock(side_effect=AssertionError("QMP"))):
+            await started_daemon.create_overlay(listed.resolve(), tmp_path / "vm.qcow2")  # as _setup_vm_infra
+        assert (tmp_path / "vm.qcow2").stat().st_size > 0
 
-        try:
-            assert pool.daemon_enabled is True
-
-            # The pool fills in the background after start()
-            queue = pool._pools[str(base_image.resolve())]
-            async with asyncio.timeout(5):
-                while queue.empty():  # noqa: ASYNC110 - the pool has no fill event to await
-                    await asyncio.sleep(0.005)
-
-            # Acquire overlay should work
-            target = tmp_path / "acquired.qcow2"
-            result = await pool.acquire(base_image, target)
-
-            assert result is True  # From pool
-            assert target.exists()
-        finally:
-            await pool.stop()
-
-    async def test_daemon_stopped_on_pool_shutdown(self, base_image: Path, tmp_path: Path) -> None:
-        """Daemon is stopped when pool shuts down: its process ends."""
-        before = _daemon_sockets().keys()
-        pool = OverlayPool(pool_size=2, pool_dir=tmp_path / "pool")
-        await pool.start([base_image])
-
-        assert pool.daemon_enabled is True
-        started = _daemon_sockets().keys() - before
-        assert len(started) == 1
-
-        await pool.stop()
-
-        assert pool.daemon_enabled is False
-        assert not started & _daemon_sockets().keys()
+    async def test_a_failed_template_is_logged_not_raised(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A daemon that cannot make the overlay (here: not started): a warning, and the start goes on."""
+        manager = SimpleNamespace(
+            images=SimpleNamespace(present_base_images=lambda: [tmp_path / "base.qcow2"]),
+            _overlay_daemon=QemuStorageDaemon(),
+            _run_dir_path=tmp_path,
+        )
+        with caplog.at_level(logging.WARNING, logger="exec_sandbox"):
+            await VmManager._make_overlay_templates(manager)  # type: ignore[arg-type]  # pyright: ignore[reportPrivateUsage]
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+            "No overlay template for a base image"
+        ]
 
 
 # ============================================================================

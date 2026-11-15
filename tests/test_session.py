@@ -664,13 +664,13 @@ class TestSessionConcurrency:
     """Tests for exec serialization and coexistence with run()."""
 
     async def test_concurrent_execs_serialized(self, scheduler: Scheduler) -> None:
-        """Concurrent exec() calls are serialized (no interleaved output)."""
+        """Concurrent exec() calls run one after the other in the session's one REPL, in call
+        order: the second sees what the first set, after its sleep, with its own output only."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             results = await asyncio.gather(
-                session.exec("print('a' * 100)"),
-                session.exec("print('b' * 100)"),
+                session.exec("import time; time.sleep(0.3); x = 'a' * 100; print(x)"),
+                session.exec("print(x.replace('a', 'b'))"),
             )
-            # Both succeed, each with its own output only (serialized by exec_lock)
             assert [(r.exit_code, r.stdout) for r in results] == [(0, "a" * 100 + "\n"), (0, "b" * 100 + "\n")]
 
     async def test_session_plus_run_coexist(self, scheduler: Scheduler) -> None:

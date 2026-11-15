@@ -22,11 +22,11 @@ from __future__ import annotations
 from pathlib import Path  # noqa: TC003 - pydantic evaluates annotations at runtime
 from typing import Final, Self
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from exec_sandbox import constants
 from exec_sandbox.platform_utils import UserDir, get_user_dir
-from exec_sandbox.settings import InstanceStoreKind, check_s3_prefixes
+from exec_sandbox.settings import InstanceStoreKind, check_s3_prefixes, kept_secret
 
 MIN_SESSION_IDLE_TIMEOUT_SECONDS: Final[int] = 10
 MAX_SESSION_IDLE_TIMEOUT_SECONDS: Final[int] = 3600
@@ -208,11 +208,17 @@ class SchedulerConfig(BaseModel):
         default_factory=lambda: get_user_dir(kind=UserDir.DATA) / "instances",
         description='Root folder of the "local" instance store',
     )
-    instance_keyring: SecretStr | None = Field(
+    instance_keyring: SecretStr | str | None = Field(
         default=None,
         description="Comma-separated base64 keys of 32 random bytes, newest first: the first encrypts new saves, "
-        "the others only open older ones. Parsed at Scheduler start; never logged or passed to child processes.",
+        "the others only open older ones. Parsed at Scheduler start; never logged or passed to child processes. "
+        "A str (keyring.get_password) is kept as a SecretStr.",
     )
+
+    @field_validator("instance_keyring")
+    @classmethod
+    def _keyring_is_secret(cls, value: SecretStr | str | None) -> SecretStr | None:
+        return kept_secret(value)
 
     @model_validator(mode="after")
     def _check_s3_prefixes(self) -> Self:

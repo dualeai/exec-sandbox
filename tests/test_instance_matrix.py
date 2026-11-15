@@ -41,7 +41,7 @@ pytestmark = skip_unless_hwaccel
 async def _walk(scheduler: Scheduler, world: InstanceWorld, session: Session, model: GuestModel) -> InstanceRef:
     """round -> save (gen 1) -> round -> save (gen 2) -> lost changes -> close (warns) -> reuse == gen 2
     -> round -> save (gen 3). Returns the gen-3 ref; `model` ends at gen 3."""
-    await start_guest(session, model, ticker=True)
+    await start_guest(session, model)
     await play_round(session, model)
     first = await session.save()
     assert first.generation == 1
@@ -115,7 +115,7 @@ async def test_origin_walk(instance_world: InstanceWorld, language: Language, pa
     ) as scheduler:
         info = await scheduler.describe_instance(ref.instance_id)
         assert info.host is not None
-        digest = info.host.packages_image
+        digest = info.guest.packages_image
         assert digest is not None
         downloaded = world.asset_dir / f"{digest}.img"
         assert not downloaded.exists()  # every earlier load used the local L2 (same digest)

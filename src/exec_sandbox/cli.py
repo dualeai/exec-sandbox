@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
+import random
 import signal
 import sys
 import time
@@ -61,14 +63,14 @@ from exec_sandbox import (
     __version__,
     constants,
 )
-from exec_sandbox._imports import require_cli_keyring, require_instance_admin
+from exec_sandbox._imports import require_cli_keyring, require_instance_admin, require_instance_keyring
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.assets import PrefetchResult, prefetch_all_assets
 from exec_sandbox.dns_filter import validate_domain
 from exec_sandbox.instance.ids import check_instance_id
 from exec_sandbox.platform_utils import UserDir, get_account_dir
 from exec_sandbox.process_registry import force_kill_all, get_tracked_count
-from exec_sandbox.settings import Settings
+from exec_sandbox.settings import Settings, kept_secret
 
 
 def _run_with_interrupt_handling(coro: Coroutine[Any, Any, int]) -> int:
@@ -118,6 +120,7 @@ def _run_with_interrupt_handling(coro: Coroutine[Any, Any, int]) -> int:
 
 # Exit codes following Unix conventions
 EXIT_SUCCESS = 0
+EXIT_CHECK_FAILED = 1  # sbx instance check: an instance this worker cannot continue
 EXIT_CLI_ERROR = 2
 EXIT_TIMEOUT = 124  # Matches `timeout` command
 EXIT_SANDBOX_ERROR = 125
@@ -576,13 +579,12 @@ _SPEC_OPTIONS: dict[str, tuple[str, str]] = {
 
 _ACTION_ADVICE: dict[ErrorAction, str] = {
     ErrorAction.RETRY: "Run the same command again later.",
-    ErrorAction.VERIFY: "Check before you run again: the code may have run, or the save may be "
-    "stored. For an instance, read the generation with 'sbx instance describe {id}'.",
+    ErrorAction.VERIFY: "Check before you run again: the code may have run, and the save may or may not be stored.",
     ErrorAction.RESTART: "Run the command again.",
     ErrorAction.FIX_INPUT: "Correct the command, then run again.",
     ErrorAction.FIX_CONFIG: "Correct the settings, then run again.",
     ErrorAction.ROUTE: "Run it on a host with the needed values "
-    "(CPU, accelerator, QEMU, guest images, exec-sandbox release, memory and CPU budget). "
+    "(CPU, accelerator, QEMU machine type and version, guest images, memory and CPU budget). "
     "Do not remove a saved instance for this error: its data is good.",
     ErrorAction.RECREATE: "This instance cannot be used again. "
     "Remove it with 'sbx instance rm {id}', then run again to make a new one.",
@@ -612,7 +614,7 @@ _CODE_ADVICE: dict[ErrorCode, list[str]] = {
 }
 """Extra advice for some codes, printed before the action's advice."""
 
-_INSTANCE_IDS = TypeAdapter(list[str])
+_STRINGS = TypeAdapter(list[str])
 
 
 def _valid_instance_id(value: str) -> str:
@@ -656,7 +658,7 @@ def _instance_store(settings: Settings) -> tuple[InstanceStoreKind, SecretStr | 
     """
     store: InstanceStoreKind = settings.instance_store or "local"
     if store != "local" or settings.instance_keyring is not None:
-        return store, settings.instance_keyring
+        return store, kept_secret(settings.instance_keyring)
     require_cli_keyring()
     from exec_sandbox import cli_keyring  # noqa: PLC0415 - the cli extra, checked by require_cli_keyring
 
@@ -694,6 +696,21 @@ def _scheduler_config(*, timeout: int, no_validation: bool, instances: bool) -> 
             instance_store=store,
             instance_keyring=keyring,
         )
+
+
+def _store_settings() -> tuple[Settings, InstanceStoreKind]:
+    """The EXEC_SANDBOX_* settings with the CLI's instance store and keyring (_instance_store),
+    and that store."""
+    settings = _env_settings()
+    store, keyring = _instance_store(settings)
+    return settings.model_copy(update={"instance_store": store, "instance_keyring": keyring}), store
+
+
+def _store_config() -> SchedulerConfig:
+    """SchedulerConfig of a command that opens the CLI's instance store and starts no VM."""
+    store, keyring = _instance_store(_env_settings())
+    with _valid_settings():
+        return SchedulerConfig(instance_store=store, instance_keyring=keyring)
 
 
 def _spec_flags(ctx: click.Context, *, source: str) -> frozenset[str]:
@@ -745,7 +762,7 @@ async def _open_session(
         if e.code is not ErrorCode.INSTANCE_NOT_FOUND:  # never make a new one over a damaged instance
             raise
         return await scheduler.new(spec, on_boot_log=on_boot_log, instance_id=instance_id)
-    if info.spec is not None:  # None: this keyring lacks the instance's key, and reuse() says so
+    if info.spec is not None:  # None: no key, or another release wrote it; reuse() says which
         _check_saved_spec(instance_id=instance_id, saved=info.spec, wanted=spec, flag_fields=flag_fields)
     return await scheduler.reuse(instance_id)
 
@@ -807,7 +824,8 @@ def _report_error(error: SandboxError, *, saved: InstanceRef | None) -> int:
 
     One path for every error: its code and action, its message, its hint, the
     extra advice of its code (_CODE_ADVICE: install, prefetch, package allow-list,
-    boot timeout), then the advice of its action. After a run that saved (`saved`,
+    boot timeout), then the advice of its action (for INSTANCE_SAVE_OUTCOME_UNKNOWN, also
+    the commit to look for with 'sbx instance describe'). After a run that saved (`saved`,
     for a failed download) the action's advice gives way to a note: a new run
     starts from the saved state and runs the code again on it.
 
@@ -822,6 +840,11 @@ def _report_error(error: SandboxError, *, saved: InstanceRef | None) -> int:
         )
     else:
         suggestions.append(_ACTION_ADVICE[error.action].format(id=error.instance_id or "ID"))
+        if error.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN:  # its context names the commit (save_context)
+            suggestions.append(
+                f"The save is stored if 'sbx instance describe {error.instance_id}' lists commit "
+                f"{error.context['commit_id']}."
+            )
     click.echo(format_error(f"{error.code} ({error.action})", error.message, suggestions=suggestions), err=True)
     return _error_exit_code(action=error.action, code=error.code)
 
@@ -829,14 +852,9 @@ def _report_error(error: SandboxError, *, saved: InstanceRef | None) -> int:
 async def run_code(
     *,
     code: str,
-    language: Language,
-    packages: list[str],
+    spec: VmSpec,
     timeout: int,
-    memory: int,
     env_vars: dict[str, str],
-    network: bool,
-    allowed_domains: list[str],
-    expose_ports: list[PortMapping] | None,
     json_output: bool,
     quiet: bool,
     no_validation: bool,
@@ -855,18 +873,12 @@ async def run_code(
     downloads and the save; the first of these errors sets the exit code (see
     _report_error: 2 for FIX_INPUT and FIX_CONFIG, 124 for VM_BOOT_TIMEOUT, else 125).
     Without an error, the code's exit code, or 124 when the code timed out (_run_exit_code).
-    VM options the VmSpec refuses raise click.UsageError (exit 2) before the scheduler starts.
 
     Args:
         code: Code to execute
-        language: Programming language
-        packages: Packages to install
-        timeout: Timeout in seconds
-        memory: Memory in MB
+        spec: The VM (_make_spec)
+        timeout: Timeout in seconds (the scheduler's default_timeout_seconds)
         env_vars: Environment variables
-        network: Enable network
-        allowed_domains: Allowed domains for network
-        expose_ports: Ports to expose from guest to host
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
@@ -879,10 +891,6 @@ async def run_code(
     Returns:
         Exit code to return from CLI
     """
-    spec = _make_spec(
-        language=language, memory=memory, packages=packages, network=network,
-        allowed_domains=allowed_domains, expose_ports=expose_ports,
-    )  # fmt: skip
 
     # Streaming callbacks for non-JSON output
     def on_stdout(chunk: str) -> None:
@@ -913,7 +921,6 @@ async def run_code(
 
                     result = await vm.exec(
                         code,
-                        timeout_seconds=timeout,
                         env_vars=env_vars if env_vars else None,
                         on_stdout=on_stdout,
                         on_stderr=on_stderr,
@@ -953,13 +960,9 @@ async def run_code(
 async def run_multiple(
     *,
     sources: list[SourceInput],
-    packages: list[str],
+    specs: list[VmSpec],
     timeout: int,
-    memory: int,
     env_vars: dict[str, str],
-    network: bool,
-    allowed_domains: list[str],
-    expose_ports: list[PortMapping] | None,
     json_output: bool,
     quiet: bool,
     no_validation: bool,
@@ -972,13 +975,9 @@ async def run_multiple(
 
     Args:
         sources: List of SourceInput objects to execute
-        packages: Packages to install (applied to all sources)
-        timeout: Timeout in seconds per source
-        memory: Memory in MB per VM
+        specs: The VM of each source (_make_spec), in the order of `sources`
+        timeout: Timeout in seconds per source (the scheduler's default_timeout_seconds)
         env_vars: Environment variables
-        network: Enable network
-        allowed_domains: Allowed domains for network
-        expose_ports: Ports to expose from guest to host
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
@@ -987,18 +986,6 @@ async def run_multiple(
     Returns:
         Exit code to return from CLI (the _report_error one when the scheduler fails)
     """
-    # Every spec before the scheduler starts: options the VmSpec refuses exit 2 (click.UsageError)
-    specs = [
-        _make_spec(
-            language=src.language,
-            memory=memory,
-            packages=packages,
-            network=network,
-            allowed_domains=allowed_domains,
-            expose_ports=expose_ports,
-        )
-        for src in sources
-    ]
     config = _scheduler_config(timeout=timeout, no_validation=no_validation, instances=False)
     on_boot_log = _make_boot_log_callback(debug)
 
@@ -1015,9 +1002,7 @@ async def run_multiple(
                 try:
                     start = time.perf_counter()
                     async with await scheduler.new(specs[idx], on_boot_log=on_boot_log) as vm:
-                        result = await vm.exec(
-                            src.code, timeout_seconds=timeout, env_vars=env_vars if env_vars else None
-                        )
+                        result = await vm.exec(src.code, env_vars=env_vars if env_vars else None)
                         startup, exposed_ports = vm.startup_timing, vm.exposed_ports
                     run = OneShotRun(
                         result=result,
@@ -1322,19 +1307,26 @@ def run_command(
     if instance_id is not None and len(resolved_sources) != 1:
         raise click.UsageError("--instance requires exactly one source.")
 
+    # Every spec before the scheduler starts: options the VmSpec refuses exit 2 (click.UsageError)
+    specs = [
+        _make_spec(
+            language=src.language,
+            memory=memory,
+            packages=list(packages),
+            network=network,
+            allowed_domains=list(allowed_domains),
+            expose_ports=parsed_ports,
+        )
+        for src in resolved_sources
+    ]
     if len(resolved_sources) == 1:
         src_input = resolved_sources[0]
         exit_code = _run_with_interrupt_handling(
             run_code(
                 code=src_input.code,
-                language=src_input.language,
-                packages=list(packages),
+                spec=specs[0],
                 timeout=timeout,
-                memory=memory,
                 env_vars=parsed_env_vars,
-                network=network,
-                allowed_domains=list(allowed_domains),
-                expose_ports=parsed_ports,
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,
@@ -1350,13 +1342,9 @@ def run_command(
         exit_code = _run_with_interrupt_handling(
             run_multiple(
                 sources=resolved_sources,
-                packages=list(packages),
+                specs=specs,
                 timeout=timeout,
-                memory=memory,
                 env_vars=parsed_env_vars,
-                network=network,
-                allowed_domains=list(allowed_domains),
-                expose_ports=parsed_ports,
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,
@@ -1378,9 +1366,7 @@ async def _instance_admin(action: Callable[[InstanceAdmin], Awaitable[int]]) -> 
     Only the store and the keyring open: no Scheduler, no VM, no image download.
     """
     try:
-        settings = _env_settings()
-        store, keyring = _instance_store(settings)
-        opened = settings.model_copy(update={"instance_store": store, "instance_keyring": keyring})
+        opened, store = _store_settings()
         async with require_instance_admin(store=store)(opened) as admin:
             return await action(admin)
     except SandboxError as e:
@@ -1391,32 +1377,54 @@ async def _instance_admin(action: Callable[[InstanceAdmin], Awaitable[int]]) -> 
 def instance_group() -> None:
     """List, describe and remove saved instances.
 
-    These commands start no VM. They use the store of 'sbx run --instance ID':
-    a folder on this host (EXEC_SANDBOX_INSTANCE_STORE_DIR, else the user's
-    data folder) with its key in EXEC_SANDBOX_INSTANCE_KEYRING, else in the
-    OS keyring; or S3 with EXEC_SANDBOX_INSTANCE_STORE=s3 and
+    'sbx instance keys' shows the id of each key of the keyring; 'sbx instance
+    check' checks that this worker can continue instances. These commands
+    start no VM. They use the store of 'sbx run --instance ID': a
+    folder on this host (EXEC_SANDBOX_INSTANCE_STORE_DIR, else the user's data
+    folder) with its key in EXEC_SANDBOX_INSTANCE_KEYRING, else in the OS
+    keyring; or S3 with EXEC_SANDBOX_INSTANCE_STORE=s3 and
     EXEC_SANDBOX_INSTANCE_KEYRING.
 
-    Exit codes: 0 on success; 2 for invalid settings, a bad id, or a FIX_INPUT
-    or FIX_CONFIG error; 125 for the other errors; 130 after Ctrl+C.
+    Exit codes: 0 on success ('sbx instance check': 1 when an instance fails); 2
+    for invalid settings, a bad id, or a FIX_INPUT or FIX_CONFIG error; 125 for the
+    other errors; 130 after Ctrl+C.
     """
 
 
 @instance_group.command(name="list", context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--json", "json_output", is_flag=True, help="Output as a JSON array")
-def instance_list_command(*, json_output: bool) -> NoReturn:
+@click.option(
+    "--long",
+    "long_output",
+    is_flag=True,
+    help="Describe each instance: one JSON object on each line (--json: an array)",
+)
+def instance_list_command(*, json_output: bool, long_output: bool) -> NoReturn:
     """Show the id of each saved instance, one on each line.
 
     An id can have no current state (a first save that did not finish, or a
     removal that did not finish): 'sbx instance describe' then fails, and
-    'sbx instance rm' removes what is left.
+    'sbx instance rm' removes what is left. With --long, each line is what
+    'sbx instance describe' shows, or for an id it cannot describe
+    {"instance_id": ..., "error": {"code": ..., "action": ..., "message": ...}}.
     """
     configure_logging()
 
     async def show(admin: InstanceAdmin) -> int:
         ids = [instance_id async for instance_id in admin.list_ids()]
-        if json_output:
-            click.echo(_INSTANCE_IDS.dump_json(ids, indent=2).decode())
+        if long_output:
+            lines: list[str] = []
+            for start in range(0, len(ids), _DESCRIBE_AT_ONCE):
+                batch = ids[start : start + _DESCRIBE_AT_ONCE]
+                described = await asyncio.gather(*(_described(admin, instance_id) for instance_id in batch))
+                if not json_output:
+                    for line in described:
+                        click.echo(line)
+                lines.extend(described)
+            if json_output:
+                click.echo("[" + ",".join(lines) + "]")
+        elif json_output:
+            click.echo(_STRINGS.dump_json(ids, indent=2).decode())
         else:
             for instance_id in ids:
                 click.echo(instance_id)
@@ -1425,14 +1433,28 @@ def instance_list_command(*, json_output: bool) -> NoReturn:
     sys.exit(_run_with_interrupt_handling(_instance_admin(show)))
 
 
+_DESCRIBE_AT_ONCE = 32
+"""Instances `sbx instance list --long` describes at a time (store requests in flight)."""
+
+
+async def _described(admin: InstanceAdmin, instance_id: str) -> str:
+    """One JSON line: the InstanceInfo of `instance_id`, or the error of its describe as data."""
+    try:
+        return (await admin.describe(instance_id)).model_dump_json()
+    except SandboxError as e:
+        error = {"code": str(e.code), "action": e.action, "message": e.message}
+        return json.dumps({"instance_id": instance_id, "error": error})
+
+
 @instance_group.command(name="describe", context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("instance_id", metavar="ID", callback=_instance_id_param)
 def instance_describe_command(*, instance_id: str) -> NoReturn:
     """Show what the store holds for one saved instance, as JSON.
 
-    Generation, recent commits and key id; also the VM settings (spec) and the
-    host it was saved on when this keyring has the instance's key (verified).
-    Without the key, "verified" is false and nothing checks the other fields.
+    Generation, recent commits, key id, access and the release that wrote it; also
+    the VM settings (spec) and the host it was saved on when access is "full".
+    "other_release": another release wrote it (load it there); "no_key": this
+    keyring lacks the key, and nothing checks the other fields.
     """
     configure_logging()
 
@@ -1442,6 +1464,85 @@ def instance_describe_command(*, instance_id: str) -> NoReturn:
         return EXIT_SUCCESS
 
     sys.exit(_run_with_interrupt_handling(_instance_admin(show)))
+
+
+@instance_group.command(name="keys", context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--json", "json_output", is_flag=True, help="Output as a JSON array")
+def instance_keys_command(*, json_output: bool) -> NoReturn:
+    """Show the id of each key of the keyring, newest first, one on each line.
+
+    'sbx instance describe' shows the id of the key of an instance (key_id): an
+    instance whose key id is not listed here does not open with this keyring.
+    The store is not opened.
+    """
+    configure_logging()
+
+    async def show() -> int:
+        try:
+            opened, store = _store_settings()
+            keyring = require_instance_keyring(store=store)(opened)
+        except SandboxError as e:
+            return _report_error(e, saved=None)
+        key_ids = [key.id for key in keyring.keys]
+        if json_output:
+            click.echo(_STRINGS.dump_json(key_ids, indent=2).decode())
+        else:
+            for key_id in key_ids:
+                click.echo(key_id)
+        return EXIT_SUCCESS
+
+    sys.exit(_run_with_interrupt_handling(show()))
+
+
+@instance_group.command(name="check", context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument("instance_ids", metavar="[ID...]", nargs=-1, callback=_instance_ids_param)
+@click.option("--sample", type=click.IntRange(min=1), help="Check this many instances of the store, picked at random")
+@click.option("--json", "json_output", is_flag=True, help="One JSON object on each line")
+def instance_check_command(*, instance_ids: tuple[str, ...], sample: int | None, json_output: bool) -> NoReturn:
+    """Check that this worker can continue saved instances (Scheduler.check_reuse).
+
+    What 'sbx run --instance ID' checks before its download, with no download
+    and no VM: the instance opens with this keyring and release, this worker
+    has its host facts and its budget, and its guest images are here or in the
+    store. QEMU still decides at the reuse. Without ID, every instance of the
+    store (--sample K: K of them at random). One line for each instance: "ID ok",
+    or "ID CODE (ACTION): message".
+
+    Exit codes: 0 when every instance passes; 1 when one fails; 2 for invalid
+    settings, a bad id, --sample with IDs, or a FIX_INPUT or FIX_CONFIG error before the
+    checks; 125 for an error of the store or of this
+    host that can pass (the check stops there); 130 after Ctrl+C.
+    """
+    configure_logging()
+    if sample is not None and instance_ids:
+        raise click.UsageError("--sample picks instances of the store: give it without ID.")
+
+    async def check() -> int:
+        try:
+            async with Scheduler(_store_config()) as scheduler:
+                ids = list(instance_ids) or [instance_id async for instance_id in scheduler.list_instances()]
+                if sample is not None:
+                    ids = random.sample(ids, min(sample, len(ids)))
+                failed = False
+                for instance_id in ids:
+                    try:
+                        await scheduler.check_reuse(instance_id)
+                    except SandboxError as e:
+                        if e.action is ErrorAction.RETRY:  # the store or this host failed: no answer
+                            raise
+                        failed = True
+                        error = {"code": str(e.code), "action": e.action, "message": e.message}
+                        line: dict[str, object] = {"instance_id": instance_id, "ok": False, "error": error}
+                        text = f"{instance_id} {e.code} ({e.action}): {e.message}"
+                    else:
+                        line = {"instance_id": instance_id, "ok": True}
+                        text = f"{instance_id} ok"
+                    click.echo(json.dumps(line) if json_output else text)
+        except SandboxError as e:
+            return _report_error(e, saved=None)
+        return EXIT_CHECK_FAILED if failed else EXIT_SUCCESS
+
+    sys.exit(_run_with_interrupt_handling(check()))
 
 
 @instance_group.command(name="rm", context_settings={"help_option_names": ["-h", "--help"]})
@@ -1468,8 +1569,43 @@ def instance_rm_command(*, instance_ids: tuple[str, ...]) -> NoReturn:
 
 
 # ============================================================================
-# Prefetch Command
+# Worker and Prefetch Commands
 # ============================================================================
+
+
+@cli.group(name="worker", cls=_OrderedGroup, context_settings={"help_option_names": ["-h", "--help"]})
+def worker_group() -> None:
+    """Show this worker's facts for a broker.
+
+    A broker routes saved instances on these facts.
+
+    Exit codes: 0 on success; 2 for invalid settings or a FIX_CONFIG error; 125
+    for the other errors; 130 after Ctrl+C.
+    """
+
+
+@worker_group.command(name="describe", context_settings={"help_option_names": ["-h", "--help"]})
+def worker_describe_command() -> NoReturn:
+    """Show this worker's facts as JSON (Scheduler.describe_worker).
+
+    "values": one value per key of RouteError.required (arch, accelerator,
+    CPU vendor, guest CPU model, QEMU version and machine types, the guest
+    images on this worker's disk, the admission budget); "key_ids": the
+    instance keys of the store of 'sbx run --instance ID'. A call that raised
+    RouteError can run on a worker whose facts satisfy the error's "required".
+    No VM starts.
+    """
+    configure_logging()
+
+    async def show() -> int:
+        try:
+            async with Scheduler(_store_config()) as scheduler:
+                click.echo((await scheduler.describe_worker()).model_dump_json(indent=2))
+        except SandboxError as e:
+            return _report_error(e, saved=None)
+        return EXIT_SUCCESS
+
+    sys.exit(_run_with_interrupt_handling(show()))
 
 
 @cli.command(name="prefetch", context_settings={"help_option_names": ["-h", "--help"]})

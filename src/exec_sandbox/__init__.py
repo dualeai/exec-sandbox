@@ -89,11 +89,13 @@ from exec_sandbox.exceptions import (
     InvalidInputError,
     OutcomeUnknownError,
     RouteError,
+    RouteKey,
+    RouteRule,
     SandboxError,
     SessionClosedError,
     TransientError,
 )
-from exec_sandbox.instance.models import HostFacts, InstanceInfo, RecentCommit
+from exec_sandbox.instance.models import GuestFacts, HostFacts, InstanceInfo, RecentCommit
 from exec_sandbox.models import (
     ExecutionResult,
     ExposedPort,
@@ -104,9 +106,10 @@ from exec_sandbox.models import (
     StartupTiming,
     TimingBreakdown,
 )
-from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.scheduler import Scheduler, instance_admin
 from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
+from exec_sandbox.worker_facts import WorkerFacts
 
 __all__ = [
     "ConfigError",
@@ -115,6 +118,7 @@ __all__ = [
     "ExecutionResult",
     "ExposedPort",
     "FileInfo",
+    "GuestFacts",
     "HostFacts",
     "InstanceGoneError",
     "InstanceInfo",
@@ -127,6 +131,8 @@ __all__ = [
     "PortMapping",
     "RecentCommit",
     "RouteError",
+    "RouteKey",
+    "RouteRule",
     "SandboxError",
     "Scheduler",
     "SchedulerConfig",
@@ -136,5 +142,7 @@ __all__ = [
     "TimingBreakdown",
     "TransientError",
     "VmSpec",
+    "WorkerFacts",
     "configure_logging",
+    "instance_admin",
 ]

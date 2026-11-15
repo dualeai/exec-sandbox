@@ -67,6 +67,7 @@ async def test_wait_for_guest_fails_at_once_on_socket_access_denied(
         gvproxy_proc=None,
         qemu_log_task=None,
         gvproxy_log_task=None,
+        device_layout="",
     )
     try:
         with pytest.raises(ConfigError) as caught:

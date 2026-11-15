@@ -362,10 +362,16 @@ class TestMemoryFilesystem:
         real_open = Path.open
 
         def no_mount_table(self: Path, *args: Any, **kwargs: Any) -> Any:
-            assert str(self) != "/proc/self/mounts", "memory_filesystem read the mount table"
+            assert str(self) not in {"/proc/self/mounts", "/proc/self/mountinfo"}, (
+                "memory_filesystem read the mount table"
+            )
             return real_open(self, *args, **kwargs)
 
+        def no_overlay_parse(_path: Path) -> Path | None:
+            raise AssertionError("memory_filesystem parsed the mount table (overlay_upper)")
+
         monkeypatch.setattr("exec_sandbox.files.disk.statfs_type", fake_statfs_type)
+        monkeypatch.setattr("exec_sandbox.files.disk.overlay_upper", no_overlay_parse)
         monkeypatch.setattr(Path, "open", no_mount_table)
 
         assert memory_filesystem(tmp_path / "not" / "made") == "tmpfs"

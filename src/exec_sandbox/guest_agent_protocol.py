@@ -9,6 +9,8 @@ file_io.rs, packages.rs).
 
 from __future__ import annotations
 
+import base64
+import os
 import re
 import time
 from typing import Annotated, Literal
@@ -61,19 +63,39 @@ class GuestAgentRequest(BaseModel):
         return time.time_ns()
 
 
+def new_host_entropy() -> str:
+    """32 random bytes of the host, base64: a PingRequest's host_entropy."""
+    return base64.b64encode(os.urandom(32)).decode()
+
+
+def request_line(request: GuestAgentRequest) -> bytes:
+    """`request` as the guest agent reads it: its JSON with no null field, then a newline (every
+    host send site: GuestChannel, QemuVM's file transfers)."""
+    return request.model_dump_json(by_alias=False, exclude_none=True).encode() + b"\n"
+
+
 class PingRequest(GuestAgentRequest):
     """Health check request.
 
-    Response: PongMessage with version field.
+    Response: PongMessage with version field; with host_entropy, a StreamingErrorMessage
+    (io_error) instead when the guest cannot reseed its kernel random source.
     """
 
     action: Literal["ping"] = Field(default="ping")  # type: ignore[assignment]
+    host_entropy: str | None = Field(
+        description=(
+            "32 random bytes of the host, base64 (new_host_entropy): the guest mixes them into its "
+            "kernel random source and reseeds it, and answers an error, not a pong, when it cannot. "
+            "None: no host bytes (the guest reseeds from its own input pool, as before each command)"
+        )
+    )
 
 
 class WarmReplRequest(GuestAgentRequest):
     """Warm the REPL of a language: the guest takes its live REPL, or starts one and waits
-    for its ready line, then runs a no-op on it, so the first exec of a user is not the
-    REPL's first.
+    for its ready line, then runs a no-op on it with the reseed flag (ExecuteCodeRequest.reseed),
+    so the first exec of a user is not the REPL's first, and a copy of a saved state runs its
+    reseed warm.
 
     Response: WarmReplAckMessage (status "ok" or "error").
     """
@@ -88,10 +110,11 @@ class ExecuteCodeRequest(GuestAgentRequest):
     Guest agent enforces:
     - Code size limit: 1 MiB
     - Timeout limit: 300s
-    - Env var limits: 100 vars, 256 char names, 4096 char values
+    - Env var limits: 100 vars, names of 1-256 bytes, values of at most 4096 bytes (UTF-8;
+      the host check counts characters)
     - Blocked env vars: LD_PRELOAD, NODE_OPTIONS, PATH, etc. (security)
 
-    Response: Streaming messages (OutputChunkMessage, ExecutionCompleteMessage).
+    Response: OutputChunkMessage messages, then ExecutionCompleteMessage or StreamingErrorMessage.
     """
 
     action: Literal["exec"] = Field(default="exec")  # type: ignore[assignment]
@@ -101,6 +124,12 @@ class ExecuteCodeRequest(GuestAgentRequest):
     # Note: empty-code and null-byte checks live in guest-agent validation.rs.
     # The host translates the guest's code_error response to InvalidInputError (CODE_INVALID)
     # via guest_error_to_exception. No Pydantic validator here.
+
+    reseed: bool = Field(
+        description="True: the REPL reseeds its random generators from the kernel before it runs the "
+        "code (Python: ssl and the module functions of random; JavaScript: BoringSSL's generator of the "
+        "REPL thread; bash: $RANDOM)"
+    )
 
     timeout: int = Field(
         ge=0, le=300, default=0, description="Execution timeout in seconds (0 = the default, 300 s; max 300 s)"
@@ -129,7 +158,7 @@ class ExecuteCodeRequest(GuestAgentRequest):
             # Validate value length
             if len(value) > MAX_ENV_VAR_VALUE_LENGTH:
                 raise ValueError(
-                    f"Env var '{key}' value too large: {len(value)} bytes (max {MAX_ENV_VAR_VALUE_LENGTH})"
+                    f"Env var '{key}' value too large: {len(value)} characters (max {MAX_ENV_VAR_VALUE_LENGTH})"
                 )
 
             # Check for control characters in name, then in value (the first one found)
@@ -150,9 +179,10 @@ class InstallPackagesRequest(GuestAgentRequest):
     - Package spec length: 214 bytes, name and version (npm's name limit)
     - Version specifier required: pandas==2.0.0, lodash@4.17.21
     - Path traversal protection: no /, .., \\
-    - Timeout: at most 300 s (0 = the default, 300 s)
+    - Timeout: 0 = the default, 300 s (the host model caps it at 300 s; the guest checks no
+      maximum)
 
-    Response: Streaming messages (OutputChunkMessage for stdout/stderr, ExecutionCompleteMessage for completion).
+    Response: OutputChunkMessage messages, then ExecutionCompleteMessage or StreamingErrorMessage.
     """
 
     action: Literal["install_packages"] = Field(default="install_packages")  # type: ignore[assignment]
@@ -183,8 +213,10 @@ class WriteFileRequest(GuestAgentRequest):
     3. Host sends a file_end frame (op_id; signals end of stream)
     4. Guest responds with FileWriteAckMessage
 
-    QemuVM writes the file_chunk and file_end frames itself (no model: one per
-    128 KB chunk); guest-agent/src/types.rs GuestCommand::FileChunk/FileEnd parse them.
+    QemuVM writes the file_chunk and file_end frames itself (no model): at most one
+    file_chunk per 128 KB read of the source (none while the compressor buffers), one more
+    for the compressor's flush, then file_end; guest-agent/src/types.rs
+    GuestCommand::FileChunk/FileEnd parse them.
 
     Guest agent enforces:
     - Path length: PATH_MAX 4096 bytes, NAME_MAX 255 bytes per component
@@ -269,11 +301,13 @@ class OutputChunkMessage(GuestAgentResponse):
 
 
 class ExecutionCompleteMessage(GuestAgentResponse):
-    """Final completion message for ANY command (exec, install_packages, etc).
+    """Last message of an exec or an install_packages that ran to its end.
 
     Sent after the command's output (OutputChunkMessage): an exec streams its
     output while it runs; install_packages sends its output once the install
-    ends. Each command then sends this completion message.
+    ends. A refused or failed command (validation, output limit, timeout) ends with
+    StreamingErrorMessage instead. Other commands end with their own reply
+    (PongMessage, WarmReplAckMessage, the file messages).
     """
 
     type: Literal["complete"] = "complete"
@@ -288,7 +322,10 @@ class ExecutionCompleteMessage(GuestAgentResponse):
     )
     process_ms: int | None = Field(
         default=None,
-        description="Time from spawn to process exit in milliseconds (guest-reported)",
+        description=(
+            "Time from the code's write to the REPL to the end of its output, in milliseconds "
+            "(guest-reported); None for install_packages"
+        ),
     )
 
 
@@ -311,7 +348,6 @@ class WarmReplAckMessage(GuestAgentResponse):
     """Acknowledgement for REPL pre-warming."""
 
     type: Literal["warm_repl_ack"] = "warm_repl_ack"
-    language: str
     status: str  # "ok" or "error"
     message: str | None = None
 
@@ -362,7 +398,10 @@ class FileEntryInfo(BaseModel):
 
     name: str = Field(description="File or directory name")
     is_dir: bool = Field(description="True if entry is a directory")
-    size: int = Field(description="File size in bytes (0 for directories)")
+    size: int = Field(
+        description="Bytes the file takes on disk, at most its length: min(length, allocated blocks x 512); "
+        "0 for directories"
+    )
 
 
 class FileListMessage(GuestAgentResponse):

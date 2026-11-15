@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from exec_sandbox import constants
@@ -61,7 +61,7 @@ class Settings(QemuBinaries):
     instance_store_dir: Path = Field(
         default_factory=lambda: get_user_dir(kind=UserDir.DATA) / "instances"
     )  # root of the local store
-    instance_keyring: SecretStr | None = None  # env EXEC_SANDBOX_INSTANCE_KEYRING
+    instance_keyring: SecretStr | str | None = None  # env EXEC_SANDBOX_INSTANCE_KEYRING; a str: kept_secret
     instance_asset_dir: Path = Field(
         default_factory=lambda: get_user_dir(kind=UserDir.CACHE) / "instance-assets"
     )  # images by digest
@@ -70,6 +70,11 @@ class Settings(QemuBinaries):
     def _check_s3_prefixes(self) -> Self:
         check_s3_prefixes(snapshot=self.s3_snapshot_prefix, instance=self.s3_instance_prefix)
         return self
+
+    @field_validator("instance_keyring")
+    @classmethod
+    def _keyring_is_secret(cls, value: SecretStr | str | None) -> SecretStr | None:
+        return kept_secret(value)
 
     # Resource overcommit (same bounds as SchedulerConfig: env vars reach these fields directly)
     memory_overcommit_ratio: float = Field(default=constants.DEFAULT_MEMORY_OVERCOMMIT_RATIO, ge=1.0, le=10.0)
@@ -93,6 +98,12 @@ class Settings(QemuBinaries):
     force_emulation: bool = False
     """Force software emulation instead of hardware virtualization (KVM/HVF).
     Useful for testing emulation code paths locally."""
+
+
+def kept_secret(value: SecretStr | str | None) -> SecretStr | None:
+    """A secret given as a str (keyring.get_password returns one) as a SecretStr: never in a
+    repr, a log or a dump. The field types also take str, so a str type-checks."""
+    return SecretStr(value) if isinstance(value, str) else value
 
 
 def check_s3_prefixes(*, snapshot: str, instance: str) -> None:

@@ -423,7 +423,6 @@ class TestQemuVmFolderReal:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
         folder = vm.workdir.path
         cmd_socket, planted = Path(vm.workdir.cmd_socket), folder / "planted"

@@ -2,12 +2,14 @@
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
 from exec_sandbox.dns_filter import (
     create_outbound_patterns,
     generate_outbound_allow_json,
+    resolved_domains,
     validate_domain,
 )
 
@@ -15,8 +17,14 @@ from exec_sandbox.dns_filter import (
 def _allows(patterns_json: str, host: str) -> bool:
     """Whether gvproxy lets `host` through: it lowercases the DNS name or TLS SNI, drops a
     trailing dot, and allows it when one pattern matches (Go regexp MatchString, which
-    Python's re.search follows for these patterns)."""
-    return any(re.search(pattern, host) for pattern in json.loads(patterns_json))
+    Python's re.search follows for these patterns: gvproxy-wrapper/main_test.go runs the same
+    cases, tests/fixtures/dns_filter, through Go's regexp)."""
+    name = host.lower().removesuffix(".")
+    return any(re.search(pattern, name) for pattern in json.loads(patterns_json))
+
+
+_EXAMPLE_COM = json.loads((Path(__file__).parent / "fixtures" / "dns_filter" / "example_com.json").read_text())
+"""Patterns and answers shared with the Go test of gvproxy-wrapper."""
 
 
 def test_create_outbound_patterns():
@@ -43,15 +51,24 @@ def test_create_outbound_patterns():
 )
 def test_none_is_the_package_registries_of_the_language(language: str, allowed: list[str], blocked: list[str]):
     """allowed_domains=None: the package registries of the language only."""
-    patterns = generate_outbound_allow_json(None, language)
+    patterns = generate_outbound_allow_json(resolved_domains(None, language))
 
     assert [host for host in allowed if _allows(patterns, host)] == allowed
     assert [host for host in blocked if _allows(patterns, host)] == []
 
 
+def test_resolved_domains_is_what_the_filter_allows():
+    """The list a saved instance stores (the policy at save): None resolves to the language's
+    package registries (raw: none, so no filter), a list stays itself, empty: no filter."""
+    assert resolved_domains(None, "python") == ("pypi.org", "files.pythonhosted.org")
+    assert resolved_domains(None, "raw") == ()
+    assert resolved_domains(["a.example"], "python") == ("a.example",)
+    assert resolved_domains([], "javascript") == ()
+
+
 def test_generate_outbound_allow_json_custom():
     """Custom domains replace the language's registries."""
-    patterns = generate_outbound_allow_json(["custom.com"], "python")
+    patterns = generate_outbound_allow_json(resolved_domains(["custom.com"], "python"))
 
     assert _allows(patterns, "custom.com")
     assert _allows(patterns, "api.custom.com")
@@ -61,29 +78,25 @@ def test_generate_outbound_allow_json_custom():
 def test_generate_outbound_allow_json_empty_means_no_filter():
     """allowed_domains=[]: no pattern, so no domain filter (with allow_network, all outbound
     is allowed). Blocking all outbound is the separate BlockAllOutbound flag."""
-    assert generate_outbound_allow_json([], "python") == "[]"
+    assert generate_outbound_allow_json(resolved_domains([], "python")) == "[]"
 
 
 def test_generate_outbound_allow_json_none_uses_defaults_or_no_filter():
     """raw has no package registry: None means no domain filter."""
-    assert generate_outbound_allow_json(None, "raw") == "[]"
+    assert generate_outbound_allow_json(resolved_domains(None, "raw")) == "[]"
 
 
-@pytest.mark.parametrize(
-    ("host", "allowed"),
-    [
-        ("example.com", True),
-        ("www.example.com", True),
-        ("a.b.example.com", True),
-        ("exampleXcom", False),  # an unescaped dot would match any character
-        ("notexample.com", False),  # a subdomain needs its own label
-        ("example.com.evil.org", False),
-        ("example.co", False),
-    ],
-)
+def test_the_shared_cases_are_this_generator():
+    """The fixture the Go test reads holds what this release generates."""
+    assert create_outbound_patterns(_EXAMPLE_COM["domains"]) == _EXAMPLE_COM["patterns"]
+
+
+@pytest.mark.parametrize(("host", "allowed"), _EXAMPLE_COM["hosts"].items())
 def test_pattern_matches_the_domain_and_its_subdomains_only(host: str, allowed: bool):
-    """The dots are literal: only the domain and its subdomains match."""
-    assert _allows(json.dumps(create_outbound_patterns(["example.com"])), host) is allowed
+    """The dots are literal: only the domain and its subdomains match (exampleXcom: an
+    unescaped dot would match any character; notexample.com: a subdomain needs its own label),
+    in any case and with a final dot."""
+    assert _allows(json.dumps(_EXAMPLE_COM["patterns"]), host) is allowed
 
 
 # =============================================================================

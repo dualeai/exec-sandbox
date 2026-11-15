@@ -67,10 +67,10 @@ logger = get_logger(__name__)
 # Transport failures of a health ping: the guest cannot answer (QEMU died, froze or
 # closed its sockets). The ping is tried again; when every try fails, the VM is unhealthy.
 # - OSError: a socket refuses or breaks; TimeoutError (a subclass): no pong in time
-# - EOFError: a socket reached EOF
-# - CommunicationError: the transport failed before the ping was sent. SocketAuthError
-#   (a subclass): SO_PEERCRED returns pid=0 when QEMU is frozen (SIGSTOP) due to a kernel race
-_HEALTH_CHECK_TRANSIENT_ERRORS: tuple[type[Exception], ...] = (OSError, EOFError, CommunicationError)
+# - CommunicationError: the transport failed before the ping was sent (a socket EOF
+#   among them). SocketAuthError (a subclass): SO_PEERCRED returns pid=0 when QEMU is
+#   frozen (SIGSTOP) due to a kernel race
+_HEALTH_CHECK_TRANSIENT_ERRORS: tuple[type[Exception], ...] = (OSError, CommunicationError)
 
 
 def _is_failed_health_ping(error: BaseException) -> bool:
@@ -132,7 +132,6 @@ class WarmVMPool:
 
         # Track background replenish tasks (prevent GC)
         self._replenish_tasks: set[asyncio.Task[None]] = set()
-        self._initial_boot_tasks: set[asyncio.Task[None]] = set()
 
         # Semaphore that throttles concurrent replenishment boots per language,
         # up to ~50% of pool_size for faster catch-up under load. It bounds boot
@@ -198,19 +197,16 @@ class WarmVMPool:
         # spawns serialize on that lock and degrade from ~150ms to 250-400ms per
         # VM.  15ms ≈ single-process dyld resolve time, so the next spawn starts
         # just as the previous one releases the lock.
-        # Publish every initial boot task before awaiting. Shutdown owns this set
-        # separately from the parent start task because a child may need to
-        # finish cancellation cleanup after gather itself is cancelled.
-        boot_tasks = [
-            asyncio.create_task(self._boot_and_add_vm(language, index=i, boot_delay=order * 0.015))
-            for order, (language, i) in enumerate(itertools.product(Language, range(self.pool_size_per_language)))
-        ]
-        self._initial_boot_tasks.update(boot_tasks)
-        for task in boot_tasks:
-            task.add_done_callback(self._initial_boot_tasks.discard)
-
-        # Boot all VMs in parallel (_boot_and_add_vm logs each failure: graceful degradation)
-        await asyncio.gather(*boot_tasks, return_exceptions=True)
+        # Boot all VMs in parallel (_boot_and_add_vm logs each failure: graceful degradation).
+        # A cancel of this start task cancels each boot, and gather ends only once each
+        # boot ended (its cleanup too): stop() awaits this task alone.
+        await asyncio.gather(
+            *(
+                self._boot_and_add_vm(language, index=i, boot_delay=order * 0.015)
+                for order, (language, i) in enumerate(itertools.product(Language, range(self.pool_size_per_language)))
+            ),
+            return_exceptions=True,
+        )
 
         boot_duration = asyncio.get_running_loop().time() - boot_start
 
@@ -374,17 +370,11 @@ class WarmVMPool:
         await stop_task
 
     async def _stop_initial_boots(self) -> None:
-        """Cancel and await every owner that can still enqueue an initial VM."""
-        start_task = self._start_task
-        if start_task is not None and not start_task.done():
+        """Cancel and await the start task: no initial boot can enqueue a VM after it
+        (its gather ends once each boot ended)."""
+        if (start_task := self._start_task) is not None:
             start_task.cancel()
-        initial_boot_tasks = list(self._initial_boot_tasks)
-        for task in initial_boot_tasks:
-            if not task.done():
-                task.cancel()
-        startup_tasks = [task for task in (start_task, *initial_boot_tasks) if task is not None]
-        if startup_tasks:
-            await asyncio.gather(*startup_tasks, return_exceptions=True)
+            await asyncio.gather(start_task, return_exceptions=True)
 
     async def _stop_health_check(self) -> None:
         """Stop the health owner without letting its failure abort pool drain."""
@@ -503,15 +493,9 @@ class WarmVMPool:
         """
         if boot_delay > 0:
             await asyncio.sleep(boot_delay)
-        vm: QemuVM | None = None
         try:
-            vm = await self._boot_warm_vm(language, index)
-            await self._prepare_and_enqueue_vm(vm, language)
+            vm = await self._boot_and_enqueue(language, index=index)
         except BaseException as e:
-            # CRITICAL: destroy VM to release admission slot if creation succeeded
-            if vm is not None:
-                with contextlib.suppress(BaseException):
-                    await self.vm_manager.destroy_vm(vm)
             if not isinstance(e, asyncio.CancelledError):
                 logger.error(
                     "Failed to boot warm VM",
@@ -613,7 +597,6 @@ class WarmVMPool:
                     expose_ports=None,
                     on_boot_log=None,
                     mem_path=None,
-                    mem_path_share=False,
                 )
         finally:
             if l1_entry is not None:  # restore() releases it; this covers a failed admission
@@ -632,7 +615,6 @@ class WarmVMPool:
             language: Programming language enum to replenish
         """
         async with self._replenish_semaphores[language]:
-            vm: QemuVM | None = None
             try:
                 if self._shutdown_event.is_set():
                     return
@@ -642,12 +624,9 @@ class WarmVMPool:
                     logger.debug("Warm pool already full (skip replenish)", extra={"language": language.value})
                     return
 
-                # Boot new VM
+                # Boot new VM (the same readiness and idle-memory path as initial fill)
                 index = self.pools[language].maxsize - self.pools[language].qsize()
-                vm = await self._boot_warm_vm(language, index=index)
-
-                # Use the same readiness and idle-memory path as initial fill.
-                await self._prepare_and_enqueue_vm(vm, language)
+                vm = await self._boot_and_enqueue(language, index=index)
 
                 logger.info(
                     "Warm pool replenished",
@@ -655,25 +634,30 @@ class WarmVMPool:
                 )
 
             except asyncio.CancelledError:
-                # CancelledError is BaseException, not caught by 'except Exception'
-                # Cleanup VM if creation succeeded before cancellation
-                if vm is not None:
-                    with contextlib.suppress(Exception):
-                        await self.vm_manager.destroy_vm(vm)
                 logger.debug("Replenish task cancelled", extra={"language": language.value})
                 raise  # Re-raise cancellation to propagate shutdown
 
             except Exception as e:
-                # CRITICAL: destroy VM to release admission slot if creation succeeded
-                if vm is not None:
-                    with contextlib.suppress(Exception):
-                        await self.vm_manager.destroy_vm(vm)
                 logger.error(
                     "Failed to replenish warm pool",
                     extra={"language": language.value, "error": str(e)},
                     exc_info=True,
                 )
                 # Don't propagate - graceful degradation
+
+    async def _boot_and_enqueue(self, language: Language, *, index: int) -> QemuVM:
+        """Boot a warm VM and put it in its pool (_prepare_and_enqueue_vm). On a failure, a
+        cancel too, destroy the VM it booted (its admission slot comes back), then raise."""
+        vm: QemuVM | None = None
+        try:
+            vm = await self._boot_warm_vm(language, index)
+            await self._prepare_and_enqueue_vm(vm, language)
+        except BaseException:
+            if vm is not None:
+                with contextlib.suppress(Exception):
+                    await self.vm_manager.destroy_vm(vm)
+            raise
+        return vm
 
     async def _prepare_and_enqueue_vm(self, vm: QemuVM, language: Language) -> None:
         """Apply the one readiness/memory contract for every pool insertion."""
@@ -714,6 +698,7 @@ class WarmVMPool:
         )
         if not (isinstance(response, WarmReplAckMessage) and response.status == "ok"):
             raise RuntimeError(f"REPL pre-warm failed for {language.value}: {response}")
+        vm.reseed_next_exec = False  # the warm-up ran the REPL's reseed (WarmReplRequest)
         logger.debug("REPL pre-warmed", extra={"vm_id": vm.vm_id, "language": language.value})
 
     async def _health_check_loop(self) -> None:
@@ -867,7 +852,9 @@ class WarmVMPool:
             """Single ping attempt - may raise on transient failure."""
             await vm.channel.connect(timeout_seconds=5)  # reconnects only a failed connection
             logger.debug("Health check: sending ping request", extra={"vm_id": vm.vm_id})
-            response = await vm.channel.send_request(PingRequest(), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS)
+            response = await vm.channel.send_request(
+                PingRequest(host_entropy=None), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS
+            )
             logger.debug(
                 "Health check: received response",
                 extra={"vm_id": vm.vm_id, "response_type": type(response).__name__},

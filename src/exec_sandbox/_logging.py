@@ -6,8 +6,8 @@ Library logging best practices (Python docs, PEP 282):
 - Support EXEC_SANDBOX_LOG_LEVEL env var for level control
 - Provide configure_logging() for CLI entry points
 
-CLI output format (httpx convention):
-    WARNING [2026-02-25 10:02:54] exec_sandbox.cgroup - message
+CLI output format (httpx convention), then the record's extra fields (ExtrasFormatter):
+    WARNING [2026-02-25 10:02:54] exec_sandbox.cgroup - message vm_id='...' error='...'
 
 Non-blocking logging:
     Uses QueueHandler + QueueListener (stdlib) to decouple log emission
@@ -28,6 +28,7 @@ import logging.handlers
 import os
 import queue
 import sys
+from typing import override
 
 LIBRARY_LOGGER_NAME: str = "exec_sandbox"
 
@@ -49,6 +50,25 @@ _DATEFMT = "%Y-%m-%d %H:%M:%S"
 _QUEUE_CAPACITY = 4096
 _DIM, _RESET = "\x1b[2m", "\x1b[0m"
 
+# The attributes every LogRecord has (taskName too on Python 3.12+), and the two that
+# Formatter.format sets: a record's other attributes are its extra fields
+_RECORD_ATTRIBUTES = frozenset(vars(logging.LogRecord("", logging.INFO, "", 0, "", None, None))) | {
+    "message",
+    "asctime",
+}
+
+
+class ExtrasFormatter(logging.Formatter):
+    """A Formatter that appends a record's extra fields (``logger.warning(..., extra={...})``)
+    to its message, as key=repr(value): the library logs its details there (vm_id, error,
+    context), which a plain format string drops. A traceback still comes after. The library
+    handler (configure_logging) and the test logs (tests/conftest.py) use it."""
+
+    @override
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        extras = [f"{key}={value!r}" for key, value in vars(record).items() if key not in _RECORD_ATTRIBUTES]
+        return " ".join([super().formatMessage(record), *extras])
+
 
 class _StderrHandler(logging.Handler):
     """Target handler: writes to stderr, dim when stderr is a terminal.
@@ -59,7 +79,7 @@ class _StderrHandler(logging.Handler):
 
     def __init__(self) -> None:
         super().__init__()
-        self.formatter = logging.Formatter(fmt=_FMT, datefmt=_DATEFMT)
+        self.formatter = ExtrasFormatter(fmt=_FMT, datefmt=_DATEFMT)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:

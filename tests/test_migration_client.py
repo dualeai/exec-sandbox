@@ -19,8 +19,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from exec_sandbox import constants
-from exec_sandbox.exceptions import ConfigError, ErrorCode, RouteError, SandboxError, TransientError
-from exec_sandbox.migration_client import MigrationClient, migration_timeout, rejected_by_qemu
+from exec_sandbox.exceptions import ConfigError, ErrorCode, RouteError, RouteKey, SandboxError, TransientError
+from exec_sandbox.migration_client import MigrationClient, migration_timeout, qemu_refusal
 from exec_sandbox.qmp_client import QmpClient
 from tests.instance_support import FakeQmp
 
@@ -149,7 +149,7 @@ async def _run(
     client: MigrationClient,
     operation: str,
     *,
-    qemu_version: tuple[int, int, int] | None,
+    qemu_version: tuple[int, int, int],
     use_template: bool,
     timeout: float,
 ) -> None:
@@ -301,7 +301,9 @@ class TestMigrationClientExchange:
             {"execute": "cont", "id": "migration-4"},
         ]
 
-    @pytest.mark.parametrize(("events", "completes"), [(63, True), (65, False)], ids=["under-the-limit", "over"])
+    @pytest.mark.parametrize(
+        ("events", "completes"), [(63, True), (64, False)], ids=["under-the-limit", "at-the-limit"]
+    )
     async def test_skipped_events_limit(self, qemu: _Connect, events: int, completes: bool) -> None:
         """Up to 63 skipped messages before an answer: 64 or more is MIGRATION_FAILED (a QEMU
         that floods its monitor), not an endless read."""
@@ -374,9 +376,9 @@ class TestMigrationCapabilities:
         assert states == {"multifd": True, "mapped-ram": True, "x-ignore-shared": use_template}
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
-    @pytest.mark.parametrize("version", [None, (10, 99, 99), (8, 2, 0)], ids=["unknown", "just-below", "old"])
+    @pytest.mark.parametrize("version", [(10, 99, 99), (8, 2, 0)], ids=["just-below", "old"])
     async def test_below_floor_sends_nothing(
-        self, qemu: _Connect, operation: str, version: tuple[int, int, int] | None
+        self, qemu: _Connect, operation: str, version: tuple[int, int, int]
     ) -> None:
         client, peer = await qemu([], at_end="silent")
 
@@ -386,7 +388,7 @@ class TestMigrationCapabilities:
             await _run(client, operation, qemu_version=version, use_template=False, timeout=5.0)
 
         assert await peer.sent(client) == []
-        assert rejected_by_qemu(exc.value)  # an L1 entry this QEMU cannot load is evicted
+        assert qemu_refusal(exc.value) is not None  # an L1 entry this QEMU cannot load is evicted
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
     async def test_refused_capability_is_rejected(self, qemu: _Connect, operation: str) -> None:
@@ -459,13 +461,13 @@ class TestMigrationProgress:
         if operation == "save":
             assert sent[-2:] == ["migrate_cancel", "cont"]
             assert exc.value.context["vm_resumed"] is True
-            assert not rejected_by_qemu(exc.value)
+            assert qemu_refusal(exc.value) is None
         else:
             assert sent[-1] == "query-migrate"
             assert isinstance(exc.value, RouteError)
-            assert exc.value.required == {"qemu_version": "a QEMU that accepts this saved state"}
+            assert exc.value.required == {}  # the caller names the target: it knows who saved the state
             assert exc.value.found == {"qemu_version": "11.2.0"}
-            assert rejected_by_qemu(exc.value)
+            assert qemu_refusal(exc.value) is not None
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
     async def test_failed_query_is_transient(self, qemu: _Connect, operation: str) -> None:
@@ -479,7 +481,7 @@ class TestMigrationProgress:
             ) as exc,
         ):
             await _run(client, operation, qemu_version=_QEMU, use_template=False, timeout=5.0)
-        assert not rejected_by_qemu(exc.value)  # a good L1 entry is kept
+        assert qemu_refusal(exc.value) is None  # a good L1 entry is kept
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
     async def test_hung_migration_is_transient(self, qemu: _Connect, operation: str) -> None:
@@ -498,7 +500,7 @@ class TestMigrationProgress:
 
 
 class TestRejectedByQemu:
-    """rejected_by_qemu decides the L1 eviction and the reuse() ROUTE rule. It matches by code
+    """qemu_refusal decides the L1 eviction and the reuse() ROUTE rule. It matches by code
     (MIGRATION_REJECTED, MIGRATION_UNSUPPORTED), never by class, anywhere in the cause or
     context chain: a restore whose setup fails (HOST_DEPENDENCY, also a ConfigError) or whose
     QEMU fails otherwise must not evict a good entry."""
@@ -508,8 +510,8 @@ class TestRejectedByQemu:
         return RouteError(
             "migrate-incoming command failed",
             code=ErrorCode.MIGRATION_REJECTED,
-            required={"qemu_version": "a QEMU that accepts this saved state"},
-            found={"qemu_version": "11.2.0"},
+            required={},
+            found={RouteKey.QEMU_VERSION: "11.2.0"},
             context=None,
             hint=None,
             instance_id=None,
@@ -573,19 +575,19 @@ class TestRejectedByQemu:
     )
     def test_matches_only_refusal_codes(self, make: str, refused: bool, link: str) -> None:
         error = self._chained(getattr(self, make)(), link=link)
-        assert rejected_by_qemu(error) is refused
+        assert (qemu_refusal(error) is not None) is refused
 
     def test_refusal_below_a_plain_error_is_found(self) -> None:
         """The restore wrap, then an OSError (context), then QEMU's refusal (its cause)."""
         os_error = OSError("QMP socket closed")
-        assert rejected_by_qemu(self._chained(os_error, link="context")) is False
+        assert qemu_refusal(self._chained(os_error, link="context")) is None
         os_error.__cause__ = self._rejected()
-        assert rejected_by_qemu(self._chained(os_error, link="context")) is True
+        assert qemu_refusal(self._chained(os_error, link="context")) is not None
 
     def test_cycle_in_the_chain_ends(self) -> None:
         a, b = self._failed(), self._crashed()
         a.__context__, b.__context__ = b, a
-        assert rejected_by_qemu(a) is False
+        assert qemu_refusal(a) is None
 
 
 class TestMigrationTimeout:
@@ -1134,7 +1136,7 @@ class TestMigrationClientRestoreSnapshot:
             check=lambda e: e.code is ErrorCode.MIGRATION_FAILED,
         ) as exc_info:
             await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
-        assert not rejected_by_qemu(exc_info.value)
+        assert qemu_refusal(exc_info.value) is None
 
 
 # ============================================================================

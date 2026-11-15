@@ -5,7 +5,7 @@ package import. On restore, the VM resumes at the exact instruction — ~50-60 m
 regardless of packages.
 
 Cache structure (the names next to the vmstate: memory_snapshot_files):
-    {cache_dir}/{key}.vmstate       # QEMU migration stream (sparse: ~140MB apparent, ~3MB on disk)
+    {cache_dir}/{key}.vmstate       # QEMU migration stream: device state only (x-ignore-shared, ~100 KB-1 MB); the RAM is {key}.ram
     {cache_dir}/{key}.vmstate.meta  # JSON metadata sidecar
     {cache_dir}/{key}.vmstate.lock  # flock for cross-process deduplication of saves
     {cache_dir}/{key}.vmstate.use.lock  # record lock (fcntl) each restored VM holds shared (no eviction)
@@ -15,7 +15,7 @@ Cache structure (the names next to the vmstate: memory_snapshot_files):
 Cache key includes ALL parameters that affect VM state:
     sha256 fingerprint(language, *sorted_packages, exec_sandbox_version, img_hash,
           qemu_version, arch, accel_type, cpu_model, memory_mb, cpu_cores, disk_mb,
-          network_device, format_version, kernel_hash, initramfs_hash
+          network_device, device_layout (with the migration capabilities), kernel_hash, initramfs_hash
           [, l2_image_hash when there are packages])
 
 Format: 'l1-{language}-v{major.minor}-{sha256}'
@@ -59,11 +59,11 @@ from exec_sandbox.memory_snapshot_files import (
     open_live_ram_dir,
     ram_path_from_vmstate,
 )
-from exec_sandbox.migration_client import MigrationClient, migration_timeout, rejected_by_qemu
+from exec_sandbox.migration_client import MigrationClient, migration_timeout, qemu_refusal
 from exec_sandbox.permission_utils import get_expected_socket_uid, grant_qemu_vm_acl, probe_qemu_as_qemu_vm
 from exec_sandbox.platform_utils import detect_host_arch
 from exec_sandbox.qemu_cmd import guest_cpu_model
-from exec_sandbox.system_probes import detect_accel_type, probe_qemu_version
+from exec_sandbox.system_probes import detect_accel_type, require_qemu_version
 
 if TYPE_CHECKING:
     import threading
@@ -254,6 +254,10 @@ class MemorySnapshotManager(BaseCacheManager):
         # call for a key in flight returns at once, without a task (the save lock
         # stops a save of another process).
         self._in_flight_saves: dict[str, asyncio.Task[None]] = {}
+        # Keys whose restored guest could not reseed its kernel random source: the key fixes the
+        # guest (image, kernel, initramfs), so each later save of it would fail at its first
+        # restore and be removed
+        self._no_save_keys: set[str] = set()
 
     def _cache_paths(self, key: str) -> tuple[Path, Path]:
         """Return (vmstate_path, meta_path) for a given cache key."""
@@ -273,8 +277,13 @@ class MemorySnapshotManager(BaseCacheManager):
         `l2_path` is the L2 layer the VM boots with (None without packages).
 
         Raises:
-            ConfigError: ASSET_NOT_FOUND: the base image of `spec` is missing
-            TransientError: LOCAL_DISK: an image of the key cannot be read (images.key_part)
+            ConfigError: ASSET_NOT_FOUND: the base image of `spec` is missing; HOST_DEPENDENCY:
+                this host cannot run the QEMU binary, or its version or accelerators cannot be
+                read (the QEMU probes), or ARM64 TCG with a QEMU below 9.0.4 (restore_layout)
+            TransientError: LOCAL_DISK: an image of the key cannot be read (images.key_part);
+                QEMU_CRASHED: a QEMU probe hit a process, memory or file-handle limit, the
+                binary was being written, a signal ended it, or it gave no answer in time; or
+                the QEMU binary came or went during the build (VmManager.restore_layout)
         """
         version_parts = __version__.split(".")
         version = f"{version_parts[0]}.{version_parts[1]}"
@@ -291,7 +300,7 @@ class MemorySnapshotManager(BaseCacheManager):
             images.append(l2_path)
         # One worker-thread job for every digest (a stat each once known, a full read the first time)
         img_hash, *boot_and_l2_hashes = await asyncio.to_thread(lambda: [key_part(path) for path in images])
-        qemu_version = await probe_qemu_version()
+        qemu_version = await require_qemu_version()
         accel_type = await detect_accel_type(force_emulation=self.settings.force_emulation)
         cpu_model = await guest_cpu_model(arch, accel_type)
 
@@ -300,7 +309,7 @@ class MemorySnapshotManager(BaseCacheManager):
             *spec.packages,
             str(__version__),
             img_hash,
-            ".".join(str(v) for v in qemu_version) if qemu_version else "unknown",
+            ".".join(str(v) for v in qemu_version),
             arch.name,
             accel_type.value,
             cpu_model,
@@ -308,7 +317,10 @@ class MemorySnapshotManager(BaseCacheManager):
             str(spec.cpu_cores),
             f"disk{spec.disk_mb}",
             "net" if spec.has_network_device else "nonet",
-            f"fmt{constants.MEMORY_SNAPSHOT_FORMAT_VERSION}",
+            # The devices of the restore's command and the migration capabilities
+            # (device_layout): a release that changes either never restores an entry saved
+            # with the old ones
+            await self.vm_manager.restore_layout(spec, machine_type=None, packages=l2_path is not None),
             *boot_and_l2_hashes,
         ]
 
@@ -360,13 +372,12 @@ class MemorySnapshotManager(BaseCacheManager):
             meta = None
         if meta is None:
             return "L1 cache metadata invalid"
-        if meta.vmstate_sha256:
-            try:
-                if await asyncio.to_thread(_vmstate_digest, vmstate_path) != meta.vmstate_sha256:
-                    return "L1 cache vmstate integrity check failed"
-            except OSError:
-                return "L1 cache vmstate unreadable during integrity check"
-        if meta.use_template and not ram_path_from_vmstate(vmstate_path).exists():
+        try:
+            if await asyncio.to_thread(_vmstate_digest, vmstate_path) != meta.vmstate_sha256:
+                return "L1 cache vmstate integrity check failed"
+        except OSError:
+            return "L1 cache vmstate unreadable during integrity check"
+        if not ram_path_from_vmstate(vmstate_path).exists():
             return "L1 cache RAM template missing"
         if not home_path_from_vmstate(vmstate_path).exists():
             return "L1 cache home disk missing"
@@ -415,7 +426,7 @@ class MemorySnapshotManager(BaseCacheManager):
             self._remove_entry(vmstate_path)
 
         try:
-            qemu_version = await probe_qemu_version()
+            qemu_version = await require_qemu_version()
             expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
 
             # QEMU opens the file the host made (O_CREAT without O_EXCL, then
@@ -465,7 +476,7 @@ class MemorySnapshotManager(BaseCacheManager):
                 await _grant_entry_files([tmp_path, ram_path], perms="r", key=key)
 
             # Write typed metadata sidecar before atomic rename
-            meta = SnapshotMetadata(vmstate_sha256=vmstate_sha256, use_template=True)
+            meta = SnapshotMetadata(vmstate_sha256=vmstate_sha256)
             meta_path.unlink(missing_ok=True)  # left by a failed save
             with create_file(meta_path, mode=0o600, dir_fd=None) as f:  # QEMU never reads it
                 f.write(meta.to_json().encode())
@@ -515,8 +526,8 @@ class MemorySnapshotManager(BaseCacheManager):
 
         Checked before booting a sacrificial VM: below the floor every save fails.
         """
-        qemu_version = await probe_qemu_version()
-        return qemu_version is not None and qemu_version >= constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION
+        qemu_version = await require_qemu_version()
+        return qemu_version >= constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION
 
     async def lease(self, key: str) -> EntryLease | None:
         """A lease on the L1 entry `key` (compute_cache_key), or None: no entry, or its use
@@ -547,18 +558,21 @@ class MemorySnapshotManager(BaseCacheManager):
         None on a miss (a broken entry) or on any failed restore: the caller cold boots
         with the same reservation. An entry QEMU refused (incompatible or corrupt:
         MIGRATION_REJECTED or MIGRATION_UNSUPPORTED in the cause chain), or whose guest
-        never answered after its state loaded (GUEST_SILENT_AFTER_RESTORE), is removed with
-        all its files, as an eviction removes one (BaseCacheManager._remove_broken: not while
-        another lease holds it); otherwise every later restore of it fails again. A host
-        problem (no access to a file or a socket) keeps the entry.
+        never answered after its state loaded or could not reseed its kernel random source
+        (GUEST_SILENT_AFTER_RESTORE), is removed with all its files, as an eviction removes
+        one (BaseCacheManager._remove_broken: not while another lease holds it); otherwise
+        every later restore of it fails again. A host problem (no access to a file or a
+        socket) keeps the entry. A guest that could not reseed also stops the L1 saves of
+        the key in this process (schedule_background_save).
 
         Raises:
             InternalError: CLEANUP_UNCONFIRMED: the failed restore's QEMU may still run
                 and keeps the reservation, so no cold boot may use it
         """
         checked: tuple[Path, str] | None = None
+        key = entry.path.name.removesuffix(self._cache_ext)
         try:
-            checked = await self._check_entry(entry.path.name.removesuffix(self._cache_ext), lease=entry)
+            checked = await self._check_entry(key, lease=entry)
             if checked is None:
                 return None
             return await self.vm_manager.restore_vm(
@@ -571,6 +585,10 @@ class MemorySnapshotManager(BaseCacheManager):
                 cache_leases=(entry,) if snapshot_drive is None else (entry, snapshot_drive),
                 expose_ports=expose_ports,
                 reservation=reservation,
+                machine_type=None,  # the L1 key holds the QEMU version
+                egress_domains=None,  # the spec's policy
+                boot=None,  # this worker's kernel and initramfs (the L1 key holds their digests)
+                use_template=True,
             )
         except InternalError as e:
             if e.code is ErrorCode.CLEANUP_UNCONFIRMED:
@@ -582,15 +600,33 @@ class MemorySnapshotManager(BaseCacheManager):
             entry.release()  # the VM, if any, holds its own share
         logger.warning(
             "L1 restore failed, falling back to cold boot",
-            extra={"language": spec.language, "task_id": task_id, "error": f"{type(failure).__name__}: {failure}"},
+            extra={
+                "language": spec.language,
+                "task_id": task_id,
+                "error": f"{type(failure).__name__}: {failure}",
+                "context": failure.context if isinstance(failure, SandboxError) else None,  # QEMU's console
+            },
         )
         logger.debug("L1 restore traceback", exc_info=failure)
-        refused = rejected_by_qemu(failure) or (
+        refused = qemu_refusal(failure) is not None or (
             isinstance(failure, SandboxError) and failure.code is ErrorCode.GUEST_SILENT_AFTER_RESTORE
         )
         if refused and checked is not None:
             await self._remove_broken(checked[0], stamp=checked[1], lease=None)
-            logger.info("L1 entry refused by QEMU, removed unless in use", extra={"vmstate_path": str(checked[0])})
+            logger.info(
+                "L1 entry refused (by QEMU, or by its guest after the load), removed unless in use",
+                extra={"vmstate_path": str(checked[0])},
+            )
+        # The guest answered the entropy ping with an error (guest_channel): no new saves
+        if (
+            isinstance(failure, SandboxError)
+            and failure.code is ErrorCode.GUEST_SILENT_AFTER_RESTORE
+            and "guest_error_type" in failure.context
+        ):
+            self._no_save_keys.add(key)
+            logger.warning(
+                "L1 saves stopped: the restored guest could not reseed its kernel random source", extra={"key": key}
+            )
         return None
 
     async def schedule_background_save(
@@ -607,13 +643,14 @@ class MemorySnapshotManager(BaseCacheManager):
         layer before its VM opens it.
         Returns the background task handle so callers can optionally await or
         monitor completion. Returns None (no-op) when QEMU is below the migration
-        floor (can_save), the entry exists, or a save of the key runs in this process.
+        floor (can_save), the entry exists, a save of the key runs in this process, or a
+        restore of the key in this process found a guest that could not reseed (restore).
 
         Used by the scheduler after a cold boot, and by the warm pool at start.
         The save lock prevents duplicate work: while another process saves the
         same key, the task skips (BlockingIOError, logged at debug level).
         """
-        if not await self.can_save():
+        if key in self._no_save_keys or not await self.can_save():
             return None
         if await self.check_cache(key):
             return None
@@ -674,7 +711,6 @@ class MemorySnapshotManager(BaseCacheManager):
                             cache_leases=(layer,) if layer is not None else (),
                             retry_profile=constants.RETRY_BACKGROUND,
                             mem_path=str(live_ram.path),
-                            mem_path_share=True,  # Template save: QEMU writes RAM to file
                         ) as vm:
                             # Warm REPL (the interpreter start: 0.2-0.7 s with KVM or HVF, 3-5 s
                             # under TCG; it has its own timeout)

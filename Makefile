@@ -1,16 +1,5 @@
 # Misc
-name ?= exec_sandbox
 python_version ?= 3.12  # Lowest compatible version (see pyproject.toml requires-python)
-
-# System version pins + content hashes — managed by `make upgrade`
-# (scripts/upgrade-versions.sh). versions.lock is the single source of truth:
-# build scripts and sub-makes read it themselves; nothing passes versions around.
-# qemu pin exists for CI build-from-source (Ubuntu 24.04 ships 8.2.2 with ARM64 TCG bugs).
-include versions.lock
-
-# Versions
-version_full ?= $(shell $(MAKE) --silent version-full)
-version_small ?= $(shell $(MAKE) --silent version)
 
 # Flamegraph
 PROFILES_DIR := profiles
@@ -26,15 +15,6 @@ version-full:
 
 version-pypi:
 	@bash ./cicd/version.sh -g .
-
-rust-version:
-	@echo $(RUST_VERSION)
-
-alpine-version:
-	@echo $(ALPINE_VERSION)
-
-qemu-version:
-	@echo $(QEMU_VERSION)
 
 # ============================================================================
 # Installation
@@ -151,7 +131,7 @@ define ci-monitor-run
 	exit $$_rc
 endef
 
-# All tests together for accurate coverage measurement (excludes sudo and slow tests)
+# All tests together in one run (excludes sudo and slow tests)
 test-func:
 	$(call ci-monitor-run,uv run pytest tests/ -v -n auto -m "not sudo and not slow" --ignore=tests/benchmarks)
 

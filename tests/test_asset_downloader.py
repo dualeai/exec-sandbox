@@ -259,7 +259,7 @@ class TestRetrieve:
                 decompress=False,
             )
         assert exc.value.code is ErrorCode.SETTING_INVALID
-        assert exc.value.context == {"cache_dir": str(tmp_path / "cache" / "exec-sandbox"), "errno": errno.ENOTDIR}
+        assert exc.value.context == {"folder": str(tmp_path / "cache" / "exec-sandbox"), "errno": errno.ENOTDIR}
         assert exc.value.hint == "Set EXEC_SANDBOX_CACHE_DIR to a folder this user can write, on a writable disk."
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root writes a 0500 folder")
@@ -281,7 +281,7 @@ class TestRetrieve:
         finally:
             cache.chmod(0o700)
         assert exc.value.code is ErrorCode.SETTING_INVALID
-        assert exc.value.context == {"cache_dir": str(cache), "errno": errno.EACCES}
+        assert exc.value.context == {"folder": str(cache), "errno": errno.EACCES}
         assert exc.value.hint == "Set EXEC_SANDBOX_CACHE_DIR to a folder this user can write, on a writable disk."
 
     async def test_cache_folder_is_private_whatever_the_umask(self, tmp_path: Path):
@@ -540,7 +540,7 @@ class TestRetrieve:
                 )
             assert attempts(m, url) == 1
         assert exc.value.code is code
-        assert exc.value.context == {"cache_dir": str(tmp_path), "errno": error}
+        assert exc.value.context == {"folder": str(tmp_path), "errno": error}
         assert retry_waits == []
 
     async def test_connection_error(self, tmp_path: Path, retry_waits: list[float]):

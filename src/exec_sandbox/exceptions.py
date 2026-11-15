@@ -27,19 +27,22 @@ user's code or its output.
 
 from __future__ import annotations
 
+import contextlib
 import errno
+import json
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Generator, Mapping
 
 
 class ErrorAction(StrEnum):
     """What the caller does next. Each error class has exactly one."""
 
     RETRY = "RETRY"
-    """Repeat the same call unchanged: it can succeed later. The failed call did nothing you rely
+    """Repeat the same call unchanged, on this worker or another: it can succeed later. Bound the
+    repeats (for example 3, with backoff): the library does not. The failed call did nothing you rely
     on (an exec did not send the code). If the failure closed the session, the work since its last
     save is lost (all of it, for a session never saved): open a new session, do that work again,
     then repeat the call."""
@@ -63,10 +66,10 @@ class ErrorAction(StrEnum):
 
     ROUTE = "ROUTE"
     """Repeat the call on another worker: this one has another CPU architecture, CPU vendor, guest
-    CPU model or accelerator, lacks a guest image the instance needs (and the store has no
-    copy), runs a QEMU that refuses the saved state, runs another exec-sandbox release than the
-    one that saved the instance, or has a smaller budget than the VM needs (see the error's
-    `required` field)."""
+    CPU model or accelerator, lacks the saved machine type or a guest image the instance needs
+    (and the store has no copy), runs a QEMU older than the one that saved the state, cannot
+    read data that another exec-sandbox release wrote, or has a smaller budget than the VM
+    needs (see the error's `required` field)."""
 
     RECREATE = "RECREATE"
     """The instance can no longer be used (deleted, expired, or its stored data is damaged): create a new one."""
@@ -100,7 +103,8 @@ class ErrorCode(StrEnum):
     between two calls). The code did not run."""
     GUEST_SILENT_AFTER_RESTORE = "GUEST_SILENT_AFTER_RESTORE"
     """The guest of a memory snapshot restore (an L1 memory snapshot or a saved instance) did not
-    answer once its state loaded. A silent L1 memory snapshot is removed, and the VM boots cold."""
+    answer once its state loaded, or could not reseed its kernel random source then. A silent L1 memory
+    snapshot is removed, and the VM boots cold."""
     LOCAL_DISK = "LOCAL_DISK"
     """A local file the call needs is missing (not a path the caller gave: that is ARGUMENT_INVALID);
     or this host cannot open or write a local file now (disk full, quota, I/O error, out of file
@@ -120,7 +124,8 @@ class ErrorCode(StrEnum):
     GUEST_OUTCOME_UNKNOWN = "GUEST_OUTCOME_UNKNOWN"
     """The call reached the guest, then the transport was lost. The code may have run."""
     INSTANCE_CONFLICT = "INSTANCE_CONFLICT"
-    """Another save was stored first, or the id given to new() is taken. This save was not stored."""
+    """Another save of the instance was stored first, or the id of a first save (Scheduler.new(instance_id=...),
+    Session.save(instance_id=...)) is taken. This save was not stored."""
     INSTANCE_SAVE_OUTCOME_UNKNOWN = "INSTANCE_SAVE_OUTCOME_UNKNOWN"
     """The store did not confirm the save, and reading it back could not tell whether it was stored."""
 
@@ -181,13 +186,14 @@ class ErrorCode(StrEnum):
 
     # RouteError (ROUTE)
     INSTANCE_HOST_MISMATCH = "INSTANCE_HOST_MISMATCH"
-    """This worker's host or release values differ from the saved ones."""
+    """This worker's host values differ from the saved ones, or it cannot read the saved data."""
     CAPACITY_NEVER_FITS = "CAPACITY_NEVER_FITS"
     """The VM is larger than this worker's whole budget."""
     MIGRATION_REJECTED = "MIGRATION_REJECTED"
     """QEMU refused the saved state (incompatible or damaged stream). Callers see it only in the
-    cause chain of the error they get: INSTANCE_HOST_MISMATCH from reuse(); an L1 memory snapshot
-    it refuses is removed, and the VM boots cold."""
+    cause chain of the error they get: from reuse(), RouteError INSTANCE_HOST_MISMATCH on a QEMU
+    older than the saver's, else InternalError INTERNAL. An L1 memory snapshot it refuses is
+    removed, and the VM boots cold."""
 
     # InstanceGoneError (RECREATE)
     INSTANCE_NOT_FOUND = "INSTANCE_NOT_FOUND"
@@ -256,7 +262,8 @@ def _rebuild_error[E: BaseException](cls: type[E], args: tuple[Any, ...]) -> E:
 class TransientError(SandboxError):
     """The call did nothing you rely on (an exec did not send the code).
 
-    Repeat it unchanged: it can succeed later. If the failure closed the session
+    Repeat it unchanged, on this worker or another: it can succeed later. Bound the
+    repeats (for example 3, with backoff): the library does not. If the failure closed the session
     (`session.closed`), the work since its last save is lost (all of it, for a
     session never saved): open a new session (new() or reuse()), do that work
     again, then repeat the call.
@@ -282,14 +289,14 @@ class TransientError(SandboxError):
 
 
 class OutcomeUnknownError(SandboxError):
-    """You do not know the state the call left.
+    """You do not know the state the call left, or must read it before you do the work again.
 
-    The code was sent and then the transport was lost; the store gave no clear
-    answer to a save; or another save was stored first (INSTANCE_CONFLICT). Read the
-    state (side effects of the code; for a save, `context["generation"]` and
-    `context["commit_id"]` name the commit it would make: it was stored if
-    `describe_instance(id).recent_commits` holds it) before you do the work again.
-    The session is closed.
+    GUEST_OUTCOME_UNKNOWN: the code was sent and then the transport was lost; the session
+    is closed. INSTANCE_SAVE_OUTCOME_UNKNOWN: the store gave no clear answer to a save;
+    `context["generation"]` and `context["commit_id"]` name the commit it would make: it
+    was stored if `describe_instance(id).recent_commits` holds it. INSTANCE_CONFLICT:
+    another save was stored first, or the id of a first save is taken; this save was not
+    stored. After either save code the session stays open.
     """
 
     action = ErrorAction.VERIFY
@@ -357,13 +364,102 @@ class ConfigError(SandboxError):
     )
 
 
-class RouteError(SandboxError):
-    """This worker cannot serve the call; a worker with the `required` values can.
+class RouteRule(StrEnum):
+    """How a worker satisfies one key of RouteError.required (RouteKey.rule)."""
 
-    `required` and `found` map the same keys (arch, accelerator, cpu_vendor, cpu_model,
-    base_image, packages_image, qemu_version, release, memory_mb, cpu) to the
-    needed and the local values; only differing keys are listed. Never delete a
-    saved instance for this error.
+    EQUAL = "equal"
+    """Its value is the same string."""
+    AT_LEAST = "at_least"
+    """Its value is not below the required one: a number (memory_mb, cpu), or a version
+    compared part by part (qemu_version)."""
+    CONTAINS = "contains"
+    """It holds the required value among its own (an image on its disk)."""
+
+
+class RouteKey(StrEnum):
+    """Keys of RouteError.required and RouteError.found. A release adds keys; it never
+    renames or removes one, and a key keeps its rule and its value form."""
+
+    ARCH = "arch"
+    """x86_64 or aarch64."""
+    ACCELERATOR = "accelerator"
+    """kvm, hvf or tcg."""
+    CPU_VENDOR = "cpu_vendor"
+    """x86 vendor of the guest CPU model; absent on ARM."""
+    CPU_MODEL = "cpu_model"
+    """The guest -cpu value."""
+    QEMU_VERSION = "qemu_version"
+    """MAJOR.MINOR.PATCH. QEMU loads a state that the same or an older QEMU saved, with the
+    same versioned machine type: a worker whose QEMU is this version or newer."""
+    MACHINE_TYPE = "machine_type"
+    """A QEMU machine type as QEMU resolves it (virt-11.1, microvm): the worker's QEMU has it."""
+    BASE_IMAGE = "base_image"
+    """Full SHA-256 of a guest base image the worker can use."""
+    PACKAGES_IMAGE = "packages_image"
+    """Full SHA-256 of a packages (L2) image the worker can use."""
+    MEMORY_MB = "memory_mb"
+    """Whole MB of admission budget, the VM overhead included."""
+    CPU = "cpu"
+    """Cores of admission budget (two decimals), the VM overhead included."""
+
+    @property
+    def rule(self) -> RouteRule:
+        return _ROUTE_RULES[self]
+
+    def holds(self, have: str | frozenset[str] | None, need: str) -> bool:
+        """Whether a worker's value `have` gives `need` by this key's rule: EQUAL, the same
+        string; CONTAINS, the value itself or a set that holds it; AT_LEAST, not below
+        (qemu_version part by part, the others as numbers), a set never. None: no value, so
+        False, but for memory_mb and cpu, where None is no limit (a worker always has a QEMU
+        version)."""
+        match self.rule:
+            case RouteRule.EQUAL:
+                return have == need
+            case RouteRule.CONTAINS:
+                return need in have if isinstance(have, frozenset) else have == need
+            case RouteRule.AT_LEAST:
+                if have is None:
+                    return self is not RouteKey.QEMU_VERSION  # memory_mb, cpu: no limit
+                if isinstance(have, frozenset):
+                    return False
+                if self is RouteKey.QEMU_VERSION:
+                    return tuple(map(int, have.split("."))) >= tuple(map(int, need.split(".")))
+                return float(have) >= float(need)
+
+
+_ROUTE_RULES = {
+    RouteKey.ARCH: RouteRule.EQUAL,
+    RouteKey.ACCELERATOR: RouteRule.EQUAL,
+    RouteKey.CPU_VENDOR: RouteRule.EQUAL,
+    RouteKey.CPU_MODEL: RouteRule.EQUAL,
+    RouteKey.QEMU_VERSION: RouteRule.AT_LEAST,
+    RouteKey.MACHINE_TYPE: RouteRule.CONTAINS,
+    RouteKey.BASE_IMAGE: RouteRule.CONTAINS,
+    RouteKey.PACKAGES_IMAGE: RouteRule.CONTAINS,
+    RouteKey.MEMORY_MB: RouteRule.AT_LEAST,
+    RouteKey.CPU: RouteRule.AT_LEAST,
+}
+
+
+class RouteError(SandboxError):
+    """This worker cannot serve the call; a worker that satisfies `required` can.
+
+    `required` maps RouteKey to the value the call needs: every fact the call checked
+    up to this error, not only the facts that differ here. `found` maps this worker's
+    values for those keys, and may hold more keys; None: this worker has no value for
+    the key (no such image or machine type; no cpu_vendor on ARM; for memory_mb and
+    cpu, no limit). Values are plain strings: qemu_version MAJOR.MINOR.PATCH, full
+    SHA-256 digests, memory_mb a whole number, cpu with two decimals. A fact that does
+    not apply to the saved host (cpu_vendor on ARM) is absent from `required`.
+
+    A worker satisfies `required` when each key holds by its rule (RouteKey.rule):
+    EQUAL, its value is the same string; AT_LEAST, its value is not below (qemu_version
+    part by part); CONTAINS, it holds the value. A worker that satisfies `required` passes the checks that
+    raised this error; a later check of the same call can raise RouteError with more
+    keys (a load checks the host, then the budget, then the guest images, and QEMU
+    decides at the restore). An empty `required` (data this release cannot read: another
+    release wrote it): a worker of another release. Never delete a saved instance for
+    this error.
     """
 
     action = ErrorAction.ROUTE
@@ -380,15 +476,15 @@ class RouteError(SandboxError):
         message: str,
         *,
         code: ErrorCode,
-        required: Mapping[str, str],
-        found: Mapping[str, str],
+        required: Mapping[RouteKey, str],
+        found: Mapping[RouteKey, str | None],
         context: dict[str, Any] | None,
         hint: str | None,
         instance_id: str | None,
     ) -> None:
         super().__init__(message, code=code, context=context, hint=hint, instance_id=instance_id)
-        self.required = dict(required)
-        self.found = dict(found)
+        self.required: dict[RouteKey, str] = dict(required)
+        self.found: dict[RouteKey, str | None] = dict(found)
 
 
 class InstanceGoneError(SandboxError):
@@ -431,9 +527,22 @@ def no_instance_store(*, instance_id: str | None) -> ConfigError:
         code=ErrorCode.INSTANCE_CONFIG,
         context=None,
         hint="Set instance_store and instance_keyring "
-        "(or EXEC_SANDBOX_INSTANCE_STORE and EXEC_SANDBOX_INSTANCE_KEYRING).",
+        "(or EXEC_SANDBOX_INSTANCE_STORE and EXEC_SANDBOX_INSTANCE_KEYRING); "
+        "instance_store=None set in code turns saved instances off, whatever the variables say.",
         instance_id=instance_id,
     )
+
+
+@contextlib.contextmanager
+def named_instance(instance_id: str) -> Generator[None]:
+    """Name `instance_id` in each SandboxError raised in the block that names no instance:
+    store, VM and guest errors do not know which instance they served."""
+    try:
+        yield
+    except SandboxError as e:
+        if e.instance_id is None:
+            e.instance_id = instance_id
+        raise
 
 
 def damaged_instance_data(message: str, *, instance_id: str | None) -> InstanceGoneError:
@@ -466,19 +575,38 @@ def spawn_error(
     return ConfigError(message, code=ErrorCode.HOST_DEPENDENCY, context=context, hint=hint, instance_id=None)
 
 
-def host_mismatch(*, instance_id: str, required: Mapping[str, str], found: Mapping[str, str]) -> RouteError:
-    """The RouteError of a worker that cannot run the instance: the host or release
-    values it was saved with differ. For an image key, `found` says why no image
-    with that digest is available."""
-    wanted = ", ".join(f"{k}={v}" for k, v in sorted(required.items()))
-    local = ", ".join(f"{k}={v}" for k, v in sorted(found.items()))
+def host_mismatch(
+    *,
+    instance_id: str,
+    required: Mapping[RouteKey, str],
+    found: Mapping[RouteKey, str | None],
+    reason: str | None,
+) -> RouteError:
+    """The RouteError of a worker that cannot run the instance. `required` is the whole
+    target, `found` this worker's values for its keys; the message names the keys whose
+    value does not hold by its rule (RouteKey.holds), values in JSON form (a cpu_model holds commas). `reason`: why, when the
+    values alone do not say it (an image missing from the store too)."""
+    differ = [key for key in required if not key.holds(found.get(key), required[key])] or list(required)
+    wanted = ", ".join(f"{key}={json.dumps(required[key])}" for key in differ)
+    local = ", ".join(f"{key}={json.dumps(found.get(key))}" for key in differ)
+    if required:
+        message = f"Instance {instance_id} needs {wanted}; this worker has {local}" + (
+            f": {reason}." if reason else "."
+        )
+    else:  # nothing names the target
+        message = f"Instance {instance_id}: {reason or 'this worker cannot serve it'}."
     return RouteError(
-        f"Instance {instance_id} needs {wanted}; this worker has {local}.",
+        message,
         code=ErrorCode.INSTANCE_HOST_MISMATCH,
         required=required,
         found=found,
-        context=None,
-        hint="Load it on a worker whose host values match the error's `required` field.",
+        context=None if reason is None else {"reason": reason},
+        hint=(
+            "Reuse it on a worker that satisfies the error's `required` field."
+            if required
+            else "Reuse it on a worker of another exec-sandbox release."
+        )
+        + " Keep the instance: its data is intact.",
         instance_id=instance_id,
     )
 
@@ -522,4 +650,5 @@ class SocketAuthError(CommunicationError):
 
 class InstanceNotSavedWarning(UserWarning):
     """A session of a saved instance closed cleanly after exec() or write_file()
-    calls that no save() followed: those changes are not in the store."""
+    calls that no save() followed: those changes are not in the store. Not raised once
+    another save of the instance won: no plain save of the session can store them."""

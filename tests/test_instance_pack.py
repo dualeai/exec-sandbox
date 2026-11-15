@@ -257,7 +257,12 @@ class TestTamper:
         new_stream_file(target)
         with target.open("r+b") as out:
             apply_object(
-                obj, data_key=_KEY, instance_id=_ID, commit_id=commit, targets={0: out.fileno()}, sizes={0: _SIZE}
+                obj,
+                data_key=_KEY,
+                instance_id=_ID,
+                commit_id=commit,
+                targets={0: out.fileno()},
+                sizes={0: _SIZE},
             )
 
     def test_every_byte_flip_fails(self, tmp_path: Path) -> None:
@@ -326,7 +331,7 @@ class TestTamper:
         with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
             self._apply(tmp_path, obj, commit)
         assert exc.value.action == "ROUTE"
-        assert exc.value.required == {"release": "one that reads this object index"}
+        assert exc.value.required == {}  # no head here names the release that wrote it
 
     @pytest.mark.parametrize(
         ("delta", "message"),

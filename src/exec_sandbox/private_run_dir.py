@@ -120,7 +120,8 @@ _START_WATCHER: Final = (
     '/bin/sh -c "$2" exec-sandbox-watcher "$3" "$4" 0<&3 3<&- &\n'
 )
 """Moves itself into the watcher's cgroup ($1, when there is one), starts the watcher there
-in the background, and exits at once: init, not this process, reaps the watcher. A
+in the background, and exits at once: the orphaned watcher goes to init, or to this process
+when it is PID 1 or a subreaper (permission_utils._Left), which does not wait for it. A
 background command reads /dev/null unless its stdin is set explicitly, so the pipe goes
 through fd 3 (a separate line: `a && b &` would put `a` in the background)."""
 
@@ -210,8 +211,10 @@ class PrivateRunDir:
 
     def close(self) -> None:
         """End the VM cgroups still recorded (the watcher's too), remove the folders still
-        recorded and this one, and release the lock. Idempotent. Blocking (the folder holds
-        whole disks): async callers use asyncio.to_thread."""
+        recorded, then this one, and release the lock. A folder whose recorded cgroup still
+        has a process stays whole, and one whose recorded folder stays keeps that record: the
+        next sweep tries again (_end). Idempotent. Blocking (the folder holds whole disks):
+        async callers use asyncio.to_thread."""
         self._finalizer()
 
     def _start_watcher(self) -> None:

@@ -1,11 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
+	"os"
+	"regexp"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/containers/gvisor-tap-vsock/pkg/services/forwarder"
 )
 
 // failingListener fails Accept with each error of errs in turn (a nil entry accepts a
@@ -84,6 +90,54 @@ func TestAcceptLoopResetsThePauseAfterAConnection(t *testing.T) {
 	for i := range want {
 		if pauses[i] != want[i] {
 			t.Fatalf("pauses = %v, want %v", pauses, want)
+		}
+	}
+}
+
+func TestRequireNetwork(t *testing.T) {
+	if err := requireNetwork("192.168.127.0/24", "192.168.127.1", "5a:94:ef:e4:0c:dd", 1500); err != nil {
+		t.Fatalf("all flags given: %v", err)
+	}
+	for _, missing := range []struct {
+		name                 string
+		subnet, gateway, mac string
+		mtu                  int
+	}{
+		{"subnet", "", "192.168.127.1", "5a:94:ef:e4:0c:dd", 1500},
+		{"gateway-ip", "192.168.127.0/24", "", "5a:94:ef:e4:0c:dd", 1500},
+		{"gateway-mac", "192.168.127.0/24", "192.168.127.1", "", 1500},
+		{"mtu", "192.168.127.0/24", "192.168.127.1", "5a:94:ef:e4:0c:dd", 0},
+	} {
+		if err := requireNetwork(missing.subnet, missing.gateway, missing.mac, missing.mtu); err == nil {
+			t.Errorf("no -%s: want an error", missing.name)
+		}
+	}
+}
+
+// TestOutboundPatternsMatchInGo runs the host's patterns (tests/fixtures/dns_filter, which
+// tests/test_dns_filter.py checks against its generator) through the vendored fork's own
+// matcher, forwarder.MatchesAllowlist, on the name as its callers give it: lowercased, with
+// no trailing dot (pkg/services/forwarder/sni.go and pkg/services/dns/dns.go).
+func TestOutboundPatternsMatchInGo(t *testing.T) {
+	raw, err := os.ReadFile("../tests/fixtures/dns_filter/example_com.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Patterns []string        `json:"patterns"`
+		Hosts    map[string]bool `json:"hosts"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	var allow []*regexp.Regexp
+	for _, pattern := range fixture.Patterns {
+		allow = append(allow, regexp.MustCompile(pattern))
+	}
+	for host, want := range fixture.Hosts {
+		got := forwarder.MatchesAllowlist(strings.ToLower(strings.TrimSuffix(host, ".")), allow)
+		if got != want {
+			t.Errorf("%q: allowed %v, want %v", host, got, want)
 		}
 	}
 }

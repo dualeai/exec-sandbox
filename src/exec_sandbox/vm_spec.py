@@ -27,8 +27,8 @@ class VmSpec(BaseModel):
     Frozen and hashable: keep a catalog of specs, one per workload, and
     set only the fields that a workload needs:
 
-        SMALL = VmSpec(language="python")
-        DATA = VmSpec(language="python", memory_mb=1024, disk_mb=4096, packages=("pandas==3.0.1",))
+        SMALL = VmSpec(language=Language.PYTHON)
+        DATA = VmSpec(language=Language.PYTHON, memory_mb=1024, disk_mb=4096, packages=("pandas==3.0.1",))
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

@@ -1,6 +1,10 @@
 printf "__REPL_READY__\n" >&2
-while read sentinel_id code_len; do
-    code=$(head -c "$code_len")
+# reseed: 1 to give $RANDOM a new seed from the kernel ($SRANDOM) before the code runs
+while read sentinel_id code_len reseed; do
+    # code_len bytes, with no process: a builtin read; LC_ALL=C makes -N count bytes (user code
+    # may set a UTF-8 locale)
+    LC_ALL=C IFS= read -r -N "$code_len" code
+    if [ "$reseed" = 1 ]; then RANDOM=$SRANDOM; fi  # an if: the code starts with $? = 0
     eval "$code" < /dev/null
     _ec=$?
     printf "__STDOUT_END_%s__\n" "$sentinel_id"

@@ -60,7 +60,6 @@ class TestZramConfiguration:
             reservation=None,
             retry_profile=constants.RETRY_USER_FACING,
             mem_path=None,
-            mem_path_share=False,
         )
         try:
             result = await vm.execute(

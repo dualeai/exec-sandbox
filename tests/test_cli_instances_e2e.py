@@ -7,14 +7,16 @@ the variable wins is tests/test_cli.py's fact).
 """
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner, Result
 
-from exec_sandbox import InstanceInfo, InstanceRef, Language, VmSpec
+from exec_sandbox import InstanceInfo, InstanceRef, Language, RouteKey, VmSpec, WorkerFacts, __version__
 from exec_sandbox.cli import OneShotRun, cli
+from exec_sandbox.instance.keyring import Keyring
 from tests.conftest import skip_unless_hwaccel
 from tests.instance_support import new_keyring
 from tests.keyring_support import isolate_account
@@ -79,8 +81,15 @@ def test_list_describe_rm(store_dir: Path) -> None:
     assert json.loads(_sbx("instance", "list", "--json").stdout) == [_ID]
 
     info = _describe()
-    assert (info.instance_id, info.generation, info.verified) == (_ID, 1, True)
+    assert (info.instance_id, info.generation, info.access) == (_ID, 1, "full")
     assert info.spec == VmSpec(language=Language.PYTHON)
+    assert _sbx("instance", "keys").stdout.splitlines() == [info.key_id]  # the key that saved it
+
+    checked = _sbx("instance", "check", _ID, "missing-id")  # what a reuse checks, no download
+    assert checked.exit_code == 1, checked.output
+    assert checked.stdout.splitlines()[0] == f"{_ID} ok"
+    assert checked.stdout.splitlines()[1].startswith("missing-id INSTANCE_NOT_FOUND (RECREATE): ")
+    assert json.loads(_sbx("instance", "check", "--json", _ID).stdout) == {"instance_id": _ID, "ok": True}
 
     removed = _sbx("instance", "rm", _ID)
     assert removed.exit_code == 0, removed.output
@@ -110,3 +119,36 @@ def test_other_vm_settings_exit_2_and_save_nothing(store_dir: Path) -> None:
     assert same.exit_code == 0, same.output
     assert same.stdout == "7\n"
     assert _describe().generation == 2
+
+
+def test_worker_describe(store_dir: Path) -> None:
+    """The worker's facts as JSON: the key of EXEC_SANDBOX_INSTANCE_KEYRING, the built base
+    images, and facts that satisfy everything a load of an instance this worker saved checks
+    (the host target, the budget, the guest images, the saver's QEMU)."""
+    made = _sbx("run", "--instance", _ID, "-q", "-c", "y = 1")
+    assert made.exit_code == 0, made.output
+    shown = _sbx("worker", "describe")
+    assert shown.exit_code == 0, shown.output
+    facts = WorkerFacts.model_validate_json(shown.stdout)
+    assert facts.key_ids == (Keyring.parse(os.environ["EXEC_SANDBOX_INSTANCE_KEYRING"]).latest.id,)
+    info = _describe()
+    host, guest, spec = info.host, info.guest, info.spec
+    assert host is not None and guest is not None and spec is not None
+    assert host.release == __version__  # a diagnostic, not a route key
+    # Each fact a load checks, written out from the save (not from the code that checks it);
+    # the budget with the VM's own size, which its overhead only raises
+    required = {
+        RouteKey.ARCH: host.arch,
+        RouteKey.ACCELERATOR: host.accelerator,
+        RouteKey.CPU_MODEL: host.cpu_model,
+        RouteKey.MACHINE_TYPE: host.machine_type,
+        RouteKey.QEMU_VERSION: host.qemu_version,
+        RouteKey.BASE_IMAGE: guest.base_image,
+        RouteKey.MEMORY_MB: str(spec.memory_mb),
+        RouteKey.CPU: str(spec.cpu_cores),
+    }
+    if host.cpu_vendor is not None:
+        required[RouteKey.CPU_VENDOR] = host.cpu_vendor
+    if guest.packages_image is not None:
+        required[RouteKey.PACKAGES_IMAGE] = guest.packages_image
+    assert facts.satisfies(required)

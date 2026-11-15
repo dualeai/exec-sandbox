@@ -8,12 +8,14 @@ single-port building block composed by DualPortChannel.
 
 import asyncio
 import contextlib
+import json
+import logging
 import socket
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Never
+from typing import Final, Never, cast
 from uuid import uuid4
 
 from pydantic import TypeAdapter, ValidationError
@@ -21,15 +23,19 @@ from pydantic import TypeAdapter, ValidationError
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import gather_or_cancel
-from exec_sandbox.exceptions import CommunicationError, ErrorCode, OutcomeUnknownError
+from exec_sandbox.exceptions import CommunicationError, ErrorCode, InternalError, OutcomeUnknownError, TransientError
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     GuestAgentRequest,
+    ListFilesRequest,
     OutputChunkMessage,
     PingRequest,
     PongMessage,
     StreamingErrorMessage,
     StreamingMessage,
+    WarmReplRequest,
+    new_host_entropy,
+    request_line,
 )
 from exec_sandbox.socket_auth import connect_and_verify
 from exec_sandbox.subprocess_utils import socket_access_error
@@ -38,13 +44,14 @@ logger = get_logger(__name__)
 
 # StreamReader buffer limit of each port socket: readuntil() fails on a line
 # longer than it (the asyncio default is 64KB), and asyncio pauses the
-# transport when the buffer holds more (backpressure). Must exceed the largest
+# transport when the buffer holds more than twice it (backpressure). Must exceed the largest
 # single message:
 #   - File chunks: ~175KB (a 128KB chunk that does not compress → base64 → JSON)
-#   - REPL stdout: ~70KB (64KB buffer + JSON overhead)
+#   - Exec output: at most 64KB of text per frame (guest-agent flush_output_buffer); JSON
+#     writes a control character as \u00XX (6 bytes), so at most ~390KB
 #   - Package output: ~55KB (50KB limit + JSON overhead)
-# 512KB gives more than 2x headroom for the largest message and keeps memory
-# bounded during file transfers (no O(file_size) buffering).
+# 512KB holds the largest message and keeps memory bounded during file transfers (no
+# O(file_size) buffering).
 STREAM_BUFFER_LIMIT = 512 * 1024  # 512KB
 
 # Smallest kernel send buffer of each port socket: it holds the largest frame
@@ -76,15 +83,43 @@ CLOSE_SEND_TIMEOUT_SECONDS = 5.0
 _STREAMING_MESSAGE_ADAPTER: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)  # pyright: ignore[reportArgumentType, reportUnknownVariableType]
 
 
+def _raw_op_id(data: bytes) -> str | None:
+    """The op_id of a frame that did not validate: a JSON object with a string op_id, else
+    None (the frame names no operation this host can fail)."""
+    try:
+        value: object = json.loads(data)
+    except (ValueError, RecursionError):
+        return None
+    op_id = cast("dict[str, object]", value).get("op_id") if isinstance(value, dict) else None
+    return op_id if isinstance(op_id, str) else None
+
+
 class StreamDeadlineExceededError(TimeoutError):
-    """The channel's total streaming deadline expired. Always after the command was handed to
-    the transport (stream_messages has no await before it): its outcome is unknown."""
+    """The channel's total streaming deadline expired. Always after the command was marked
+    sent (enqueue_registered): its outcome is unknown. The only wait before that is a put on a
+    full write queue, which enqueue_raw bounds at 5 s, below every caller's deadline."""
+
+
+_READ_ONLY_REQUESTS: Final = (PingRequest, ListFilesRequest, WarmReplRequest)
+"""send_request() commands that run no user code and change no file: a reply this release
+cannot read fails them with GUEST_PROTOCOL, not with an unknown outcome."""
+
+_FRAME_TEXT_CHARS: Final = 64
+"""Characters of a guest value a log record keeps (repr): never the user's output."""
 
 
 class OperationInbox:
-    """Bounded per-operation data queue with an out-of-band failure signal."""
+    """Bounded per-operation data queue with an out-of-band failure signal.
 
-    def __init__(self) -> None:
+    `changes_state`: the command may run user code or change a file (exec, write_file).
+    A reply this release cannot read then fails it with an unknown outcome (the command
+    may have run); a read-only command fails with GUEST_PROTOCOL.
+    """
+
+    def __init__(self, *, changes_state: bool) -> None:
+        self._changes_state = changes_state
+        # Set by fail_unreadable: the guest answered, in a form this release cannot read
+        self._unreadable = False
         self._queue: asyncio.Queue[StreamingMessage] = asyncio.Queue(maxsize=OP_QUEUE_DEPTH)
         # One-shot future carrying the failure reason as its result. It is the
         # out-of-band signal *and* the reason store, and is awaitable directly
@@ -162,8 +197,15 @@ class OperationInbox:
             while not self._queue.empty():
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._queue.get_nowait()
-        self._failed.set_result(reason or "event transport is closed")
+        self._failed.set_result(reason)
         self._wake_getters()
+
+    def fail_unreadable(self, reason: str) -> None:
+        """Fail at once: the guest answered with a frame this release cannot read (no
+        deadline wait). The frames before it stay ahead of the failure."""
+        if not self._failed.done():
+            self._unreadable = True
+        self.fail(reason)
 
     def _wake_getters(self) -> None:
         """Wake each waiting get(): it reads the queue again, then the failure."""
@@ -173,6 +215,8 @@ class OperationInbox:
 
     def _raise_failure(self) -> Never:
         reason = self._failed.result()
+        if self._unreadable and not self._changes_state:
+            raise InternalError(reason, code=ErrorCode.GUEST_PROTOCOL, context=None, hint=None, instance_id=None)
         if self._sent_at is not None:
             raise OutcomeUnknownError(
                 reason, code=ErrorCode.GUEST_OUTCOME_UNKNOWN, context=None, hint=None, instance_id=None
@@ -212,6 +256,8 @@ class FileOpDispatcher:
         # single event loop they cannot interleave with each other or the
         # dispatch loop's _op_queues read.
         self._failure_reason: str | None = None
+        # Frames this release could not read: the first is logged at WARNING, the next at DEBUG
+        self.unreadable_frames = 0
 
     def start(self) -> None:
         """Start the dispatch loop as a background task."""
@@ -233,8 +279,7 @@ class FileOpDispatcher:
                 # The loop's end from the cancel above, unless the caller was cancelled meanwhile
                 if current is not None and current.cancelling() > cancels_before:
                     caller_cancel = error
-            except Exception:
-                logger.error("Event dispatcher stopped after an unexpected failure", exc_info=True)
+            # No other end: _dispatch_loop turns every failure into the failure of its operations
             self._task = None
         self.fail_registered_ops("event dispatcher stopped")
         if caller_cancel is not None:
@@ -244,9 +289,10 @@ class FileOpDispatcher:
         """Check if the dispatch loop task is still running."""
         return self._task is not None and not self._task.done()
 
-    def register_op(self, op_id: str) -> OperationInbox:
-        """Register an op_id and return its dedicated bounded queue."""
-        inbox = OperationInbox()
+    def register_op(self, op_id: str, *, changes_state: bool) -> OperationInbox:
+        """Register an op_id and return its dedicated bounded queue (OperationInbox:
+        `changes_state`)."""
+        inbox = OperationInbox(changes_state=changes_state)
         self._op_queues[op_id] = inbox
         if self._failure_reason is not None:
             inbox.fail(self._failure_reason)
@@ -271,12 +317,8 @@ class FileOpDispatcher:
                 data = await self._reader.readuntil(b"\n")
                 try:
                     msg = _STREAMING_MESSAGE_ADAPTER.validate_json(data.rstrip(b"\n"))
-                except ValidationError:
-                    logger.warning(
-                        "Dispatch loop: failed to parse message, discarding",
-                        extra={"raw": data[:200]},
-                        exc_info=True,
-                    )
+                except ValidationError as error:
+                    self._unreadable_frame(data, error)
                     continue
                 op_id = getattr(msg, "op_id", None)
                 if op_id is not None:
@@ -312,6 +354,27 @@ class FileOpDispatcher:
             logger.error("Unexpected event dispatcher failure", exc_info=True)
         finally:
             self.fail_registered_ops(failure_reason)
+
+    def _unreadable_frame(self, data: bytes, error: ValidationError) -> None:
+        """A frame this release cannot read: fail its operation at once (by the op_id of the
+        raw frame, when it names a registered one), and log where it does not parse. The
+        record holds types and field locations only: a frame can carry the user's output."""
+        self.unreadable_frames += 1
+        op_id = _raw_op_id(data)
+        problems = "; ".join(
+            f"{'.'.join(repr(part)[:_FRAME_TEXT_CHARS] for part in problem['loc'])}: {problem['type']}"
+            for problem in error.errors(include_input=False, include_url=False, include_context=False)[:5]
+        )
+        inbox = self._op_queues.get(op_id) if op_id is not None else None
+        if inbox is not None:
+            inbox.fail_unreadable(f"The guest agent sent a reply this release cannot read ({problems}).")
+        logger.log(
+            logging.WARNING if self.unreadable_frames == 1 else logging.DEBUG,
+            "Guest frame this release cannot read (%d so far): %s",
+            self.unreadable_frames,
+            problems,
+            extra={"op_id": op_id if inbox is not None else None, "frames": self.unreadable_frames},
+        )
 
     def fail_registered_ops(self, reason: str) -> None:
         """Wake every active operation exactly once when the transport dies.
@@ -399,8 +462,9 @@ class UnixSocketChannel:
         # (e.g. file upload read+compress), improving throughput. Memory cost:
         # HOST_WRITE_QUEUE_DEPTH slots x ~175 KB ≈ 11 MB in the queue, plus up
         # to HOST_WRITE_BATCH_FRAMES + 1 frames (~3 MB) in the transport. Must
-        # stay bounded to prevent unbounded growth on slow guest drains. Paired
-        # with the guest-side WRITE_QUEUE_SIZE (128) to keep both ends balanced.
+        # stay bounded to prevent unbounded growth on slow guest drains: the guest
+        # reads one command line at a time and holds at most 16 chunks of a write in
+        # progress (file_io.rs handle_write_file).
         self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=constants.HOST_WRITE_QUEUE_DEPTH)
         self._write_task: asyncio.Task[None] | None = None
 
@@ -439,9 +503,9 @@ class UnixSocketChannel:
         raise_send_buffer(self._writer.get_extra_info("socket"))
 
         # Start background write worker
-        self._write_task = asyncio.create_task(self._write_worker())
+        self._write_task = asyncio.create_task(self._write_worker(self._writer))
 
-    async def _write_worker(self) -> None:
+    async def _write_worker(self, writer: asyncio.StreamWriter) -> None:
         """Background worker drains write queue with batched drain for throughput.
 
         Decouples writing from reading to prevent deadlocks when virtio-serial
@@ -450,30 +514,28 @@ class UnixSocketChannel:
         backpressure overhead. Blocks
         on the queue until data arrives; close() stops it by cancelling the
         task (after draining the queue), so no wakeup poll or stop flag is
-        needed. A write error is logged and breaks the loop.
+        needed. A write error is logged and breaks the loop. `writer`: the connection's,
+        which outlives the worker (close() cancels the worker before it drops the writer).
         """
         while True:
             try:
                 # Block until the next frame; cancellation is the stop signal.
                 data = await self._write_queue.get()
 
-                if self._writer:
-                    self._writer.write(data)
+                writer.write(data)
                 self._write_queue.task_done()
 
                 # Greedily batch up to HOST_WRITE_BATCH_FRAMES - 1 more queued items before draining
                 for _ in range(constants.HOST_WRITE_BATCH_FRAMES - 1):
                     try:
                         data = self._write_queue.get_nowait()
-                        if self._writer:
-                            self._writer.write(data)
+                        writer.write(data)
                         self._write_queue.task_done()
                     except asyncio.QueueEmpty:
                         break
 
                 # Single drain for the whole batch
-                if self._writer:
-                    await self._writer.drain()
+                await writer.drain()
 
             except Exception as e:
                 # The end of the loop (a RuntimeError "event loop is closed") is no error
@@ -602,7 +664,7 @@ class DualPortChannel:
         await channel.connect(timeout_seconds=5)
 
         # Request-response (auto-assigns op_id, routes reply)
-        response = await channel.send_request(PingRequest(), timeout=5)
+        response = await channel.send_request(PingRequest(host_entropy=None), timeout=5)
 
         # Stream execution output (auto op_id routing)
         async for msg in channel.stream_messages(ExecuteCodeRequest(...), timeout=30):
@@ -623,20 +685,28 @@ class DualPortChannel:
         self._event_channel: UnixSocketChannel = UnixSocketChannel(event_socket, expected_uid)
         self._dispatcher: FileOpDispatcher | None = None
         self._has_been_connected: bool = False
+        # The guest was restored and has not answered a ping with a pong since: each ping of the
+        # next probe carries new host entropy, so the guest reseeds its kernel random source
+        self._reseed_pending: bool = False
 
     async def connect(self, timeout_seconds: float) -> None:
         """Connect both command and event ports.
 
-        Connects in parallel for speed. Single connection attempt with timeout (no retry).
-        Caller handles retry logic (e.g., wait_for_guest exponential backoff).
+        Connects both ports in parallel, one attempt of timeout_seconds. On a reconnection,
+        the ping probe opens the connection again when it fails (at most once per probe
+        attempt); the caller handles any other retry (e.g., wait_for_guest).
 
-        On reconnection (after a previous close(), or an L1 restore), probes the
-        guest agent with a PingRequest to confirm that the guest runs and reads
-        its port before the caller sends real work.
+        On reconnection (after a previous close(), or a restore: mark_restored), probes the
+        guest agent with a PingRequest to confirm that the guest runs and reads its port
+        before the caller sends real work. After a restore, each ping carries host entropy,
+        and the guest reseeds its kernel random source before its pong.
 
         Raises:
             What UnixSocketChannel.connect raises; on a reconnection, TimeoutError when no
-            pong came after every probe attempt (GUEST_RECONNECT_PROBE_TIMEOUTS)
+            pong came after every probe attempt (GUEST_RECONNECT_PROBE_TIMEOUTS), and
+            InternalError GUEST_PROTOCOL when the guest answers a ping with another reply;
+            after a restore, TransientError GUEST_SILENT_AFTER_RESTORE when the guest answers
+            the ping with an io_error (it could not reseed its kernel random source)
         """
         # Already connected and dispatcher healthy — nothing to do.
         # Dispatcher EOF is the earliest signal that the guest has disconnected.
@@ -650,14 +720,17 @@ class DualPortChannel:
         await self._raw_connect(timeout_seconds)
 
         if self._has_been_connected:
-            await self._probe_guest_ready(timeout_seconds)
+            await self._probe_guest_ready(timeout_seconds, host_entropy=self._reseed_pending)
+            self._reseed_pending = False  # the pong came: the guest reseeded
 
         self._has_been_connected = True
 
     def mark_restored(self) -> None:
-        """The guest of this channel was restored from a save (L1) whose ports were
-        connected: its first connect() probes the guest, as a reconnection does."""
+        """The guest of this channel was restored from a save (an L1 memory snapshot or a saved
+        instance) whose ports were connected: its first connect() probes the guest, as a
+        reconnection does, with a ping that carries host entropy (the guest reseeds)."""
         self._has_been_connected = True
+        self._reseed_pending = True
 
     async def _raw_connect(self, timeout_seconds: float) -> None:
         """Low-level connect: open sockets and start dispatcher."""
@@ -678,8 +751,13 @@ class DualPortChannel:
                 self._dispatcher = FileOpDispatcher(reader)
                 self._dispatcher.start()
 
-    async def _probe_guest_ready(self, caller_timeout: float) -> None:
-        """Send PingRequests until a PongMessage confirms that the guest listens.
+    async def _probe_guest_ready(self, caller_timeout: float, *, host_entropy: bool) -> None:
+        """Send PingRequests until a PongMessage confirms that the guest listens; with
+        `host_entropy` (after a restore: mark_restored), each ping carries new host entropy
+        (new_host_entropy). Another answer, or one this release cannot read, raises
+        InternalError GUEST_PROTOCOL at once; with `host_entropy`, an io_error answer (the guest
+        could not reseed its kernel random source) raises TransientError
+        GUEST_SILENT_AFTER_RESTORE at once.
 
         The guest agent keeps its ports open, so QEMU and the guest kernel hold
         a ping until the agent reads it: a ping with no answer yet is slow, not
@@ -692,24 +770,15 @@ class DualPortChannel:
         attempts = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
         for attempt, probe_timeout in enumerate(constants.GUEST_RECONNECT_PROBE_TIMEOUTS, start=1):
             try:
-                response = await asyncio.wait_for(
-                    self.send_request(PingRequest(), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS),
-                    timeout=probe_timeout,
-                )
+                ping = PingRequest(host_entropy=new_host_entropy() if host_entropy else None)
+                response = await self.send_request(ping, timeout=probe_timeout)
             except TimeoutError:
                 logger.debug(
                     "Reconnection probe got no pong yet, sending another ping",
                     extra={"attempt": attempt, "max": attempts, "timeout_seconds": probe_timeout},
                 )
                 continue
-            except (
-                OSError,
-                asyncio.IncompleteReadError,
-                ConnectionError,
-                RuntimeError,
-                CommunicationError,
-                OutcomeUnknownError,
-            ) as error:
+            except (OSError, RuntimeError, CommunicationError, OutcomeUnknownError) as error:
                 if attempt == attempts:
                     break  # no attempt left: no reconnect to pay for
                 # The connection failed: only a new one can carry the next ping.
@@ -724,6 +793,29 @@ class DualPortChannel:
             if isinstance(response, PongMessage):
                 logger.debug("Reconnection probe succeeded", extra={"attempt": attempt})
                 return
+            if (
+                host_entropy
+                and isinstance(response, StreamingErrorMessage)
+                and response.error_type == constants.GuestErrorType.IO
+            ):
+                # The restored guest could not reseed its kernel random source (its only error
+                # answer to a ping): without the host's bytes, its CRNG keeps the secret of the
+                # save, which every other VM of the same save holds too (entropy.rs)
+                raise TransientError(
+                    f"The restored guest could not reseed its kernel random source: {response.message}",
+                    code=ErrorCode.GUEST_SILENT_AFTER_RESTORE,
+                    context={"guest_error_type": response.error_type},
+                    hint=None,
+                    instance_id=None,
+                )
+            # The guest answered, and not with a pong: another ping gets the same answer
+            raise InternalError(
+                f'The guest agent answered a ping with a message of type "{response.type}", not a pong.',
+                code=ErrorCode.GUEST_PROTOCOL,
+                context={"message_type": response.type},
+                hint=None,
+                instance_id=None,
+            )
 
         raise TimeoutError(f"Guest agent did not respond to ping after {attempts} attempts")
 
@@ -737,11 +829,11 @@ class DualPortChannel:
         inbox.mark_command_sent()
         await self.enqueue_raw(data)
 
-    def register_op(self, op_id: str) -> OperationInbox:
-        """Register an op_id for file transfer multiplexing."""
+    def register_op(self, op_id: str, *, changes_state: bool) -> OperationInbox:
+        """Register an op_id for file transfer multiplexing (OperationInbox: `changes_state`)."""
         if not self._dispatcher:
             raise RuntimeError("Dispatcher not initialized - channel not connected")
-        return self._dispatcher.register_op(op_id)
+        return self._dispatcher.register_op(op_id, changes_state=changes_state)
 
     def unregister_op(self, op_id: str) -> None:
         """Unregister an op_id after operation completes."""
@@ -777,7 +869,7 @@ class DualPortChannel:
         self,
         request: GuestAgentRequest,
         *,
-        timeout: int,
+        timeout: float,
     ) -> StreamingMessage:
         """Send command and receive single response via op_id-routed queue.
 
@@ -793,14 +885,18 @@ class DualPortChannel:
             TimeoutError: If no response within timeout
             CommunicationError: The event transport failed before the request was queued
             OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the event transport failed
-                after the request was queued
+                after the request was queued, or the guest answers a request that changes
+                state with a frame this release cannot read
+            InternalError: GUEST_PROTOCOL when the guest answers a read-only request
+                (PingRequest, ListFilesRequest, WarmReplRequest) with a frame this release
+                cannot read
         """
         op_id = uuid4().hex
         tagged_request = request.model_copy(update={"op_id": op_id})
-        op_queue = self.register_op(op_id)  # RuntimeError when not connected
+        # RuntimeError when not connected
+        op_queue = self.register_op(op_id, changes_state=not isinstance(request, _READ_ONLY_REQUESTS))
         try:
-            request_json = tagged_request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-            await self.enqueue_registered(op_queue, request_json.encode())
+            await self.enqueue_registered(op_queue, request_line(tagged_request))
             return await asyncio.wait_for(op_queue.get(), timeout=float(timeout))
         finally:
             self.unregister_op(op_id)
@@ -823,7 +919,7 @@ class DualPortChannel:
             StreamingMessage from event port
 
         Raises (while iterating, not at the call):
-            RuntimeError: If channels not connected
+            RuntimeError: If channels not connected, or the write queue stays full
             StreamDeadlineExceededError: The total deadline expired
             CommunicationError, OutcomeUnknownError: The event transport failed (as in send_request)
         """
@@ -834,10 +930,9 @@ class DualPortChannel:
             async with timeout_context:
                 op_id = uuid4().hex
                 tagged_request = request.model_copy(update={"op_id": op_id})
-                op_queue = self.register_op(op_id)  # RuntimeError when not connected
+                op_queue = self.register_op(op_id, changes_state=True)  # RuntimeError when not connected
                 try:
-                    request_json = tagged_request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-                    await self.enqueue_registered(op_queue, request_json.encode())
+                    await self.enqueue_registered(op_queue, request_line(tagged_request))
                     while True:
                         message = await op_queue.get()
                         yield message
@@ -897,7 +992,7 @@ async def consume_stream(
     vm_id: str,
     on_stdout: Callable[[str], None] | None,
     on_stderr: Callable[[str], None] | None,
-    on_error: Callable[[StreamingErrorMessage], Awaitable[None]] | None,
+    on_error: Callable[[StreamingErrorMessage], Awaitable[None]],
 ) -> StreamResult:
     """Send request via channel, consume the streaming response, return collected result.
 
@@ -914,8 +1009,8 @@ async def consume_stream(
         vm_id: VM identifier for logging.
         on_stdout: Optional callback for stdout chunks.
         on_stderr: Optional callback for stderr chunks.
-        on_error: Optional async callback for StreamingErrorMessage.
-            Called before default handling. If it raises, the exception propagates.
+        on_error: Async callback for StreamingErrorMessage, called before the default
+            handling. If it raises, the exception propagates.
 
     Returns:
         StreamResult with collected output, exit code, and timing.
@@ -955,9 +1050,7 @@ async def consume_stream(
                 break
 
             elif isinstance(msg, StreamingErrorMessage):
-                # Let caller handle error first (may raise)
-                if on_error is not None:
-                    await on_error(msg)
+                await on_error(msg)  # the caller's handling first (it may raise)
                 # Default handling: append error to stderr, exit_code stays -1
                 chunks["stderr"].append(f"[{msg.error_type}] {msg.message}")
                 break

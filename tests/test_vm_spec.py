@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from exec_sandbox.models import Language, PortMapping
+from exec_sandbox.models import InstanceRef, Language, PortMapping
 from exec_sandbox.vm_spec import VmSpec
 
 
@@ -33,6 +33,18 @@ class TestVmSpec:
         """Network access or an exposed port adds the virtio-net device."""
         spec = VmSpec(language=Language.PYTHON, allow_network=allow_network, expose_ports=ports)
         assert spec.has_network_device is expected
+
+    def test_unknown_fields_are_refused(self) -> None:
+        """A misspelled field (or one a newer release added) fails, never drops silently: in a
+        port given to a VM, a spec stored in a saved instance, or an instance reference."""
+        with pytest.raises(ValidationError, match="extrenal"):
+            PortMapping.model_validate({"internal": 8080, "extrenal": 3000})
+        with pytest.raises(ValidationError, match="added_later"):
+            VmSpec.model_validate({"language": "python", "expose_ports": [{"internal": 80, "added_later": 1}]})
+        with pytest.raises(ValidationError, match="added_later"):
+            VmSpec.model_validate({"language": "python", "added_later": 1})
+        with pytest.raises(ValidationError, match="added_later"):
+            InstanceRef.model_validate({"instance_id": "my-vm", "generation": 1, "added_later": 1})
 
     def test_int_port_is_internal_port(self) -> None:
         spec = VmSpec(language=Language.PYTHON, expose_ports=[8080, PortMapping(internal=9000, external=3000)])

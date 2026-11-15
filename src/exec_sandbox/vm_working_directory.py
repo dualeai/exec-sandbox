@@ -68,7 +68,8 @@ class VmWorkingDirectory:
 
         Args:
             vm_id: VM identifier for logging
-            path: Directory path (must already exist)
+            path: Directory path (create() makes it; VmManager.restore_layout passes one it
+                never makes, for the paths only)
             home_dir: Directory for the home disk file: host disk, not the
                 (often tmpfs) temp directory that holds `path`
         """

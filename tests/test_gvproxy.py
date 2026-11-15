@@ -9,7 +9,6 @@ import errno
 import logging
 import os
 import re
-import signal
 import socket
 from contextlib import ExitStack
 from pathlib import Path
@@ -18,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from exec_sandbox import subprocess_utils
+from exec_sandbox.dns_filter import resolved_domains
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.gvproxy import start_gvproxy
 from exec_sandbox.platform_utils import HostOS, detect_host_os
@@ -42,6 +41,11 @@ def _stand_in(tmp_path: Path) -> Path:
     binary.write_text('#!/bin/sh\necho "Listening on QEMU socket"\nexec sleep 30\n')
     binary.chmod(0o755)
     return binary
+
+
+def _unowned(_proc: ProcessWrapper, _drain: asyncio.Task[None] | None) -> None:
+    """An on_process_started that keeps nothing: the process ends on its own, or the test
+    ends it."""
 
 
 def _no_qemu_vm_access(stack: ExitStack, tmp_path: Path, sock: socket.socket) -> None:
@@ -80,13 +84,12 @@ class TestStartGvproxyOwnership:
             start = asyncio.create_task(
                 start_gvproxy(
                     "gvproxy-lookup",
-                    allowed_domains=None,
-                    language="python",
+                    allowed_domains=resolved_domains(None, "python"),
                     workdir=_workdir(tmp_path / "g"),
                     images_dir=tmp_path,
                     expose_ports=None,
                     block_outbound=False,
-                    on_process_started=None,
+                    on_process_started=_unowned,
                 )
             )
             await lookup.wait()
@@ -105,8 +108,7 @@ class TestStartGvproxyOwnership:
             _no_qemu_vm_access(stack, tmp_path, sock)
             await start_gvproxy(
                 "gvproxy-owner",
-                allowed_domains=None,
-                language="python",
+                allowed_domains=resolved_domains(None, "python"),
                 workdir=_workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
@@ -125,39 +127,6 @@ class TestStartGvproxyOwnership:
             unregister_process(proc)
             if drain is not None:
                 await asyncio.wait((drain,))
-
-    async def test_without_an_owner_a_failure_stops_the_process_and_its_drain(self, tmp_path: Path) -> None:
-        """No on_process_started: start_gvproxy owns the process until it returns. A failure
-        after the spawn (setfacl) stops it (SIGTERM, reaped) and waits for its drain task."""
-        sock = socket.socket(socket.AF_UNIX)
-        spawned: list[ProcessWrapper] = []
-        real_start = subprocess_utils.start_managed_process
-
-        async def recording_start(*args: Any, **kwargs: Any) -> ProcessWrapper:
-            proc = await real_start(*args, **kwargs)
-            spawned.append(proc)
-            return proc
-
-        with ExitStack() as stack:
-            stack.enter_context(patch("exec_sandbox.gvproxy.start_managed_process", recording_start))
-            _no_qemu_vm_access(stack, tmp_path, sock)
-            await start_gvproxy(
-                "gvproxy-no-owner",
-                allowed_domains=None,
-                language="python",
-                workdir=_workdir(tmp_path / "g"),
-                images_dir=tmp_path,
-                expose_ports=None,
-                block_outbound=False,
-                on_process_started=None,
-            )
-        (proc,) = spawned
-        unregister_process(proc)
-        assert proc.returncode == -signal.SIGTERM
-        assert [
-            task for task in asyncio.all_tasks() if task.get_name() == "gvproxy-wrapper-drain-gvproxy-no-owner"
-        ] == []
-        assert sock.fileno() == -1
 
 
 class TestGvproxyStderrLevel:
@@ -203,13 +172,12 @@ class TestStartGvproxy:
         ):
             await start_gvproxy(
                 "gvproxy-socket",
-                allowed_domains=None,
-                language="python",
+                allowed_domains=resolved_domains(None, "python"),
                 workdir=self._workdir(tmp_path / ("s" * 120)),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
-                on_process_started=None,
+                on_process_started=_unowned,
             )
 
     async def test_missing_binary_is_host_dependency(self, tmp_path: Path) -> None:
@@ -227,13 +195,12 @@ class TestStartGvproxy:
             ):
                 await start_gvproxy(
                     "gvproxy-binary",
-                    allowed_domains=None,
-                    language="python",
+                    allowed_domains=resolved_domains(None, "python"),
                     workdir=self._workdir(tmp_path / "g"),
                     images_dir=tmp_path,
                     expose_ports=None,
                     block_outbound=False,
-                    on_process_started=None,
+                    on_process_started=_unowned,
                 )
         assert sock.fileno() == -1  # the pre-bound socket is closed
 
@@ -259,13 +226,12 @@ class TestStartGvproxy:
             ) as exc_info:
                 await start_gvproxy(
                     "gvproxy-spawn",
-                    allowed_domains=None,
-                    language="python",
+                    allowed_domains=resolved_domains(None, "python"),
                     workdir=self._workdir(tmp_path / "g"),
                     images_dir=tmp_path,
                     expose_ports=None,
                     block_outbound=False,
-                    on_process_started=None,
+                    on_process_started=_unowned,
                 )
         assert exc_info.value.context["errno"] == err
         assert exc_info.value.context["binary"] == str(binary)
@@ -301,13 +267,12 @@ class TestStartGvproxy:
         ):
             _, _, wait_ready = await start_gvproxy(
                 "gvproxy-format",
-                allowed_domains=None,
-                language="python",
+                allowed_domains=resolved_domains(None, "python"),
                 workdir=self._workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
-                on_process_started=None,
+                on_process_started=_unowned,
             )
             await wait_ready()
         assert asyncio.get_running_loop().time() - start < 1.0
@@ -367,13 +332,12 @@ class TestStartGvproxy:
             )
             _, _, wait_ready = await start_gvproxy(
                 "gvproxy-fatal",
-                allowed_domains=None,
-                language="python",
+                allowed_domains=resolved_domains(None, "python"),
                 workdir=self._workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
-                on_process_started=None,
+                on_process_started=_unowned,
             )
             await wait_ready()
         assert exc_info.value.context["output"] == ["starting", fatal]
@@ -423,13 +387,12 @@ class TestStartGvproxy:
             )
             _, _, wait_ready = await start_gvproxy(
                 "gvproxy-signal",
-                allowed_domains=None,
-                language="python",
+                allowed_domains=resolved_domains(None, "python"),
                 workdir=self._workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
-                on_process_started=None,
+                on_process_started=_unowned,
             )
             await wait_ready()
         assert exc_info.value.context["crash"] == cause
@@ -463,13 +426,12 @@ class TestStartGvproxy:
             )
             _, _, wait_ready = await start_gvproxy(
                 "gvproxy-crash",
-                allowed_domains=None,
-                language="python",
+                allowed_domains=resolved_domains(None, "python"),
                 workdir=self._workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
-                on_process_started=None,
+                on_process_started=_unowned,
             )
             await wait_ready()
         assert exc_info.value.context["crash"] == cause
@@ -492,13 +454,12 @@ class TestStartGvproxy:
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GVPROXY_FAILED) as exc_info:
                 await start_gvproxy(
                     "gvproxy-spawn",
-                    allowed_domains=None,
-                    language="python",
+                    allowed_domains=resolved_domains(None, "python"),
                     workdir=self._workdir(tmp_path / "g"),
                     images_dir=tmp_path,
                     expose_ports=None,
                     block_outbound=False,
-                    on_process_started=None,
+                    on_process_started=_unowned,
                 )
         assert exc_info.value.context["errno"] == errno.EAGAIN
         assert sock.fileno() == -1
@@ -523,13 +484,12 @@ class TestStartGvproxy:
         ):
             await start_gvproxy(
                 "gvproxy-pdeath",
-                allowed_domains=None,
-                language="python",
+                allowed_domains=resolved_domains(None, "python"),
                 workdir=self._workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
-                on_process_started=None,
+                on_process_started=_unowned,
             )
         cmd, kwargs = list(spawn.call_args.args), spawn.call_args.kwargs
         assert cmd[:4] == ["setpriv", "--pdeathsig", "KILL", "--"]
@@ -563,13 +523,12 @@ class TestStartGvproxy:
         ):
             proc, log_task, wait_ready = await start_gvproxy(
                 "gvproxy-early",
-                allowed_domains=None,
-                language="python",
+                allowed_domains=resolved_domains(None, "python"),
                 workdir=workdir,
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
-                on_process_started=None,
+                on_process_started=_unowned,
             )
         try:
             ready = asyncio.create_task(wait_ready())
@@ -605,13 +564,12 @@ class TestStartGvproxy:
         ):
             proc, log_task, _wait_ready = await start_gvproxy(
                 "gvproxy-drain",
-                allowed_domains=None,
-                language="python",
+                allowed_domains=resolved_domains(None, "python"),
                 workdir=workdir,
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
-                on_process_started=None,
+                on_process_started=_unowned,
             )
         try:
             assert proc.drain_task is log_task

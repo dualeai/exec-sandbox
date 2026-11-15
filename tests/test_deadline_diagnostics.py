@@ -121,6 +121,7 @@ async def make_vm(qmp_path: Path) -> AsyncGenerator[_MakeVm]:
             gvproxy_proc=None,
             qemu_log_task=None,
             gvproxy_log_task=None,
+            device_layout="",
         )
         vm._state = VmState.READY  # pyright: ignore[reportPrivateUsage]
         vms.append(vm)
@@ -329,7 +330,6 @@ async def test_deadline_on_a_paused_guest_carries_the_qemu_state(
         reservation=None,
         retry_profile=constants.RETRY_USER_FACING,
         mem_path=None,
-        mem_path_share=False,
     )
     try:
         await vm.write_file("warm.txt", io.BytesIO(b"x"))  # connected and answering

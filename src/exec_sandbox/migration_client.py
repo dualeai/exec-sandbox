@@ -42,6 +42,7 @@ from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
     RouteError,
+    RouteKey,
     SandboxError,
     TransientError,
 )
@@ -60,19 +61,20 @@ _QMP_TIMEOUT = constants.MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS
 _POLL_FIRST_SECONDS = 0.001  # query-migrate poll: 1 ms, doubling up to MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS
 
 
-def rejected_by_qemu(error: BaseException) -> bool:
-    """A MIGRATION_REJECTED or MIGRATION_UNSUPPORTED error anywhere in the cause/context
+def qemu_refusal(error: BaseException) -> SandboxError | None:
+    """The MIGRATION_REJECTED or MIGRATION_UNSUPPORTED error anywhere in the cause/context
     chain (a QEMU that died while refusing the stream is reported by an error raised
-    without `from`). By code: a setup failure of the restore (HOST_DEPENDENCY, for
-    example) must not count as a refusal of the saved state."""
+    without `from`): its message holds QEMU's reason. None without one. By code: a setup
+    failure of the restore (HOST_DEPENDENCY, for example) must not count as a refusal of
+    the saved state."""
     seen: set[int] = set()
     current: BaseException | None = error
     while current is not None and id(current) not in seen:
         if isinstance(current, SandboxError) and current.code in _REFUSED:
-            return True
+            return current
         seen.add(id(current))
         current = current.__cause__ or current.__context__
-    return False
+    return None
 
 
 _REFUSED = frozenset({ErrorCode.MIGRATION_REJECTED, ErrorCode.MIGRATION_UNSUPPORTED})
@@ -88,14 +90,13 @@ def _unsupported(message: str) -> ConfigError:
     return ConfigError(message, code=ErrorCode.MIGRATION_UNSUPPORTED, context=None, hint=None, instance_id=None)
 
 
-def _rejected(message: str, *, qemu_version: tuple[int, int, int] | None) -> RouteError:
+def _rejected(message: str, *, qemu_version: tuple[int, int, int]) -> RouteError:
     """The RouteError (MIGRATION_REJECTED) of a saved state this QEMU refuses."""
-    found = ".".join(map(str, qemu_version)) if qemu_version else "unknown"
     return RouteError(
         message,
         code=ErrorCode.MIGRATION_REJECTED,
-        required={"qemu_version": "a QEMU that accepts this saved state"},
-        found={"qemu_version": found},
+        required={},  # the caller names the target: it knows who saved the state
+        found={RouteKey.QEMU_VERSION: ".".join(map(str, qemu_version))},
         context=None,
         hint=None,
         instance_id=None,
@@ -196,7 +197,7 @@ class MigrationClient:
 
     async def _set_capabilities(
         self,
-        qemu_version: tuple[int, int, int] | None,
+        qemu_version: tuple[int, int, int],
         *,
         use_template: bool,
     ) -> None:
@@ -222,16 +223,18 @@ class MigrationClient:
         - CPR (cpr-reboot/transfer/exec) is not a resume-anywhere primitive: all
           modes are same-host only (fd/RAM handoff to a peer QEMU).
         - The migration stream can change between QEMU versions. The L1 cache key
-          includes the QEMU version and MEMORY_SNAPSHOT_FORMAT_VERSION. A saved
-          instance has no such check: QEMU accepts or refuses its state at
-          restore (then RouteError INSTANCE_HOST_MISMATCH).
+          includes the QEMU version and the device layout of the restore, which holds
+          MIGRATION_CAPABILITIES (qemu_cmd.device_layout). A load of a saved instance
+          compares its machine type and device layout before the download; QEMU accepts
+          or refuses the rest of its state at restore (qemu_refusal: on a QEMU below the
+          saved one, RouteError with the saved QEMU version).
 
         Raises:
             ConfigError: MIGRATION_UNSUPPORTED: QEMU below the floor or capability refused
         """
-        if qemu_version is None or qemu_version < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
+        if qemu_version < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
             floor = ".".join(map(str, constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION))
-            found = ".".join(map(str, qemu_version)) if qemu_version else "unknown"
+            found = ".".join(map(str, qemu_version))
             raise _unsupported(f"QEMU {found} is below the migration floor {floor}")
 
         # mapped-ram + x-ignore-shared coexist safely only since 11.0 (earlier
@@ -239,8 +242,7 @@ class MigrationClient:
         # Ref: QEMU commit "migration/mapped-ram: Fix x-ignore-shared snapshots"
         #      (Pawel Zmarzly, Nov 2025; reviewed by Peter Xu, Dec 2025)
         capabilities = [
-            {"capability": "multifd", "state": True},
-            {"capability": "mapped-ram", "state": True},
+            *({"capability": name, "state": True} for name in constants.MIGRATION_CAPABILITIES),
             {"capability": "x-ignore-shared", "state": use_template},
         ]
         resp = await self._execute(
@@ -293,7 +295,7 @@ class MigrationClient:
         self,
         vmstate_path: Path,
         *,
-        qemu_version: tuple[int, int, int] | None,
+        qemu_version: tuple[int, int, int],
         timeout: float,
         use_template: bool,
         keep_running: bool,
@@ -406,7 +408,7 @@ class MigrationClient:
         self,
         vmstate_path: Path,
         *,
-        qemu_version: tuple[int, int, int] | None,
+        qemu_version: tuple[int, int, int],
         timeout: float,
         use_template: bool,
     ) -> None:

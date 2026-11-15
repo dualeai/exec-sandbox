@@ -16,8 +16,8 @@ Path Resolution Priority:
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
-import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,21 +35,6 @@ from exec_sandbox.permission_utils import chmod_executable
 from exec_sandbox.platform_utils import UserDir, arch_of, detect_host_arch, get_arch_name, get_user_dir
 
 logger = get_logger(__name__)
-
-# Public API - only these should be used externally
-__all__ = [
-    "PrefetchResult",
-    "ensure_assets",
-    "ensure_assets_available",
-    "ensure_base_image",
-    "ensure_registry_loaded",
-    "fetch_gvproxy",
-    "get_assets",
-    "get_gvproxy_path",
-    "images_download_dir",
-    "is_offline_mode",
-    "prefetch_all_assets",
-]
 
 # GitHub repository info
 GITHUB_OWNER = "dualeai"
@@ -94,8 +79,10 @@ def _get_asset_version() -> tuple[str, str]:
     return __version__, f"v{__version__}"
 
 
-def _create_assets_registry() -> AsyncPooch:
-    """Create the assets registry singleton."""
+@functools.cache
+def get_assets() -> AsyncPooch:
+    """The assets registry of this process, made at the first call (no I/O: the registry
+    loads at its first use; two threads racing the first call make two, which is harmless)."""
     pooch_version, _ = _get_asset_version()
     return AsyncPooch(
         path=images_download_dir(),
@@ -103,25 +90,6 @@ def _create_assets_registry() -> AsyncPooch:
         version=pooch_version,
         setting="EXEC_SANDBOX_CACHE_DIR",  # images_download_dir() is under it
     )
-
-
-# Global assets registry (lazy initialization with thread-safe double-checked locking)
-_assets_singleton: AsyncPooch | None = None
-_assets_lock = threading.Lock()
-
-
-def get_assets() -> AsyncPooch:
-    """Get or create the assets registry singleton.
-
-    Thread-safe using double-checked locking pattern.
-    """
-    global _assets_singleton  # noqa: PLW0603 - Singleton pattern
-    if _assets_singleton is None:
-        with _assets_lock:
-            # Double-check after acquiring lock
-            if _assets_singleton is None:
-                _assets_singleton = _create_assets_registry()
-    return _assets_singleton
 
 
 def is_offline_mode() -> bool:

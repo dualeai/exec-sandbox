@@ -113,7 +113,7 @@ addopts = [
 markers = [
     "sudo: tests that test sudo-related functionality (may require sudo privileges in real environment)",
     "slow: marks tests as slow running (deselect with -m 'not slow')",
-    "benchmark: CodSpeed performance benchmarks (run separately via codspeed.yml)",
+    "benchmark: CodSpeed performance benchmarks (the test.yml benchmark job runs them)",
 ]
 filterwarnings = [
     # Catch pending task warnings early - Python 3.14 has stricter detection

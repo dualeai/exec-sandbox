@@ -56,7 +56,7 @@ async def file_hash(path: Path, algorithm: str) -> str:
 
     Args:
         path: Path to file
-        algorithm: Hash algorithm (default: sha256)
+        algorithm: hashlib algorithm name (for example "sha256")
 
     Returns:
         Hex digest string
