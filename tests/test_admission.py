@@ -3771,8 +3771,12 @@ class TestDiskGate:
         cache = _Cache(tmp_path / "l2", disk, [300] * 4, gives_back=0)
         ctrl.add_cache(cache)
         loop = asyncio.get_running_loop()
-        for step in range(1, 100):  # 0.2 MB every 10 ms: it grows, under 1/64 of the pass
-            loop.call_later(step / 100, lambda: setattr(disk, "free_mb", disk.free_mb + 0.2))
+        # Reads: the space grows for 1 s (0.2 MB every 10 ms), and the pass reads it to its limit. Sync:
+        # no growth, so the pass gains nothing and syncs; with growth, a loop stall that ends 0.235 s
+        # after the pass's first read makes the gain reach 1/64 of the pass, which skips the sync
+        if slow == "reads":
+            for step in range(1, 100):
+                loop.call_later(step / 100, lambda: setattr(disk, "free_mb", disk.free_mb + 0.2))
         settle = (
             _Settle(quiet=0.15, limit=1.0, sync_once=False, later=0.0, counts_writes=True)
             if slow == "reads"
