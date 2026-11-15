@@ -15,7 +15,7 @@ from collections.abc import Callable
 import pytest
 
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError
-from exec_sandbox.models import Language
+from exec_sandbox.models import ExecutionResult, Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import run_once
@@ -47,8 +47,8 @@ EXTRA_LARGE_TIMEOUT_SECONDS = 300
 
 # Throughput thresholds (MiB/s) - CI runners have variable I/O performance,
 # so we use low thresholds to catch severe regressions only
-MIN_THROUGHPUT_DEVZERO_MIBPS = 1  # /dev/zero throughput (local: ~20+, CI: ~2)
-MIN_THROUGHPUT_URANDOM_MIBPS = 0.5  # /dev/urandom throughput (local: ~15+, CI: ~0.8-3)
+MIN_THROUGHPUT_DEVZERO_MIBPS = 1  # /dev/zero, second exec of a VM (macOS HVF: 60-72)
+MIN_THROUGHPUT_URANDOM_MIBPS = 0.5  # /dev/urandom, second exec of a VM (macOS HVF: 48-97)
 
 
 @pytest.fixture(params=list(PAYLOAD_SIZES.keys()))
@@ -358,6 +358,19 @@ class TestOutputOverTheLimit:
 # Measure raw streaming throughput by minimizing generation overhead
 
 
+async def _second_run(scheduler: Scheduler, code: str, on_stdout: Callable[[str], None]) -> ExecutionResult:
+    """Run code twice in one raw VM; return the second result, whose stdout goes to on_stdout.
+
+    The first exec of a VM pays one-time costs that are not streaming; on a restored VM, the
+    first fork and the first runs of dd and base64. With them, the 100 KB urandom exec takes
+    13 ms on macOS HVF and took 197 ms on a slow CI runner; its second exec takes 2 ms on
+    macOS HVF.
+    """
+    async with await scheduler.new(VmSpec(language=Language.RAW)) as vm:
+        await vm.exec(code)
+        return await vm.exec(code, on_stdout=on_stdout)
+
+
 @pytest.mark.slow  # MiB/s thresholds are sensitive to CI runner I/O load
 @skip_unless_hwaccel
 class TestStreamingThroughput:
@@ -385,11 +398,9 @@ class TestStreamingThroughput:
             nonlocal streamed_bytes
             streamed_bytes += len(chunk.encode("utf-8"))
 
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), code, on_stdout=on_stdout)
+        result = await _second_run(scheduler, code, on_stdout)
 
-        # Use execute_ms (host-measured execution phase) — excludes VM
-        # preparation (warm pool lookup, L1 restore, cold boot) which is
-        # not part of streaming throughput.
+        # execute_ms (host-measured) of the second exec: no VM preparation, no one-time costs
         elapsed_s = result.timing.execute_ms / 1000
         throughput_mibps = (streamed_bytes / (1024 * 1024)) / elapsed_s
 
@@ -411,11 +422,9 @@ class TestStreamingThroughput:
             nonlocal streamed_bytes
             streamed_bytes += len(chunk)
 
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), code, on_stdout=on_stdout)
+        result = await _second_run(scheduler, code, on_stdout)
 
-        # Use execute_ms (host-measured execution phase) — excludes VM
-        # preparation (warm pool lookup, L1 restore, cold boot) which is
-        # not part of streaming throughput.
+        # execute_ms (host-measured) of the second exec: no VM preparation, no one-time costs
         elapsed_s = result.timing.execute_ms / 1000
         # base64 expands by ~33%, so effective raw bytes is 3/4 of output
         effective_mib = (streamed_bytes * 3 // 4) / (1024 * 1024)
