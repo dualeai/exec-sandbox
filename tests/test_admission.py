@@ -2657,8 +2657,12 @@ class TestDiskGate:
         cache = _Cache(tmp_path / "l2", disk, [300, 300], gives_back=0)
         ctrl.add_cache(cache)
         loop = asyncio.get_running_loop()
-        for step in range(1, 30):  # 0.2 MB every 5 ms: under 1/64 of the pass by its 0.1 s limit
-            loop.call_later(step / 200, lambda: setattr(disk, "free_mb", disk.free_mb + 0.2))
+        # 0.1 MB every 5 ms for 0.2 s: still growing at the pass's 0.1 s limit, and under 1/64
+        # of the pass (300 / 64 = 4.7 MB) even once every step ran (4 MB): a read that a loaded
+        # runner makes late gives the same verdict (with 0.2 MB steps, a read 30 ms late saw
+        # 5.2 MB, and the pass never synced)
+        for step in range(1, 41):
+            loop.call_later(step / 200, lambda: setattr(disk, "free_mb", disk.free_mb + 0.1))
 
         def sync(_path: Path) -> None:
             disk.free_mb += sum(cache.evicted)
