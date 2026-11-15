@@ -12,12 +12,13 @@ exec-sandbox runs untrusted Python, JavaScript or shell code in QEMU microVMs on
 ```python
 import asyncio
 
-from exec_sandbox import Scheduler, VmSpec
+from exec_sandbox import Language, Scheduler, VmSpec
 
 
 async def main() -> None:
     async with Scheduler() as scheduler:
-        async with await scheduler.new(VmSpec(language="python")) as session:  # or "javascript", "raw"
+        # Language.PYTHON, Language.JAVASCRIPT or Language.RAW
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec("print('Hello from a secure VM!')")
             print(result.stdout)  # Hello from a secure VM!
             print(result.exit_code)  # 0
@@ -72,7 +73,7 @@ test -r /dev/kvm -a -w /dev/kvm && echo ok    # Linux: ok means your user can us
 sysctl kern.hv_support                        # macOS: kern.hv_support: 1 means HVF is available
 ```
 
-exec-sandbox uses `qemu-system-x86_64` or `qemu-system-aarch64` from `/usr/bin/`, else from `PATH` (`EXEC_SANDBOX_QEMU_BIN_X86` and `EXEC_SANDBOX_QEMU_BIN_ARM` set another file), and `qemu-img` and `qemu-storage-daemon` from `PATH`. A missing binary raises `ConfigError` (`HOST_DEPENDENCY`). Check the version with `/usr/bin/qemu-system-x86_64 --version` (or `qemu-system-aarch64`): Ubuntu 24.04 ships 8.2.2.
+exec-sandbox uses `qemu-system-x86_64` or `qemu-system-aarch64` from `/usr/bin/`, else from `PATH` (`EXEC_SANDBOX_QEMU_BIN_X86` and `EXEC_SANDBOX_QEMU_BIN_ARM` set another file), and `qemu-img` and `qemu-storage-daemon` from `PATH`. A missing QEMU binary, or one whose version or machine types this user cannot read, raises `ConfigError` (`HOST_DEPENDENCY`) when the `Scheduler` starts; a missing `qemu-img` raises it at its first use. Check the version with `/usr/bin/qemu-system-x86_64 --version` (or `qemu-system-aarch64`): Ubuntu 24.04 ships 8.2.2. Saved instances and L1 snapshots need QEMU 11.0 or later: where the distribution ships an older one, build QEMU from its source release ([qemu.org/download](https://www.qemu.org/download/#source)) and set `EXEC_SANDBOX_QEMU_BIN_X86` or `EXEC_SANDBOX_QEMU_BIN_ARM` to the binary.
 
 On Linux, give your user access to KVM with `sudo usermod -aG kvm $USER`, then log in again. Without this access, exec-sandbox logs a warning and uses TCG. To run QEMU as its own user, with cgroup limits and namespaces, see [Linux host setup](#linux-host-setup).
 
@@ -96,8 +97,10 @@ sbx run --instance my-vm -c 'print(x + 1)'                             # 42
 |------|---------|
 | Spec | A `VmSpec`: what a VM is made of ([VmSpec](#vmspec)) |
 | REPL | The interpreter in the VM that runs your code |
+| Session | One VM that runs your code: `new()` or `reuse()` gives it, `close()` ends the VM ([Sessions](#sessions)) |
+| Saved instance | The state of a session that `save()` stored (RAM, processes, files in `/home/user`): `reuse()` continues it on any worker of its host kind ([Saved instances](#saved-instances)) |
 | Warm pool | VMs started before the request ([Warm pool](#warm-pool)) |
-| L1, L2, L3 | The snapshot cache: memory snapshots, disk snapshots with the packages installed, and a copy of L2 in S3 ([Snapshot cache](#snapshot-cache)) |
+| L1, L2, L3 | The snapshot cache: memory snapshots, disk snapshots with the packages installed, and a copy of L2 in S3 ([Snapshot cache](#snapshot-cache)). It makes new VMs start faster; it holds no saved instance |
 | Instance store | Where saved instances live: your S3 bucket (`s3`) or a folder on this host (`local`) ([Choose a store](#choose-a-store)) |
 | Generation | The save number of an instance: 1, then +1 for each save |
 | Head | The object in the store that names the current state of an instance |
@@ -115,7 +118,7 @@ sbx run --instance my-vm -c 'print(x + 1)'                             # 42
 
 ```python
 async with Scheduler() as scheduler:
-    async with await scheduler.new(VmSpec(language="python")) as session:
+    async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
         await session.exec("import math")
         await session.exec("x = math.pi * 2")
         result = await session.exec("print(f'{x:.4f}')")
@@ -150,7 +153,7 @@ sbx run --upload ./local.csv:input.csv --download output.csv:./result.csv -c "op
 
 Set `packages` in the spec. The first VM of a spec installs the packages and caches the result; later VMs of that spec start from the cache ([Snapshot cache](#snapshot-cache)). Count and size limits: [Limits](#limits). Runtimes and tools: [Guest environment](#guest-environment).
 
-- Give each package a version: `VmSpec(language="python", packages=("pandas==3.0.1",))`, `VmSpec(language="javascript", packages=("lodash@4.17.21",))`. Other operators (`>=`, `~=`) pass too; `==` gives a stable cache entry.
+- Give each package a version: `VmSpec(language=Language.PYTHON, packages=("pandas==3.0.1",))`, `VmSpec(language=Language.JAVASCRIPT, packages=("lodash@4.17.21",))`. Other operators (`>=`, `~=`) pass too; `==` gives a stable cache entry.
 - A package without a version, a bad name, or packages for `raw` raise `InvalidInputError` (`ARGUMENT_INVALID`). Scoped npm names (`@scope/name`) are refused.
 - A package outside the allow-list (the top 10,000 of PyPI or npm) raises `InvalidInputError` (`PACKAGE_NOT_ALLOWED`). To skip this check, set `enable_package_validation=False` (`sbx run --no-validation`).
 - Python packages install into Python 3.14 on musl with no build step: use packages with pure-Python or musllinux wheels.
@@ -169,9 +172,10 @@ Set `packages` in the spec. The first VM of a spec installs the packages and cac
 ### Port forwarding
 
 ```python
-from exec_sandbox import PortMapping
+from exec_sandbox import Language, PortMapping
 
-spec = VmSpec(language="python", expose_ports=(PortMapping(internal=8080, external=3000),))  # guest 8080 -> host 3000
+# Guest port 8080 on host port 3000
+spec = VmSpec(language=Language.PYTHON, expose_ports=(PortMapping(internal=8080, external=3000),))
 async with await scheduler.new(spec) as session:
     print(session.exposed_ports[0].url)  # http://127.0.0.1:3000
 ```
@@ -186,18 +190,25 @@ async with await scheduler.new(spec) as session:
 `save()` writes the state of a VM (RAM, processes, files in `/home/user`), compressed and encrypted, to the instance store. `reuse()` continues it later, on any worker of the same host kind. Every worker needs QEMU 11.0 or later (else the `Scheduler` start fails with `ConfigError` `MIGRATION_UNSUPPORTED`) and a keyring: set `EXEC_SANDBOX_INSTANCE_KEYRING`, or pass `instance_keyring=` in code ([Keys](#keys)).
 
 ```python
-async with Scheduler(SchedulerConfig(instance_store="local")) as scheduler:  # "s3" for several workers
-    async with await scheduler.new(VmSpec(language="python")) as session:
+import os
+
+from exec_sandbox import Language, Scheduler, SchedulerConfig, VmSpec
+
+KEYRING = os.environ["MY_KEYRING"]  # from your secret store: see Keys
+config = SchedulerConfig(instance_store="local", instance_keyring=KEYRING)  # "s3" for several workers
+async with Scheduler(config) as scheduler:
+    async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
         await session.exec("x = 41")
         ref = await session.save()  # InstanceRef(instance_id=..., generation=1)
     async with await scheduler.reuse(ref.instance_id) as session:  # Later, with the same keyring
-        await session.exec("x += 1; print(x)")  # 42
+        result = await session.exec("x += 1; print(x)")
+        print(result.stdout)  # 42
         await session.save()  # generation 2
 ```
 
 ### Keys
 
-Make a key with `python -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())"`. The keyring is a comma-separated list of keys, newest first: the first key encrypts new saves, the others only open older instances. Keep the keyring in your secret store, and give every worker the same keyring. Keep every key that saved an instance: without it, `reuse()` raises `ConfigError` (`INSTANCE_KEY_MISSING`). To change keys: [Key rotation](#key-rotation).
+Make a key with `python3 -c "import base64, secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())"`. The keyring is a comma-separated list of keys, newest first: the first key encrypts new saves, the others only open older instances. Keep the keyring in your secret store, and give every worker the same keyring. Keep every key that saved an instance: without it, `reuse()` raises `ConfigError` (`INSTANCE_KEY_MISSING`). To change keys: [Key rotation](#key-rotation).
 
 ### Instance ids
 
@@ -205,7 +216,7 @@ To choose the id, pass it to `new()`: `scheduler.new(spec, instance_id="user-42"
 
 ### Choose a store
 
-The `local` store (`instance_store="local"`) is a folder on this host, for one host. For the `s3` store, set up the bucket ([Set up the S3 bucket](#set-up-the-s3-bucket)), then give every worker the same keyring and the same config: `SchedulerConfig(instance_store="s3", s3_bucket="my-bucket")`. At start, the `Scheduler` checks the bucket and logs "Instance store ready" with its `key_ids`.
+The `local` store (`instance_store="local"`) is a folder on this host, for one host. For the `s3` store, set up the bucket ([Set up the S3 bucket](#set-up-the-s3-bucket)), then give every worker the same keyring and the same config: `SchedulerConfig(instance_store="s3", s3_bucket="my-bucket")`. At start, the `Scheduler` checks the bucket and logs "Instance store ready" with its key ids.
 
 ### Use instances from the command line
 
@@ -215,7 +226,11 @@ The `local` store (`instance_store="local"`) is a folder on this host, for one h
 sbx run --instance my-vm -c 'x = 41'            # Created instance my-vm, generation 1
 sbx run --instance my-vm -c 'x += 1; print(x)'  # 42, then: Saved instance my-vm, generation 2
 sbx instance list                               # One id on each line (--json for an array)
-sbx instance describe my-vm                     # JSON: generation, recent commits, key id, verified; spec and host when verified
+sbx instance list --long                        # One JSON object for each instance: as describe, or its error
+sbx instance describe my-vm                     # JSON: generation, recent commits, key id, access, writer release; spec, host (with the device layout), guest and egress domains when access is full
+sbx instance keys                               # The id of each key of the keyring, newest first
+sbx instance check my-vm                        # "my-vm ok", or why this worker cannot continue it
+sbx worker describe                             # JSON: this worker's facts (WorkerFacts), for a broker
 sbx instance rm my-vm other-vm                  # In order, stops at the first error; exit code 0 when they are gone
 ```
 
@@ -236,11 +251,22 @@ async for instance_id in scheduler.list_instances():
     ...
 ```
 
+To do this without a `Scheduler` (no VM, no guest image, no QEMU: a cleanup job on any host), open the store with `instance_admin`:
+
+```python
+from exec_sandbox import SchedulerConfig, instance_admin
+
+async with instance_admin(SchedulerConfig(instance_store="s3", s3_bucket="my-bucket")) as admin:
+    async for instance_id in admin.list_ids():
+        info = await admin.describe(instance_id)
+```
+
 ### Rules for save and reuse
 
 - **One writer.** `save()` fails, and closes its session, if another save of the instance was stored since this session loaded or last saved it. If two requests can reach one instance at the same time, use your own lock.
+- **Network.** A reused instance reaches the domains its last save allowed (`describe_instance(id).egress_domains`; empty: all), also after a release that changes the default list of `allowed_domains=None`.
 - **`close()` never saves.** After an `exec()` or `write_file()` with no later save, `close()` warns with `InstanceNotSavedWarning`. The idle timeout closes the session with no save and no warning: save before a long pause.
-- **Host kind.** An instance loads only on a worker with the same CPU architecture, accelerator (`kvm`, `hvf` or `tcg`), CPU vendor (x86), guest CPU model and exec-sandbox release, and a QEMU that accepts the saved state. Other workers raise `RouteError`; its `required` field gives the values.
+- **Host kind.** An instance loads only on a worker with the same CPU architecture, accelerator (`kvm`, `hvf` or `tcg`), CPU vendor (x86) and guest CPU model, and a QEMU that has the saved machine type (for example `virt-11.1`) and accepts the saved state. The release of the worker must run the saved devices (`describe_instance(id).host.device_layout`). Other workers raise `RouteError`; its `required` field gives the values (empty for the devices: load it on a worker of another release).
 - **After `reuse()`.** The network connections that were open at the save are closed.
 
 ### Errors of saved instances
@@ -248,9 +274,10 @@ async for instance_id in scheduler.list_instances():
 | `action` (class) | Codes | Do this |
 |------------------|-------|---------|
 | `RETRY` (`TransientError`) | `INSTANCE_STORE_UNAVAILABLE`, `LOCAL_DISK` | Call again later. A failed save stored nothing. |
-| `ROUTE` (`RouteError`) | `INSTANCE_HOST_MISMATCH` | Use a worker that matches `required` ([Upgrades](#upgrades)). Keep the instance. |
+| `ROUTE` (`RouteError`) | `INSTANCE_HOST_MISMATCH` | Use a worker that satisfies `required` ([Upgrades](#upgrades)). Keep the instance. |
 | `RECREATE` (`InstanceGoneError`) | `INSTANCE_NOT_FOUND`, `INSTANCE_EXPIRED`, `INSTANCE_INTEGRITY` | Start a new instance. To use the same id again, call `delete_instance(id)` first. |
-| `VERIFY` (`OutcomeUnknownError`) | `INSTANCE_CONFLICT`, `INSTANCE_SAVE_OUTCOME_UNKNOWN` | The session is closed. The save was stored if `describe_instance(id).recent_commits` has `error.context["commit_id"]`: check before you do the work again. |
+| `VERIFY` (`OutcomeUnknownError`) | `INSTANCE_SAVE_OUTCOME_UNKNOWN` | The session is closed. The save was stored if `describe_instance(id).recent_commits` has `error.context["commit_id"]`: check before you do the work again. |
+| `VERIFY` (`OutcomeUnknownError`) | `INSTANCE_CONFLICT` | The session is closed and this save was not stored: `reuse()` the instance (it has the other save), then do the work again. For the first save of `new(instance_id=...)`, the id is taken: use another id. |
 | `FIX_CONFIG` (`ConfigError`) | `INSTANCE_CONFIG`, `INSTANCE_KEY_MISSING`, `MIGRATION_UNSUPPORTED`, `IMAGE_DAMAGED` | `INSTANCE_CONFIG`: fix the bucket, store folder, permissions or keyring, or use a store with conditional writes. `INSTANCE_KEY_MISSING`: add the named key; keep the instance. `MIGRATION_UNSUPPORTED`: upgrade QEMU to 11.0+. `IMAGE_DAMAGED`: download or rebuild the images. |
 | `FIX_INPUT` (`InvalidInputError`) | `INSTANCE_INVALID_ID` | Fix the id ([Instance ids](#instance-ids)). |
 
@@ -340,17 +367,32 @@ Every run-time error is a `SandboxError` with an `action` (what to do next, from
 | Name | Action | When |
 |------|--------|------|
 | `SandboxError` | — | Base class (never raised itself) |
-| `TransientError` | `RETRY` | The call did nothing you rely on (exec: the code was not sent). If the session closed, redo its unsaved work on a new session first |
+| `TransientError` | `RETRY` | The call did nothing you rely on (exec: the code was not sent). Repeat it, on this worker or another, a bounded number of times (for example 3, with backoff). If the session closed, redo its unsaved work on a new session first |
 | `OutcomeUnknownError` | `VERIFY` | The code may have run, or a save's outcome is unknown, or another save was stored first. Check the state first |
 | `SessionClosedError` | `RESTART` | The session is closed. Open a new one with `new()` or `reuse()` |
 | `InvalidInputError` | `FIX_INPUT` | The call is wrong, or the scheduler cannot take it now. The session stays open |
 | `ConfigError` | `FIX_CONFIG` | This worker's setup is wrong: settings, keyring, store, binaries, images, Python extras, permissions or OS |
-| `RouteError` | `ROUTE` | Another worker can serve the call: `required` gives its values, `found` this worker's |
+| `RouteError` | `ROUTE` | Another worker can serve the call: `required` gives the facts the call checked, `found` this worker's values. A worker satisfies `required` when each key holds by its rule (`RouteKey.rule`: `equal`, `at_least` or `contains`); it passes the checks that raised the error |
 | `InstanceGoneError` | `RECREATE` | The saved instance is gone, expired or damaged. Start a new one |
 | `InternalError` | `REPORT` | A bug or a broken host. Report it with the log |
 | `ErrorAction` | | The 8 actions above |
 | `ErrorCode` | | See [Error codes](#error-codes) |
 | `InstanceNotSavedWarning` | | Warning: `close()` of a saved-instance session with `exec()` or `write_file()` calls after its last `save()` |
+
+`RouteKey` names the keys of `RouteError.required` and of `WorkerFacts.values` (`describe_worker()`, `sbx worker describe`); `RouteRule` names their rules. In `WorkerFacts.values`, a `contains` key holds the set of values this worker has (a sorted list in JSON).
+
+| Key | Rule | Value |
+|-----|------|-------|
+| `arch` | `equal` | `x86_64` or `aarch64` |
+| `accelerator` | `equal` | `kvm`, `hvf` or `tcg` |
+| `cpu_vendor` | `equal` | x86 CPU vendor (`GenuineIntel`, `AuthenticAMD`); absent on ARM |
+| `cpu_model` | `equal` | The guest CPU model (QEMU `-cpu` value) |
+| `qemu_version` | `at_least` | `MAJOR.MINOR.PATCH`, compared part by part |
+| `machine_type` | `contains` | A QEMU machine type (`virt-11.1`, `microvm`) |
+| `base_image` | `contains` | SHA-256 digest (64 hex characters) |
+| `packages_image` | `contains` | SHA-256 digest (64 hex characters) |
+| `memory_mb` | `at_least` | Whole MB; a worker's `null`: no limit |
+| `cpu` | `at_least` | Cores with two decimals; a worker's `null`: no limit |
 
 Catch the class of each action that you handle:
 
@@ -358,7 +400,7 @@ Catch the class of each action that you handle:
 from exec_sandbox import ErrorCode, InvalidInputError, OutcomeUnknownError, SandboxError, TransientError
 
 try:
-    async with await scheduler.new(VmSpec(language="python")) as session:
+    async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
         result = await session.exec("print('hello')", timeout_seconds=5)  # A timeout does not raise: exit_code -1
 except InvalidInputError as e:  # FIX_INPUT: change the call
     if e.code is ErrorCode.PACKAGE_NOT_ALLOWED:
@@ -421,12 +463,12 @@ except SandboxError as e:  # The other actions
 | `MIGRATION_UNSUPPORTED` | `ConfigError` | This worker's QEMU cannot save or load VM state (below QEMU 11.0, or a capability refused). |
 | `INSTANCE_CONFIG` | `ConfigError` | The instance settings are wrong (store, keyring, store check). |
 | `INSTANCE_KEY_MISSING` | `ConfigError` | The instance's key is not in this keyring. The data is intact: do not delete the instance. |
-| `INSTANCE_HOST_MISMATCH` | `RouteError` | This worker's host or release values differ from the saved ones. |
+| `INSTANCE_HOST_MISMATCH` | `RouteError` | This worker cannot load the saved instance: a value in `required` differs, or (empty `required`) this release cannot read the stored data or runs other devices for it (`describe_instance(id).host.device_layout`). |
 | `CAPACITY_NEVER_FITS` | `RouteError` | The VM is larger than this worker's whole budget. |
-| `MIGRATION_REJECTED` | `RouteError` | QEMU refused the saved state. It shows only in the cause chain of `INSTANCE_HOST_MISMATCH`. |
+| `MIGRATION_REJECTED` | `RouteError` | QEMU refused the saved state. It shows only in the cause chain of `INSTANCE_HOST_MISMATCH` (this QEMU is older than the saver's) or of `InternalError` `INTERNAL` (the same or a newer QEMU). |
 | `INSTANCE_NOT_FOUND` | `InstanceGoneError` | No instance with this id (deleted, expired, or never saved). |
 | `INSTANCE_EXPIRED` | `InstanceGoneError` | Part of the saved state is gone from the store. |
-| `INSTANCE_INTEGRITY` | `InstanceGoneError` | Stored data failed its checks. |
+| `INSTANCE_INTEGRITY` | `InstanceGoneError` | Stored data failed its checks. A head this release authenticates but cannot read gives `RouteError` (`INSTANCE_HOST_MISMATCH`), not this code. |
 | `CLEANUP_UNCONFIRMED` | `InternalError` | The end of a QEMU or gvproxy process, or the release of VM resources, was not confirmed. |
 | `GUEST_PROTOCOL` | `InternalError` | The guest sent a protocol error or an answer of the wrong type. |
 | `INTERNAL` | `InternalError` | A bug. |
@@ -442,7 +484,7 @@ Set `warm_pool_size` to keep that many VMs ready for each language. Only `VmSpec
 ```python
 async with Scheduler(SchedulerConfig(warm_pool_size=1)) as scheduler:
     await scheduler.wait_pool_ready()  # Waits until the pool is full, 120 s at most
-    async with await scheduler.new(VmSpec(language="python")) as session:  # From the warm pool
+    async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:  # From the warm pool
         ...
 ```
 
@@ -461,7 +503,7 @@ The cache folder (`<cache dir>`) is `~/Library/Caches/exec-sandbox/` on macOS an
 - `v<version>/`: the download cache (VM images and gvproxy-wrapper)
 - `memory-snapshots/` (L1) and `disk-snapshots/` (L2)
 - `home-disks/`: the home disks of running VMs
-- `instance-assets/`: guest images from the instance store
+- `instance-assets/`: guest images from the instance store (removed oldest first when the home disks need the space, never one a VM runs on)
 
 `EXEC_SANDBOX_CACHE_DIR` moves all of them (the download cache is then the folder itself, with no `v<version>`). Use one cache folder per host. Put the home disk folder and the L1 cache on a disk, not on tmpfs (`/tmp` on many Linux hosts): on tmpfs, QEMU writes count against the memory of the VM.
 
@@ -595,6 +637,7 @@ Namespaces (layer 7) need `unshare` from util-linux 2.32 or later. Check: `/usr/
 
 - **Conditional writes.** The store must support `If-None-Match` and `If-Match` on PUT: AWS S3, Cloudflare R2, MinIO and Ceph RGW 19.2.7 or later do. The `Scheduler` checks this at start.
 - **Credentials.** The standard AWS chain (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `~/.aws/credentials`, or the machine role). For R2, MinIO or Ceph RGW, set `s3_endpoint_url`.
+- **L3 cache.** `s3_bucket` also turns on the L3 snapshot cache in the same bucket (keys under `s3_snapshot_prefix`): give the workers its permissions too ([L3: S3 snapshot cache](#l3-s3-snapshot-cache)), else each new L2 entry logs a warning.
 - **Permissions.** `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:AbortMultipartUpload` on `<prefix>*`, and `s3:ListBucket` on the bucket (without it, S3 answers 403 for a missing key). An access error raises `ConfigError` (`INSTANCE_CONFIG`). Example for `instances/`:
 
   ```json
@@ -607,7 +650,7 @@ Namespaces (layer 7) need `unshare` from util-linux 2.32 or later. Check: `/usr/
   }
   ```
 
-- **Lifecycle rules.** `AbortIncompleteMultipartUpload` (1 day) on `<prefix>`, and an expiration of 1 day on `<prefix>probe/`. To remove unused instances, add an expiration of X days on `<prefix>s/` ([Expiration](#expiration)); without it, instances stay until `delete_instance()`. Never expire `<prefix>assets/`: all instances share these guest images. Delete an image there only when no instance uses it.
+- **Lifecycle rules.** `AbortIncompleteMultipartUpload` (1 day) on `<prefix>`, and an expiration of 1 day on `<prefix>probe/`. To remove unused instances, add an expiration of X days on `<prefix>s/` ([Expiration](#expiration)); without it, instances stay until `delete_instance()`. Never expire `<prefix>assets/`: all instances share these guest images. Delete an image there only when no instance uses it (`instance_admin`: `list_assets()`, `delete_asset(digest)`; `describe(id).guest` names the images of an instance whose `access` is `"full"`: keep every image while one is not). A save stores its images before its head: keep the images whose `LastModified` in the bucket is newer than your longest save.
 - **No versioning.** With versioning, deleted instances still use storage. If versioning was on, suspend it and add a lifecycle rule that deletes noncurrent versions.
 - **No archive storage class** (such as S3 Glacier Flexible Retrieval or Deep Archive): a load cannot read an archived object and fails with `ConfigError` (`INSTANCE_CONFIG`).
 - `s3_instance_prefix` and `s3_snapshot_prefix` must not overlap.
@@ -627,11 +670,11 @@ An instance moves to the newest key at its next save. To rotate the key on all w
 
 1. Add the new key at the end of `instance_keyring` on every worker (`OLD,NEW`).
 2. When every worker has it, move it to the front (`NEW,OLD`). If one worker puts it first too early, the others fail to load the instances it saves (`INSTANCE_KEY_MISSING`).
-3. Remove the old key when no instance uses it: for each id of `list_instances()`, `describe_instance(id).key_id` is not the old key's id. An instance that is never saved again keeps the old key. Each `Scheduler` logs its key ids at start (log "Instance store ready", field `key_ids`, newest first).
+3. Remove the old key when no instance uses it: for each id of `list_instances()`, `describe_instance(id).key_id` is not the old key's id. An instance that is never saved again keeps the old key. `sbx instance keys` (or `describe_worker().key_ids`) shows the id of each key of a keyring, newest first.
 
 ### Upgrades
 
-A saved instance loads only on the exec-sandbox release that saved it (`describe_instance(id).host.release`). On another release, `reuse()` fails with `RouteError` (`INSTANCE_HOST_MISMATCH`) before any download. Before you upgrade all workers, keep workers of the old release for the instances you need, or plan to make these instances again. Old L1 snapshots and VM images stay on disk ([Clean up](#clean-up)).
+A saved instance loads on other exec-sandbox releases and on the same or a newer QEMU: it keeps the QEMU machine type of its first boot (`describe_instance(id).host.machine_type`). On x86 that type (`microvm`) has no version: give x86 workers the QEMU version of the save. A release that changes the devices of the VM or their migration capabilities (`describe_instance(id).host.device_layout`) cannot load the instances of an earlier one: `RouteError` with an empty `required`, before any download. Data that a release cannot read (another release changed the stored format) gives `RouteError` (`INSTANCE_HOST_MISMATCH`) with an empty `required`: load it on a worker of another release. `describe_instance(id).writer_release` names the release of the last save. Old L1 snapshots and VM images stay on disk ([Clean up](#clean-up)).
 
 ### Storage layout and costs
 
@@ -689,7 +732,9 @@ A single source that fails before its code runs prints no JSON: the error goes t
 
 | Command | Use | Exit codes |
 |---------|-----|------------|
-| `sbx instance list\|describe\|rm` | [Use instances from the command line](#use-instances-from-the-command-line) | 0 on success; 2 for invalid settings, a bad id, or a `FIX_INPUT` or `FIX_CONFIG` error; 125 for the other errors; 130 after Ctrl+C |
+| `sbx instance list\|describe\|keys\|rm` | [Use instances from the command line](#use-instances-from-the-command-line) | 0 on success; 2 for invalid settings, a bad id, or a `FIX_INPUT` or `FIX_CONFIG` error; 125 for the other errors; 130 after Ctrl+C |
+| `sbx instance check` | [Use instances from the command line](#use-instances-from-the-command-line) | 0 when every instance passes; 1 when one fails; otherwise as `sbx instance list` |
+| `sbx worker describe` | [Use instances from the command line](#use-instances-from-the-command-line) | As `sbx instance list` |
 | `sbx prefetch` | [Offline hosts and Docker](#offline-hosts-and-docker) | 1 when a download fails |
 
 `sbx ARGS...` is `sbx run ARGS...`. `sbx -V` shows the version. `exec-sandbox` is the same command as `sbx`.
@@ -709,7 +754,10 @@ The docstring of each method (`help(Scheduler.new)`) lists its errors.
 | `describe_instance(instance_id)` | `InstanceInfo` of a saved instance ([List, describe and delete instances](#list-describe-and-delete-instances)) |
 | `list_instances()` | Async iterator of the instance ids in the store |
 | `delete_instance(instance_id)` | Delete a saved instance; `True` if it existed |
-| `config` | The `SchedulerConfig` |
+| `describe_worker()` | `WorkerFacts` of this worker: what a call that raised `RouteError` needs; `facts.satisfies(error.required)` says whether this worker can serve it |
+| `config` | The `SchedulerConfig` as given in code: a value set by an `EXEC_SANDBOX_*` variable only is not in it (the `Scheduler` uses it) |
+
+`instance_admin(config)` opens the instance store alone: `async with instance_admin(config) as admin:`, then `admin.describe(instance_id)`, `admin.list_ids()` and `admin.delete(instance_id)`, as the three `Scheduler` methods above ([List, describe and delete instances](#list-describe-and-delete-instances)).
 
 ### Session
 
@@ -771,9 +819,12 @@ Times in ms of the `new()` or `reuse()` call, measured on the host. After a cold
 | `generation` | int | 1 after the first save; +1 for each later save |
 | `recent_commits` | tuple[RecentCommit, ...] | The last saves (`generation`, `commit_id`), newest first, at most 16 |
 | `key_id` | str | Id of the keyring key that protects the instance |
-| `verified` | bool | True: this keyring opened and authenticated the head. False: this keyring does not have the key, and the other fields are not checked |
-| `spec` | VmSpec \| None | What the VM is made of (None unless `verified`) |
-| `host` | HostFacts \| None | The host that saved it: `arch`, `accelerator`, `cpu_vendor`, `cpu_model`, `qemu_version`, `base_image`, `packages_image`, `release` (None unless `verified`) |
+| `access` | `"full"`, `"other_release"` or `"no_key"` | `"full"`: this keyring opened the head and this release read it. `"other_release"`: the head opened, but another release wrote it and this release cannot read it. `"no_key"`: this keyring does not have the key, and the other fields are not checked |
+| `writer_release` | str \| None | The exec-sandbox release of the last save; None when `access` is `"no_key"`, or when the body names no release |
+| `spec` | VmSpec \| None | What the VM is made of (None unless `access` is `"full"`) |
+| `host` | HostFacts \| None | The host of the last save: `arch`, `accelerator`, `cpu_vendor`, `cpu_model`, `qemu_version`, `machine_type`, `release`, `device_layout` (one line for each part of the VM the guest sees: the board, the RAM, each drive and device; then the migration capabilities) (None unless `access` is `"full"`) |
+| `guest` | GuestFacts \| None | The SHA-256 digests of the files the guest booted on: `base_image`, `packages_image` (None without packages), `kernel`, `initramfs`; every save carries them (None unless `access` is `"full"`) |
+| `egress_domains` | tuple[str, ...] \| None | The domains the VM may reach with the network on, as its last save resolved them; each reuse applies them (empty: all; None unless `access` is `"full"`) |
 
 ## Limits
 
@@ -805,7 +856,7 @@ All images include `bash`; the GNU `coreutils`, `grep` (PCRE with `-P`), `findut
 
 - **Python.** Use `uv pip install`: there is no `pip` command. There is no gcc or musl-dev, so packages that need a source build do not install ([Packages](#packages)). `multiprocessing.Pool` works with no setup, also with functions, lambdas and closures defined in the REPL. With the default `cpu_cores=1`, CPU-bound work does not run faster: set `VmSpec(cpu_cores=N)` or use several sessions.
 - **JavaScript.** Bun is a Node.js-compatible runtime, not Node.js. `exec()` runs JavaScript and TypeScript with no build step, but not JSX: put JSX in a `.jsx` or `.tsx` file and run it with `bun run`. Use `bun install` for packages and `bun run` for scripts.
-- **Shell (raw).** The common tools only, for shell scripts and runtimes that you install yourself. `language="raw"` runs GNU Bash. Code that starts with `#!` runs as a script file in its own process: its variables and working folder do not stay for the next call.
+- **Shell (raw).** The common tools only, for shell scripts and runtimes that you install yourself. `Language.RAW` runs GNU Bash. Code that starts with `#!` runs as a script file in its own process: its variables and working folder do not stay for the next call.
 
 ### Memory and file systems
 
