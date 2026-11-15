@@ -20,7 +20,7 @@ import pytest
 from _pytest.runner import runtestprotocol
 
 from exec_sandbox import subprocess_utils
-from exec_sandbox._logging import LIBRARY_LOGGER_NAME
+from exec_sandbox._logging import LIBRARY_LOGGER_NAME, ExtrasFormatter
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.exceptions import ErrorCode, SandboxError, TransientError
@@ -54,6 +54,20 @@ logger = logging.getLogger(__name__)
 # cgroup, so a save can be OOM-killed. Before pytest makes its temp folder, a tmpfs
 # temp folder is replaced by one on disk: tempfile.tempdir for this process, TMPDIR
 # for the xdist workers and every child (QEMU among them).
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """The captured logs of a failed test (and caplog.text) show each record's extra fields:
+    the library logs its details there (the error, QEMU's console, the vm_id), which pytest's
+    plain log_format drops. Each xdist worker runs it: a worker formats its own reports."""
+    plugin = session.config.pluginmanager.get_plugin("logging-plugin")
+    if plugin is None:  # -p no:logging
+        return
+    formatter = ExtrasFormatter(
+        fmt=session.config.getini("log_format"), datefmt=session.config.getini("log_date_format")
+    )
+    for handler in (plugin.caplog_handler, plugin.report_handler):
+        handler.setFormatter(formatter)
 
 
 @pytest.hookimpl(tryfirst=True)
