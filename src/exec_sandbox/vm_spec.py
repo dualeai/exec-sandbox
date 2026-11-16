@@ -3,8 +3,9 @@
 One frozen object holds everything that shapes the guest: the L1 memory
 snapshot cache key holds the fields that change the guest state (the domain
 list and the port numbers stay on the host side, so they are not in it), and a
-saved instance stores it, so a load makes the same VM again. Values of one launch only (vm id, work paths, host ports
-picked at launch, timeouts) are not part of it.
+saved instance stores it, so a load makes the same VM again. Values of one
+launch only (vm id, work paths, host ports picked at launch, timeouts) are not
+part of it.
 """
 
 from __future__ import annotations

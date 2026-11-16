@@ -542,7 +542,7 @@ async def wait_for_socket(
 
     A connect before the file exists gets FileNotFoundError, one between the file's
     creation and the end of listen() ConnectionRefusedError (seen under load): the
-    probe retries both.
+    probe retries both, and ConnectionResetError too.
 
     Args:
         path: Path to the socket file.

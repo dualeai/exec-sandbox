@@ -1,7 +1,5 @@
-"""Port forwarding utilities for exposing guest VM ports to the host.
-
-This module provides port allocation and mapping resolution functions for
-exposing guest VM ports to the host.
+"""Port forwarding utilities for exposing guest VM ports to the host: host port allocation
+and mapping resolution.
 
 Architecture (gvproxy -port-forward forwards the ports in both modes):
 - Mode 1: expose_ports without allow_network -> gvproxy -block-outbound (no

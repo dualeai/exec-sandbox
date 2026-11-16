@@ -1,11 +1,11 @@
 """L1 memory snapshot cache manager.
 
-Captures full VM state (CPU + RAM + device state) after REPL warm-up and
-package import. On restore, the VM resumes at the exact instruction — ~50-60 ms
+Captures full VM state (CPU + RAM + device state) after the REPL warm-up (a new
+REPL runs a no-op). On restore, the VM resumes at the exact instruction — ~50-60 ms
 regardless of packages.
 
 Cache structure (the names next to the vmstate: memory_snapshot_files):
-    {cache_dir}/{key}.vmstate       # QEMU migration stream: device state only (x-ignore-shared, ~100 KB-1 MB); the RAM is {key}.ram
+    {cache_dir}/{key}.vmstate       # QEMU migration stream: device state and small RAM blocks (x-ignore-shared; data: ~3 MB aarch64, ~50 KB x86_64); the RAM is {key}.ram
     {cache_dir}/{key}.vmstate.meta  # JSON metadata sidecar
     {cache_dir}/{key}.vmstate.lock  # flock for cross-process deduplication of saves
     {cache_dir}/{key}.vmstate.use.lock  # record lock (fcntl) each restored VM holds shared (no eviction)
@@ -107,7 +107,7 @@ def _vmstate_digest(path: Path) -> str:
     """SHA-256 hex digest of the file's size, then of each non-zero 64 KiB block
     with its offset (the size fixes each block's length).
 
-    A mapped-ram vmstate is sparse (a 140 MB file can hold 3 MB of data): holes
+    A mapped-ram vmstate is sparse (an aarch64 file of 140 MB holds 3 MB of data): holes
     are skipped (SEEK_DATA), not read. A hole and a zero block hash alike, so a
     copy that changes the hole layout keeps the digest. Without SEEK_DATA every
     block is read. Sync: callers use asyncio.to_thread.
@@ -268,10 +268,12 @@ class MemorySnapshotManager(BaseCacheManager):
         """Compute L1 cache key. Includes ALL parameters that affect VM state.
 
         memory_mb IS in L1 key (unlike L2) because the migration stream
-        encodes physical address layout. qemu_version and accel_type are included
-        because different QEMU versions produce incompatible migration streams and
-        different accelerators (KVM/HVF/TCG) have different CPU state; the -cpu value
-        too (a restore onto other CPU features fails).
+        encodes physical address layout. qemu_version and the machine facts
+        (worker_facts.machine_facts: arch, accelerator, -cpu value, the host CPU's identity on
+        ARM64 with KVM or HVF) are included because different QEMU versions produce
+        incompatible migration streams, different accelerators (KVM/HVF/TCG) have different
+        CPU state, and a restore onto other CPU features fails. counter_hz too: the guest
+        calibrated its clock at the template's boot.
         The network device (network access or exposed ports) is included because
         it changes device topology (-nic none vs -device virtio-net).
         `l2_path` is the L2 layer the VM boots with (None without packages).
@@ -279,11 +281,14 @@ class MemorySnapshotManager(BaseCacheManager):
         Raises:
             ConfigError: ASSET_NOT_FOUND: the base image of `spec` is missing; HOST_DEPENDENCY:
                 this host cannot run the QEMU binary, or its version or accelerators cannot be
-                read (the QEMU probes), or ARM64 TCG with a QEMU below 9.0.4 (restore_layout)
-            TransientError: LOCAL_DISK: an image of the key cannot be read (images.key_part);
-                QEMU_CRASHED: a QEMU probe hit a process, memory or file-handle limit, the
-                binary was being written, a signal ended it, or it gave no answer in time; or
-                the QEMU binary came or went during the build (VmManager.restore_layout)
+                read (the QEMU probes), or the host CPU's identity cannot be read (ARM64 with KVM
+                or HVF: qemu_cmd.guest_cpu_id), or ARM64 TCG with a QEMU below 9.0.4
+                (restore_layout)
+            TransientError: LOCAL_DISK: an image of the key cannot be read (images.key_part), or
+                the read of the host CPU's identity hit a host limit; QEMU_CRASHED: a QEMU probe
+                hit a process, memory or file-handle limit, the binary was being written, a
+                signal ended it, or it gave no answer in time; or the QEMU binary came or went
+                during the build (VmManager.restore_layout)
         """
         version_parts = __version__.split(".")
         version = f"{version_parts[0]}.{version_parts[1]}"
@@ -436,8 +441,10 @@ class MemorySnapshotManager(BaseCacheManager):
             if vm.use_qemu_vm_user:
                 await _grant_entry_files([tmp_path], perms="rw", key=key)
 
-            # VM Templating: with x-ignore-shared, migration saves only device
-            # state (~340KB). RAM stays in the memory-backend-file (share=on).
+            # VM Templating: with x-ignore-shared, migration saves device state and
+            # the RAM blocks outside the memory-backend-file (~3 MB of data on aarch64:
+            # flash and ACPI tables; ~50 KB on x86_64). The guest RAM stays in the
+            # memory-backend-file (share=on).
             async with MigrationClient(vm.qmp_socket, expected_uid) as client:
                 await client.save_snapshot(
                     tmp_path,
@@ -557,12 +564,12 @@ class MemorySnapshotManager(BaseCacheManager):
         returns: the VM, if any, holds its own share.
 
         None on a miss (a broken entry) or on any failed restore: the caller cold boots
-        with the same reservation. An entry QEMU refused (incompatible or corrupt:
-        MIGRATION_REJECTED or MIGRATION_UNSUPPORTED in the cause chain), or whose guest
-        never answered after its state loaded or could not reseed its kernel random source
-        (GUEST_SILENT_AFTER_RESTORE), is removed with all its files, as an eviction removes
-        one (BaseCacheManager._remove_broken: not while another lease holds it); otherwise
-        every later restore of it fails again. A host problem (no access to a file or a
+        with the same reservation. An entry that this worker cannot run (migration_client.
+        refusal_cause: QEMU refused it or died while it loaded it, or its guest panicked right
+        after), or whose guest never answered after its state loaded or could not reseed its
+        kernel random source (GUEST_SILENT_AFTER_RESTORE), is removed with all its files, as
+        an eviction removes one (BaseCacheManager._remove_broken: not while another lease
+        holds it); otherwise every later restore of it fails again. A host problem (no access to a file or a
         socket) keeps the entry. A guest that could not reseed also stops the L1 saves of
         the key in this process (schedule_background_save).
 

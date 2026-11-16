@@ -467,7 +467,8 @@ class InstanceManager(InstanceAdmin):
         InstanceGoneError INSTANCE_NOT_FOUND (deleted meanwhile): the VM runs on, and the
         caller's session stays open on those. TransientError LOCAL_DISK: local disk full or files gone;
         nothing was saved. ConfigError IMAGE_DAMAGED: a guest image does not match its
-        digest; nothing was saved. ConfigError HOST_DEPENDENCY: QEMU does not list the
+        digest, or its digest is unknown (the file was missing at the VM's start); nothing
+        was saved. ConfigError HOST_DEPENDENCY: QEMU does not list the
         VM's machine type, or qemu-vm cannot get write access to the migration file;
         ConfigError MIGRATION_UNSUPPORTED or TransientError MIGRATION_FAILED: the migration failed
         (MigrationClient.save_snapshot); InvalidInputError SCHEDULER_STATE: stop() began;
@@ -838,7 +839,8 @@ class InstanceManager(InstanceAdmin):
         INSTANCE_INTEGRITY or RouteError INSTANCE_HOST_MISMATCH (another release) when it
         does not open, and the store's errors; RouteError INSTANCE_HOST_MISMATCH when the
         host facts differ (arch, accelerator, guest CPU model, host CPU identity, the guest's
-        counter rate by its rule, the machine type this QEMU has), when this release runs another device layout for the VM, or
+        counter rate by its rule, the machine type this QEMU has), when this release runs
+        another device layout for the VM, or
         when a guest image is neither on this worker nor in the store (or the store's copy
         does not match its digest); RouteError CAPACITY_NEVER_FITS when the VM is larger
         than this worker's whole budget; ConfigError HOST_DEPENDENCY or TransientError
@@ -960,12 +962,12 @@ class InstanceManager(InstanceAdmin):
 
     async def refused_by_qemu(self, state: InstanceState, *, qemu_error: str) -> SandboxError:
         """The error of a loaded state that cannot run on this worker (migration_client.refusal_cause:
-        QEMU refused it or aborted on it, or its guest panicked right after it). QEMU loads a state that
-        the same or an older QEMU saved: on an older QEMU, ROUTE to a worker with the saver's
-        facts, the budget the VM needs, its guest images and a QEMU of the saved version or newer (qemu_version,
-        rule AT_LEAST); on the
-        same or a newer QEMU, InternalError (REPORT): QEMU broke that rule, or the device
-        model of this release differs. `qemu_error`: QEMU's reason, in the message."""
+        QEMU refused it or aborted on it, or its guest panicked right after it). QEMU loads a
+        state that the same or an older QEMU saved: on an older QEMU, ROUTE to a worker with
+        the saver's facts, the budget the VM needs, its guest images and a QEMU of the saved
+        version or newer (qemu_version, rule AT_LEAST); on the same or a newer QEMU,
+        InternalError (REPORT): QEMU broke that rule, or the device model of this release
+        differs. `qemu_error`: QEMU's reason, in the message."""
         host = state.body.host
         local_qemu = await qemu_version_fact()
         if RouteKey.QEMU_VERSION.holds(local_qemu, host.qemu_version):
@@ -1226,10 +1228,11 @@ class InstanceManager(InstanceAdmin):
         }
 
     def _guest_facts(self, vm: QemuVM) -> GuestFacts:
-        """The files the saved guest booted on: the digests of its images, taken when QEMU
-        opened them (after reuse() these may differ from this worker's own images; a file
-        evicted or rebuilt at the same path since does not change them), and of its kernel
-        and initramfs (a reused VM keeps those of its first boot).
+        """What the saved guest got at its cold boot: the digests of its images, taken when
+        QEMU opened them (after reuse() these may differ from this worker's own images; a file
+        evicted or rebuilt at the same path since does not change them), of its kernel and
+        initramfs, and the rate of its clock's counter (a reused VM keeps those of its first
+        boot).
 
         Raises:
             ConfigError: IMAGE_DAMAGED: a digest is unknown (the file was missing at the VM's

@@ -147,8 +147,8 @@ async def start_gvproxy(  # noqa: PLR0915
     connections are blocked at the gvproxy level. This provides true
     network isolation while still allowing host-to-guest port forwarding.
 
-    Outbound Filtering (Mode 2)
-    ===========================
+    Outbound Filtering (Modes 2 and 3)
+    ==================================
     OutboundAllow patterns are set for a non-empty allowed_domains (the caller resolves
     a spec's None to the language's package registries: dns_filter.resolved_domains).
     Both DNS resolution and TLS connections are filtered — only domains matching at
@@ -266,7 +266,7 @@ async def start_gvproxy(  # noqa: PLR0915
             str(constants.GUEST_MTU),
         ]
 
-        # Add OutboundAllow patterns for outbound filtering (Mode 2)
+        # Add OutboundAllow patterns for outbound filtering (Modes 2 and 3)
         # Only pass when there are patterns (non-empty JSON array)
         if outbound_allow_json != "[]":
             gvproxy_args.extend(["-outbound-allow", outbound_allow_json])

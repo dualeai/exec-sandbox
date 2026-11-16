@@ -66,10 +66,11 @@ class ErrorAction(StrEnum):
 
     ROUTE = "ROUTE"
     """Repeat the call on another worker: this one has another CPU architecture, guest CPU
-    model, host CPU (ARM with KVM or HVF), guest clock rate or accelerator, lacks the saved machine type or a guest image the instance needs
-    (and the store has no copy), runs a QEMU older than the one that saved the state, cannot
-    read data that another exec-sandbox release wrote, or has a smaller budget than the VM
-    needs (see the error's `required` field)."""
+    model, host CPU (ARM with KVM or HVF), guest clock rate or accelerator, lacks the saved
+    machine type or a guest image the instance needs (and the store has no copy), runs a QEMU
+    older than the one that saved the state, cannot read data that another exec-sandbox
+    release wrote, or has a smaller budget than the VM needs (see the error's `required`
+    field)."""
 
     RECREATE = "RECREATE"
     """The instance can no longer be used (deleted, expired, or its stored data is damaged): create a new one."""
@@ -474,8 +475,9 @@ class RouteError(SandboxError):
     keys (a load checks the host, then the budget, then the guest images, and QEMU
     decides at the restore). An empty `required` (data or devices this release cannot read:
     another release wrote it) names no worker, and no worker satisfies it
-    (WorkerFacts.satisfies): a worker of another release (describe_instance writer_release). Never delete a saved instance for
-    this error.
+    (WorkerFacts.satisfies): a worker of another release (describe_instance writer_release, or
+    context["writer_release"] when the data names its release)
+    can. Never delete a saved instance for this error.
     """
 
     action = ErrorAction.ROUTE
@@ -604,8 +606,9 @@ def host_mismatch(
 ) -> RouteError:
     """The RouteError of a worker that cannot run the instance. `required` is the whole
     target, `found` this worker's values for its keys; the message names the keys whose
-    value does not hold by its rule (RouteKey.holds), values in JSON form (a cpu_model holds commas). `reason`: why, when the
-    values alone do not say it (an image missing from the store too)."""
+    value does not hold by its rule (RouteKey.holds), values in JSON form (a cpu_model holds
+    commas), or every key when each one holds. `reason`: why, when the values alone do not
+    say it (an image missing from the store too)."""
     differ = [key for key in required if not key.holds(found.get(key), required[key])] or list(required)
     wanted = ", ".join(f"{key}={json.dumps(required[key])}" for key in differ)
     local = ", ".join(f"{key}={json.dumps(found.get(key))}" for key in differ)

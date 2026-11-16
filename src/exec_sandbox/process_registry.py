@@ -4,7 +4,8 @@ Enables force-kill of all child processes on second Ctrl+C.
 subprocess_utils.start_managed_process registers each child it starts (QEMU, gvproxy,
 qemu-storage-daemon, qemu-img); their cleanup unregisters them; the CLI kills the rest.
 
-Thread-safe: Uses a simple set with GIL protection (adequate for signal handlers).
+Thread-safe: each set operation is atomic in CPython (the GIL, or the set's own lock in a
+free-threaded build), and force_kill_all iterates a copy: enough for the SIGINT handler.
 """
 
 import os

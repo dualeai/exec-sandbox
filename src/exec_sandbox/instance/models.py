@@ -138,8 +138,9 @@ class HostFacts(BaseModel):
 
 
 class GuestFacts(BaseModel):
-    """The files the guest booted on, set at its cold boot: every save carries them
-    unchanged (a reused VM runs the RAM of that boot, on the same disks). The images are
+    """What the guest got at its cold boot, the files it booted on and the rate of its
+    clock's counter: every save carries them unchanged (a reused VM runs the RAM of that
+    boot, on the same disks). The images are
     matched by digest at a load (a worker without them downloads them from the store); the
     kernel and initramfs only name what runs (a load boots nothing), for a cleanup or a
     vulnerability audit by digest."""

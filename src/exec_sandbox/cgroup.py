@@ -80,10 +80,12 @@ CGROUP_APP_NAMESPACE: Final[str] = "code-exec"
 CGROUP_PIDS_LIMIT: Final[int] = 256
 """Maximum PIDs in cgroup (fork bomb prevention).
 
-256 provides ample headroom for QEMU + gvproxy threads in both aio=io_uring
-(~38 peak) and aio=threads (~102 peak) modes, while still preventing fork
-bombs (thousands of processes).  Guest code runs inside the VM and does NOT
-count toward this host cgroup limit.
+256 leaves wide headroom over what one VM uses, and still stops a fork bomb (thousands of
+processes). Measured on x86 KVM (QEMU 11.1.3, 2026-11-16), pids.peak of one VM cgroup under
+disk and network I/O, 1 and 2 vCPUs: 17-19 tasks with aio=io_uring and 13-16 with
+aio=threads without the network; 31-32 and 26-29 with it (gvproxy joins the cgroup). The
+QEMU thread pools are capped at 8 (thread-pool-max in qemu_cmd). Guest code runs inside the
+VM and does NOT count toward this host cgroup limit.
 
 Note: pids.max limits both processes AND threads (including goroutines)."""
 

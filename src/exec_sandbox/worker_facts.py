@@ -24,7 +24,7 @@ async def machine_facts(*, force_emulation: bool) -> dict[RouteKey, str | None]:
     """This host's EQUAL facts, which a save records as its host's (HostFacts): arch,
     accelerator, guest CPU model and CPU identity (None where the guest CPU is a fixed
     model). Every probe is cached for the process, so a call after the first costs no
-    subprocess."""
+    subprocess. Raises as detect_accel_type and guest_cpu_id."""
     arch = detect_host_arch()
     accel = await detect_accel_type(force_emulation=force_emulation)
     return {
@@ -38,7 +38,8 @@ async def machine_facts(*, force_emulation: bool) -> dict[RouteKey, str | None]:
 async def counter_fact(*, force_emulation: bool) -> str | None:
     """This worker's counter_hz: "any" (ROUTE_ANY) with x86 KVM TSC scaling, else the rate a
     guest that boots here gets; None: no exact rate here (qemu_cmd.counter_rate). Not a
-    machine fact: a save keeps the rate of the guest's boot (GuestFacts), not its own."""
+    machine fact: a save keeps the rate of the guest's boot (GuestFacts), not its own. Raises
+    as detect_accel_type and counter_rate."""
     rate = await counter_rate(detect_host_arch(), await detect_accel_type(force_emulation=force_emulation))
     if rate.any_rate:
         return ROUTE_ANY
@@ -80,7 +81,8 @@ class WorkerFacts(BaseModel):
         from JSON). A key these facts do not list, or that this release does not know (a
         newer release added it), is not satisfied. An empty `required` names no worker
         (another release wrote the instance): False, so a broker never sends the call back to
-        a worker like this one; describe_instance(id).writer_release names the release."""
+        a worker like this one; describe_instance(id).writer_release names the release, or the
+        error's context["writer_release"] when the data names it and describe raises too."""
         if not required:
             return False
         for name, need in required.items():

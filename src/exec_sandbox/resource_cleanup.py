@@ -1,8 +1,8 @@
 """Resource cleanup utilities for VM lifecycle management.
 
 Defensive cleanup operations that log errors but don't fail.
-Used by VmManager, DiskSnapshotManager (L2 builds), qemu-storage-daemon, gvproxy and
-subprocess_utils to end their child processes.
+Used by VmManager (QEMU, gvproxy), DiskSnapshotManager (L2 builds), QemuStorageDaemon and
+subprocess_utils (communicate_managed_process) to end their child processes.
 """
 
 from exec_sandbox._logging import get_logger

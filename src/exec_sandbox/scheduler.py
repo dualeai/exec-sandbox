@@ -341,7 +341,8 @@ class Scheduler:
         Shutdown sequence:
         1. Stop WarmVMPool (drains and destroys pre-booted VMs, frees resource slots)
         2. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
-        3. Stop DiskSnapshotManager (awaits in-flight L3 uploads)
+        3. Stop DiskSnapshotManager (awaits in-flight L3 uploads up to
+           L3_UPLOAD_STOP_GRACE_SECONDS, then cancels the ones left)
         4. Wait for instance saves in flight (InstanceManager.stop: new ones are refused)
         5. Stop VmManager: refuses new launches, waits for those in flight (new() and
            reuse() calls), then destroys the remaining VMs (sessions not closed) and
@@ -433,7 +434,8 @@ class Scheduler:
             idle_timeout_seconds: Close after this long without a call, 10 to 3600 seconds
                 (the range of SchedulerConfig.session_idle_timeout_seconds). None: that config value.
             on_boot_log: Callback for the boot console output (kernel, init, guest agent).
-                When given, it turns on verbose boot logging (and skips the warm pool and L1).
+                When given, it turns on verbose boot logging (and skips the warm pool and the L1
+                restore).
             instance_id: Id the session's first save() gives the new instance, unless that save
                 names another id (save(instance_id=...)) (1 to 64
                 lowercase letters, digits, ".", "_" or "-", starting with a letter or
@@ -721,14 +723,19 @@ class Scheduler:
 
     async def describe_worker(self) -> WorkerFacts:
         """This worker's facts, one value per RouteKey in the value forms of RouteError.required
-        (host facts, QEMU version and machine types, the guest images it holds, its whole
-        admission budget), and its instance key ids. A broker reads them once per worker, and
-        again after a change of QEMU, guest images or budget, and sends a call that raised
-        RouteError to a worker whose facts satisfy the error's `required`
-        (WorkerFacts.satisfies). The library places nothing. No VM starts; the probes are
-        the cached ones of the start (run again after a change of the QEMU binary).
+        (host facts, the clock counter rate of its guests, QEMU version and machine types, the
+        guest images it holds, its whole admission budget), and its instance key ids. A broker
+        reads them once per worker, and again after a change of QEMU, guest images or budget,
+        and sends a call that raised RouteError to a worker whose facts satisfy the error's
+        `required` (WorkerFacts.satisfies). The library places nothing. No VM starts; the
+        probes are the cached ones of the start (run again after a change of the QEMU binary).
 
-        Raises InvalidInputError (SCHEDULER_STATE: not started).
+        Raises:
+            InvalidInputError: SCHEDULER_STATE: not started
+            ConfigError: HOST_DEPENDENCY, or TransientError: QEMU_CRASHED: a QEMU probe that
+                runs again after a change of the QEMU binary fails (detect_accel_type,
+                require_qemu_version, require_qemu_machine_types, and on x86 KVM
+                require_guest_cpu through counter_rate)
         """
         if not self._started or self._vm_manager is None:
             raise _scheduler_state(_NOT_STARTED)
@@ -828,7 +835,8 @@ class Scheduler:
             on_boot_log: Optional callback for streaming boot console output.
 
         Returns:
-            Tuple of (vm, is_cold_boot, admission_ms); the VM holds its forwarded ports
+            Tuple of (vm, is_cold_boot, admission_ms); is_cold_boot is False only for a warm
+            pool VM (an L1 restore is True). The VM holds its forwarded ports
             (QemuVM.exposed_ports).
 
         Raises:

@@ -70,7 +70,7 @@ def new_host_entropy() -> str:
 
 def request_line(request: GuestAgentRequest) -> bytes:
     """`request` as the guest agent reads it: its JSON with no null field, then a newline (every
-    host send site: GuestChannel, QemuVM's file transfers)."""
+    host send site: DualPortChannel, QemuVM's file transfers)."""
     return request.model_dump_json(by_alias=False, exclude_none=True).encode() + b"\n"
 
 

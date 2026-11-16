@@ -91,8 +91,9 @@ class Session:
     until close(). To keep the state after close(), call save() first.
 
     The calls of one session (exec, the file calls, save) run one at a time, in the order
-    they reach the session (write_file first opens a local Path source). One exception: the calls made after a save() run once its VM runs again, while
-    the save stores the state (save() still returns only once the store committed it).
+    they reach the session (write_file first opens a local Path source). One exception: the
+    calls made after a save() run once its VM runs again, while the save stores the state
+    (save() still returns only once the store committed it).
     """
 
     def __init__(
@@ -234,10 +235,10 @@ class Session:
                 raise _session_closed("Session closed while waiting for lock")
             if self._vm.state in (VmState.DESTROYING, VmState.DESTROYED) or self._vm.process.returncode is not None:
                 # QEMU died while the session was idle: the process-exit
-                # watcher (armed lazily on first execute) publishes DESTROYING;
-                # before that first execute, death is visible only via
-                # returncode. Fail fast instead of letting every operation
-                # time out one transient error at a time.
+                # watcher (armed by a cold boot's guest wait, else by the first
+                # execute) publishes DESTROYING; a restored VM before its first
+                # execute shows its death only through returncode. Fail fast instead
+                # of letting every operation time out one transient error at a time.
                 await self._close_for_failure()
                 raise _session_closed("Session VM was retired")
             self._busy += 1
@@ -419,7 +420,8 @@ class Session:
                 )
             except InvalidInputError:
                 # Caller bugs (bad input, output above the guest limit), not VM
-                # failures: the REPL is preserved and the session stays alive.
+                # failures: the session stays alive (a REPL that exited after its output went
+                # past the limit is replaced at the next exec).
                 raise
             except Exception:
                 # VM failure — auto-close session. CancelledError is handled by

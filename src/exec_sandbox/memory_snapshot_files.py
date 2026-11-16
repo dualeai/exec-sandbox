@@ -2,7 +2,8 @@
 metadata sidecar, and the RAM folders in memory (/dev/shm) of template save VMs.
 
 VmManager (restore_vm, the sweep of start) and MemorySnapshotManager (the L1 cache)
-both use it; it imports neither.
+both use it, and InstanceManager names a saved instance's home disk with it; it imports
+none of them.
 """
 
 from __future__ import annotations

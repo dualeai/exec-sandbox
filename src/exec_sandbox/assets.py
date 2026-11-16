@@ -269,8 +269,8 @@ async def ensure_assets_available() -> tuple[Path, Path]:
         Tuple of (images_dir: the download cache, gvproxy_path)
 
     Raises:
-        ConfigError: ASSET_NOT_FOUND: release not found on GitHub, or offline mode
-            and assets missing. SETTING_INVALID: the download cache (under
+        ConfigError: ASSET_NOT_FOUND: release not found on GitHub, a file the release lacks,
+            or offline mode and assets missing. SETTING_INVALID: the download cache (under
             EXEC_SANDBOX_CACHE_DIR) cannot be made or written.
         TransientError: ASSET_DOWNLOAD: the release metadata could not be read, or a
             download or hash verification failed after retries. LOCAL_DISK: a host error
@@ -308,7 +308,8 @@ async def ensure_assets(*, override: Path | None, download: bool) -> Path:
         Path to images directory.
 
     Raises:
-        ConfigError: ASSET_NOT_FOUND: assets not found and download=False, or release not found on GitHub.
+        ConfigError: ASSET_NOT_FOUND: assets not found and download=False; with download, release
+            not found on GitHub, a file the release lacks, or offline mode.
             SETTING_INVALID: the download cache (under EXEC_SANDBOX_CACHE_DIR) cannot be made or written.
         TransientError: ASSET_DOWNLOAD: the release metadata could not be read, or a download or
             hash verification failed after retries. LOCAL_DISK: a host error on the download cache

@@ -57,10 +57,10 @@ def detect_host_os() -> HostOS:
         >>> os_type = detect_host_os()
         >>> match os_type:
         ...     case HostOS.LINUX:
-        ...         # Use KVM, ioeventfd, seccomp sandbox
+        ...         # Use KVM and QEMU's seccomp sandbox
         ...         pass
         ...     case HostOS.MACOS:
-        ...         # Use HVF (no ioeventfd, no seccomp)
+        ...         # Use HVF (no seccomp)
         ...         pass
         ...     case HostOS.UNKNOWN:
         ...         raise RuntimeError("Unsupported OS")

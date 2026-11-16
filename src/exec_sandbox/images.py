@@ -131,7 +131,7 @@ class GuestImages:
 
     def present_base_images(self) -> list[Path]:
         """The base image of each language that is on disk, as base_image finds it (VmManager.start
-        makes the overlay template of each)."""
+        makes the overlay template of each; Scheduler.describe_worker lists their digests)."""
         images = (self._base_image_or_none(image.file_name(self.arch)) for image in BASE_IMAGES.values())
         return [image for image in images if image is not None]
 

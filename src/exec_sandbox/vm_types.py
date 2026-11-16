@@ -1,4 +1,5 @@
-"""VM type definitions: states, acceleration types, and transition rules."""
+"""VM type definitions: states, acceleration types, transition rules, and what a guest got at
+its boot."""
 
 from dataclasses import dataclass
 from enum import Enum

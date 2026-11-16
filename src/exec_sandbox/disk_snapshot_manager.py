@@ -289,8 +289,9 @@ class DiskSnapshotManager(BaseCacheManager):
         # Max 1 concurrent snapshot creation (heavy operations: VM boot + package install)
         self._creation_semaphore = asyncio.Semaphore(1)
 
-        # Limit concurrent S3 uploads to prevent network saturation and memory exhaustion
-        # S3 PutObject is atomic - aborted uploads leave no partial blobs
+        # Limit concurrent S3 uploads to prevent network saturation and memory exhaustion.
+        # S3 writes an object whole (a PUT, or the completion of a multipart upload, which
+        # upload_object aborts on a failure or a cancel): an interrupted upload leaves no object
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_s3_uploads)
         self._stopping = False
         """stop() began: no upload starts."""
@@ -329,8 +330,8 @@ class DiskSnapshotManager(BaseCacheManager):
         language: Language,
         packages: list[str],
     ) -> EntryLease | None:
-        """Check L2 cache without creating snapshot (Scheduler.reuse: a saved instance's
-        L2 layer, used when its digest matches).
+        """Check L2 cache without creating snapshot (Scheduler.reuse and check_reuse: a saved
+        instance's L2 layer, used when its digest matches).
 
         Args:
             language: Programming language

@@ -161,7 +161,7 @@ def _check_absent(mine: HeadHeader, base: Base, *, repaired: bool, maybe_applied
     )
 
 
-# Hint parts of the store errors of a save (here and InstanceManager._save)
+# Hint parts of the conflict, gone and unknown-outcome errors of a save (here and manager.py)
 LANDED_FIRST = (
     "If an earlier save of this session had an unknown outcome, look for its commit id in "
     "describe_instance(id).recent_commits first: it may be the save that is stored. "

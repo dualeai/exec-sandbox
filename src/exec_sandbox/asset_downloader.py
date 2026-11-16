@@ -138,7 +138,8 @@ async def _retrieve_into(url: str, known_hash: str, *, path: Path, decompress: b
 
 
 async def _verify_hash(path: Path, expected_hash: str) -> bool:
-    """Verify file hash matches expected value."""
+    """Whether the file's digest is `expected_hash` ("algorithm:digest"). An empty
+    `expected_hash` (a release asset with no digest) always matches."""
     if not expected_hash:
         return True
 

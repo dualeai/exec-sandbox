@@ -327,6 +327,7 @@ async def guest_cpu_id(arch: HostArch, accel_type: AccelType) -> str | None:
     Raises:
         ConfigError: HOST_DEPENDENCY: ARM64 KVM or HVF, and the identity could not be read
             (a save without it would load on any CPU)
+        TransientError: LOCAL_DISK: as probe_host_cpu_id (ARM64 KVM or HVF)
     """
     if arch != HostArch.AARCH64 or accel_type not in (AccelType.KVM, AccelType.HVF):
         return None
@@ -366,7 +367,8 @@ async def counter_rate(arch: HostArch, accel_type: AccelType) -> CounterRate:
 
     Raises:
         ConfigError, TransientError: as require_guest_cpu (x86 KVM)
-        TransientError: LOCAL_DISK: as probe_host_counter_hz and probe_kvm_tsc_scaling (x86 KVM)
+        TransientError: LOCAL_DISK: as probe_host_counter_hz (all but ARM64 TCG) and
+            probe_kvm_tsc_scaling (x86 KVM)
     """
     if arch == HostArch.AARCH64 and accel_type == AccelType.TCG:
         return CounterRate(hz=constants.ARM_TCG_COUNTER_HZ, any_rate=False)
@@ -520,7 +522,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     tsc_available = False  # x86 only: set below from the TSC_DEADLINE probe
     if arch == HostArch.AARCH64:
         # highmem=off: Keep all RAM below 4GB for simpler memory mapping (faster boot)
-        # gic-version=3: Explicit GIC version for TCG (ITS not modeled in TCG)
+        # gic-version=3: an explicit GIC version (GICv3), the same under every accelerator
         # virtualization=off: Disable nested virt emulation (not needed, faster TCG)
         # its=off: Disable GICv3 ITS (Interrupt Translation Service) — we use virtio-mmio
         #   (not PCI), so MSI-X translation is unused; skips kernel ITS init (1-3ms)
@@ -1231,7 +1233,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     #
     # NOTE (non-adoption): -run-with chroot=/user= are not used. Both require a
     # privileged launcher (QEMU starts root, then drops), which conflicts with our
-    # unprivileged model — sudo -u qemu-vm + fd-passing (socket-activated QMP).
+    # unprivileged model: QEMU as this user with inherited sockets, or as qemu-vm through sudo
+    # (sudo closes inherited fds: QEMU makes its sockets).
     # unshare --mount (Linux, when probe_unshare_support passes) gives QEMU a private copy of
     # the host mounts; it does not limit which files QEMU can open: file access follows the
     # uid QEMU runs as (see the TODO (security) below).

@@ -217,8 +217,9 @@ def _start_work(key: _LockKey, work: Literal["lease", "evict", "check"]) -> _Use
 
 def _open_use_lock(lock_path: Path) -> IO[bytes] | None:
     """A file on the use lock `lock_path`, or None when no lock can be held: the lock file
-    cannot be made (a read-only disk or folder) and does not exist. Read and write when it
-    can (an exclusive lock needs write), else read (a shared lock needs read only)."""
+    cannot be made (a read-only disk or folder) and does not exist, or this user cannot
+    read it. Read and write when it can (an exclusive lock needs write), else read (a shared
+    lock needs read only)."""
     try:
         return _open_lock_file(lock_path)
     except OSError as e:
@@ -418,8 +419,9 @@ class CacheEntry:
     @contextmanager
     def _try_unused(self) -> Generator[None]:
         """The use lock exclusive, without wait (try_evicting's first lock): BlockingIOError
-        while a lease of the entry is open, in this process or another, or another eviction
-        or check holds it."""
+        while a lease of the entry is open or an eviction holds it, in this process or
+        another, or another thread of this process works on the lock (a lease, a close, a
+        check)."""
         lock_path = _use_lock_path(self.path)
         key = _lock_key(lock_path)
         with _use_guard:

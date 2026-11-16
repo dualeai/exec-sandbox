@@ -22,7 +22,8 @@ class VmTiming:
             gvproxy start, QEMU spawn, kernel and guest agent init); 0 for a restore
 
     Granular setup timing:
-        overlay_ms: Time to acquire overlay from pool or create new
+        overlay_ms: Time to create the overlay (QemuStorageDaemon.create_overlay: a clone
+            of the base image's template)
 
     Granular boot timing:
         qemu_cmd_build_ms: Time to build QEMU command line

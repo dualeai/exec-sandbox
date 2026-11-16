@@ -60,6 +60,10 @@ async def file_hash(path: Path, algorithm: str) -> str:
 
     Returns:
         Hex digest string
+
+    Raises:
+        OSError: the file cannot be read (missing, no access, an I/O error)
+        ValueError: hashlib has no such algorithm
     """
     return await asyncio.to_thread(_file_digest, path, algorithm)
 

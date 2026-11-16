@@ -41,6 +41,8 @@ class VmWorkingDirectory:
 
     Attributes:
         vm_id: VM identifier for logging
+        use_qemu_vm_user: QEMU runs as qemu-vm (set by VmManager): build_qemu_cmd starts it
+            through sudo, and cleanup() removes its files with sudo
         path: Root directory path (created by mkdtemp with mode 0700). When QEMU
             runs as qemu-vm, it gets group qemu-vm and mode 2770
             (VmManager._apply_overlay_permissions): other users get no access.
@@ -75,7 +77,7 @@ class VmWorkingDirectory:
         """
         self.vm_id = vm_id
         self._path = path
-        # Files owned by qemu-vm (set by VmManager): cleanup needs sudo
+        # QEMU runs as qemu-vm (set by VmManager): it owns the files, so cleanup needs sudo
         self.use_qemu_vm_user = False
         self._cleaned_up = False
         self._cleanup_task: asyncio.Task[bool] | None = None

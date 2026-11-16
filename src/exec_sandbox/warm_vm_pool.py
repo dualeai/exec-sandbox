@@ -416,8 +416,8 @@ class WarmVMPool:
         # enqueue after a successful stop.
         await self._stop_initial_boots()
 
-        # Stop health check with timeout to prevent indefinite wait
-        # Timeout must be > health check interval (15s) to allow current iteration to complete
+        # The shutdown event ends the wait between passes at once; a pass in progress ends
+        # first, at most WARM_POOL_HEALTH_CHECK_INTERVAL + 2 s, then it is cancelled
         await self._stop_health_check()
 
         # Close replenish ingress before draining. Otherwise a boot can enqueue
@@ -689,8 +689,8 @@ class WarmVMPool:
         when none runs, then runs a no-op on it).
 
         A failed warm-up (RuntimeError, or the error of send_request) makes this VM
-        ineligible for pooling (and index 0 then schedules no L1 save). The caller
-        (_boot_and_add_vm or _replenish_pool) destroys it.
+        ineligible for pooling (and index 0 then schedules no L1 save):
+        _boot_and_enqueue destroys it.
         """
         response = await vm.channel.send_request(
             WarmReplRequest(language=language),
