@@ -313,16 +313,16 @@ class DensityResult:
 # ============================================================================
 
 
-async def _median_sample(n: int = 5, interval: float = 0.5) -> HostMemorySample:
-    """Take n samples and return the one with median used_mb.
+async def _median_sample() -> HostMemorySample:
+    """Take 5 samples, 0.5 s apart, and return the one with median used_mb.
 
     Sorting sample objects (not just values) ensures all fields on the
     selected sample are from the same instant — no Franken-sample.
     """
     samples: list[HostMemorySample] = []
-    for _ in range(n):
+    for _ in range(5):
         samples.append(sample_host_memory())
-        await asyncio.sleep(interval)
+        await asyncio.sleep(0.5)
     by_used = sorted(samples, key=lambda s: s.used_mb)
     return by_used[len(by_used) // 2]
 
@@ -466,9 +466,8 @@ def _fmt_latency(values: list[int]) -> str:
         return "-"
     s = sorted(values)
     med = statistics.median(s)
-    # Nearest-rank p95, matching benchmark_latency.py's _percentile()
-    p95_idx = min(math.ceil(len(s) * 0.95) - 1, len(s) - 1)
-    return f"{med:.0f} / {s[p95_idx]}"
+    # Nearest-rank p95, matching benchmark_latency.py's _median_p95()
+    return f"{med:.0f} / {s[math.ceil(len(s) * 0.95) - 1]}"
 
 
 def print_result(r: DensityResult) -> None:
@@ -692,13 +691,12 @@ async def main() -> None:
     if args.json:
         print_json_summary(all_results)
 
-    # Final verdict
+    # Final verdict (argparse gives at least one VM count and one language: one result or more)
     print(f"\n{'=' * 70}")
-    if all_results:
-        best = min(all_results, key=lambda r: r.marginal_mb_per_vm if r.marginal_mb_per_vm > 0 else float("inf"))
-        print(f"  BEST DENSITY: {best.scenario} at {best.marginal_mb_per_vm:.1f} MB/VM marginal cost")
-        if best.estimated_max_vms:
-            print(f"  ESTIMATED MAX: ~{best.estimated_max_vms} VMs on this host ({total_mb} MB RAM)")
+    best = min(all_results, key=lambda r: r.marginal_mb_per_vm if r.marginal_mb_per_vm > 0 else float("inf"))
+    print(f"  BEST DENSITY: {best.scenario} at {best.marginal_mb_per_vm:.1f} MB/VM marginal cost")
+    if best.estimated_max_vms:
+        print(f"  ESTIMATED MAX: ~{best.estimated_max_vms} VMs on this host ({total_mb} MB RAM)")
     print("=" * 70)
 
 

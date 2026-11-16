@@ -36,7 +36,7 @@ OUTPUT_DIR="$REPO_ROOT/images/dist"
 
 build_for_arch() {
     local arch=$1
-    local variant="${2:-all}"
+    local variant=$2
 
     echo "=== Building for $arch (variant: $variant) ==="
 

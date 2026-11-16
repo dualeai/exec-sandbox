@@ -270,11 +270,7 @@ RUN --mount=type=cache,target=/root/.ccache \
     export KBUILD_BUILD_HOST='buildkit' && \
     export PATH="/usr/lib/ccache:$PATH" && \
     make -j$(nproc) ARCH=${KERNEL_ARCH} ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} ${KERNEL_IMAGE} && \
-    if [ "$KERNEL_ARCH" = "x86" ]; then \
-        cp arch/x86/boot/bzImage /vmlinuz-${ARCH}; \
-    else \
-        cp arch/${KERNEL_ARCH}/boot/${KERNEL_IMAGE} /vmlinuz-${ARCH}; \
-    fi && \
+    cp arch/${KERNEL_ARCH}/boot/${KERNEL_IMAGE} /vmlinuz-${ARCH} && \
     cp System.map /vmlinuz-${ARCH}.map
 
 # Output stage (vmlinuz-* also takes the .map)

@@ -89,13 +89,8 @@ def _shorten_job(name: str) -> str:
 
 
 def _clean_tb(lines: list[str]) -> str:
-    """Filter noise and join traceback lines."""
-    out = [ln for ln in lines if not _NOISE_RE.search(ln)]
-    while out and not out[0].strip():
-        out.pop(0)
-    while out and not out[-1].strip():
-        out.pop()
-    return "\n".join(out)
+    """Filter noise (blank lines too) and join traceback lines."""
+    return "\n".join(ln for ln in lines if not _NOISE_RE.search(ln))
 
 
 def _parse_failures_section(log: str) -> dict[str, str]:

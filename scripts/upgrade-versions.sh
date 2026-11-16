@@ -48,7 +48,7 @@
 # extracted config is verified against the locked version instead of pinned.
 #
 # Usage:
-#   ./scripts/upgrade-versions.sh    # resolve latest everything, rewrite the lock
+#   ./scripts/upgrade-versions.sh    # resolve the newest cleared versions; rewrite the lock if a line changed
 
 set -euo pipefail
 
@@ -370,15 +370,15 @@ resolve_qemu_sha256() {
     local url="https://download.qemu.org/qemu-${qemu_ver}.tar.xz"
     local tmp
     tmp=$(mktemp)
-    # Called in a $(...) subshell: these traps end with it. Ctrl-C leaves no ~130 MB file.
+    # Called in a $(...) subshell: these traps end with it, and the EXIT one removes the file
+    # on every path (die too). Ctrl-C leaves no ~130 MB file.
     # shellcheck disable=SC2064 # expand now: tmp is local to this function
     trap "rm -f '$tmp'" EXIT
     trap 'exit 130' INT TERM
     echo "Downloading $url for sha256 pinning..." >&2
-    curl -sfL --retry 3 -o "$tmp" "$url" || { rm -f "$tmp"; die "Could not download $url"; }
+    curl -sfL --retry 3 -o "$tmp" "$url" || die "Could not download $url"
     local sha
-    sha=$(sha256sum "$tmp" | cut -d' ' -f1) || { rm -f "$tmp"; die "sha256sum failed on $url"; }
-    rm -f "$tmp"
+    sha=$(sha256sum "$tmp" | cut -d' ' -f1) || die "sha256sum failed on $url"
     echo "$sha"
 }
 
@@ -441,7 +441,7 @@ vendor_config() {
         || die "Config extraction failed for $arch (alpine:${alpine_ver})"
 
     # First line = config filename (parameter expansion — `| head -1` would
-    # SIGPIPE under pipefail on the ~120KB payload)
+    # SIGPIPE under pipefail on the ~150 KB payload)
     local config_name="${raw%%$'\n'*}"
     case "$config_name" in
         config-"${expected_kver}"-*-virt) ;;
