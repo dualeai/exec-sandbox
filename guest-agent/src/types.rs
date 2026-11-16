@@ -15,6 +15,16 @@ use std::collections::HashMap;
 /// `op_id` and `host_time_ns` from the raw JSON before this parse. The host
 /// sends every field that is not null (request_line), so none has a default here:
 /// an Option field is absent when the host has no value for it.
+///
+/// Hosts and agents of different releases meet with no version check: a saved
+/// VM keeps its agent and loads on older and newer hosts. A change stays additive
+/// both ways:
+/// - a new request field is an Option here (an older host does not send it); an
+///   older agent ignores it (no deny_unknown_fields), so the call must stay
+///   correct when the agent does not act on it;
+/// - no new reply type and no new error_type (an older host cannot read them:
+///   the call fails); a new reply field is optional on the host;
+/// - before file_end, a write gets no reply but a terminal error.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
 pub(crate) enum GuestCommand {
@@ -53,6 +63,13 @@ pub(crate) enum GuestCommand {
         op_id: String,
         path: String,
         make_executable: bool,
+        /// Bytes of the file after decompression, when the host knows them:
+        /// absent from a host of an earlier release, and for a source that is
+        /// not seekable or has no end to seek to (a procfs file). At the header,
+        /// the agent refuses a size over MAX_FILE_SIZE_BYTES or one that does not
+        /// fit in the free space, else reserves it (file_io.rs); the file still
+        /// gets the bytes that come before file_end.
+        size: Option<u64>,
     },
 
     #[serde(rename = "read_file")]
@@ -198,13 +215,39 @@ mod tests {
                 op_id,
                 path,
                 make_executable,
+                size,
             } => {
                 assert_eq!(op_id, "abc123");
                 assert_eq!(path, "test.txt");
                 assert!(!make_executable);
+                // No size: a host of an earlier release, or a source of unknown size
+                assert_eq!(size, None);
             }
             _ => panic!("Expected WriteFile"),
         }
+    }
+
+    // The header's size: a number; null, read as absent (request_line never sends it); and a
+    // key this release does not know (ignored: a newer host's field)
+    #[rstest::rstest]
+    #[case(r#""size":524288000"#, Some(524_288_000))]
+    #[case(r#""size":null"#, None)]
+    #[case(r#""size":1,"newer_field":true"#, Some(1))]
+    fn test_deserialize_write_file_size(#[case] field: &str, #[case] size: Option<u64>) {
+        let json = format!(
+            r#"{{"action":"write_file","op_id":"abc","path":"t.txt","make_executable":false,{field}}}"#
+        );
+        match serde_json::from_str::<GuestCommand>(&json).unwrap() {
+            GuestCommand::WriteFile { size: parsed, .. } => assert_eq!(parsed, size),
+            _ => panic!("Expected WriteFile"),
+        }
+    }
+
+    // A size the type cannot hold is refused at the parse (a request error)
+    #[test]
+    fn test_deserialize_write_file_refuses_a_negative_size() {
+        let json = r#"{"action":"write_file","op_id":"abc","path":"t.txt","make_executable":false,"size":-1}"#;
+        assert!(serde_json::from_str::<GuestCommand>(json).is_err());
     }
 
     #[test]

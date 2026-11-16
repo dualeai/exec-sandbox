@@ -509,9 +509,10 @@ pub(crate) async fn handle_connection(
                 op_id,
                 path,
                 make_executable,
+                size,
             } => {
                 log_info!(
-                    "Processing: write_file (op_id={op_id}, path={path}, executable={make_executable})"
+                    "Processing: write_file (op_id={op_id}, path={path}, executable={make_executable}, size={size:?})"
                 );
                 match active_writes.entry(op_id) {
                     Entry::Occupied(entry) => {
@@ -523,7 +524,13 @@ pub(crate) async fn handle_connection(
                             .await;
                     }
                     Entry::Vacant(slot) => {
-                        match handle_write_file(slot.key(), &path, make_executable) {
+                        match handle_write_file(
+                            std::path::Path::new(SANDBOX_ROOT),
+                            slot.key(),
+                            &path,
+                            make_executable,
+                            size,
+                        ) {
                             Ok(handle) => {
                                 slot.insert(handle);
                             }
