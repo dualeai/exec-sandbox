@@ -392,7 +392,7 @@ Every run-time error is a `SandboxError` with an `action` (what to do next, from
 | `SessionClosedError` | `RESTART` | The session is closed. Open a new one with `new()` or `reuse()` |
 | `InvalidInputError` | `FIX_INPUT` | The call is wrong, or the scheduler cannot take it now. The session stays open |
 | `ConfigError` | `FIX_CONFIG` | This worker's setup is wrong: settings, keyring, store, binaries, images, Python extras, permissions or OS |
-| `RouteError` | `ROUTE` | Another worker can serve the call: `required` gives the facts the call checked, `found` this worker's values. A worker satisfies `required` when each key holds by its rule (`RouteKey.rule`: `equal`, `at_least`, `contains` or `equal_or_any`); it passes the checks that raised the error. An empty `required` (another release wrote the instance) names no worker: use a worker of the release in `describe_instance(id).writer_release` |
+| `RouteError` | `ROUTE` | Another worker can serve the call: `required` gives the facts the call checked, `found` this worker's values. A worker satisfies `required` when each key holds by its rule (`RouteKey.rule`: `equal`, `at_least`, `contains` or `equal_or_any`); it passes the checks that raised the error. An empty `required` (another release wrote the instance) names no worker: use a worker of the release in `describe_instance(id).writer_release`, or in the error's `context["writer_release"]` when `describe_instance` raises it too and the data names its release |
 | `InstanceGoneError` | `RECREATE` | The saved instance is gone, expired or damaged. Start a new one |
 | `InternalError` | `REPORT` | A bug or a broken host. Report it with the log |
 | `ErrorAction` | | The 8 actions above |
@@ -440,8 +440,8 @@ except SandboxError as e:  # The other actions
 
 ### What closes a session
 
-- **Stays open, state kept:** an exception, a syntax error, `sys.exit(n)` with n ≠ 137, and `InvalidInputError` (for example `OUTPUT_LIMIT`).
-- **Stays open, the next `exec()` runs in a new REPL:** a timeout (-1), a signal other than SIGKILL (128 + signal), `os._exit(n)` with n ≠ 137, and a REPL exit between two calls with a code other than 137.
+- **Stays open, state kept:** an exception, a syntax error, `sys.exit(n)` with n ≠ 137, and `InvalidInputError` (for example `OUTPUT_LIMIT`, unless its message ends with "the REPL then exited with code n": see the next line).
+- **Stays open, the next `exec()` runs in a new REPL:** a timeout (-1), a signal other than SIGKILL (128 + signal), `os._exit(n)` with n ≠ 137 (a REPL exit or signal after output past the limit: `OUTPUT_LIMIT` whose message ends with "the REPL then exited with code n"), and a REPL exit between two calls with a code other than 137.
 - **Closes, state lost:** exit code 137 (for example SIGKILL), also between two calls (the next `exec()` raises `GUEST_UNAVAILABLE`); a VM communication failure; QEMU stops; a full host disk under the home disk. Every later call raises `SessionClosedError`.
 - Other errors: in `exec()`, they close the session. File calls close it only on cancellation, `OutcomeUnknownError`, a dead VM or a full host disk. For `save()`, see its docstring.
 
