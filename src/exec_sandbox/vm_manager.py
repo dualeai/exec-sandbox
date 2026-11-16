@@ -7,8 +7,8 @@ Architecture:
 
 QEMU settings (qemu_cmd.build_qemu_cmd):
 - CPU: x86 guests get one fixed x86-64-v3 (AVX2-level) model, so a saved instance
-  loads on any such host; ARM guests get "host" (KVM, HVF) or "neoverse-v1,pauth=off"
-  (TCG: qemu_cmd.guest_cpu_model)
+  loads on any such host; ARM guests get "host" (KVM, HVF) or
+  "neoverse-v1,pauth=off,cntfrq=62500000" (TCG: qemu_cmd.guest_cpu_model)
 - virtio-blk: num-queues=1, queue-size=64
 - virtio-net: multiqueue off, TCP offload disabled (simpler for short VMs)
 - Drive tuning: detect-zeroes=unmap, copy-on-read off, werror/rerror explicit
@@ -82,10 +82,17 @@ from exec_sandbox.permission_utils import (
     probe_qemu_as_qemu_vm,
     setting_folder_error,
 )
-from exec_sandbox.platform_utils import ProcessWrapper, detect_host_arch
+from exec_sandbox.platform_utils import HostArch, ProcessWrapper, detect_host_arch
 from exec_sandbox.private_run_dir import PrivateRunDir, new_folder_name, remove_dead_folders
 from exec_sandbox.process_registry import unregister_process
-from exec_sandbox.qemu_cmd import build_qemu_cmd, device_layout, resolve_machine_type
+from exec_sandbox.qemu_cmd import (
+    build_qemu_cmd,
+    counter_rate,
+    device_layout,
+    guest_cpu_id,
+    guest_cpu_model,
+    resolve_machine_type,
+)
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.resource_cleanup import cleanup_process
@@ -105,16 +112,30 @@ from exec_sandbox.system_probes import (
     probe_qemu_version,
     probe_unshare_support,
     qemu_system_binary,
+    require_guest_cpu,
     require_qemu_machine_types,
     require_qemu_version,
 )
 from exec_sandbox.validation import validate_kernel_initramfs
 from exec_sandbox.vm_spec import VmSpec
-from exec_sandbox.vm_types import AccelType, VmState
+from exec_sandbox.vm_types import AccelType, GuestBoot, VmState
 from exec_sandbox.vm_working_directory import VmWorkingDirectory, drain_workdir_cleanup_tasks
 
 logger = get_logger(__name__)
 LOG_DRAIN_AFTER_PROCESS_EXIT_TIMEOUT_SECONDS = 1.0
+RESTORE_EXIT_WAIT_SECONDS = 1.0
+"""After a restored guest closed its port, the wait for QEMU's end (a guest reset ends QEMU
+with -no-reboot, in about 12 ms): its exit code tells a panic (0) from a silent guest."""
+
+
+async def _exit_code(vm: QemuVM, *, port_closed: bool) -> int | None:
+    """QEMU's exit code; None while it runs. When QEMU closed a port (the guest's, or QMP: not
+    a timeout), QEMU is ending: wait for its end, at most RESTORE_EXIT_WAIT_SECONDS."""
+    if vm.process.returncode is None and port_closed:
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(RESTORE_EXIT_WAIT_SECONDS):
+                await vm.process.wait()
+    return vm.process.returncode
 
 
 async def _finish_process_log_drain(task: asyncio.Task[None] | None) -> None:
@@ -366,6 +387,9 @@ class VmManager:
         """
         self.settings = settings
         self.arch = detect_host_arch()
+        # The counter rate a guest that boots here gets (qemu_cmd.counter_rate: start reads it;
+        # None before, or with no exact source), for the saves of cold-booted VMs (counter_hz)
+        self._counter_hz: int | None = None
         self.images = GuestImages.from_settings(settings, arch=self.arch)  # the guest files VMs boot
         self._run_dir_path = settings.home_disk_dir / new_folder_name()
         self._run_dir: PrivateRunDir | None = None  # made by start (_open_run_dir)
@@ -456,17 +480,31 @@ class VmManager:
         return device_layout(cmd, binary=binary)
 
     async def check_fits(
-        self, spec: VmSpec, *, vm_id: str, target: Mapping[RouteKey, str]
+        self,
+        spec: VmSpec,
+        *,
+        vm_id: str,
+        required: Mapping[RouteKey, str],
+        found: Mapping[RouteKey, str | None],
     ) -> tuple[dict[RouteKey, str], dict[RouteKey, str | None]]:
         """The budget facts a VM of `spec` needs and this worker's; raise when it can never
         fit the whole budget, before any work for it (ResourceAdmissionController.check_fits;
-        `target` as there).
+        `required` and `found` as there).
 
         Raises:
             RouteError: CAPACITY_NEVER_FITS
         """
         use_tcg = await self._detect_accel_type() == AccelType.TCG
-        return self._admission.check_fits(vm_id, spec.memory_mb, spec.cpu_cores, use_tcg=use_tcg, target=target)
+        return self._admission.check_fits(
+            vm_id, spec.memory_mb, spec.cpu_cores, use_tcg=use_tcg, required=required, found=found
+        )
+
+    @property
+    def counter_hz(self) -> int | None:
+        """The counter rate every VM that boots here (cold boot, L1 template) gets and a save
+        records: start reads it once (qemu_cmd.counter_rate); None: no exact source, or not
+        started."""
+        return self._counter_hz
 
     @property
     def work_dir(self) -> Path:
@@ -551,6 +589,13 @@ class VmManager:
 
         # Pre-flight check: the kernel and initramfs exist (QEMU boots each VM on them)
         await validate_kernel_initramfs(self.images)
+
+        # x86: this host runs the guest CPU (one paused QEMU: enforce names the flags it lacks),
+        # else each VM start would fail after its boot retries. The counter rate of every boot.
+        if self.arch == HostArch.X86_64:
+            await require_guest_cpu(await guest_cpu_model(self.arch, accel_type), accel=accel_type.value)
+        self._counter_hz = (await counter_rate(self.arch, accel_type)).hz
+        await guest_cpu_id(self.arch, accel_type)  # ARM KVM/HVF: an identity, or no start
 
         # The overlay daemon, and in the background the template of each base image here: the
         # first VM of each gets a clone too, not a QMP creation
@@ -1268,13 +1313,14 @@ class VmManager:
         cache_leases: tuple[EntryLease, ...],
         machine_type: str | None,
         egress: tuple[str, ...],
-        boot: tuple[str, str] | None,
+        boot: GuestBoot | None,
         layout: str,
     ) -> QemuVM:
         """Launch QEMU subprocess, create VM object, register in tracking.
 
-        `boot`: the digests of the kernel and initramfs the guest booted (a restore: the
-        saved ones); None: this worker's files, which a cold boot and an L1 template use.
+        `boot`: what the guest got at its boot (a restore: the saved values); None: this
+        worker's kernel, initramfs and counter rate, which a cold boot and an L1 template use
+        (an L1 key holds them).
 
         `machine_type`: the machine type the VM runs, as QEMU resolves its -M value
         (resolve_machine_type; None: unknown), kept on the VM for a save; `egress` too (the
@@ -1298,9 +1344,11 @@ class VmManager:
 
         # The bytes QEMU opens next, for a saved instance (the leases keep these files)
         base_digest, packages_digest = await asyncio.to_thread(guest_digests, infra.base_image, packages_image)
-        kernel_digest, initramfs_digest = (
-            await asyncio.to_thread(guest_digests, self.images.kernel, self.images.initramfs) if boot is None else boot
-        )
+        if boot is None:
+            kernel_digest, initramfs_digest = await asyncio.to_thread(
+                guest_digests, self.images.kernel, self.images.initramfs
+            )
+            boot = GuestBoot(kernel=kernel_digest, initramfs=initramfs_digest, counter_hz=self._counter_hz)
         # Before QEMU opens them: the launch's own shares of the cache leases. The pending
         # owner, then the VM, releases them once QEMU's death is confirmed.
         pending.cache_leases = share_all(cache_leases)
@@ -1396,7 +1444,7 @@ class VmManager:
         vm.resource_reservation = reservation
         vm.cache_leases, pending.cache_leases = pending.cache_leases, ()
         vm.base_image_digest, vm.packages_image_digest = base_digest, packages_digest
-        vm.kernel_digest, vm.initramfs_digest = kernel_digest, initramfs_digest
+        vm.kernel_digest, vm.initramfs_digest, vm.counter_hz = boot.kernel, boot.initramfs, boot.counter_hz
         vm.machine_type = machine_type
         vm.egress_domains = egress
 
@@ -1750,7 +1798,7 @@ class VmManager:
         reservation: ResourceReservation,
         machine_type: str | None,
         egress_domains: tuple[str, ...] | None,
-        boot: tuple[str, str] | None,
+        boot: GuestBoot | None,
         use_template: bool,
     ) -> QemuVM:
         """Restore a VM from a saved state (L1 template or saved instance): full CPU, RAM and device state.
@@ -1779,8 +1827,8 @@ class VmManager:
                 None for an L1 template (build_qemu_cmd)
             egress_domains: The domains the saved instance could reach (HeadBody.egress_domains:
                 the policy at its save); None for an L1 template (the spec's)
-            boot: The kernel and initramfs digests of the saved instance's boot (GuestFacts);
-                None for an L1 template (this worker's files: its key holds their digests)
+            boot: What the saved instance's guest got at its boot (GuestFacts); None for an L1
+                template (this worker's files and counter rate: its key holds them)
             use_template: True for an L1 template: its guest RAM is the RAM template next to
                 vmstate_path (memory_snapshot_files.ram_path_from_vmstate), mapped copy-on-write;
                 False for a saved instance: the RAM is in the vmstate
@@ -1855,7 +1903,7 @@ class VmManager:
         start_time: float,
         machine_type: str | None,
         egress: tuple[str, ...],
-        boot: tuple[str, str] | None,
+        boot: GuestBoot | None,
         use_template: bool,
     ) -> QemuVM:
         """Restore VM with an already-acquired reservation. Ownership transfers to VM on success."""
@@ -1969,13 +2017,15 @@ class VmManager:
                 qmp_parent_sock = None
 
             # Abort-check: fail fast if QEMU dies during startup
-            # (as QemuStorageDaemon._wait_and_connect_qmp does)
-            def _check_qemu_alive() -> None:
+            # (as QemuStorageDaemon._wait_and_connect_qmp does). `loading`: QEMU was loading
+            # the state (a death then can come from the state: migration_client.refusal_cause)
+            def _check_qemu_alive(*, loading: bool) -> None:
                 if vm.process.returncode is not None:
                     # QEMU's own reason is in its console (stderr): the VM and its log go next
                     context = {
                         "vm_id": infra.vm_id,
                         "returncode": vm.process.returncode,
+                        "loading": loading,
                         "console_log": vm.collect_diagnostics().console_log,
                     }
                     raise self._qemu_exec_failed(vm, qemu_cmd=qemu_cmd, context=context) or TransientError(
@@ -1986,7 +2036,7 @@ class VmManager:
                         instance_id=None,
                     )
 
-            _check_qemu_alive()
+            _check_qemu_alive(loading=False)
 
             # Wait for QMP socket (only needed on sudo path where QEMU creates the socket)
             qemu_version = await require_qemu_version()
@@ -1996,7 +2046,7 @@ class VmManager:
                     await wait_for_socket(
                         vm.qmp_socket,
                         timeout=constants.MEMORY_SNAPSHOT_QMP_SOCKET_TIMEOUT_SECONDS,
-                        abort_check=_check_qemu_alive,
+                        abort_check=functools.partial(_check_qemu_alive, loading=False),
                         keep_connection=False,
                     )
                 except TimeoutError as e:
@@ -2010,8 +2060,9 @@ class VmManager:
             # else: socket activation — socket is pre-created, no wait needed
 
             # Restore VM state via QMP migration (load vmstate → resume vCPU)
+            client = MigrationClient(vm.qmp_socket, infra.expected_uid)
             try:
-                async with MigrationClient(vm.qmp_socket, infra.expected_uid) as client:
+                async with client:
                     await client.restore_snapshot(
                         vmstate_path,
                         qemu_version=qemu_version,
@@ -2019,8 +2070,13 @@ class VmManager:
                         use_template=use_template,
                     )
             except Exception as e:
-                # Check if QEMU died — provides a more informative error
-                _check_qemu_alive()
+                # Check if QEMU died — provides a more informative error. A QEMU that ends
+                # closes the QMP connection before the loop reaps it: wait for that end,
+                # bounded, so its exit code is read. A QEMU that answered (a refused stream, a
+                # deadline) still runs: no wait. A death counts as the state's only once
+                # migrate-incoming was sent (a startup death is not)
+                await _exit_code(vm, port_closed=client.qemu_closed)
+                _check_qemu_alive(loading=client.load_started)
                 diag = vm.collect_diagnostics()
                 raise TransientError(
                     f"The restore of {infra.vm_id} failed: {e}",
@@ -2042,13 +2098,17 @@ class VmManager:
                 # VM again. LOCAL_DISK, so the L1 layer cold boots and keeps a good entry.
                 await vm.raise_if_host_disk_full()
                 # The saved state does not run (a torn RAM template, for example): the L1
-                # layer cold boots and removes the entry, as for a stream QEMU refuses.
+                # layer cold boots and removes the entry, as for a stream QEMU refuses. QEMU's
+                # exit code 0: the guest panicked (refusal_cause).
+                exit_code = await _exit_code(vm, port_closed=not isinstance(e, TimeoutError))
                 raise TransientError(
-                    f"VM {infra.vm_id}: the guest did not answer after its saved state loaded.",
+                    f"VM {infra.vm_id}: the guest did not answer after its saved state loaded"
+                    + ("." if exit_code is None else f" (QEMU exit code {exit_code})."),
                     code=ErrorCode.GUEST_SILENT_AFTER_RESTORE,
                     context={
                         "vm_id": infra.vm_id,
                         "vmstate_path": str(vmstate_path),
+                        "exit_code": exit_code,
                         "console_log": vm.collect_diagnostics().console_log,
                     },
                     hint=None,

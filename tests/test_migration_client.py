@@ -12,15 +12,17 @@ import asyncio
 import errno
 import json
 import os
+import signal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from exec_sandbox import constants
 from exec_sandbox.exceptions import ConfigError, ErrorCode, RouteError, RouteKey, SandboxError, TransientError
-from exec_sandbox.migration_client import MigrationClient, migration_timeout, qemu_refusal
+from exec_sandbox.migration_client import MigrationClient, migration_timeout, refusal_cause
 from exec_sandbox.qmp_client import QmpClient
 from tests.instance_support import FakeQmp
 
@@ -388,7 +390,7 @@ class TestMigrationCapabilities:
             await _run(client, operation, qemu_version=version, use_template=False, timeout=5.0)
 
         assert await peer.sent(client) == []
-        assert qemu_refusal(exc.value) is not None  # an L1 entry this QEMU cannot load is evicted
+        assert refusal_cause(exc.value) is not None  # an L1 entry this QEMU cannot load is evicted
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
     async def test_refused_capability_is_rejected(self, qemu: _Connect, operation: str) -> None:
@@ -461,13 +463,13 @@ class TestMigrationProgress:
         if operation == "save":
             assert sent[-2:] == ["migrate_cancel", "cont"]
             assert exc.value.context["vm_resumed"] is True
-            assert qemu_refusal(exc.value) is None
+            assert refusal_cause(exc.value) is None
         else:
             assert sent[-1] == "query-migrate"
             assert isinstance(exc.value, RouteError)
             assert exc.value.required == {}  # the caller names the target: it knows who saved the state
             assert exc.value.found == {"qemu_version": "11.2.0"}
-            assert qemu_refusal(exc.value) is not None
+            assert refusal_cause(exc.value) is not None
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
     async def test_failed_query_is_transient(self, qemu: _Connect, operation: str) -> None:
@@ -481,7 +483,7 @@ class TestMigrationProgress:
             ) as exc,
         ):
             await _run(client, operation, qemu_version=_QEMU, use_template=False, timeout=5.0)
-        assert qemu_refusal(exc.value) is None  # a good L1 entry is kept
+        assert refusal_cause(exc.value) is None  # a good L1 entry is kept
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
     async def test_hung_migration_is_transient(self, qemu: _Connect, operation: str) -> None:
@@ -500,10 +502,11 @@ class TestMigrationProgress:
 
 
 class TestRejectedByQemu:
-    """qemu_refusal decides the L1 eviction and the reuse() ROUTE rule. It matches by code
-    (MIGRATION_REJECTED, MIGRATION_UNSUPPORTED), never by class, anywhere in the cause or
-    context chain: a restore whose setup fails (HOST_DEPENDENCY, also a ConfigError) or whose
-    QEMU fails otherwise must not evict a good entry."""
+    """refusal_cause decides the L1 eviction and the reuse() ROUTE rule, from the evidence of
+    one failure. It matches by code (MIGRATION_REJECTED, MIGRATION_UNSUPPORTED; QEMU_CRASHED
+    with SIGABRT; GUEST_SILENT_AFTER_RESTORE with QEMU's exit code 0), never by class, anywhere
+    in the cause or context chain: a restore whose setup fails (HOST_DEPENDENCY, also a
+    ConfigError) or whose QEMU fails otherwise must not evict a good entry."""
 
     @staticmethod
     def _rejected() -> SandboxError:
@@ -544,6 +547,85 @@ class TestRejectedByQemu:
         return TransientError("QEMU exited", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None)
 
     @staticmethod
+    def _died(returncode: int, console: str, *, loading: bool) -> SandboxError:
+        return TransientError(
+            f"QEMU died during the restore of vm (rc={returncode}).",
+            code=ErrorCode.QEMU_CRASHED,
+            context={"vm_id": "vm", "returncode": returncode, "loading": loading, "console_log": console},
+            hint=None,
+            instance_id=None,
+        )
+
+    _MSR_ABORT = (
+        "qemu-system-x86_64: error: failed to set MSR 0x48f to 0x7fffff00036dfb\n"
+        "qemu-system-x86_64: ../target/i386/kvm/kvm.c:4116: kvm_buf_set_msrs: Assertion `ret == cpu->kvm_msr_buf->nmsrs' failed."
+    )
+
+    def _aborted(self) -> SandboxError:
+        """QEMU killed by SIGABRT while it loaded the state (an x86 MSR KVM refuses asserts)."""
+        return self._died(-signal.SIGABRT, self._MSR_ABORT, loading=True)
+
+    def _aborted_before_the_load(self) -> SandboxError:
+        """The same abort before the load started (QEMU waits with -incoming defer): not the state."""
+        return self._died(-signal.SIGABRT, self._MSR_ABORT, loading=False)
+
+    def _aborted_on_a_limit(self) -> SandboxError:
+        """QEMU could not make a thread (a host limit: error_exit aborts): it can pass."""
+        return self._died(-signal.SIGABRT, "qemu: qemu_thread_create: Resource temporarily unavailable", loading=True)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "qemu: qemu_thread_create: Invalid argument",
+            "qemu-system-x86_64: kvm_init_vcpu: Resource temporarily unavailable",
+            "qemu-system-x86_64: cannot set up guest memory 'mem0': Cannot allocate memory",
+            "(process:4242): GLib-ERROR **: ../glib/gmem.c:136: failed to allocate 1073741824 bytes",
+        ],
+        ids=["thread-create", "eagain", "enomem", "glib-allocation"],
+    )
+    def test_an_abort_on_a_host_limit_can_pass(self, line: str) -> None:
+        """Each host-limit line makes a SIGABRT during the load no refusal (_HOST_LIMIT_LINES)."""
+        assert refusal_cause(self._died(-signal.SIGABRT, f"[    1.2] guest line\n{line}", loading=True)) is None
+
+    def _registers_after_init(self) -> SandboxError:
+        """KVM refused the loaded vCPU registers: QEMU ends with 1 (accel/kvm/kvm-all.c)."""
+        return self._died(1, "qemu-system-aarch64: Failed to put registers after init: Invalid argument", loading=True)
+
+    def _exit_1_other(self) -> SandboxError:
+        return self._died(
+            1, "qemu-system-aarch64: cannot set up guest memory 'mem0': Cannot allocate memory", loading=True
+        )
+
+    def _killed(self) -> SandboxError:
+        """QEMU killed by SIGKILL (the OOM killer): it can pass."""
+        return self._died(-signal.SIGKILL, "(empty)", loading=True)
+
+    @staticmethod
+    def _silent(exit_code: int | None) -> SandboxError:
+        console = "[    0.000000] Linux version 6.18.63\n[    2.413000] Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b"
+        return TransientError(
+            "VM vm: the guest did not answer after its saved state loaded.",
+            code=ErrorCode.GUEST_SILENT_AFTER_RESTORE,
+            context={"vm_id": "vm", "vmstate_path": "/x", "exit_code": exit_code, "console_log": console},
+            hint=None,
+            instance_id=None,
+        )
+
+    def _panicked(self) -> SandboxError:
+        """The guest panicked right after the load: the reboot ends QEMU with 0 (-no-reboot)."""
+        return self._silent(0)
+
+    def _terminated(self) -> SandboxError:
+        """QEMU ended with 0 on a SIGTERM from outside: not a guest panic."""
+        error = self._silent(0)
+        error.context["console_log"] = "qemu-system-x86_64: terminating on signal 15 from pid 4242 (<unknown process>)"
+        return error
+
+    def _silent_running(self) -> SandboxError:
+        """The guest did not answer and QEMU still runs (host load, or a hang): it can pass."""
+        return self._silent(None)
+
+    @staticmethod
     def _chained(inner: BaseException, *, link: str) -> BaseException:
         """`inner` as raised, or under the restore's TransientError wrap: `raise ... from` (cause)
         or a raise inside the handler without `from` (context only, as _check_qemu_alive does)."""
@@ -571,23 +653,49 @@ class TestRejectedByQemu:
             ("_host_dependency", False),
             ("_failed", False),
             ("_crashed", False),
+            ("_aborted", True),
+            ("_aborted_before_the_load", False),
+            ("_aborted_on_a_limit", False),
+            ("_registers_after_init", True),
+            ("_exit_1_other", False),
+            ("_killed", False),
+            ("_panicked", True),
+            ("_terminated", False),
+            ("_silent_running", False),
         ],
     )
     def test_matches_only_refusal_codes(self, make: str, refused: bool, link: str) -> None:
         error = self._chained(getattr(self, make)(), link=link)
-        assert (qemu_refusal(error) is not None) is refused
+        assert (refusal_cause(error) is not None) is refused
+
+    @pytest.mark.parametrize(
+        ("make", "cause"),
+        [
+            ("_rejected", "migrate-incoming command failed"),
+            (
+                "_aborted",
+                "qemu-system-x86_64: ../target/i386/kvm/kvm.c:4116: kvm_buf_set_msrs: "
+                "Assertion `ret == cpu->kvm_msr_buf->nmsrs' failed.",
+            ),
+            ("_panicked", "Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b"),
+            ("_registers_after_init", "qemu-system-aarch64: Failed to put registers after init: Invalid argument"),
+        ],
+    )
+    def test_the_cause_is_qemus_or_the_guests_line(self, make: str, cause: str) -> None:
+        """The reason a reuse() error names: QEMU's message, its last line, the panic line."""
+        assert refusal_cause(self._chained(getattr(self, make)(), link="cause")) == cause
 
     def test_refusal_below_a_plain_error_is_found(self) -> None:
         """The restore wrap, then an OSError (context), then QEMU's refusal (its cause)."""
         os_error = OSError("QMP socket closed")
-        assert qemu_refusal(self._chained(os_error, link="context")) is None
+        assert refusal_cause(self._chained(os_error, link="context")) is None
         os_error.__cause__ = self._rejected()
-        assert qemu_refusal(self._chained(os_error, link="context")) is not None
+        assert refusal_cause(self._chained(os_error, link="context")) is not None
 
     def test_cycle_in_the_chain_ends(self) -> None:
         a, b = self._failed(), self._crashed()
         a.__context__, b.__context__ = b, a
-        assert qemu_refusal(a) is None
+        assert refusal_cause(a) is None
 
 
 class TestMigrationTimeout:
@@ -1136,7 +1244,61 @@ class TestMigrationClientRestoreSnapshot:
             check=lambda e: e.code is ErrorCode.MIGRATION_FAILED,
         ) as exc_info:
             await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
-        assert qemu_refusal(exc_info.value) is None
+        assert refusal_cause(exc_info.value) is None
+
+
+class TestRestoreEvidence:
+    """What restore_vm reads after a failed load: whether migrate-incoming was sent (a QEMU
+    death counts as the state's only then) and whether QEMU closed the connection (it ends:
+    wait for its exit code; one that answered still runs)."""
+
+    async def test_no_load_before_migrate_incoming(self, qemu: _Connect) -> None:
+        client, _peer = await qemu([{"error": {"class": "GenericError", "desc": "no mapped-ram"}}], at_end="silent")
+        with pytest.raises(ConfigError):
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
+        assert client.load_started is False
+
+    async def test_qemu_gone_before_it_took_the_load(self, qemu: _Connect) -> None:
+        """QEMU ended before it answered migrate-incoming: it never started the load (QEMU
+        reads the stream only after its reply), so a death then is not the state's."""
+        client, _peer = await qemu([{"return": {}}], at_end="close")  # set-capabilities only
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
+        await client.close()
+        assert (client.load_started, client.qemu_closed) == (False, True)
+
+    async def test_a_reset_is_a_closed_connection(self) -> None:
+        """Linux: QEMU that exits with unread bytes on the socket resets it: the reader holds the
+        error and is not at EOF, and QEMU closed the connection all the same."""
+        client = MigrationClient(Path("/tmp/qmp.sock"), expected_uid=0)
+        reader = asyncio.StreamReader()
+        reader.set_exception(ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"))
+        client._qmp = cast("Any", SimpleNamespace(reader=reader, close=AsyncMock()))  # pyright: ignore[reportPrivateUsage]
+        await client.close()
+        assert client.qemu_closed is True
+
+    async def test_qemu_ended_during_the_load(self, qemu: _Connect) -> None:
+        """migrate-incoming sent, then EOF (QEMU exited while it loaded)."""
+        client, _peer = await qemu([{"return": {}}, {"return": {}}], at_end="close")
+        with _fast_poll(), pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
+        await client.close()
+        assert (client.load_started, client.qemu_closed) == (True, True)
+
+    async def test_qemu_that_answered_still_runs(self, qemu: _Connect) -> None:
+        """QEMU refused the stream and answered: the connection stays up (QEMU runs)."""
+        client, _peer = await qemu(
+            [
+                {"return": {}},  # migrate-set-capabilities
+                {"return": {}},  # migrate-incoming
+                {"return": {"status": "failed", "error-desc": "Unknown ramblock"}},  # query-migrate
+            ],
+            at_end="silent",
+        )
+        with _fast_poll(), pytest.raises(RouteError):
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
+        await client.close()
+        assert (client.load_started, client.qemu_closed) == (True, False)
 
 
 # ============================================================================

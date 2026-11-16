@@ -6,6 +6,7 @@ another qemu-system on PATH, each a script that answers with its own version.
 """
 
 import errno
+import fcntl
 import re
 import shutil
 import stat
@@ -21,7 +22,7 @@ from exec_sandbox import constants, system_probes
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch
-from exec_sandbox.qemu_cmd import build_qemu_cmd, resolve_machine_type
+from exec_sandbox.qemu_cmd import CounterRate, build_qemu_cmd, counter_rate, guest_cpu_id, resolve_machine_type
 from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import (
     probe_qemu_accelerators,
@@ -33,6 +34,7 @@ from exec_sandbox.system_probes import (
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
+from tests.conftest import skip_unless_hwaccel, skip_unless_linux, skip_unless_x86_64
 from tests.test_subprocess_utils import write_foreign_elf
 
 _NAME = "qemu-system-aarch64" if detect_host_arch() == HostArch.AARCH64 else "qemu-system-x86_64"
@@ -480,3 +482,93 @@ class TestResolveMachineType:
 
         monkeypatch.setattr("exec_sandbox.qemu_cmd.require_qemu_machine_types", machine_types)
         assert await resolve_machine_type(arch, saved) == resolved
+
+
+class TestGuestCpuId:
+    """guest_cpu_id: the host CPU a -cpu host guest sees, or no fact where the CPU is a model."""
+
+    @pytest.mark.parametrize(
+        ("arch", "accel"),
+        [(HostArch.X86_64, AccelType.KVM), (HostArch.AARCH64, AccelType.TCG)],
+        ids=["x86-fixed-model", "arm-tcg-fixed-model"],
+    )
+    async def test_a_fixed_model_has_none(
+        self, monkeypatch: pytest.MonkeyPatch, arch: HostArch, accel: AccelType
+    ) -> None:
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.probe_host_cpu_id", AsyncMock(side_effect=AssertionError("read")))
+        assert await guest_cpu_id(arch, accel) is None
+
+    @pytest.mark.parametrize("accel", [AccelType.KVM, AccelType.HVF])
+    async def test_an_unread_identity_is_no_start(self, monkeypatch: pytest.MonkeyPatch, accel: AccelType) -> None:
+        """ARM64 KVM or HVF with no identity: HOST_DEPENDENCY, never None (None means a fixed
+        model: a save would load on any CPU)."""
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.probe_host_cpu_id", AsyncMock(return_value=None))
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY):
+            await guest_cpu_id(HostArch.AARCH64, accel)
+
+    async def test_arm_kvm_identity(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        cpu_id = "midr_el1=0x00000000410fd4f1,revidr_el1=0x0000000000000017"
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.probe_host_cpu_id", AsyncMock(return_value=cpu_id))
+        assert await guest_cpu_id(HostArch.AARCH64, AccelType.KVM) == cpu_id
+
+
+class TestCounterRate:
+    """qemu_cmd.counter_rate: each row with stand-in probes, the ARM TCG pin, and the x86 KVM
+    row on this host's real probes (run on a KVM host)."""
+
+    @pytest.mark.parametrize(
+        ("host_hz", "scaling", "expected"),
+        [
+            (None, False, CounterRate(hz=None, any_rate=False)),
+            (None, True, CounterRate(hz=None, any_rate=True)),
+            (2_700_000_000, False, CounterRate(hz=2_700_001_000, any_rate=False)),
+            (2_700_000_000, True, CounterRate(hz=2_700_001_000, any_rate=True)),
+        ],
+        ids=["measured-rate", "measured-rate-scaling", "stated-rate", "stated-rate-scaling"],
+    )
+    async def test_x86_kvm_rows(
+        self, monkeypatch: pytest.MonkeyPatch, host_hz: int | None, scaling: bool, expected: CounterRate
+    ) -> None:
+        """x86 KVM: the vCPU's rate from QEMU (2_700_001_000 here, not the host probe's value)
+        only when the host states its rate; TSC scaling as KVM reports it."""
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.probe_host_counter_hz", AsyncMock(return_value=host_hz))
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.probe_kvm_tsc_scaling", AsyncMock(return_value=scaling))
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.require_guest_cpu", AsyncMock(return_value=2_700_001_000))
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.check_tsc_deadline", AsyncMock(return_value=True))
+        assert await counter_rate(HostArch.X86_64, AccelType.KVM) == expected
+
+    @pytest.mark.parametrize(
+        ("arch", "accel"),
+        [(HostArch.X86_64, AccelType.TCG), (HostArch.AARCH64, AccelType.HVF), (HostArch.AARCH64, AccelType.KVM)],
+        ids=["x86-tcg", "arm-hvf", "arm-kvm"],
+    )
+    async def test_other_rows_are_the_hosts_counter(
+        self, monkeypatch: pytest.MonkeyPatch, arch: HostArch, accel: AccelType
+    ) -> None:
+        """A KVM or HVF guest reads the host counter, an x86 TCG guest's TSC is the host's: the
+        host probe's rate, no QEMU probe, no scaling."""
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.probe_host_counter_hz", AsyncMock(return_value=24_000_000))
+        guest_cpu = AsyncMock(side_effect=AssertionError("no QEMU probe"))
+        monkeypatch.setattr("exec_sandbox.qemu_cmd.require_guest_cpu", guest_cpu)
+        assert await counter_rate(arch, accel) == CounterRate(hz=24_000_000, any_rate=False)
+
+    async def test_arm_tcg_is_the_pinned_rate(self) -> None:
+        """The guest CPU pins it (cntfrq): the same on every host, no probe."""
+        assert await counter_rate(HostArch.AARCH64, AccelType.TCG) == CounterRate(hz=62_500_000, any_rate=False)
+
+    @skip_unless_linux
+    @skip_unless_x86_64
+    @skip_unless_hwaccel
+    async def test_x86_kvm_rate_is_the_hosts(self) -> None:
+        """The rate KVM gives a new vCPU (QEMU's tsc-frequency, from a paused real QEMU), kept
+        only when the host states its TSC rate: then the kernel's tsc_khz, which BogoMIPS
+        gives in 5 kHz steps (an independent source); else None."""
+        rate = await counter_rate(HostArch.X86_64, AccelType.KVM)
+        stated = system_probes._bogomips_hz(Path("/proc/cpuinfo").read_text())  # pyright: ignore[reportPrivateUsage]
+        if stated is None:
+            assert rate.hz is None
+        else:
+            assert rate.hz is not None
+            assert 0 <= rate.hz - stated < 5000
+        with Path("/dev/kvm").open("rb") as kvm:  # KVM_CHECK_EXTENSION(KVM_CAP_TSC_CONTROL), read here
+            assert rate.any_rate is (fcntl.ioctl(kvm.fileno(), 0xAE03, 60) > 0)

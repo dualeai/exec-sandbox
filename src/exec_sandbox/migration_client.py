@@ -32,7 +32,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from typing import TYPE_CHECKING, Any, Self
+import signal
+from typing import TYPE_CHECKING, Any, Final, Self
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
@@ -61,23 +62,70 @@ _QMP_TIMEOUT = constants.MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS
 _POLL_FIRST_SECONDS = 0.001  # query-migrate poll: 1 ms, doubling up to MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS
 
 
-def qemu_refusal(error: BaseException) -> SandboxError | None:
-    """The MIGRATION_REJECTED or MIGRATION_UNSUPPORTED error anywhere in the cause/context
-    chain (a QEMU that died while refusing the stream is reported by an error raised
-    without `from`): its message holds QEMU's reason. None without one. By code: a setup
-    failure of the restore (HOST_DEPENDENCY, for example) must not count as a refusal of
-    the saved state."""
+def refusal_cause(error: BaseException) -> str | None:
+    """Why this worker cannot run a saved state, from the evidence of one failed restore (a
+    retry here fails the same way), anywhere in the cause/context chain (a QEMU that died
+    while refusing the stream is reported by an error raised without `from`):
+
+    - QEMU refused the stream, or cannot load VM state (MIGRATION_REJECTED,
+      MIGRATION_UNSUPPORTED): its message, QEMU's reason.
+    - QEMU died while it loaded the state (QEMU_CRASHED with context "loading"): aborted
+      (SIGABRT: an x86 MSR that KVM refuses asserts) with no host-limit line, or ended with 1
+      on a vCPU register write KVM refused ("... after init: ..."): QEMU's line.
+    - The guest panicked right after it (GUEST_SILENT_AFTER_RESTORE, and QEMU ended with 0:
+      the panic reboots at once and -no-reboot ends QEMU; not a SIGTERM, which QEMU also
+      ends with 0): the console's panic line.
+
+    None for a failure that can pass: a kill (SIGKILL, the OOM killer), a host limit (a
+    thread or memory QEMU could not get aborts it too), a QEMU death before the load, a
+    timeout, a guest that does not answer while QEMU runs, a setup failure of the restore
+    (HOST_DEPENDENCY)."""
     seen: set[int] = set()
     current: BaseException | None = error
     while current is not None and id(current) not in seen:
-        if isinstance(current, SandboxError) and current.code in _REFUSED:
-            return current
+        if isinstance(current, SandboxError):
+            console = str(current.context.get("console_log", ""))
+            match current.code:
+                case ErrorCode.MIGRATION_REJECTED | ErrorCode.MIGRATION_UNSUPPORTED:
+                    return current.message
+                case ErrorCode.QEMU_CRASHED if current.context.get("loading") is True:
+                    returncode = current.context.get("returncode")
+                    if returncode == -signal.SIGABRT and not any(mark in console for mark in _HOST_LIMIT_LINES):
+                        return _last_line(console, prefix="qemu-system") or current.message
+                    if returncode == 1 and (line := _line_with(console, " after init: ")) is not None:
+                        return line
+                case ErrorCode.GUEST_SILENT_AFTER_RESTORE if (
+                    current.context.get("exit_code") == 0 and "terminating on signal" not in console
+                ):
+                    return _last_line(console, prefix="Kernel panic") or current.message
+                case _:
+                    pass
         seen.add(id(current))
         current = current.__cause__ or current.__context__
     return None
 
 
-_REFUSED = frozenset({ErrorCode.MIGRATION_REJECTED, ErrorCode.MIGRATION_UNSUPPORTED})
+_HOST_LIMIT_LINES: Final = (
+    "qemu_thread_create",
+    "Resource temporarily unavailable",
+    "Cannot allocate memory",
+    "failed to allocate",
+)
+"""QEMU's lines when it aborts on a host limit (a thread or memory it could not get: QEMU's
+error_exit, GLib's allocation): such an abort can pass."""
+
+
+def _last_line(console: str, *, prefix: str) -> str | None:
+    """The last console line that holds `prefix`, from it on (a guest line has a timestamp
+    before it); None without one."""
+    lines = [line[line.index(prefix) :].strip() for line in console.splitlines() if prefix in line]
+    return lines[-1] if lines else None
+
+
+def _line_with(console: str, text: str) -> str | None:
+    """The last console line that holds `text`, whole; None without one."""
+    lines = [line.strip() for line in console.splitlines() if text in line]
+    return lines[-1] if lines else None
 
 
 def _failed(message: str, *, context: dict[str, Any] | None) -> TransientError:
@@ -125,12 +173,18 @@ class MigrationClient:
         "_expected_uid",
         "_qmp",
         "_qmp_socket",
+        "load_started",
+        "qemu_closed",
     )
 
     def __init__(self, qmp_socket: Path, expected_uid: int) -> None:
         self._qmp_socket = qmp_socket
         self._expected_uid = expected_uid
         self._qmp: QmpClient | None = None  # set once the handshake ends
+        self.load_started = False
+        """QEMU took restore_snapshot's migrate-incoming: it may have read the saved state since."""
+        self.qemu_closed = False
+        """QEMU closed the QMP connection (EOF or a reset), as close() saw it: QEMU ends."""
 
     async def connect(self, *, timeout: float) -> None:
         """Connect to QMP socket and complete handshake.
@@ -165,6 +219,7 @@ class MigrationClient:
         """Close the QMP connection."""
         qmp, self._qmp = self._qmp, None
         if qmp is not None:
+            self.qemu_closed = qmp.reader.at_eof() or qmp.reader.exception() is not None
             await qmp.close()
 
     async def _execute(
@@ -226,7 +281,7 @@ class MigrationClient:
           includes the QEMU version and the device layout of the restore, which holds
           MIGRATION_CAPABILITIES (qemu_cmd.device_layout). A load of a saved instance
           compares its machine type and device layout before the download; QEMU accepts
-          or refuses the rest of its state at restore (qemu_refusal: on a QEMU below the
+          or refuses the rest of its state at restore (refusal_cause: on a QEMU below the
           saved one, RouteError with the saved QEMU version).
 
         Raises:
@@ -435,6 +490,9 @@ class MigrationClient:
             arguments={"uri": f"file:{vmstate_path}", "exit-on-error": False},
             timeout=_QMP_TIMEOUT,
         )
+        # QEMU starts reading the stream after this reply (a main-loop watch: QEMU
+        # migration/file.c file_start_incoming_migration), never before it
+        self.load_started = "error" not in resp
         if "error" in resp:
             # The command fails before QEMU reads any of the stream: it could not open the
             # file (EACCES, ENOENT) or start the migration. Not a refusal of the saved state,

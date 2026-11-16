@@ -896,7 +896,7 @@ class _Proc:
         if ends:
             self._end.set()
 
-    async def communicate(self) -> tuple[bytes, bytes]:
+    async def communicate(self, _stdin: bytes | None) -> tuple[bytes, bytes]:  # run_probe passes its stdin
         await self._end.wait()
         return self._stdout, b""
 

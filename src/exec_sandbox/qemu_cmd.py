@@ -5,6 +5,7 @@ and VM configuration.
 """
 
 import re
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
@@ -20,9 +21,13 @@ from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
     probe_drive_direct_io,
+    probe_host_counter_hz,
+    probe_host_cpu_id,
     probe_io_uring_support,
+    probe_kvm_tsc_scaling,
     probe_unshare_support,
     qemu_system_binary,
+    require_guest_cpu,
     require_qemu_machine_types,
     require_qemu_sandbox_support,
     require_qemu_version,
@@ -41,7 +46,8 @@ logger = get_logger(__name__)
 # than Haswell / Zen 1 cannot run it. +hypervisor lets the guest find KVM
 # (kvm-clock, see the kernel command line). -svm,-vmx: no nested virtualization
 # (CVE-2024-50115).
-# rdrand/rdseed: entropy without a host round trip (TCG emulates both).
+# rdrand: entropy without a host round trip (TCG emulates it). No rdseed: Haswell
+# lacks it (Broadwell and later have it), and the guest kernel seeds from RDRAND.
 # aes/pclmulqdq: AES-NI and carry-less multiply (every AVX2-level host has both).
 # Without them the guest runs AES-GCM in software: TLS 1.3 measured 122 -> 1466 MB/s
 # on KVM, 12.8 -> 56.5 MB/s on TCG (QEMU maps both to host instructions).
@@ -49,8 +55,16 @@ logger = get_logger(__name__)
 # no xsaveopt hangs before the first console line (measured, QEMU 11.1.3).
 _X86_CPU_FLAGS = (
     "qemu64-v1,+avx,+avx2,+bmi1,+bmi2,+f16c,+fma,+abm,+movbe,+xsave,+xsaveopt,+cx16,+lahf_lm,"
-    "+popcnt,+sse4.1,+sse4.2,+ssse3,+aes,+pclmulqdq,+rdrand,+rdseed,+hypervisor,-svm,-vmx"
+    "+popcnt,+sse4.1,+sse4.2,+ssse3,+aes,+pclmulqdq,+rdrand,+hypervisor,-svm,-vmx"
 )
+# The CPU signature of a GenuineIntel guest: qemu64's own (family 15, model 107: AMD K8)
+# reads as a Pentium 4 with that vendor, and code that picks its routines by family and
+# model takes SSE3 ones (OpenBLAS: numpy matmul 2.3 times slower under KVM, 2.9 under TCG,
+# measured). QEMU's Haswell model has this one: the oldest Intel CPU with every flag above.
+# Other vendors keep qemu64's (OpenBLAS goes by the flags for AuthenticAMD).
+_X86_INTEL_SIGNATURE = "family=6,model=60,stepping=4"
+# ARM64 TCG guest CPU (guest_cpu_model), its timer rate pinned (constants.ARM_TCG_COUNTER_HZ)
+_ARM_TCG_CPU = f"neoverse-v1,pauth=off,cntfrq={constants.ARM_TCG_COUNTER_HZ}"
 # Hypercall paravirt features that named models leave off (KVM only).
 _X86_KVM_PV_FLAGS = "+kvm-pv-ipi,+kvm-pv-tlb-flush,+kvm-pv-sched-yield,+kvm-poll-control,+kvm-asyncpf-int"
 
@@ -70,7 +84,10 @@ def _x86_cpu(accel_type: AccelType, *, tsc_deadline: bool) -> str:
         parts.append(_X86_KVM_PV_FLAGS)
     if tsc_deadline:
         parts.append("+tsc-deadline")
-    parts += [f"vendor={detect_host_x86_vendor()}", "enforce"]
+    vendor = detect_host_x86_vendor()
+    if vendor == "GenuineIntel":
+        parts.append(_X86_INTEL_SIGNATURE)
+    parts += [f"vendor={vendor}", "enforce"]
     return ",".join(parts)
 
 
@@ -269,8 +286,8 @@ async def guest_cpu_model(arch: HostArch, accel_type: AccelType) -> str:
     a restore needs the CPU it was saved on.
 
     ARM64 hardware accel: "host".
-    ARM64 TCG: "neoverse-v1,pauth=off" (ARMv8.4 with SVE; the model and its pauth
-    property are in QEMU 9.0.0, below the 9.0.4 floor of ARM TCG): the newest model
+    ARM64 TCG: "neoverse-v1,pauth=off,cntfrq=62500000" (ARMv8.4 with SVE; the model and its
+    pauth property are in QEMU 9.0.0, below the 9.0.4 floor of ARM TCG): the newest model
     without BTI (the ARMv9 models have it, and QEMU cannot turn it off), with pointer
     authentication off. These two features cost most to emulate.
     With PAC every kernel function signs and checks its return address,
@@ -299,7 +316,65 @@ async def guest_cpu_model(arch: HostArch, accel_type: AccelType) -> str:
         # TCG and HVF never provide TSC_DEADLINE (check_tsc_deadline); KVM may lack it in nested VMs
         tsc_deadline = accel_type is AccelType.KVM and await check_tsc_deadline()
         return _x86_cpu(accel_type, tsc_deadline=tsc_deadline)
-    return "host" if accel_type in (AccelType.HVF, AccelType.KVM) else "neoverse-v1,pauth=off"
+    return "host" if accel_type in (AccelType.HVF, AccelType.KVM) else _ARM_TCG_CPU
+
+
+async def guest_cpu_id(arch: HostArch, accel_type: AccelType) -> str | None:
+    """Identity of the host CPU a VM of this host sees (probe_host_cpu_id): ARM64 under KVM
+    or HVF, where the guest CPU is "host". None where the guest CPU is a fixed model (x86,
+    ARM64 TCG): the model is the identity.
+
+    Raises:
+        ConfigError: HOST_DEPENDENCY: ARM64 KVM or HVF, and the identity could not be read
+            (a save without it would load on any CPU)
+    """
+    if arch != HostArch.AARCH64 or accel_type not in (AccelType.KVM, AccelType.HVF):
+        return None
+    if (cpu_id := await probe_host_cpu_id()) is None:
+        raise ConfigError(
+            "The identity of this host's CPU could not be read (Linux: "
+            "/sys/devices/system/cpu/cpu*/regs/identification; macOS: the Hypervisor.framework "
+            "feature registers): a VM saved here could load on another CPU.",
+            code=ErrorCode.HOST_DEPENDENCY,
+            context={"accel": accel_type.value},
+            hint="Give this process read access to /sys/devices/system/cpu (in a container, mount the host's /sys).",
+            instance_id=None,
+        )
+    return cpu_id
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CounterRate:
+    """The counter a VM's clock runs on, on this host (x86 TSC, ARM generic timer). A guest
+    calibrates its clock against the rate once, at its boot: loaded on a host with another
+    rate, its time runs fast or slow by their ratio."""
+
+    hz: int | None
+    """The rate in Hz a guest that boots here gets; None: no exact source on this host (a
+    TSC rate the kernel measures at each boot)."""
+    any_rate: bool
+    """x86 KVM with TSC scaling: a guest loaded here keeps the rate it booted with, whatever
+    it is (QEMU sets the saved rate)."""
+
+
+async def counter_rate(arch: HostArch, accel_type: AccelType) -> CounterRate:
+    """The counter rate of a VM of this host. ARM64 TCG: the pinned rate of the guest CPU
+    (constants.ARM_TCG_COUNTER_HZ). x86 KVM: the rate KVM gives a new vCPU (require_guest_cpu),
+    when this host's rate is exact (probe_host_counter_hz), and whether KVM scales a loaded
+    guest's TSC (probe_kvm_tsc_scaling). Else this host's counter (probe_host_counter_hz): a
+    KVM or HVF guest reads it, and an x86 TCG guest's TSC is the host's.
+
+    Raises:
+        ConfigError, TransientError: as require_guest_cpu (x86 KVM)
+        TransientError: LOCAL_DISK: as probe_host_counter_hz and probe_kvm_tsc_scaling (x86 KVM)
+    """
+    if arch == HostArch.AARCH64 and accel_type == AccelType.TCG:
+        return CounterRate(hz=constants.ARM_TCG_COUNTER_HZ, any_rate=False)
+    host_hz = await probe_host_counter_hz()
+    if arch == HostArch.X86_64 and accel_type == AccelType.KVM:
+        kvm_hz = await require_guest_cpu(await guest_cpu_model(arch, accel_type), accel=accel_type.value)
+        return CounterRate(hz=None if host_hz is None else kvm_hz, any_rate=await probe_kvm_tsc_scaling())
+    return CounterRate(hz=host_hz, any_rate=False)
 
 
 async def build_qemu_cmd(  # noqa: PLR0912, PLR0915

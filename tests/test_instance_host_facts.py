@@ -22,9 +22,11 @@ import pytest
 from exec_sandbox import constants, system_probes
 from exec_sandbox.admission import ResourceAdmissionController
 from exec_sandbox.exceptions import ConfigError, ErrorCode, RouteError, RouteKey, TransientError
+from exec_sandbox.qemu_cmd import CounterRate
 from tests.instance_support import (
     BLOCK,
     BUDGET_KEYS,
+    FAKE_COUNTER_HZ,
     FAKE_LAYOUT,
     NO_VM_TIMEOUT,
     PYTHON,
@@ -153,10 +155,12 @@ async def test_a_load_without_the_l2_image_routes_to_both_images(instance_env: I
 
 
 async def test_a_vm_above_the_whole_budget_routes_before_the_download(
-    instance_env: InstanceEnv, tmp_path: Path
+    instance_env: InstanceEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A worker whose whole budget can never hold the saved VM: ROUTE (CAPACITY_NEVER_FITS)
-    after the host check and before any download, with the checked facts and the budget."""
+    after the host check and before any download, with the checked facts and the budget.
+    `found` gives this worker's own values: its counter_hz "any" (TSC scaling), not the
+    saved rate it accepted."""
     env = instance_env
     saver = Saver(env, await _vm_on_a_layer(env, tmp_path), manager=env.manager, state=None)
     host = (await saver.save()).body.host
@@ -175,6 +179,10 @@ async def test_a_vm_above_the_whole_budget_routes_before_the_download(
     )
     files = env.work_files()
 
+    async def scaling(_arch: object, _accel: object) -> CounterRate:
+        return CounterRate(hz=FAKE_COUNTER_HZ, any_rate=True)
+
+    monkeypatch.setattr("exec_sandbox.worker_facts.counter_rate", scaling)
     with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS) as exc:
         await env.load(saver.instance_id, manager=env.manager)
 
@@ -182,6 +190,10 @@ async def test_a_vm_above_the_whole_budget_routes_before_the_download(
     assert exc.value.required[RouteKey.MACHINE_TYPE] == host.machine_type
     assert exc.value.required[RouteKey.MEMORY_MB] == "272"  # 192 MB and 80 MB of overhead
     assert exc.value.found[RouteKey.MEMORY_MB] == "90"
+    assert (exc.value.required[RouteKey.COUNTER_HZ], exc.value.found[RouteKey.COUNTER_HZ]) == (
+        str(FAKE_COUNTER_HZ),
+        "any",
+    )
     assert env.work_files() == files  # nothing was downloaded
 
 

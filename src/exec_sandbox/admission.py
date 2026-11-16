@@ -904,7 +904,7 @@ class ResourceAdmissionController:
         """
         # Budgets are static: a request above the whole budget can never be
         # admitted, so fail now instead of after `timeout`.
-        self.check_fits(vm_id, memory_mb, cpu_cores, use_tcg=use_tcg, target={})
+        self.check_fits(vm_id, memory_mb, cpu_cores, use_tcg=use_tcg, required={}, found={})
         total_memory_mb, total_cpu = _vm_totals(memory_mb, cpu_cores, use_tcg=use_tcg)
         reservation = ResourceReservation(
             vm_id=vm_id,
@@ -1019,13 +1019,20 @@ class ResourceAdmissionController:
             self._condition.notify(1)
 
     def check_fits(
-        self, vm_id: str, memory_mb: float, cpu_cores: float, *, use_tcg: bool, target: Mapping[RouteKey, str]
+        self,
+        vm_id: str,
+        memory_mb: float,
+        cpu_cores: float,
+        *,
+        use_tcg: bool,
+        required: Mapping[RouteKey, str],
+        found: Mapping[RouteKey, str | None],
     ) -> tuple[dict[RouteKey, str], dict[RouteKey, str | None]]:
         """The budget facts a VM of this size needs (budget_need) and this budget's (None: no
         limit), as a RouteError's `required` and `found` give them. Raise when the VM, with
-        its overheads, is larger than the whole budget: it can never be admitted. `target`:
-        route facts the caller checked before (this worker has them), added to the error's
-        `required` and `found`.
+        its overheads, is larger than the whole budget: it can never be admitted. `required`
+        and `found`: route facts the caller checked before and this worker's values for them
+        (they hold), added to the error's `required` and `found`.
 
         Raises:
             RouteError: CAPACITY_NEVER_FITS
@@ -1049,8 +1056,8 @@ class ResourceAdmissionController:
             f"{need[RouteKey.CPU]} CPU; total budget {mem_budget_str}MB memory, "
             f"{cpu_budget_str} CPU.",
             code=ErrorCode.CAPACITY_NEVER_FITS,
-            required={**target, **need},
-            found={**target, **have},
+            required={**required, **need},
+            found={**found, **have},
             context={
                 "vm_id": vm_id,
                 "requested_memory_mb": need[RouteKey.MEMORY_MB],

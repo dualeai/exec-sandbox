@@ -47,7 +47,7 @@ from exec_sandbox.settings import Settings
 from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_timing import VmTiming
-from exec_sandbox.vm_types import VmState
+from exec_sandbox.vm_types import GuestBoot, VmState
 from tests.conftest import (
     LoopClock,
     create_test_qcow2,
@@ -262,7 +262,8 @@ class TestDescribeWorker:
     async def test_facts_images_budget_and_keys(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_store: bool
     ) -> None:
-        """Host facts without the ones that do not apply; the base images on disk (by digest),
+        """Host facts without the ones that do not apply (no store: a host with no CPU
+        identity and no exact counter rate, both absent); the base images on disk (by digest),
         the L2 images of its cache (a load uses one whose digest matches) and the downloaded
         instance assets; the budget (None: no limit); the key ids."""
         base = tmp_path / "python-base.qcow2"
@@ -275,14 +276,19 @@ class TestDescribeWorker:
             return {
                 RouteKey.ARCH: "aarch64",
                 RouteKey.ACCELERATOR: "hvf",
-                RouteKey.CPU_VENDOR: None,
                 RouteKey.CPU_MODEL: "host",
+                RouteKey.CPU_ID: "pfr0=0x1101000010110011" if with_store else None,
             }
+
+        async def counter_fact(*, force_emulation: bool) -> str | None:
+            assert force_emulation is False
+            return "24000000" if with_store else None
 
         async def qemu_version_fact() -> str:
             return "11.1.3"
 
         monkeypatch.setattr("exec_sandbox.scheduler.machine_facts", machine_facts)
+        monkeypatch.setattr("exec_sandbox.scheduler.counter_fact", counter_fact)
         monkeypatch.setattr("exec_sandbox.scheduler.qemu_version_fact", qemu_version_fact)
 
         async def machine_types() -> dict[str, str]:
@@ -312,6 +318,7 @@ class TestDescribeWorker:
             RouteKey.ARCH: "aarch64",
             RouteKey.ACCELERATOR: "hvf",
             RouteKey.CPU_MODEL: "host",
+            **({RouteKey.CPU_ID: "pfr0=0x1101000010110011", RouteKey.COUNTER_HZ: "24000000"} if with_store else {}),
             RouteKey.QEMU_VERSION: "11.1.3",
             RouteKey.MACHINE_TYPE: {"virt", "virt-11.1"},
             RouteKey.BASE_IMAGE: {own, downloaded} if with_store else {own},
@@ -625,7 +632,7 @@ class TestReuseRestoreFailure:
                 spec=VmSpec(language=Language.PYTHON),
                 host=SimpleNamespace(qemu_version="11.0.2", machine_type="virt-11.0", release="1.0.0"),
                 egress_domains=("pypi.org",),
-                guest=SimpleNamespace(kernel="1" * 64, initramfs="2" * 64),
+                guest=SimpleNamespace(kernel="1" * 64, initramfs="2" * 64, counter_hz=24_000_000),
             ),
             header=SimpleNamespace(generation=3, instance_id="my-vm"),
             instance_id="my-vm",
@@ -679,7 +686,8 @@ class TestReuseRestoreFailure:
         fakes.manager.restore_vm.assert_not_called()
         instances.release.assert_awaited_once_with(state, wait=True)
 
-    async def test_state_qemu_refuses_routes(self, tmp_path: Path) -> None:
+    @staticmethod
+    def _refused_stream() -> TransientError:
         error = TransientError(
             "L1 restore failed", code=ErrorCode.MIGRATION_FAILED, context=None, hint=None, instance_id=None
         )
@@ -692,12 +700,37 @@ class TestReuseRestoreFailure:
             hint=None,
             instance_id=None,
         )
+        return error
+
+    @staticmethod
+    def _guest_panic() -> TransientError:
+        """The guest panicked right after the load: QEMU ended with 0 (-no-reboot)."""
+        return TransientError(
+            "VM vm: the guest did not answer after its saved state loaded (QEMU exit code 0).",
+            code=ErrorCode.GUEST_SILENT_AFTER_RESTORE,
+            context={"exit_code": 0, "console_log": "[    1.2] Kernel panic - not syncing: Fatal exception"},
+            hint=None,
+            instance_id=None,
+        )
+
+    @pytest.mark.parametrize(
+        ("make", "cause"),
+        [
+            ("_refused_stream", "Migration failed: incompatible stream"),
+            ("_guest_panic", "Kernel panic - not syncing: Fatal exception"),
+        ],
+        ids=["qemu-refused", "guest-panicked"],
+    )
+    async def test_state_qemu_refuses_routes(self, tmp_path: Path, make: str, cause: str) -> None:
+        """A restore that cannot run here, from the evidence of this one failure: the store
+        names the target (refused_by_qemu) with the cause; no retry would pass."""
+        error = getattr(self, make)()
         instances, state = self._loaded()
         routed = host_mismatch(
             instance_id="my-vm",
             required={RouteKey.QEMU_VERSION: "11.0.2"},
             found={RouteKey.QEMU_VERSION: "11.1.3"},
-            reason="this worker's QEMU refused the saved state",
+            reason="the saved state cannot run on this worker's QEMU",
         )
         instances.refused_by_qemu = AsyncMock(return_value=routed)
 
@@ -707,7 +740,7 @@ class TestReuseRestoreFailure:
                 await scheduler.reuse("my-vm")
 
         assert exc.value is routed  # the instance store names the target: it knows the saver's facts
-        instances.refused_by_qemu.assert_awaited_once_with(state, qemu_error="Migration failed: incompatible stream")
+        instances.refused_by_qemu.assert_awaited_once_with(state, qemu_error=cause)
         assert exc.value.__cause__ is error
         instances.release.assert_awaited_once_with(state, wait=True)
         # Admission leaves out the loaded state's files: they stay while the request waits
@@ -740,7 +773,9 @@ class TestReuseRestoreFailure:
         # egress policy of the save
         assert fakes.manager.restore_vm.call_args.kwargs["machine_type"] == "virt-11.0"
         assert fakes.manager.restore_vm.call_args.kwargs["egress_domains"] == ("pypi.org",)
-        assert fakes.manager.restore_vm.call_args.kwargs["boot"] == ("1" * 64, "2" * 64)  # its first boot
+        assert fakes.manager.restore_vm.call_args.kwargs["boot"] == GuestBoot(  # its first boot
+            kernel="1" * 64, initramfs="2" * 64, counter_hz=24_000_000
+        )
         assert fakes.manager.restore_vm.call_args.kwargs["use_template"] is False  # its RAM is in the vmstate
         # The asset cache's image: the restore's VM takes its own share, kept while it waits
         (asset_lease,) = state.asset_leases

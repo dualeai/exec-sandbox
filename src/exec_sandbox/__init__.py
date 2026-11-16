@@ -80,6 +80,7 @@ from exec_sandbox._logging import configure_logging
 from exec_sandbox._version import __version__ as __version__
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
+    ROUTE_ANY,
     ConfigError,
     ErrorAction,
     ErrorCode,
@@ -112,6 +113,7 @@ from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.worker_facts import WorkerFacts
 
 __all__ = [
+    "ROUTE_ANY",
     "ConfigError",
     "ErrorAction",
     "ErrorCode",

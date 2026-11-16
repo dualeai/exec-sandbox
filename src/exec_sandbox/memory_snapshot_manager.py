@@ -14,7 +14,8 @@ Cache structure (the names next to the vmstate: memory_snapshot_files):
 
 Cache key includes ALL parameters that affect VM state:
     sha256 fingerprint(language, *sorted_packages, exec_sandbox_version, img_hash,
-          qemu_version, arch, accel_type, cpu_model, memory_mb, cpu_cores, disk_mb,
+          qemu_version, the machine facts (arch, accelerator, cpu_model, cpu_id: as a save
+          records them), counter_hz, memory_mb, cpu_cores, disk_mb,
           network_device, device_layout (with the migration capabilities), kernel_hash, initramfs_hash
           [, l2_image_hash when there are packages])
 
@@ -59,11 +60,10 @@ from exec_sandbox.memory_snapshot_files import (
     open_live_ram_dir,
     ram_path_from_vmstate,
 )
-from exec_sandbox.migration_client import MigrationClient, migration_timeout, qemu_refusal
+from exec_sandbox.migration_client import MigrationClient, migration_timeout, refusal_cause
 from exec_sandbox.permission_utils import get_expected_socket_uid, grant_qemu_vm_acl, probe_qemu_as_qemu_vm
-from exec_sandbox.platform_utils import detect_host_arch
-from exec_sandbox.qemu_cmd import guest_cpu_model
-from exec_sandbox.system_probes import detect_accel_type, require_qemu_version
+from exec_sandbox.system_probes import require_qemu_version
+from exec_sandbox.worker_facts import machine_facts
 
 if TYPE_CHECKING:
     import threading
@@ -289,7 +289,6 @@ class MemorySnapshotManager(BaseCacheManager):
         version = f"{version_parts[0]}.{version_parts[1]}"
 
         # Collect all state-affecting parameters
-        arch = detect_host_arch()
         # Base image, then the kernel + initramfs QEMU actually boots
         guest = self.vm_manager.images
         images = [guest.base_image(spec.language), guest.kernel, guest.initramfs]
@@ -301,8 +300,11 @@ class MemorySnapshotManager(BaseCacheManager):
         # One worker-thread job for every digest (a stat each once known, a full read the first time)
         img_hash, *boot_and_l2_hashes = await asyncio.to_thread(lambda: [key_part(path) for path in images])
         qemu_version = await require_qemu_version()
-        accel_type = await detect_accel_type(force_emulation=self.settings.force_emulation)
-        cpu_model = await guest_cpu_model(arch, accel_type)
+        # The facts a save records (worker_facts.machine_facts), and the counter rate the
+        # restored guest keeps: a restore from an entry passes no boot, so it gets the rate of
+        # this VmManager's boots, as the template's boot did
+        facts = await machine_facts(force_emulation=self.settings.force_emulation)
+        counter_hz = self.vm_manager.counter_hz
 
         parts = [
             str(spec.language.value),
@@ -310,9 +312,8 @@ class MemorySnapshotManager(BaseCacheManager):
             str(__version__),
             img_hash,
             ".".join(str(v) for v in qemu_version),
-            arch.name,
-            accel_type.value,
-            cpu_model,
+            *(f"{key}={value}" for key, value in facts.items()),
+            f"counter_hz={counter_hz}",
             str(spec.memory_mb),
             str(spec.cpu_cores),
             f"disk{spec.disk_mb}",
@@ -608,7 +609,7 @@ class MemorySnapshotManager(BaseCacheManager):
             },
         )
         logger.debug("L1 restore traceback", exc_info=failure)
-        refused = qemu_refusal(failure) is not None or (
+        refused = refusal_cause(failure) is not None or (
             isinstance(failure, SandboxError) and failure.code is ErrorCode.GUEST_SILENT_AFTER_RESTORE
         )
         if refused and checked is not None:

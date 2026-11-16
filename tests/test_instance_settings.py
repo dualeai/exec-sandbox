@@ -30,11 +30,13 @@ from exec_sandbox.instance.local_store import LocalInstanceStore
 from exec_sandbox.instance.manager import InstanceManager
 from exec_sandbox.instance.models import GuestFacts, HostFacts
 from exec_sandbox.platform_utils import HostArch, HostOS, child_env
+from exec_sandbox.qemu_cmd import CounterRate
 from exec_sandbox.scheduler import settings_from_config
 from exec_sandbox.settings import Settings
 from exec_sandbox.vm_types import AccelType
 from tests.instance_support import (
     BLOCK,
+    FAKE_COUNTER_HZ,
     FAKE_LAYOUT,
     FAKE_MACHINE_TYPE,
     NO_VM_TIMEOUT,
@@ -52,14 +54,13 @@ from tests.s3_faults import Edit, Request, S3Proxy
 pytestmark = NO_VM_TIMEOUT
 
 
-def _x86_target(*, vendor: str, cpu_model: str) -> dict[str, str | None]:
-    """Route values of an x86 KVM host."""
-    return {
-        "arch": "x86_64",
-        "accelerator": "kvm",
-        "cpu_vendor": vendor,
-        "cpu_model": cpu_model,
-    }
+_X86_KVM: dict[str, str | None] = {"arch": "x86_64", "accelerator": "kvm"}
+"""Route values of an x86 KVM host (no cpu_id: the guest CPU is a fixed model)."""
+_ARM_KVM: dict[str, str | None] = {"arch": "aarch64", "accelerator": "kvm", "cpu_model": "host"}
+"""Route values of an ARM64 KVM host, but its cpu_id."""
+_CPU_A = "midr_el1=0x00000000410fd4f1,revidr_el1=0x0000000000000017"
+_CPU_B = "midr_el1=0x00000000410fd401,revidr_el1=0x0000000000000000"
+_ARM_TCG = "neoverse-v1,pauth=off,cntfrq=62500000"
 
 
 class TestS3Settings:
@@ -456,46 +457,67 @@ class TestWorkerChecks:
         [
             pytest.param(
                 (
-                    ("aarch64", "hvf", None, "host"),
-                    (HostArch.AARCH64, AccelType.TCG, None, "neoverse-v1,pauth=off"),
-                    {"arch": "aarch64", "accelerator": "hvf", "cpu_model": "host"},
+                    ("aarch64", "hvf", _CPU_A, "host", 24_000_000),
+                    (HostArch.AARCH64, AccelType.TCG, None, _ARM_TCG, CounterRate(hz=62_500_000, any_rate=False)),
+                    {
+                        "arch": "aarch64",
+                        "accelerator": "hvf",
+                        "cpu_model": "host",
+                        "cpu_id": _CPU_A,
+                        "counter_hz": "24000000",
+                    },
                     {
                         "arch": "aarch64",
                         "accelerator": "tcg",
-                        "cpu_model": "neoverse-v1,pauth=off",
+                        "cpu_model": _ARM_TCG,
+                        "cpu_id": None,
+                        "counter_hz": "62500000",
                     },
                 ),
                 id="accelerator",
             ),
             pytest.param(
                 (
-                    ("x86_64", "kvm", "GenuineIntel", "m,vendor=GenuineIntel"),
-                    (HostArch.X86_64, AccelType.KVM, "AuthenticAMD", "m,vendor=AuthenticAMD"),
-                    _x86_target(vendor="GenuineIntel", cpu_model="m,vendor=GenuineIntel"),
-                    _x86_target(vendor="AuthenticAMD", cpu_model="m,vendor=AuthenticAMD"),
+                    ("aarch64", "kvm", _CPU_A, "host", 1_000_000_000),
+                    (HostArch.AARCH64, AccelType.KVM, _CPU_B, "host", CounterRate(hz=1_000_000_000, any_rate=False)),
+                    {**_ARM_KVM, "cpu_id": _CPU_A, "counter_hz": "1000000000"},
+                    {**_ARM_KVM, "cpu_id": _CPU_B, "counter_hz": "1000000000"},
                 ),
-                id="cpu-vendor",
+                id="cpu-id",
             ),
             pytest.param(
                 (
-                    ("x86_64", "kvm", "GenuineIntel", "m,+tsc-deadline,vendor=GenuineIntel"),
-                    (HostArch.X86_64, AccelType.KVM, "GenuineIntel", "m,vendor=GenuineIntel"),
-                    _x86_target(vendor="GenuineIntel", cpu_model="m,+tsc-deadline,vendor=GenuineIntel"),
-                    _x86_target(vendor="GenuineIntel", cpu_model="m,vendor=GenuineIntel"),
+                    ("x86_64", "kvm", None, "m", 2_700_000_000),
+                    (HostArch.X86_64, AccelType.KVM, None, "m", CounterRate(hz=2_900_000_000, any_rate=False)),
+                    {**_X86_KVM, "cpu_model": "m", "counter_hz": "2700000000"},
+                    {**_X86_KVM, "cpu_model": "m", "counter_hz": "2900000000"},
+                ),
+                id="counter-rate",
+            ),
+            pytest.param(
+                (
+                    ("x86_64", "kvm", None, "m", 2_700_000_000),
+                    (HostArch.X86_64, AccelType.KVM, None, "m", CounterRate(hz=None, any_rate=False)),
+                    {**_X86_KVM, "cpu_model": "m", "counter_hz": "2700000000"},
+                    {**_X86_KVM, "cpu_model": "m", "counter_hz": None},
+                ),
+                id="no-exact-counter-rate-here",
+            ),
+            pytest.param(
+                (
+                    ("x86_64", "kvm", None, "m,+tsc-deadline", None),
+                    (HostArch.X86_64, AccelType.KVM, None, "m", CounterRate(hz=None, any_rate=True)),
+                    {**_X86_KVM, "cpu_model": "m,+tsc-deadline"},
+                    {**_X86_KVM, "cpu_model": "m"},
                 ),
                 id="cpu-model-tsc-deadline",
             ),
             pytest.param(
                 (
-                    ("x86_64", "kvm", "GenuineIntel", "m,vendor=GenuineIntel"),
-                    (HostArch.AARCH64, AccelType.KVM, None, "host"),
-                    _x86_target(vendor="GenuineIntel", cpu_model="m,vendor=GenuineIntel"),
-                    {
-                        "arch": "aarch64",
-                        "accelerator": "kvm",
-                        "cpu_vendor": None,
-                        "cpu_model": "host",
-                    },
+                    ("x86_64", "kvm", None, "m", None),
+                    (HostArch.AARCH64, AccelType.KVM, _CPU_A, "host", CounterRate(hz=1_000_000_000, any_rate=False)),
+                    {**_X86_KVM, "cpu_model": "m"},
+                    {**_ARM_KVM, "cpu_model": "host"},
                 ),
                 id="arch",
             ),
@@ -507,17 +529,20 @@ class TestWorkerChecks:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         case: tuple[
-            tuple[str, str, str | None, str],
-            tuple[HostArch, AccelType, str | None, str],
+            tuple[str, str, str | None, str, int | None],
+            tuple[HostArch, AccelType, str | None, str, CounterRate],
             dict[str, str | None],
             dict[str, str | None],
         ],
     ) -> None:
-        """(the head's arch, accelerator, cpu_vendor and cpu_model; what this host's probes find;
-        the error's `required`, the whole target, and `found`, this host's values for its keys;
-        cpu_vendor is absent from a target saved on ARM). cpu-model-tsc-deadline: same vendor, but the saving
-        host had TSC_DEADLINE (in the guest CPU model): QEMU would refuse it after the download."""
-        saved, (arch, accelerator, vendor, cpu_model), required, found = case
+        """(the head's arch, accelerator, cpu_id, cpu_model and its guest's counter_hz; what
+        this host's probes find; the error's `required`, the whole target, and `found`, this
+        host's values for its keys; cpu_id is absent from a target saved on x86, counter_hz from
+        one whose boot host had no exact rate). cpu-model-tsc-deadline: the saving host had
+        TSC_DEADLINE (in the guest CPU model): QEMU would refuse it after the download.
+        no-exact-counter-rate-here: a guest with a known rate never loads where the rate is
+        unknown."""
+        saved, (arch, accelerator, cpu_id, cpu_model, rate), required, found = case
 
         async def detect_accel_type(*, force_emulation: bool) -> AccelType:
             return accelerator
@@ -525,19 +550,29 @@ class TestWorkerChecks:
         async def guest_cpu_model(_arch: HostArch, _accel: AccelType) -> str:
             return cpu_model
 
+        async def guest_cpu_id(_arch: HostArch, _accel: AccelType) -> str | None:
+            return cpu_id
+
+        async def counter_rate(_arch: HostArch, _accel: AccelType) -> CounterRate:
+            return rate
+
         monkeypatch.setattr("exec_sandbox.worker_facts.detect_host_arch", lambda: arch)
         monkeypatch.setattr("exec_sandbox.worker_facts.detect_accel_type", detect_accel_type)
-        monkeypatch.setattr("exec_sandbox.worker_facts.detect_host_x86_vendor", lambda: vendor)
         monkeypatch.setattr("exec_sandbox.worker_facts.guest_cpu_model", guest_cpu_model)
+        monkeypatch.setattr("exec_sandbox.worker_facts.guest_cpu_id", guest_cpu_id)
+        monkeypatch.setattr("exec_sandbox.worker_facts.counter_rate", counter_rate)
         host = HostFacts(
             arch=saved[0],
             accelerator=saved[1],
-            cpu_vendor=saved[2],
+            cpu_id=saved[2],
             cpu_model=saved[3],
             qemu_version="11.0.0",
             machine_type=FAKE_MACHINE_TYPE,
             release=__version__,
             device_layout=FAKE_LAYOUT,
+        )
+        guest = GuestFacts(
+            base_image="0" * 64, packages_image=None, kernel="1" * 64, initramfs="2" * 64, counter_hz=saved[4]
         )
         scratch = tmp_path / "seed"
         scratch.mkdir()
@@ -548,7 +583,7 @@ class TestWorkerChecks:
             keyring=instance_env.keyring,
             spec=VmSpec(language=Language.PYTHON),
             host=host,
-            guest=GuestFacts(base_image="0" * 64, packages_image=None, kernel="1" * 64, initramfs="2" * 64),
+            guest=guest,
         )
         mark = len(instance_env.proxy.log)
         with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
@@ -573,6 +608,23 @@ class TestWorkerChecks:
         assert __version__ != "0.0.1"
         loaded = await instance_env.check_load(state.instance_id, generation=1, manager=instance_env.manager, want=None)
         assert loaded.body.host.release == "0.0.1"
+
+    async def test_a_save_records_the_vms_counter_rate(self, instance_env: InstanceEnv) -> None:
+        """A save records the rate the VM's guest booted with (GuestFacts.counter_hz), not this
+        worker's: this VM came from a 1 GHz host (a restore keeps its rate); this worker
+        (24 MHz) routes the load before any download."""
+        vm = await instance_env.new_vm(SparseImage(size=BLOCK), SparseImage(size=BLOCK), spec=PYTHON)
+        vm.counter_hz = 1_000_000_000
+        state = await Saver(instance_env, vm, manager=instance_env.manager, state=None).save()
+        assert state.body.guest.counter_hz == 1_000_000_000
+        mark = len(instance_env.proxy.log)
+        with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
+            await instance_env.load(state.instance_id, manager=instance_env.manager)
+        assert (exc.value.required[RouteKey.COUNTER_HZ], exc.value.found[RouteKey.COUNTER_HZ]) == (
+            "1000000000",
+            str(FAKE_COUNTER_HZ),
+        )
+        assert instance_env.proxy.entries(since=mark) == [("GET", f"s/{state.instance_id}/head", 200)]
 
     async def test_machine_type_this_qemu_lacks_routes_before_any_download(
         self, instance_env: InstanceEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -628,11 +680,13 @@ class TestWorkerChecks:
         monkeypatch.setattr("exec_sandbox.worker_facts.detect_accel_type", detect_accel_type)
         monkeypatch.setattr("exec_sandbox.worker_facts.guest_cpu_model", guest_cpu_model)
         monkeypatch.setattr("exec_sandbox.worker_facts.require_qemu_version", require_qemu_version)
+        # The faked ARM64 HVF host's identity (its probe reads the real host, maybe x86)
+        monkeypatch.setattr("exec_sandbox.worker_facts.guest_cpu_id", AsyncMock(return_value=_CPU_A))
         host = HostFacts(
             arch="aarch64",
             accelerator="hvf",
-            cpu_vendor=None,
             cpu_model="host",
+            cpu_id=None,
             qemu_version="11.1.3",
             machine_type=FAKE_MACHINE_TYPE,
             release=__version__,
@@ -642,7 +696,9 @@ class TestWorkerChecks:
             header=SimpleNamespace(instance_id="my-vm"),
             body=SimpleNamespace(
                 host=host,
-                guest=GuestFacts(base_image="0" * 64, packages_image=None, kernel="1" * 64, initramfs="2" * 64),
+                guest=GuestFacts(
+                    base_image="0" * 64, packages_image=None, kernel="1" * 64, initramfs="2" * 64, counter_hz=None
+                ),
                 spec=VmSpec(language=Language.PYTHON),
             ),
         )
@@ -656,7 +712,7 @@ class TestWorkerChecks:
         if not routes:
             assert isinstance(error, InternalError)
             assert (error.code, error.instance_id) == (ErrorCode.INTERNAL, "my-vm")
-            assert str(error).endswith("refused a state that QEMU 11.1.3 saved: Unknown ramblock.")
+            assert str(error).endswith("cannot run a state that QEMU 11.1.3 saved: Unknown ramblock.")
             return
         assert isinstance(error, RouteError)
         assert (error.code, error.instance_id) == (ErrorCode.INSTANCE_HOST_MISMATCH, "my-vm")
@@ -671,7 +727,63 @@ class TestWorkerChecks:
         # The message names only the value that does not hold
         assert str(error) == (
             'Instance my-vm needs qemu_version="11.1.3"; this worker has qemu_version="11.0.0": '
-            "this worker's QEMU refused the saved state (Unknown ramblock)."
+            "the saved state cannot run on this worker's QEMU (Unknown ramblock)."
+        )
+
+    async def test_a_scaling_worker_reports_any_in_found(
+        self, instance_env: InstanceEnv, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An x86 KVM worker with TSC scaling passes a saved rate of another host (counter_hz
+        "any"); a later error of the same load (here an older QEMU's refusal) gives this
+        worker's own values in `found`: "any", not the saved rate."""
+
+        async def detect_accel_type(*, force_emulation: bool) -> AccelType:
+            return AccelType.KVM
+
+        async def guest_cpu_model(_arch: HostArch, _accel: AccelType) -> str:
+            return "m"
+
+        async def counter_rate(_arch: HostArch, _accel: AccelType) -> CounterRate:
+            return CounterRate(hz=2_700_000_000, any_rate=True)
+
+        async def older_qemu() -> tuple[int, int, int]:
+            return (11, 0, 0)
+
+        monkeypatch.setattr("exec_sandbox.worker_facts.detect_host_arch", lambda: HostArch.X86_64)
+        monkeypatch.setattr("exec_sandbox.worker_facts.detect_accel_type", detect_accel_type)
+        monkeypatch.setattr("exec_sandbox.worker_facts.guest_cpu_model", guest_cpu_model)
+        monkeypatch.setattr("exec_sandbox.worker_facts.counter_rate", counter_rate)
+        monkeypatch.setattr("exec_sandbox.worker_facts.require_qemu_version", older_qemu)
+        host = HostFacts(
+            arch="x86_64",
+            accelerator="kvm",
+            cpu_model="m",
+            cpu_id=None,
+            qemu_version="11.1.3",
+            machine_type=FAKE_MACHINE_TYPE,
+            release=__version__,
+            device_layout=FAKE_LAYOUT,
+        )
+        state = SimpleNamespace(
+            header=SimpleNamespace(instance_id="my-vm"),
+            body=SimpleNamespace(
+                host=host,
+                guest=GuestFacts(
+                    base_image="0" * 64,
+                    packages_image=None,
+                    kernel="1" * 64,
+                    initramfs="2" * 64,
+                    counter_hz=2_970_000_000,
+                ),
+                spec=VmSpec(language=Language.PYTHON),
+            ),
+        )
+        error = await instance_env.manager.refused_by_qemu(state, qemu_error="Unknown ramblock")  # type: ignore[arg-type]
+        assert isinstance(error, RouteError)
+        assert (error.required[RouteKey.COUNTER_HZ], error.found[RouteKey.COUNTER_HZ]) == ("2970000000", "any")
+        assert str(error) == (
+            'Instance my-vm needs qemu_version="11.1.3"; this worker has qemu_version="11.0.0": '
+            "the saved state cannot run on this worker's QEMU (Unknown ramblock)."
         )
 
     async def test_save_without_acl_support_names_the_dependency(

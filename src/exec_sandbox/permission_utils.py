@@ -565,6 +565,7 @@ async def _qemu_vm_path_problem() -> str | None:
     try:
         returncode, stdout, _ = await run_probe(
             ("sudo", "-n", "-k", *_AS_QEMU_VM, "/bin/sh", "-c", "umask; id -g"),
+            stdin=None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -593,7 +594,10 @@ async def _qemu_vm_path_problem() -> str | None:
         ):
             try:
                 returncode, _, _ = await run_probe(
-                    ("sudo", "-n", *run), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                    ("sudo", "-n", *run),
+                    stdin=None,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
                 )
             except OSError:  # TimeoutError too
                 returncode = None

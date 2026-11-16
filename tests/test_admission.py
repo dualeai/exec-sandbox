@@ -223,7 +223,7 @@ async def test_a_vm_at_the_budget_fits_whatever_the_float_noise(
     ctrl = _make_controller(
         host_cpu_count=host_cpu_count, cpu_reserve_cores=cpu_reserve_cores, cpu_overcommit=cpu_overcommit
     )
-    need, have = ctrl.check_fits("vm", 256, cpu_cores, use_tcg=False, target={})
+    need, have = ctrl.check_fits("vm", 256, cpu_cores, use_tcg=False, required={}, found={})
     assert need[RouteKey.CPU] == have[RouteKey.CPU] == f"{cpu_cores + 0.25:.2f}"
     with _mock_system_memory(100_000):  # host memory never decides here
         reservation = await ctrl.acquire(
@@ -244,12 +244,14 @@ def test_check_fits_adds_the_checked_target() -> None:
         cpu_overcommit=4.0,
         cpu_reserve_cores=0.5,
     )
-    target = {RouteKey.ARCH: "aarch64", RouteKey.MACHINE_TYPE: "virt-11.1"}
-    ctrl.check_fits("my-vm", 512, 1.0, use_tcg=False, target=target)  # fits: no error
+    # This worker takes every counter rate: `found` gives its own value, not the saved one
+    target = {RouteKey.ARCH: "aarch64", RouteKey.MACHINE_TYPE: "virt-11.1", RouteKey.COUNTER_HZ: "2700000000"}
+    here = {**target, RouteKey.COUNTER_HZ: "any"}
+    ctrl.check_fits("my-vm", 512, 1.0, use_tcg=False, required=target, found=here)  # fits: no error
     with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS) as exc_info:
-        ctrl.check_fits("my-vm", 512, 64.0, use_tcg=False, target=target)
+        ctrl.check_fits("my-vm", 512, 64.0, use_tcg=False, required=target, found=here)
     assert dict(exc_info.value.required) == {**target, "memory_mb": "592", "cpu": "64.25"}
-    assert dict(exc_info.value.found) == {**target, "memory_mb": "21600", "cpu": "30.00"}
+    assert dict(exc_info.value.found) == {**here, "memory_mb": "21600", "cpu": "30.00"}
 
 
 async def test_budget_reserve_ratio_scales() -> None:

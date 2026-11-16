@@ -147,8 +147,10 @@ def test_worker_describe(store_dir: Path) -> None:
         RouteKey.MEMORY_MB: str(spec.memory_mb),
         RouteKey.CPU: str(spec.cpu_cores),
     }
-    if host.cpu_vendor is not None:
-        required[RouteKey.CPU_VENDOR] = host.cpu_vendor
+    if host.cpu_id is not None:
+        required[RouteKey.CPU_ID] = host.cpu_id
+    if guest.counter_hz is not None:
+        required[RouteKey.COUNTER_HZ] = str(guest.counter_hz)
     if guest.packages_image is not None:
         required[RouteKey.PACKAGES_IMAGE] = guest.packages_image
     assert facts.satisfies(required)

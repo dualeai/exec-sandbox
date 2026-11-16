@@ -33,7 +33,8 @@ from exec_sandbox.instance import manager as instance_manager
 from exec_sandbox.instance.keyring import Keyring
 from exec_sandbox.models import InstanceRef, Language
 from exec_sandbox.platform_utils import detect_host_arch
-from exec_sandbox.qemu_cmd import resolve_machine_type
+from exec_sandbox.qemu_cmd import counter_rate, guest_cpu_id, resolve_machine_type
+from exec_sandbox.system_probes import detect_accel_type
 from tests.conftest import skip_unless_hwaccel
 from tests.instance_support import await_until, disk_full_once, new_keyring
 from tests.s3_faults import BUCKET, After, Bucket, DropAfter, Edit, Fail, Hold, Request, Response, S3Proxy
@@ -528,6 +529,12 @@ class TestAdmin:
             hashlib.sha256(Path(images.kernel).read_bytes()).hexdigest(),
             hashlib.sha256(Path(images.initramfs).read_bytes()).hexdigest(),
         )
+        # The counter rate the VM booted with (this worker's, read at its start) and this host's
+        # CPU identity, from the probes themselves
+        arch = detect_host_arch()
+        accel = await detect_accel_type(force_emulation=scheduler._vm_manager.settings.force_emulation)  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage]
+        assert info.guest.counter_hz == (await counter_rate(arch, accel)).hz
+        assert info.host.cpu_id == await guest_cpu_id(arch, accel)
         # The machine type this QEMU resolved for the new VM (virt-11.1 for QEMU 11.1 on arm64)
         assert info.host.machine_type == await resolve_machine_type(detect_host_arch(), None)
         assert info.host.machine_type not in {None, "virt"}

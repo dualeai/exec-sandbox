@@ -377,6 +377,9 @@ class QemuVM:
         # records them (GuestFacts)
         self.kernel_digest: str | None = None
         self.initramfs_digest: str | None = None
+        # The rate of the counter the guest's clock runs on, from its boot (a restore: the
+        # saved one; None: its boot host had no exact source), as a save records it (GuestFacts)
+        self.counter_hz: int | None = None
         # The machine type QEMU runs, as it resolves the -M value (set by VmManager at the
         # spawn from the cached machine type probe; None: unknown): a save records it
         self.machine_type: str | None = None

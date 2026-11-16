@@ -31,7 +31,7 @@ import contextlib
 import errno
 import json
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Mapping
@@ -65,8 +65,8 @@ class ErrorAction(StrEnum):
     permissions or OS): change it; the same call fails again."""
 
     ROUTE = "ROUTE"
-    """Repeat the call on another worker: this one has another CPU architecture, CPU vendor, guest
-    CPU model or accelerator, lacks the saved machine type or a guest image the instance needs
+    """Repeat the call on another worker: this one has another CPU architecture, guest CPU
+    model, host CPU (ARM with KVM or HVF), guest clock rate or accelerator, lacks the saved machine type or a guest image the instance needs
     (and the store has no copy), runs a QEMU older than the one that saved the state, cannot
     read data that another exec-sandbox release wrote, or has a smaller budget than the VM
     needs (see the error's `required` field)."""
@@ -374,20 +374,30 @@ class RouteRule(StrEnum):
     compared part by part (qemu_version)."""
     CONTAINS = "contains"
     """It holds the required value among its own (an image on its disk)."""
+    EQUAL_OR_ANY = "equal_or_any"
+    """Its value is the same string, or ROUTE_ANY: it takes every value (counter_hz)."""
+
+
+ROUTE_ANY: Final = "any"
+"""A worker's value of an EQUAL_OR_ANY key that takes every required value."""
 
 
 class RouteKey(StrEnum):
-    """Keys of RouteError.required and RouteError.found. A release adds keys; it never
-    renames or removes one, and a key keeps its rule and its value form."""
+    """Keys of RouteError.required and RouteError.found, each with its rule (RouteKey.rule)."""
 
     ARCH = "arch"
     """x86_64 or aarch64."""
     ACCELERATOR = "accelerator"
     """kvm, hvf or tcg."""
-    CPU_VENDOR = "cpu_vendor"
-    """x86 vendor of the guest CPU model; absent on ARM."""
     CPU_MODEL = "cpu_model"
     """The guest -cpu value."""
+    CPU_ID = "cpu_id"
+    """The host CPU a guest with -cpu host sees (ARM64 KVM: the CPU part and revision; HVF:
+    the feature registers); absent where the guest CPU is a fixed model (x86, ARM64 TCG)."""
+    COUNTER_HZ = "counter_hz"
+    """Rate in Hz of the counter the guest's clock runs on (x86 TSC, ARM generic timer), as
+    the host of its cold boot gave it; absent when that host had no exact source. A worker's
+    "any" (ROUTE_ANY): x86 KVM with TSC scaling, which runs a loaded guest at its own rate."""
     QEMU_VERSION = "qemu_version"
     """MAJOR.MINOR.PATCH. QEMU loads a state that the same or an older QEMU saved, with the
     same versioned machine type: a worker whose QEMU is this version or newer."""
@@ -411,10 +421,12 @@ class RouteKey(StrEnum):
         string; CONTAINS, the value itself or a set that holds it; AT_LEAST, not below
         (qemu_version part by part, the others as numbers), a set never. None: no value, so
         False, but for memory_mb and cpu, where None is no limit (a worker always has a QEMU
-        version)."""
+        version); EQUAL_OR_ANY, the same string or ROUTE_ANY."""
         match self.rule:
             case RouteRule.EQUAL:
                 return have == need
+            case RouteRule.EQUAL_OR_ANY:
+                return have in (need, ROUTE_ANY)
             case RouteRule.CONTAINS:
                 return need in have if isinstance(have, frozenset) else have == need
             case RouteRule.AT_LEAST:
@@ -430,8 +442,9 @@ class RouteKey(StrEnum):
 _ROUTE_RULES = {
     RouteKey.ARCH: RouteRule.EQUAL,
     RouteKey.ACCELERATOR: RouteRule.EQUAL,
-    RouteKey.CPU_VENDOR: RouteRule.EQUAL,
     RouteKey.CPU_MODEL: RouteRule.EQUAL,
+    RouteKey.CPU_ID: RouteRule.EQUAL,
+    RouteKey.COUNTER_HZ: RouteRule.EQUAL_OR_ANY,
     RouteKey.QEMU_VERSION: RouteRule.AT_LEAST,
     RouteKey.MACHINE_TYPE: RouteRule.CONTAINS,
     RouteKey.BASE_IMAGE: RouteRule.CONTAINS,
@@ -447,18 +460,21 @@ class RouteError(SandboxError):
     `required` maps RouteKey to the value the call needs: every fact the call checked
     up to this error, not only the facts that differ here. `found` maps this worker's
     values for those keys, and may hold more keys; None: this worker has no value for
-    the key (no such image or machine type; no cpu_vendor on ARM; for memory_mb and
+    the key (no such image or machine type; no exact counter rate; for memory_mb and
     cpu, no limit). Values are plain strings: qemu_version MAJOR.MINOR.PATCH, full
-    SHA-256 digests, memory_mb a whole number, cpu with two decimals. A fact that does
-    not apply to the saved host (cpu_vendor on ARM) is absent from `required`.
+    SHA-256 digests, memory_mb a whole number, cpu with two decimals, counter_hz a whole
+    number. A fact that does not apply to the saved instance (cpu_id on x86, counter_hz of
+    a guest whose boot host had no exact rate) is absent from `required`.
 
     A worker satisfies `required` when each key holds by its rule (RouteKey.rule):
     EQUAL, its value is the same string; AT_LEAST, its value is not below (qemu_version
-    part by part); CONTAINS, it holds the value. A worker that satisfies `required` passes the checks that
+    part by part); CONTAINS, it holds the value; EQUAL_OR_ANY, its value is the same string
+    or "any". A worker that satisfies `required` passes the checks that
     raised this error; a later check of the same call can raise RouteError with more
     keys (a load checks the host, then the budget, then the guest images, and QEMU
-    decides at the restore). An empty `required` (data this release cannot read: another
-    release wrote it): a worker of another release. Never delete a saved instance for
+    decides at the restore). An empty `required` (data or devices this release cannot read:
+    another release wrote it) names no worker, and no worker satisfies it
+    (WorkerFacts.satisfies): a worker of another release (describe_instance writer_release). Never delete a saved instance for
     this error.
     """
 
@@ -557,6 +573,10 @@ def damaged_instance_data(message: str, *, instance_id: str | None) -> InstanceG
     )
 
 
+HOST_LIMIT_ERRNOS: Final = frozenset({errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE})
+"""errno of a process, memory or file-handle limit: it can pass (TransientError)."""
+
+
 def spawn_error(
     error: OSError, *, binary: str, code: ErrorCode, context: dict[str, Any], hint: str | None
 ) -> TransientError | ConfigError:
@@ -570,7 +590,7 @@ def spawn_error(
     """
     context = {**context, "binary": binary, "errno": error.errno}
     message = f"Failed to start {binary}: {error}"
-    if error.errno in (errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE):
+    if error.errno in HOST_LIMIT_ERRNOS:
         return TransientError(message, code=code, context=context, hint=None, instance_id=None)
     return ConfigError(message, code=ErrorCode.HOST_DEPENDENCY, context=context, hint=hint, instance_id=None)
 

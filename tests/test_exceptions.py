@@ -47,6 +47,7 @@ PUBLIC_ERROR_NAMES = {
     "RouteError",
     "RouteKey",
     "RouteRule",
+    "ROUTE_ANY",
     "InstanceGoneError",
     "InternalError",
     "ErrorAction",
@@ -171,16 +172,16 @@ class TestHelpers:
     def test_host_mismatch_names_required_values(self) -> None:
         """`required` keeps the whole target; the message names only the values that differ,
         in JSON form (a cpu_model holds commas; None is null)."""
-        required = {RouteKey.ARCH: "x86_64", RouteKey.CPU_VENDOR: "GenuineIntel", RouteKey.CPU_MODEL: "m,+tsc-deadline"}
+        required = {RouteKey.ARCH: "x86_64", RouteKey.CPU_MODEL: "m,+tsc-deadline", RouteKey.COUNTER_HZ: "2700000000"}
         found: dict[RouteKey, str | None] = {
             RouteKey.ARCH: "aarch64",
-            RouteKey.CPU_VENDOR: None,
             RouteKey.CPU_MODEL: "host",
+            RouteKey.COUNTER_HZ: None,
         }
         error = exceptions.host_mismatch(instance_id="0" * 32, required=required, found=found, reason=None)
         assert str(error) == (
-            f'Instance {"0" * 32} needs arch="x86_64", cpu_vendor="GenuineIntel", cpu_model="m,+tsc-deadline"; '
-            'this worker has arch="aarch64", cpu_vendor=null, cpu_model="host".'
+            f'Instance {"0" * 32} needs arch="x86_64", cpu_model="m,+tsc-deadline", counter_hz="2700000000"; '
+            'this worker has arch="aarch64", cpu_model="host", counter_hz=null.'
         )
         assert type(error) is RouteError
         assert error.code is ErrorCode.INSTANCE_HOST_MISMATCH
@@ -243,6 +244,10 @@ class TestHelpers:
             pytest.param(RouteKey.BASE_IMAGE, None, "a" * 64, False, id="no-image"),
             pytest.param(RouteKey.BASE_IMAGE, "a" * 64, "a" * 64, True, id="contains-the-value"),
             pytest.param(RouteKey.ARCH, None, "aarch64", False, id="equal-no-value"),
+            pytest.param(RouteKey.COUNTER_HZ, "24000000", "24000000", True, id="same-rate"),
+            pytest.param(RouteKey.COUNTER_HZ, "1000000000", "24000000", False, id="other-rate"),
+            pytest.param(RouteKey.COUNTER_HZ, "any", "2700000000", True, id="any-rate"),
+            pytest.param(RouteKey.COUNTER_HZ, None, "2700000000", False, id="no-exact-rate"),
         ],
     )
     def test_holds_by_rule(self, key: RouteKey, have: str | frozenset[str] | None, need: str, holds: bool) -> None:
@@ -253,8 +258,9 @@ class TestHelpers:
         assert {key: key.rule for key in RouteKey} == {
             RouteKey.ARCH: RouteRule.EQUAL,
             RouteKey.ACCELERATOR: RouteRule.EQUAL,
-            RouteKey.CPU_VENDOR: RouteRule.EQUAL,
             RouteKey.CPU_MODEL: RouteRule.EQUAL,
+            RouteKey.CPU_ID: RouteRule.EQUAL,
+            RouteKey.COUNTER_HZ: RouteRule.EQUAL_OR_ANY,
             RouteKey.QEMU_VERSION: RouteRule.AT_LEAST,
             RouteKey.MACHINE_TYPE: RouteRule.CONTAINS,
             RouteKey.BASE_IMAGE: RouteRule.CONTAINS,
@@ -345,13 +351,11 @@ class TestInternalClasses:
 
 
 class TestExports:
-    """The package exports exactly the 14 error names (RouteKey and RouteRule included)."""
+    """The package exports exactly the 15 error names (RouteKey, RouteRule and ROUTE_ANY included)."""
 
     def test_all_holds_exactly_the_error_names(self) -> None:
         from_exceptions = {
-            name
-            for name in exec_sandbox.__all__
-            if getattr(getattr(exec_sandbox, name), "__module__", None) == exceptions.__name__
+            name for name in exec_sandbox.__all__ if getattr(exceptions, name, None) is getattr(exec_sandbox, name)
         }
         assert from_exceptions == PUBLIC_ERROR_NAMES
 

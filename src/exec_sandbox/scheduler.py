@@ -66,7 +66,7 @@ from exec_sandbox.files.locks import EntryLease  # noqa: TC001 - Used at runtime
 from exec_sandbox.images import image_digest, kernel_dir_of
 from exec_sandbox.instance.ids import check_instance_id
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
-from exec_sandbox.migration_client import qemu_refusal
+from exec_sandbox.migration_client import refusal_cause
 from exec_sandbox.models import ExposedPort, Language, StartupTiming
 from exec_sandbox.package_validator import BUNDLED_NPM_ALLOW_LIST, BUNDLED_PYPI_ALLOW_LIST, PackageValidator
 from exec_sandbox.platform_utils import detect_host_arch
@@ -85,8 +85,9 @@ from exec_sandbox.system_probes import (
     warn_zswap,
 )
 from exec_sandbox.vm_manager import VmManager
+from exec_sandbox.vm_types import GuestBoot
 from exec_sandbox.warm_vm_pool import WarmVMPool
-from exec_sandbox.worker_facts import WorkerFacts, machine_facts, qemu_version_fact
+from exec_sandbox.worker_facts import WorkerFacts, counter_fact, machine_facts, qemu_version_fact
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -188,7 +189,8 @@ class Scheduler:
             TransientError: ASSET_DOWNLOAD (a VM image download failed),
                 INSTANCE_STORE_UNAVAILABLE (the instance store check got no answer),
                 LOCAL_DISK (a host error on a cache folder or the home disk folder: disk full, I/O
-                error),
+                error; or a read of the host's clock counter rate, CPU identity or KVM TSC
+                scaling hit a process, memory or file-handle limit or got no answer in time),
                 QEMU_CRASHED (a QEMU probe hit a process, memory or file-handle limit, or
                 gave no answer in time), OVERLAY_FAILED (qemu-storage-daemon did not start)
             InvalidInputError: SCHEDULER_STATE: already started, still starting, or still
@@ -520,7 +522,8 @@ class Scheduler:
                 key; do not delete the instance), HOST_DEPENDENCY (for example qemu-vm
                 cannot get access to the loaded migration file).
             RouteError: INSTANCE_HOST_MISMATCH: this worker cannot run it: arch,
-                accelerator, CPU vendor or guest CPU model differ from the saved ones, its
+                accelerator, guest CPU model, host CPU (ARM with KVM or HVF) or guest clock
+                rate (counter_hz) differ from the saved ones, its
                 QEMU lacks the saved machine type (checked before any download), a missing
                 guest image, data that another exec-sandbox release wrote and this one
                 cannot read, or a QEMU older than the saver's that refuses the saved state
@@ -642,13 +645,18 @@ class Scheduler:
                         reservation=reservation,
                         machine_type=state.body.host.machine_type,
                         egress_domains=state.body.egress_domains,  # the policy at save
-                        boot=(state.body.guest.kernel, state.body.guest.initramfs),
+                        boot=GuestBoot(
+                            kernel=state.body.guest.kernel,
+                            initramfs=state.body.guest.initramfs,
+                            counter_hz=state.body.guest.counter_hz,
+                        ),
                         use_template=False,  # the RAM is in the saved vmstate
                     )
                 except TransientError as e:
-                    if (refusal := qemu_refusal(e)) is not None:
-                        # QEMU refused the saved state: a worker with the saver's facts and QEMU can load it.
-                        raise await instances.refused_by_qemu(state, qemu_error=refusal.message) from e
+                    if (cause := refusal_cause(e)) is not None:
+                        # The saved state cannot run here (QEMU refused it, aborted on it, or its
+                        # guest panicked): a worker with the saver's facts and QEMU can load it.
+                        raise await instances.refused_by_qemu(state, qemu_error=cause) from e
                     raise
         except BaseException:
             await instances.release(state, wait=True)
@@ -725,7 +733,11 @@ class Scheduler:
         if not self._started or self._vm_manager is None:
             raise _scheduler_state(_NOT_STARTED)
         vm_manager, instances = self._vm_manager, self._instances
-        facts = await machine_facts(force_emulation=vm_manager.settings.force_emulation)
+        force_emulation = vm_manager.settings.force_emulation
+        facts = {
+            **await machine_facts(force_emulation=force_emulation),
+            RouteKey.COUNTER_HZ: await counter_fact(force_emulation=force_emulation),
+        }
         own = await asyncio.to_thread(_image_digests, vm_manager.images.present_base_images())
         # The L2 images of this worker's cache: a load uses one whose digest matches
         layers = self._snapshot_manager

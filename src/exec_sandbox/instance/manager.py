@@ -117,7 +117,7 @@ from exec_sandbox.permission_utils import (
 )
 from exec_sandbox.settings import kept_secret
 from exec_sandbox.system_probes import require_qemu_machine_types, require_qemu_version
-from exec_sandbox.worker_facts import machine_facts, qemu_version_fact
+from exec_sandbox.worker_facts import counter_fact, machine_facts, qemu_version_fact
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Coroutine, Generator, Mapping
@@ -133,9 +133,10 @@ logger = get_logger(__name__)
 _LOAD_ATTEMPTS = 3
 """Head reads per load while body objects vanish because newer saves replaced them."""
 _OBJECT_KIND = {"full": "f", "pack": "p"}
-_CHECKED_FACTS = (RouteKey.ARCH, RouteKey.ACCELERATOR, RouteKey.CPU_VENDOR, RouteKey.CPU_MODEL)
-"""Host facts a load must match (with the machine type, rule CONTAINS). cpu_model: QEMU
-refuses a state saved with other CPU features, but only at restore, after the download.
+_CHECKED_FACTS = (RouteKey.ARCH, RouteKey.ACCELERATOR, RouteKey.CPU_MODEL, RouteKey.CPU_ID)
+"""Host facts a load must match (with the machine type, rule CONTAINS, and the guest's
+counter rate, rule EQUAL_OR_ANY). cpu_model and cpu_id: QEMU refuses a state saved with
+other CPU features, but only at restore, after the download (HVF may load it silently).
 Images are fetched by digest. qemu_version is not checked: QEMU accepts or refuses the
 saved state at restore. The exec-sandbox release is not checked: a release loads the
 instances of another one; data it cannot read raises RouteError (another release)."""
@@ -836,8 +837,8 @@ class InstanceManager(InstanceAdmin):
         ConfigError INSTANCE_KEY_MISSING when this keyring lacks its key, InstanceGoneError
         INSTANCE_INTEGRITY or RouteError INSTANCE_HOST_MISMATCH (another release) when it
         does not open, and the store's errors; RouteError INSTANCE_HOST_MISMATCH when the
-        host facts differ (arch, accelerator, CPU vendor, guest CPU model, the machine
-        type this QEMU has), when this release runs another device layout for the VM, or
+        host facts differ (arch, accelerator, guest CPU model, host CPU identity, the guest's
+        counter rate by its rule, the machine type this QEMU has), when this release runs another device layout for the VM, or
         when a guest image is neither on this worker nor in the store (or the store's copy
         does not match its digest); RouteError CAPACITY_NEVER_FITS when the VM is larger
         than this worker's whole budget; ConfigError HOST_DEPENDENCY or TransientError
@@ -945,20 +946,21 @@ class InstanceManager(InstanceAdmin):
         """The checked facts of the saved host and the budget the VM needs, before any
         download: ROUTE when this host's facts differ (INSTANCE_HOST_MISMATCH) or the VM can
         never fit its whole budget (CAPACITY_NEVER_FITS)."""
-        target = _target(body.host)
+        target = _target(body)
         found = await self._found(target)
-        if found != target:
+        if any(not key.holds(found[key], need) for key, need in target.items()):
             raise host_mismatch(instance_id=instance_id, required=target, found=found, reason=None)
         here = await self._vm_manager.restore_layout(
             body.spec, machine_type=body.host.machine_type, packages=body.guest.packages_image is not None
         )
         if here != body.host.device_layout:
             raise _layout_differs(instance_id, saved=body.host.device_layout, here=here)
-        need, have = await self._vm_manager.check_fits(body.spec, vm_id=instance_id, target=target)
-        return _Checked(required={**target, **need}, found={**target, **have})
+        need, have = await self._vm_manager.check_fits(body.spec, vm_id=instance_id, required=target, found=found)
+        return _Checked(required={**target, **need}, found={**found, **have})
 
     async def refused_by_qemu(self, state: InstanceState, *, qemu_error: str) -> SandboxError:
-        """The error of a loaded state this worker's QEMU refused. QEMU loads a state that
+        """The error of a loaded state that cannot run on this worker (migration_client.refusal_cause:
+        QEMU refused it or aborted on it, or its guest panicked right after it). QEMU loads a state that
         the same or an older QEMU saved: on an older QEMU, ROUTE to a worker with the saver's
         facts, the budget the VM needs, its guest images and a QEMU of the saved version or newer (qemu_version,
         rule AT_LEAST); on the
@@ -968,7 +970,7 @@ class InstanceManager(InstanceAdmin):
         local_qemu = await qemu_version_fact()
         if RouteKey.QEMU_VERSION.holds(local_qemu, host.qemu_version):
             return InternalError(
-                f"Instance {state.header.instance_id}: QEMU {local_qemu} refused a state that QEMU "
+                f"Instance {state.header.instance_id}: QEMU {local_qemu} cannot run a state that QEMU "
                 f"{host.qemu_version} saved: {qemu_error}.",
                 code=ErrorCode.INTERNAL,
                 context=None,
@@ -984,7 +986,7 @@ class InstanceManager(InstanceAdmin):
             instance_id=state.header.instance_id,
             required={**checked.required, **images, RouteKey.QEMU_VERSION: host.qemu_version},
             found={**checked.found, **images, RouteKey.QEMU_VERSION: local_qemu},
-            reason=f"this worker's QEMU refused the saved state ({qemu_error})",
+            reason=f"the saved state cannot run on this worker's QEMU ({qemu_error})",
         )
 
     async def _download(self, header: HeadHeader, body: HeadBody, data_key: bytes, folder: Path) -> tuple[Path, Path]:
@@ -1212,7 +1214,11 @@ class InstanceManager(InstanceAdmin):
     async def _found(self, target: dict[RouteKey, str]) -> dict[RouteKey, str | None]:
         """This worker's value for each key of a host target (a CONTAINS key: the target's
         value when this worker has it, else None)."""
-        local = await self._machine_facts()
+        force_emulation = self._vm_manager.settings.force_emulation
+        local = {
+            **await self._machine_facts(),
+            RouteKey.COUNTER_HZ: await counter_fact(force_emulation=force_emulation),
+        }
         machine_types = await require_qemu_machine_types()
         return {
             key: (value if value in machine_types else None) if key is RouteKey.MACHINE_TYPE else local[key]
@@ -1244,7 +1250,9 @@ class InstanceManager(InstanceAdmin):
                 hint="Download or rebuild the guest images.",
                 instance_id=None,
             )
-        return GuestFacts(base_image=base, packages_image=packages, kernel=kernel, initramfs=initramfs)
+        return GuestFacts(
+            base_image=base, packages_image=packages, kernel=kernel, initramfs=initramfs, counter_hz=vm.counter_hz
+        )
 
     async def _host_facts(self, vm: QemuVM) -> HostFacts:
         """The saving host's facts (recomputed at each save: HostFacts).
@@ -1328,13 +1336,16 @@ def _close_after(job: asyncio.Future[None] | None, fds: Collection[int]) -> None
         job.add_done_callback(close)
 
 
-def _target(host: HostFacts) -> dict[RouteKey, str]:
-    """The checked facts of a saved host, as route values (a fact that does not apply, such
-    as cpu_vendor on ARM, is absent)."""
-    saved = host.model_dump()
-    return {key: saved[key] for key in _CHECKED_FACTS if saved[key] is not None} | {
-        RouteKey.MACHINE_TYPE: host.machine_type
-    }
+def _target(body: HeadBody) -> dict[RouteKey, str]:
+    """The checked facts of a saved instance, as route values: its host's (a fact that does
+    not apply, such as cpu_id on x86, is absent), its machine type, and the counter rate its
+    guest booted with (absent when the boot host had no exact rate)."""
+    saved = body.host.model_dump()
+    target = {key: saved[key] for key in _CHECKED_FACTS if saved[key] is not None}
+    target[RouteKey.MACHINE_TYPE] = body.host.machine_type
+    if body.guest.counter_hz is not None:
+        target[RouteKey.COUNTER_HZ] = str(body.guest.counter_hz)
+    return target
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

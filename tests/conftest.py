@@ -870,13 +870,15 @@ async def instance_env(
     """Saved instances without QEMU (tests/instance_support.py): yields an InstanceEnv, the real
     InstanceManager on a store behind `s3_proxy`, fake VMs whose QMP sockets live under a short
     path, and the bytes each commit saved. The host probes of the manager are replaced: the QEMU
-    version (no binary needed) and the accelerator (probed once for the worker)."""
-    from tests.instance_support import InstanceEnv, accelerator_probe, fake_machine_types, qemu_floor
+    version (no binary needed), the accelerator (probed once for the worker) and the counter
+    rate (the fake VMs')."""
+    from tests.instance_support import InstanceEnv, accelerator_probe, fake_counter_rate, fake_machine_types, qemu_floor
 
     monkeypatch.setattr("exec_sandbox.instance.manager.require_qemu_version", qemu_floor)
     monkeypatch.setattr("exec_sandbox.worker_facts.require_qemu_version", qemu_floor)
     monkeypatch.setattr("exec_sandbox.instance.manager.require_qemu_machine_types", fake_machine_types)
     monkeypatch.setattr("exec_sandbox.worker_facts.detect_accel_type", accelerator_probe(host_accelerator))
+    monkeypatch.setattr("exec_sandbox.worker_facts.counter_rate", fake_counter_rate)
     async with InstanceEnv.open(proxy=s3_proxy, root=short_tmp_dir, tmp=tmp_path) as env:
         yield env
 

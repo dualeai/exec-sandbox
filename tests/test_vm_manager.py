@@ -45,6 +45,7 @@ from exec_sandbox.exceptions import (
 )
 from exec_sandbox.files.locks import CacheEntry, EntryLease, share_all
 from exec_sandbox.images import GuestImages, guest_digests
+from exec_sandbox.migration_client import refusal_cause
 from exec_sandbox.models import ExposedPort, Language
 from exec_sandbox.platform_utils import (
     HostArch,
@@ -52,6 +53,7 @@ from exec_sandbox.platform_utils import (
     detect_host_arch,
 )
 from exec_sandbox.process_registry import unregister_process
+from exec_sandbox.qemu_cmd import CounterRate, guest_cpu_model
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
 from exec_sandbox.qemu_vm import QemuDiagnostics, QemuVM
 from exec_sandbox.settings import Settings
@@ -73,7 +75,7 @@ from exec_sandbox.vm_manager import (
     _stop_qemu,
 )
 from exec_sandbox.vm_spec import VmSpec
-from exec_sandbox.vm_types import AccelType, VmState
+from exec_sandbox.vm_types import AccelType, GuestBoot, VmState
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 from tests.conftest import asyncio_with, skip_unless_linux, skip_unless_macos
 from tests.instance_support import qemu_file
@@ -104,9 +106,10 @@ def unit_test_vm_manager(unit_test_settings: Any) -> Iterator[VmManager]:
 # another only with the same model): written out here, never derived from qemu_cmd.
 _X86_MODEL = (
     "qemu64-v1,+avx,+avx2,+bmi1,+bmi2,+f16c,+fma,+abm,+movbe,+xsave,+xsaveopt,+cx16,+lahf_lm,"
-    "+popcnt,+sse4.1,+sse4.2,+ssse3,+aes,+pclmulqdq,+rdrand,+rdseed,+hypervisor,-svm,-vmx"
+    "+popcnt,+sse4.1,+sse4.2,+ssse3,+aes,+pclmulqdq,+rdrand,+hypervisor,-svm,-vmx"
 )
 _X86_KVM_PV = "+kvm-pv-ipi,+kvm-pv-tlb-flush,+kvm-pv-sched-yield,+kvm-poll-control,+kvm-asyncpf-int"
+_X86_INTEL = "family=6,model=60,stepping=4"  # GenuineIntel only: QEMU Haswell's signature
 
 
 class TestVmState:
@@ -1475,39 +1478,70 @@ class TestConsoleSelection(_QemuCmdTestBase):
 class TestCpuModelSelection(_QemuCmdTestBase):
     """Verify -cpu flag matches arch/accel combinations.
 
-    ARM64 HVF/KVM → host, ARM64 TCG → neoverse-v1,pauth=off (no PAC, no BTI),
+    ARM64 HVF/KVM → host, ARM64 TCG → neoverse-v1,pauth=off,cntfrq=62500000 (no PAC, no BTI),
     x86 (every accel) → the fixed AVX2-level model; KVM adds PV flags, and
     +tsc-deadline with TSC_DEADLINE (HVF never passes it: check_tsc_deadline).
     """
 
     @pytest.mark.parametrize(
-        "arch, accel_type, expected_cpu",
+        "arch, accel_type, x86_vendor, expected_cpu",
         [
-            pytest.param(HostArch.AARCH64, AccelType.HVF, "host", id="arm64-hvf"),
-            pytest.param(HostArch.AARCH64, AccelType.KVM, "host", id="arm64-kvm"),
-            pytest.param(HostArch.AARCH64, AccelType.TCG, "neoverse-v1,pauth=off", id="arm64-tcg"),
+            pytest.param(HostArch.AARCH64, AccelType.HVF, "AuthenticAMD", "host", id="arm64-hvf"),
+            pytest.param(HostArch.AARCH64, AccelType.KVM, "AuthenticAMD", "host", id="arm64-kvm"),
+            pytest.param(
+                HostArch.AARCH64, AccelType.TCG, "AuthenticAMD", "neoverse-v1,pauth=off,cntfrq=62500000", id="arm64-tcg"
+            ),
             pytest.param(
                 HostArch.X86_64,
                 AccelType.KVM,
-                f"{_X86_MODEL},{_X86_KVM_PV},+tsc-deadline,vendor=GenuineIntel,enforce",
+                "GenuineIntel",
+                f"{_X86_MODEL},{_X86_KVM_PV},+tsc-deadline,{_X86_INTEL},vendor=GenuineIntel,enforce",
                 id="x86-kvm",
             ),
-            pytest.param(HostArch.X86_64, AccelType.HVF, f"{_X86_MODEL},vendor=GenuineIntel,enforce", id="x86-hvf"),
-            pytest.param(HostArch.X86_64, AccelType.TCG, f"{_X86_MODEL},vendor=GenuineIntel,enforce", id="x86-tcg"),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.KVM,
+                "AuthenticAMD",
+                f"{_X86_MODEL},{_X86_KVM_PV},+tsc-deadline,vendor=AuthenticAMD,enforce",
+                id="x86-kvm-amd",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.HVF,
+                "GenuineIntel",
+                f"{_X86_MODEL},{_X86_INTEL},vendor=GenuineIntel,enforce",
+                id="x86-hvf",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.TCG,
+                "GenuineIntel",
+                f"{_X86_MODEL},{_X86_INTEL},vendor=GenuineIntel,enforce",
+                id="x86-tcg",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.TCG,
+                "  Shanghai  ",
+                f"{_X86_MODEL},vendor=  Shanghai  ,enforce",
+                id="x86-tcg-zhaoxin",
+            ),
         ],
     )
     async def test_cpu_model(
         self,
         vm_settings,
         workdir,
+        *,
         arch: HostArch,
         accel_type: AccelType,
+        x86_vendor: str,
         expected_cpu: str,
     ) -> None:
-        """CPU model string matches expected value."""
+        """CPU model string matches expected value (x86_vendor: the host's CPUID vendor)."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with _qemu_cmd_mocks(accel_type=accel_type, x86_vendor="GenuineIntel"):
+        with _qemu_cmd_mocks(accel_type=accel_type, x86_vendor=x86_vendor):
             cmd = await build_qemu_cmd(
                 settings=vm_settings,
                 arch=arch,
@@ -1708,7 +1742,7 @@ class TestArm64TcgVersionGuard(_QemuCmdTestBase):
                     mem_path_share=False,
                     machine_type=None,
                 )
-                assert _extract_cpu_model(cmd) == "neoverse-v1,pauth=off"  # the arm64 TCG command
+                assert _extract_cpu_model(cmd) == "neoverse-v1,pauth=off,cntfrq=62500000"  # the arm64 TCG command
 
 
 # ============================================================================
@@ -3425,8 +3459,77 @@ class TestStartAndStop:
         """Under TCG a VM also needs QEMU's translation cache: the budget it needs (a route
         fact) counts it, as admission does."""
         monkeypatch.setattr(unit_test_vm_manager, "_detect_accel_type", AsyncMock(return_value=accel))
-        need, _have = await unit_test_vm_manager.check_fits(VmSpec(language=Language.PYTHON), vm_id="vm", target={})
+        need, _have = await unit_test_vm_manager.check_fits(
+            VmSpec(language=Language.PYTHON), vm_id="vm", required={}, found={}
+        )
         assert need["memory_mb"] == needed  # 192 MB, 80 MB of overhead, 128 MB of TCG translation cache
+
+    async def test_no_start_on_a_guest_cpu_the_host_cannot_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """x86: the guest CPU probe refuses (enforce: a flag the host lacks): start raises its
+        HOST_DEPENDENCY error and the overlay daemon does not start."""
+        manager = VmManager(Settings(base_images_dir=tmp_path, kernel_path=tmp_path, home_disk_dir=tmp_path / "home"))
+        manager.arch = HostArch.X86_64
+        steps: list[str] = []
+
+        async def tcg(*, force_emulation: bool) -> AccelType:
+            return AccelType.TCG
+
+        refused = ConfigError(
+            "This host cannot run the guest CPU (qemu -accel tcg -cpu m): avx512f",
+            code=ErrorCode.HOST_DEPENDENCY,
+            context=None,
+            hint=None,
+            instance_id=None,
+        )
+        monkeypatch.setattr("exec_sandbox.vm_manager.require_guest_cpu", AsyncMock(side_effect=refused))
+        with self._probes(steps, accel=tcg):
+            try:
+                with pytest.raises(ConfigError) as exc_info:
+                    await manager.start()
+            finally:
+                await manager.stop()
+                if manager._run_dir is not None:
+                    manager._run_dir.close()
+        assert exc_info.value is refused
+        assert "pool start" not in steps
+
+    @pytest.mark.parametrize("arch", [HostArch.X86_64, HostArch.AARCH64], ids=["x86", "arm64"])
+    async def test_start_reads_the_boot_counter_rate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arch: HostArch
+    ) -> None:
+        """start reads the counter rate once: every cold boot and L1 template then gets it
+        (VmManager.counter_hz); it asks the CPU identity, and on x86 runs the guest CPU (the
+        model VMs get) on QEMU, so a host that cannot run it fails here."""
+        manager = VmManager(Settings(base_images_dir=tmp_path, kernel_path=tmp_path, home_disk_dir=tmp_path / "home"))
+        manager.arch = arch
+        steps: list[str] = []
+
+        async def tcg(*, force_emulation: bool) -> AccelType:
+            return AccelType.TCG
+
+        rate = AsyncMock(return_value=CounterRate(hz=1_000_000_000, any_rate=False))
+        cpu_id = AsyncMock(return_value=None)
+        guest_cpu = AsyncMock(return_value=None)
+        monkeypatch.setattr("exec_sandbox.vm_manager.counter_rate", rate)
+        monkeypatch.setattr("exec_sandbox.vm_manager.guest_cpu_id", cpu_id)
+        monkeypatch.setattr("exec_sandbox.vm_manager.require_guest_cpu", guest_cpu)
+        with self._probes(steps, accel=tcg):
+            try:
+                assert manager.counter_hz is None  # not started
+                await manager.start()
+                assert manager.counter_hz == 1_000_000_000
+            finally:
+                await manager.stop()
+                if manager._run_dir is not None:
+                    manager._run_dir.close()
+        rate.assert_awaited_once_with(arch, AccelType.TCG)
+        cpu_id.assert_awaited_once_with(arch, AccelType.TCG)
+        if arch == HostArch.X86_64:
+            guest_cpu.assert_awaited_once_with(await guest_cpu_model(arch, AccelType.TCG), accel="tcg")
+        else:
+            guest_cpu.assert_not_awaited()
 
     async def test_no_start_without_a_qemu_version(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every VM needs the QEMU version (command line, migration, saved facts): a start that
@@ -4135,12 +4238,18 @@ class TestImageDigestsOfAVm:
     _launch_qemu_vm with a faked spawn: the file must change at the spawn, a moment that
     create_vm does not give on demand."""
 
-    @pytest.mark.parametrize("saved_boot", [None, ("a" * 64, "b" * 64)], ids=["cold-boot", "restore"])
+    @pytest.mark.parametrize(
+        "saved_boot",
+        [None, GuestBoot(kernel="a" * 64, initramfs="b" * 64, counter_hz=1_000_000_000)],
+        ids=["cold-boot", "restore"],
+    )
     async def test_digests_are_taken_before_the_spawn(
-        self, unit_test_vm_manager: VmManager, tmp_path: Path, saved_boot: tuple[str, str] | None
+        self, unit_test_vm_manager: VmManager, tmp_path: Path, saved_boot: GuestBoot | None
     ) -> None:
-        """The VM keeps the digests of its images, of its boot (a restore: the saved ones, else
-        this worker's kernel and initramfs) and its device layout, for its next save."""
+        """The VM keeps the digests of its images, of its boot (a restore: the saved ones and
+        counter rate, else this worker's kernel and initramfs and the rate start read) and its
+        device layout, for its next save."""
+        unit_test_vm_manager._counter_hz = 24_000_000  # pyright: ignore[reportPrivateUsage] - start reads it
         base, layer = tmp_path / "base.qcow2", tmp_path / "l2.qcow2"
         base.write_bytes(b"base image")
         layer.write_bytes(b"l2 layer")
@@ -4187,8 +4296,10 @@ class TestImageDigestsOfAVm:
             assert vm.base_image_digest == hashlib.sha256(b"base image").hexdigest()
             assert vm.packages_image_digest == hashlib.sha256(b"l2 layer").hexdigest()
             assert vm.device_layout == "-device virtio-blk-device drive=base serial=base"
-            assert (vm.kernel_digest, vm.initramfs_digest) == (
-                saved_boot or (hashlib.sha256(b"kernel").hexdigest(), hashlib.sha256(b"initramfs").hexdigest())
+            assert (vm.kernel_digest, vm.initramfs_digest, vm.counter_hz) == (
+                (saved_boot.kernel, saved_boot.initramfs, 1_000_000_000)
+                if saved_boot is not None
+                else (hashlib.sha256(b"kernel").hexdigest(), hashlib.sha256(b"initramfs").hexdigest(), 24_000_000)
             )
         finally:
             unit_test_vm_manager._vms.pop(pending.vm_id, None)
@@ -5141,7 +5252,7 @@ class TestEmulationMode:
     async def test_emulation_uses_tcg_not_hvf(self, emulation_vm_manager) -> None:
         """force_emulation=True uses TCG, not hardware acceleration. The running QEMU process has:
         1. -accel tcg,... (software emulation), not hvf or kvm
-        2. an emulated CPU, never host: neoverse-v1,pauth=off on arm64; on x86_64 the fixed
+        2. an emulated CPU, never host: neoverse-v1,pauth=off,cntfrq=62500000 on arm64; on x86_64 the fixed
            model with no KVM PV flags and no +tsc-deadline
         """
         vm = await emulation_vm_manager.create_vm(
@@ -5214,7 +5325,7 @@ class TestEmulationMode:
                 f"Expected TCG emulation with force_emulation=True, got: -accel {accel_found}"
             )
             if detect_host_arch() == HostArch.AARCH64:
-                assert cpu_found == "neoverse-v1,pauth=off", cpu_found
+                assert cpu_found == "neoverse-v1,pauth=off,cntfrq=62500000", cpu_found
             else:
                 assert cpu_found.startswith(f"{_X86_MODEL},"), cpu_found
                 assert cpu_found.endswith(",enforce"), cpu_found
@@ -7052,8 +7163,12 @@ class TestRestoreFailuresAfterLaunch:
         launches: list[tuple[str | None, str | None]] | None = None,
         egress_domains: tuple[str, ...] | None = None,
         egresses: list[tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
-        boot: tuple[str, str] | None = None,
-        boots: list[tuple[str, str] | None] | None = None,
+        boot: GuestBoot | None = None,
+        boots: list[GuestBoot | None] | None = None,
+        restore: Callable[..., Awaitable[None]] | None = None,
+        load_started: bool = True,
+        qemu_closed: bool = False,
+        qmp_connect: Callable[..., Awaitable[object]] | None = None,
     ) -> QemuVM:
         """Run restore_vm with QEMU's exit code `returncode` (None: it runs) and a guest
         channel whose connect raises `connect_error` (None: it answers). `host_disk_full`
@@ -7068,7 +7183,9 @@ class TestRestoreFailuresAfterLaunch:
         infra.vm_id = "restore-vm"
         infra.workdir.use_qemu_vm_user = False
         infra.channel.connect = AsyncMock(side_effect=connect_error)
-        vm = MagicMock() if vm is None else vm
+        if vm is None:
+            vm = MagicMock()
+            vm.process.wait = AsyncMock()  # its end is not seen: returncode stays as given
         vm.process.returncode = returncode
         vm.collect_diagnostics = MagicMock(
             return_value=QemuDiagnostics(
@@ -7083,7 +7200,15 @@ class TestRestoreFailuresAfterLaunch:
         vm.transition_state = AsyncMock()
         vm.raise_if_host_disk_full = AsyncMock(side_effect=host_disk_full)
         client = AsyncMock()
-        client.__aenter__ = AsyncMock(return_value=client)
+        client.load_started, client.qemu_closed = False, False
+        if restore is not None:  # the state load (MigrationClient.restore_snapshot), then what it saw
+
+            async def load(*args: object, **kwargs: object) -> None:
+                client.load_started, client.qemu_closed = load_started, qemu_closed
+                await restore(*args, **kwargs)
+
+            client.restore_snapshot = load
+        client.__aenter__ = AsyncMock(return_value=client) if qmp_connect is None else qmp_connect
         client.__aexit__ = AsyncMock(return_value=False)
         launch = AsyncMock(return_value=vm)
         build = AsyncMock(return_value=[qemu_system_binary(manager.settings, arch=manager.arch)])
@@ -7206,8 +7331,153 @@ class TestRestoreFailuresAfterLaunch:
         assert exc_info.value.context == {
             "vm_id": "restore-vm",
             "returncode": returncode,
+            "loading": False,  # before the load: no evidence against the saved state
             "console_log": "qemu-system: Unknown ramblock",
         }
+        assert refusal_cause(exc_info.value) is None
+
+    async def test_qemu_abort_while_loading_is_a_refusal(self, unit_test_vm_manager, tmp_path: Path) -> None:
+        """QEMU aborts while it loads the state (the load raises, then QEMU is gone with
+        SIGABRT): QEMU_CRASHED marked loading, which refusal_cause takes as the state's."""
+        vm = MagicMock()
+        vm.process.wait = AsyncMock()
+
+        async def load_aborts(*_args: object, **_kwargs: object) -> None:
+            vm.process.returncode = -6
+            raise ConnectionResetError
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
+            await self._restore(
+                unit_test_vm_manager,
+                tmp_path,
+                returncode=None,
+                connect_error=None,
+                vm=vm,
+                restore=load_aborts,
+                qemu_closed=True,
+            )
+        assert exc_info.value.context["loading"] is True
+        assert refusal_cause(exc_info.value) == "qemu-system: Unknown ramblock"
+
+    async def test_qemu_reaped_after_the_failed_load_is_still_its_death(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        """QEMU aborts while it loads: the load fails on the closed QMP socket before the event
+        loop has reaped QEMU (its returncode comes with its wait). The restore waits for the
+        end, so the error is QEMU's death while loading (QEMU_CRASHED), not MIGRATION_FAILED."""
+        vm = MagicMock()
+
+        async def ends() -> int:
+            vm.process.returncode = -6
+            return -6
+
+        vm.process.wait = ends
+
+        async def load_fails(*_args: object, **_kwargs: object) -> None:
+            raise ConnectionResetError
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
+            await self._restore(
+                unit_test_vm_manager,
+                tmp_path,
+                returncode=None,
+                connect_error=None,
+                vm=vm,
+                restore=load_fails,
+                qemu_closed=True,
+            )
+        assert (exc_info.value.context["returncode"], exc_info.value.context["loading"]) == (-6, True)
+
+    async def test_a_death_during_the_qmp_handshake_is_not_the_states(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        """QEMU aborts at its start (an HVF assert, KVM registers at machine init): the QMP
+        connect fails before the greeting, nothing was loaded: QEMU_CRASHED not marked loading."""
+        vm = MagicMock()
+        vm.process.wait = AsyncMock()
+
+        async def startup_abort(*_args: object) -> object:
+            vm.process.returncode = -6
+            raise TransientError(
+                "QMP connection closed before the greeting",
+                code=ErrorCode.MIGRATION_FAILED,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
+            await self._restore(
+                unit_test_vm_manager, tmp_path, returncode=None, connect_error=None, vm=vm, qmp_connect=startup_abort
+            )
+        assert exc_info.value.context["loading"] is False
+        assert refusal_cause(exc_info.value) is None
+
+    async def test_the_exit_wait_is_bounded(
+        self, unit_test_vm_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """QEMU closed the QMP connection but never ends (stuck in its exit): the restore waits
+        at most RESTORE_EXIT_WAIT_SECONDS, then fails (MIGRATION_FAILED: no exit code seen)."""
+        monkeypatch.setattr("exec_sandbox.vm_manager.RESTORE_EXIT_WAIT_SECONDS", 0.05)
+        vm = MagicMock()
+        vm.process.wait = asyncio.Event().wait  # never set: QEMU never ends
+
+        async def load_fails(*_args: object, **_kwargs: object) -> None:
+            raise ConnectionResetError
+
+        async with asyncio.timeout(5):  # an unbounded wait would hang here
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+                await self._restore(
+                    unit_test_vm_manager,
+                    tmp_path,
+                    returncode=None,
+                    connect_error=None,
+                    vm=vm,
+                    restore=load_fails,
+                    qemu_closed=True,
+                )
+
+    async def test_a_failed_load_qemu_answered_has_no_wait(self, unit_test_vm_manager, tmp_path: Path) -> None:
+        """QEMU answered the failure (a refused stream, a deadline) and runs: the restore does
+        not wait for its end (the wait would fail this test): MIGRATION_FAILED at once."""
+        vm = MagicMock()
+        vm.process.wait = AsyncMock(side_effect=AssertionError("waited for a QEMU that runs"))
+
+        async def refused(*_args: object, **_kwargs: object) -> None:
+            raise TransientError(
+                "migrate failed", code=ErrorCode.MIGRATION_FAILED, context=None, hint=None, instance_id=None
+            )
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+            await self._restore(
+                unit_test_vm_manager, tmp_path, returncode=None, connect_error=None, vm=vm, restore=refused
+            )
+        vm.process.wait.assert_not_awaited()
+
+    async def test_a_death_before_migrate_incoming_is_not_the_states(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        """QEMU aborts before migrate-incoming (a startup abort: HVF's assert, KVM's registers
+        at machine init): QEMU_CRASHED not marked loading, so no refusal of the state."""
+        vm = MagicMock()
+
+        async def startup_abort(*_args: object, **_kwargs: object) -> None:
+            vm.process.returncode = -6
+            raise ConnectionResetError
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
+            await self._restore(
+                unit_test_vm_manager,
+                tmp_path,
+                returncode=None,
+                connect_error=None,
+                vm=vm,
+                restore=startup_abort,
+                load_started=False,
+                qemu_closed=True,
+            )
+        assert exc_info.value.context["loading"] is False
+        assert refusal_cause(exc_info.value) is None
 
     @pytest.mark.parametrize("returncode", [126, 127])
     async def test_qemu_launch_ended_with_126_or_127_is_host_dependency(
@@ -7230,6 +7500,7 @@ class TestRestoreFailuresAfterLaunch:
         assert exc_info.value.context == {
             "vm_id": "restore-vm",
             "returncode": returncode,
+            "loading": False,
             "console_log": "qemu-system: Unknown ramblock",
             "qemu_cmd": qemu,
             "binary": qemu,
@@ -7252,8 +7523,33 @@ class TestRestoreFailuresAfterLaunch:
         assert exc_info.value.context == {
             "vm_id": "restore-vm",
             "vmstate_path": str(tmp_path / "entry.vmstate"),
+            "exit_code": None,  # QEMU runs: the guest may answer another time
             "console_log": "qemu-system: Unknown ramblock",  # QEMU's own reason: the VM and its log go next
         }
+        assert refusal_cause(exc_info.value) is None
+
+    async def test_a_guest_that_panics_after_the_load_ends_qemu_with_0(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        """The guest closed its port and QEMU ended with 0 (its panic reboots, -no-reboot ends
+        QEMU): the error holds the exit code, which makes the state refused here
+        (refusal_cause): the same state fails the same way on this worker."""
+        vm = MagicMock()
+
+        async def ends() -> int:
+            vm.process.returncode = 0
+            return 0
+
+        vm.process.wait = ends
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_SILENT_AFTER_RESTORE) as exc_info:
+            await self._restore(
+                unit_test_vm_manager, tmp_path, returncode=None, connect_error=ConnectionResetError(), vm=vm
+            )
+        assert exc_info.value.context["exit_code"] == 0
+        assert str(exc_info.value) == (
+            "VM restore-vm: the guest did not answer after its saved state loaded (QEMU exit code 0)."
+        )
+        assert refusal_cause(exc_info.value) == str(exc_info.value)  # no panic line in this console
 
     async def test_a_guest_that_cannot_reseed_passes_the_channel_error_on(
         self, unit_test_vm_manager, tmp_path: Path

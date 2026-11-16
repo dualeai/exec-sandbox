@@ -293,6 +293,10 @@ def _open_gate() -> asyncio.Event:
     return gate
 
 
+_ARM_CPU_ID = "pfr0=0x1101000010110011"
+"""The CPU identity of the faked ARM64 host (its own probe reads the real host)."""
+
+
 @pytest.fixture
 def mock_system_probes() -> Generator[dict[str, Any], None, None]:
     """Patch system probes (arch, QEMU version, accel) with standard defaults.
@@ -303,9 +307,10 @@ def mock_system_probes() -> Generator[dict[str, Any], None, None]:
     from exec_sandbox.system_probes import AccelType
 
     with (
-        patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
+        patch("exec_sandbox.worker_facts.detect_host_arch") as mock_arch,
+        patch("exec_sandbox.worker_facts.guest_cpu_id", new_callable=AsyncMock, return_value=_ARM_CPU_ID),
         patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as mock_qemu,
-        patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
+        patch("exec_sandbox.worker_facts.detect_accel_type", new_callable=AsyncMock) as mock_accel,
         # QEMU as this user (no sudo probe on a Linux host with the qemu-vm setup)
         patch("exec_sandbox.memory_snapshot_manager.probe_qemu_as_qemu_vm", new_callable=AsyncMock, return_value=False),
     ):
@@ -337,9 +342,10 @@ class TestComputeCacheKey:
         accel_map = {"HVF": AccelType.HVF, "KVM": AccelType.KVM, "TCG": AccelType.TCG}
 
         with (
-            patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
+            patch("exec_sandbox.worker_facts.detect_host_arch") as mock_arch,
+            patch("exec_sandbox.worker_facts.guest_cpu_id", new_callable=AsyncMock, return_value=_ARM_CPU_ID),
             patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as mock_qemu,
-            patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
+            patch("exec_sandbox.worker_facts.detect_accel_type", new_callable=AsyncMock) as mock_accel,
         ):
             mock_arch.return_value = HostArch.AARCH64
             mock_qemu.return_value = qemu_version
@@ -435,12 +441,22 @@ class TestComputeCacheKey:
     async def test_different_cpu_model_different_key(self, manager: MemorySnapshotManager) -> None:
         """Another -cpu value (same accelerator) gives another key: a restore needs the CPU it
         was saved on (an ARM TCG entry saved with pointer auth cannot resume without it)."""
-        with patch("exec_sandbox.memory_snapshot_manager.guest_cpu_model", new_callable=AsyncMock) as cpu:
+        with patch("exec_sandbox.worker_facts.guest_cpu_model", new_callable=AsyncMock) as cpu:
             cpu.return_value = "max,pauth-impdef=on"
             key_max = await self._compute_key(manager, accel="TCG")
             cpu.return_value = "neoverse-v1,pauth=off"
             key_v1 = await self._compute_key(manager, accel="TCG")
         assert key_max != key_v1
+
+    async def test_another_counter_rate_another_key(self, manager: MemorySnapshotManager) -> None:
+        """An entry restores with this host's counter rate (a restore from it passes no boot):
+        a host whose rate changed never restores an entry made at the old rate, where its
+        guest's clock would run fast or slow."""
+        keys = []
+        for hz in (24_000_000, 1_000_000_000):
+            manager.vm_manager._counter_hz = hz  # pyright: ignore[reportPrivateUsage] - VmManager.start reads it
+            keys.append(await self._compute_key(manager))
+        assert keys[0] != keys[1]
 
     async def test_x86_tsc_deadline_changes_the_key(self, manager: MemorySnapshotManager) -> None:
         """On x86 the guest CPU model holds +tsc-deadline when the host has it (KVM/HVF): a
@@ -451,9 +467,9 @@ class TestComputeCacheKey:
         keys = []
         for tsc_deadline in (True, False):
             with (
-                patch("exec_sandbox.memory_snapshot_manager.detect_host_arch", return_value=HostArch.X86_64),
+                patch("exec_sandbox.worker_facts.detect_host_arch", return_value=HostArch.X86_64),
                 patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as qemu,
-                patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as accel,
+                patch("exec_sandbox.worker_facts.detect_accel_type", new_callable=AsyncMock) as accel,
                 patch("exec_sandbox.qemu_cmd.check_tsc_deadline", new_callable=AsyncMock, return_value=tsc_deadline),
                 patch("exec_sandbox.qemu_cmd.detect_host_x86_vendor", return_value="GenuineIntel"),
             ):
@@ -2155,9 +2171,10 @@ class TestComputeCacheKeyEdgeCases:
 
         accel_map = {"HVF": AccelType.HVF, "KVM": AccelType.KVM, "TCG": AccelType.TCG}
         with (
-            patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
+            patch("exec_sandbox.worker_facts.detect_host_arch") as mock_arch,
+            patch("exec_sandbox.worker_facts.guest_cpu_id", new_callable=AsyncMock, return_value=_ARM_CPU_ID),
             patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as mock_qemu,
-            patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
+            patch("exec_sandbox.worker_facts.detect_accel_type", new_callable=AsyncMock) as mock_accel,
         ):
             mock_arch.return_value = HostArch.AARCH64
             mock_qemu.return_value = qemu_version

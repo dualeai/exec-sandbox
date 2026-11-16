@@ -69,14 +69,16 @@ _SPEC = VmSpec(language=Language.JAVASCRIPT, memory_mb=512)
 _HOST = HostFacts(
     arch="aarch64",
     accelerator="hvf",
-    cpu_vendor=None,
     cpu_model="host",
+    cpu_id="pfr0=0x1101000010110011",
     qemu_version="10.1.0",
     machine_type="virt-10.1",
     release=__version__,
     device_layout=FAKE_LAYOUT,
 )
-_GUEST = GuestFacts(base_image="0" * 64, packages_image=None, kernel="1" * 64, initramfs="2" * 64)
+_GUEST = GuestFacts(
+    base_image="0" * 64, packages_image=None, kernel="1" * 64, initramfs="2" * 64, counter_hz=24_000_000
+)
 
 
 def _forbid_vm_path(monkeypatch: pytest.MonkeyPatch) -> None:

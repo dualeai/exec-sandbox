@@ -53,6 +53,7 @@ The other Python examples use `async with` and `await` at the top level: run the
 - **OS:** Linux or macOS, x64 or arm64. On Windows, use WSL2 (on native Windows, `import exec_sandbox` raises `ConfigError` `PLATFORM_UNSUPPORTED`).
 - **QEMU:** 11.0+ for L1 memory snapshots and saved instances; 8.0+ for the rest. ARM64 without KVM or HVF needs 9.0.4+.
 - **Hardware acceleration:** KVM (Linux) or HVF (macOS), recommended (~5-8x faster).
+- **x86 CPU with KVM or HVF:** x86-64-v3 (Intel Haswell, AMD Zen 1 or newer). On a CPU without it, the `Scheduler` start raises `ConfigError` `HOST_DEPENDENCY` with the missing features. TCG runs on any x86 CPU.
 
 ### Install the package
 
@@ -285,7 +286,7 @@ async with instance_admin(SchedulerConfig(instance_store="s3", s3_bucket="my-buc
 - **One writer.** `save()` fails with `INSTANCE_CONFLICT` if another save of the instance was stored since this session loaded or last saved it. The session stays open: save it under a new id to keep its work, or close it. If two requests can reach one instance at the same time, use your own lock.
 - **Network.** A reused instance reaches the domains its last save allowed (`describe_instance(id).egress_domains`; empty: all), also after a release that changes the default list of `allowed_domains=None`.
 - **`close()` never saves.** After an `exec()` or `write_file()` with no later save, `close()` warns with `InstanceNotSavedWarning` (not after another save of the instance won: no plain save of that session can store its work). The idle timeout closes the session with no save (it logs a warning in the cases where `close()` warns): save before a long pause.
-- **Host kind.** An instance loads only on a worker with the same CPU architecture, accelerator (`kvm`, `hvf` or `tcg`), CPU vendor (x86) and guest CPU model, and a QEMU that has the saved machine type (for example `virt-11.1`) and accepts the saved state. The release of the worker must run the saved devices (`describe_instance(id).host.device_layout`). Other workers raise `RouteError`; its `required` field gives the values (empty for the devices: load it on a worker of another release).
+- **Host kind.** An instance loads only on a worker with the same CPU architecture, accelerator (`kvm`, `hvf` or `tcg`), guest CPU model, host CPU (ARM with KVM or HVF) and guest clock rate (any rate on x86 KVM with TSC scaling), and a QEMU that has the saved machine type (for example `virt-11.1`) and accepts the saved state. The release of the worker must run the saved devices (`describe_instance(id).host.device_layout`). Other workers raise `RouteError`; its `required` field gives the values (empty for the devices: load it on a worker of another release).
 - **After `reuse()`.** The network connections that were open at the save are closed.
 
 ### Errors of saved instances
@@ -391,21 +392,22 @@ Every run-time error is a `SandboxError` with an `action` (what to do next, from
 | `SessionClosedError` | `RESTART` | The session is closed. Open a new one with `new()` or `reuse()` |
 | `InvalidInputError` | `FIX_INPUT` | The call is wrong, or the scheduler cannot take it now. The session stays open |
 | `ConfigError` | `FIX_CONFIG` | This worker's setup is wrong: settings, keyring, store, binaries, images, Python extras, permissions or OS |
-| `RouteError` | `ROUTE` | Another worker can serve the call: `required` gives the facts the call checked, `found` this worker's values. A worker satisfies `required` when each key holds by its rule (`RouteKey.rule`: `equal`, `at_least` or `contains`); it passes the checks that raised the error |
+| `RouteError` | `ROUTE` | Another worker can serve the call: `required` gives the facts the call checked, `found` this worker's values. A worker satisfies `required` when each key holds by its rule (`RouteKey.rule`: `equal`, `at_least`, `contains` or `equal_or_any`); it passes the checks that raised the error. An empty `required` (another release wrote the instance) names no worker: use a worker of the release in `describe_instance(id).writer_release` |
 | `InstanceGoneError` | `RECREATE` | The saved instance is gone, expired or damaged. Start a new one |
 | `InternalError` | `REPORT` | A bug or a broken host. Report it with the log |
 | `ErrorAction` | | The 8 actions above |
 | `ErrorCode` | | See [Error codes](#error-codes) |
 | `InstanceNotSavedWarning` | | Warning: `close()` of a saved-instance session with `exec()` or `write_file()` calls after its last `save()` |
 
-`RouteKey` names the keys of `RouteError.required` and of `WorkerFacts.values` (`describe_worker()`, `sbx worker describe`); `RouteRule` names their rules. In `WorkerFacts.values`, a `contains` key holds the set of values this worker has (a sorted list in JSON).
+`RouteKey` names the keys of `RouteError.required` and of `WorkerFacts.values` (`describe_worker()`, `sbx worker describe`); `RouteRule` names their rules. In `WorkerFacts.values`, a `contains` key holds the set of values this worker has (a sorted list in JSON), and `ROUTE_ANY` (`"any"`) is the value of an `equal_or_any` key that takes every value.
 
 | Key | Rule | Value |
 |-----|------|-------|
 | `arch` | `equal` | `x86_64` or `aarch64` |
 | `accelerator` | `equal` | `kvm`, `hvf` or `tcg` |
-| `cpu_vendor` | `equal` | x86 CPU vendor (`GenuineIntel`, `AuthenticAMD`); absent on ARM |
 | `cpu_model` | `equal` | The guest CPU model (QEMU `-cpu` value) |
+| `cpu_id` | `equal` | The host CPU an ARM guest sees with KVM or HVF; absent on x86 and ARM TCG |
+| `counter_hz` | `equal_or_any` | Rate in Hz of the guest clock's counter, set at its first boot; absent when that host had no exact rate. A worker's `any`: x86 KVM with TSC scaling, which takes every rate |
 | `qemu_version` | `at_least` | `MAJOR.MINOR.PATCH`, compared part by part |
 | `machine_type` | `contains` | A QEMU machine type (`virt-11.1`, `microvm`) |
 | `base_image` | `contains` | SHA-256 digest (64 hex characters) |
@@ -473,7 +475,7 @@ except SandboxError as e:  # The other actions
 | `PACKAGE_INSTALL_FAILED` | `InvalidInputError` | The package manager refused the packages. |
 | `INSTANCE_INVALID_ID` | `InvalidInputError` | The value breaks the instance id rule. |
 | `SCHEDULER_STATE` | `InvalidInputError` | The scheduler is not started, already started, or stopping. |
-| `HOST_DEPENDENCY` | `ConfigError` | A binary (QEMU, qemu-img, qemu-storage-daemon, gvproxy-wrapper), system user, cgroup or ACL support is missing or too old, or this user cannot run it. |
+| `HOST_DEPENDENCY` | `ConfigError` | A binary (QEMU, qemu-img, qemu-storage-daemon, gvproxy-wrapper), system user, cgroup or ACL support is missing or too old, or this user cannot run it; with KVM or HVF, the host CPU cannot run the x86 guest CPU, or the ARM host CPU identity cannot be read. |
 | `EXTRA_MISSING` | `ConfigError` | A Python extra is not installed (the message gives the pip command). |
 | `SETTING_INVALID` | `ConfigError` | A worker setting is not valid. |
 | `ASSET_NOT_FOUND` | `ConfigError` | A VM image is not on this host and was not downloaded. |
@@ -841,8 +843,8 @@ Times in ms of the `new()` or `reuse()` call, measured on the host. After a cold
 | `access` | `"full"`, `"other_release"` or `"no_key"` | `"full"`: this keyring opened the head and this release read it. `"other_release"`: the head opened, but another release wrote it and this release cannot read it. `"no_key"`: this keyring does not have the key, and the other fields are not checked |
 | `writer_release` | str \| None | The exec-sandbox release of the last save; None when `access` is `"no_key"`, or when the body names no release |
 | `spec` | VmSpec \| None | What the VM is made of (None unless `access` is `"full"`) |
-| `host` | HostFacts \| None | The host of the last save: `arch`, `accelerator`, `cpu_vendor`, `cpu_model`, `qemu_version`, `machine_type`, `release`, `device_layout` (one line for each part of the VM the guest sees: the board, the RAM, each drive and device; then the migration capabilities) (None unless `access` is `"full"`) |
-| `guest` | GuestFacts \| None | The SHA-256 digests of the files the guest booted on: `base_image`, `packages_image` (None without packages), `kernel`, `initramfs`; every save carries them (None unless `access` is `"full"`) |
+| `host` | HostFacts \| None | The host of the last save: `arch`, `accelerator`, `cpu_model`, `cpu_id`, `qemu_version`, `machine_type`, `release`, `device_layout` (one line for each part of the VM the guest sees: the board, the RAM, each drive and device; then the migration capabilities) (None unless `access` is `"full"`) |
+| `guest` | GuestFacts \| None | What the guest got at its first boot: the SHA-256 digests of its files, `base_image`, `packages_image` (None without packages), `kernel`, `initramfs`, and `counter_hz`, the rate of its clock's counter (None when that host had no exact rate); every save carries them (None unless `access` is `"full"`) |
 | `egress_domains` | tuple[str, ...] \| None | The domains the VM may reach with the network on, as its last save resolved them; each reuse applies them (empty: all; None unless `access` is `"full"`) |
 
 ## Limits

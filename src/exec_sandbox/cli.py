@@ -1589,7 +1589,7 @@ def worker_describe_command() -> NoReturn:
     """Show this worker's facts as JSON (Scheduler.describe_worker).
 
     "values": one value per key of RouteError.required (arch, accelerator,
-    CPU vendor, guest CPU model, QEMU version and machine types, the guest
+    guest CPU model, host CPU, guest clock rate, QEMU version and machine types, the guest
     images on this worker's disk, the admission budget); "key_ids": the
     instance keys of the store of 'sbx run --instance ID'. A call that raised
     RouteError can run on a worker whose facts satisfy the error's "required".

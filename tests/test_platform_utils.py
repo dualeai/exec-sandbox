@@ -25,6 +25,7 @@ from exec_sandbox.platform_utils import (
     UserDir,
     detect_host_arch,
     detect_host_os,
+    detect_host_x86_vendor,
     get_account_dir,
     get_arch_name,
     get_os_name,
@@ -97,6 +98,30 @@ class TestGetOsName:
     def test_returns_linux_on_linux(self) -> None:
         """get_os_name returns 'linux' on Linux."""
         assert get_os_name() == "linux"
+
+
+class TestDetectHostX86Vendor:
+    """detect_host_x86_vendor on Linux x86: the vendor_id line of /proc/cpuinfo, as the
+    kernel prints it ("vendor_id\\t: %s" of the 12 CPUID bytes)."""
+
+    @pytest.fixture(autouse=True)
+    def linux_x86(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """A Linux x86 host; each test starts and ends with no answer kept."""
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_arch", lambda: HostArch.X86_64)
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
+        detect_host_x86_vendor.cache_clear()
+        yield
+        detect_host_x86_vendor.cache_clear()
+
+    @pytest.mark.parametrize(
+        "vendor",
+        ["GenuineIntel", "AuthenticAMD", "HygonGenuine", "CentaurHauls", "  Shanghai  "],
+        ids=["intel", "amd", "hygon", "centaur", "zhaoxin"],
+    )
+    def test_the_12_characters_spaces_kept(self, vendor: str) -> None:
+        cpuinfo = f"processor\t: 0\nvendor_id\t: {vendor}\ncpu family\t: 7\n"
+        with patch.object(Path, "read_text", return_value=cpuinfo):
+            assert detect_host_x86_vendor() == vendor
 
 
 class TestGetArchName:

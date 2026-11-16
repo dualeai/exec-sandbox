@@ -11,6 +11,7 @@ _FACTS = WorkerFacts(
         RouteKey.ARCH: "aarch64",
         RouteKey.ACCELERATOR: "hvf",
         RouteKey.CPU_MODEL: "host",
+        RouteKey.COUNTER_HZ: "24000000",
         RouteKey.QEMU_VERSION: "11.10.0",
         RouteKey.MACHINE_TYPE: frozenset({"virt", "virt-11.10"}),
         RouteKey.BASE_IMAGE: frozenset({"a" * 64}),
@@ -25,10 +26,16 @@ _FACTS = WorkerFacts(
 @pytest.mark.parametrize(
     ("required", "satisfied"),
     [
-        pytest.param({}, True, id="nothing-required"),
+        pytest.param({}, False, id="no-target-another-release"),
         pytest.param({RouteKey.ARCH: "aarch64", RouteKey.CPU_MODEL: "host"}, True, id="equal"),
         pytest.param({RouteKey.ARCH: "x86_64"}, False, id="equal-differs"),
-        pytest.param({RouteKey.CPU_VENDOR: "GenuineIntel"}, False, id="fact-this-worker-lacks"),
+        pytest.param(
+            {RouteKey.CPU_ID: "midr_el1=0x00000000410fd4f1,revidr_el1=0x0000000000000000"},
+            False,
+            id="fact-this-worker-lacks",
+        ),
+        pytest.param({RouteKey.COUNTER_HZ: "24000000"}, True, id="same-counter-rate"),
+        pytest.param({RouteKey.COUNTER_HZ: "1000000000"}, False, id="other-counter-rate"),
         pytest.param({RouteKey.BASE_IMAGE: "a" * 64}, True, id="contains"),
         pytest.param({RouteKey.BASE_IMAGE: "c" * 64}, False, id="image-not-here"),
         pytest.param({RouteKey.PACKAGES_IMAGE: "a" * 64}, False, id="image-of-another-role"),
@@ -64,3 +71,10 @@ def test_required_decoded_from_json() -> None:
     assert _FACTS.satisfies({"arch": "aarch64", "qemu_version": "11.9.3", "base_image": "a" * 64})
     assert not _FACTS.satisfies({"arch": "x86_64"})
     assert not _FACTS.satisfies({"arch": "aarch64", "added_later": "1"})
+
+
+def test_any_counter_rate_takes_every_rate() -> None:
+    """x86 KVM with TSC scaling: the worker's counter_hz "any" satisfies every saved rate."""
+    scaling = WorkerFacts(values={RouteKey.COUNTER_HZ: "any"}, key_ids=())
+    assert scaling.satisfies({RouteKey.COUNTER_HZ: "2969960000"}) is True
+    assert scaling.satisfies({"counter_hz": "2700000000"}) is True

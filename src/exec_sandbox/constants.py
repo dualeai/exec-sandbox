@@ -567,6 +567,12 @@ execs 37-44 MB, with 0 flushes. Forced smaller caps at boot: 16 MB 1 flush (+20 
 8 MB 6 (+135 ms), 4 MB 23 (+360 ms). 128 MB is about three times that use, and an eighth
 of QEMU's 1 GiB default in the budget."""
 
+ARM_TCG_COUNTER_HZ: Final[int] = 62_500_000
+"""Rate of the ARM generic timer of ARM64 TCG guests (qemu_cmd: cntfrq of the guest CPU): the
+rate QEMU gives that model today, pinned. QEMU picks 62.5 MHz or 1 GHz by the model and the
+machine-type version, and a load under another rate is accepted with no error (the guest
+clock then runs 16 times too fast or too slow)."""
+
 RESOURCE_ADMISSION_TIMEOUT_SECONDS: Final[float] = 120.0
 """Timeout for resource admission acquire (seconds). Blocks waiting for
 resources to become available, then raises TransientError (CAPACITY)."""

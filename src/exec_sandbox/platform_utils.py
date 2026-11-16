@@ -117,7 +117,8 @@ def detect_host_arch() -> HostArch:
 
 @cache
 def detect_host_x86_vendor() -> str:
-    """CPUID vendor of the host CPU ("GenuineIntel" or "AuthenticAMD").
+    """CPUID vendor of the host CPU: its 12 characters, spaces kept ("GenuineIntel",
+    "AuthenticAMD", Zhaoxin's "  Shanghai  "); QEMU refuses a vendor of another length.
 
     x86 guests get the host vendor (KVM runs best with matching vendors). A
     non-x86 host runs x86 guests under TCG and gets qemu64's own vendor.
@@ -132,10 +133,11 @@ def detect_host_x86_vendor() -> str:
             text=True,
             check=True,
             env=child_env(),
-        ).stdout.strip()
+        ).stdout.removesuffix("\n")
     for line in Path("/proc/cpuinfo").read_text().splitlines():
         if line.startswith("vendor_id"):
-            return line.split(":", 1)[1].strip()
+            # The kernel prints "vendor_id\t: <the 12 bytes>"
+            return line.split(": ", 1)[1]
     return "AuthenticAMD"
 
 

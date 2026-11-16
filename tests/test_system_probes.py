@@ -2,20 +2,24 @@
 probes, the POSIX ACL read, and the probe cache."""
 
 import asyncio
+import ctypes
 import errno
 import logging
 import os
+import re
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
 from exec_sandbox import system_probes
-from exec_sandbox.exceptions import ErrorCode, TransientError
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.platform_utils import HostArch, HostOS
 from exec_sandbox.system_probes import check_kvm_available, probe_setpriv_pdeathsig
+from tests.conftest import skip_unless_aarch64, skip_unless_hwaccel, skip_unless_linux, skip_unless_macos_arm64
 
 
 class TestKvmAccess:
@@ -415,3 +419,320 @@ class TestKvmCheckWithNoAnswer:
             await system_probes.detect_accel_type(force_emulation=False)
         assert await system_probes.check_kvm_available() is False  # asked again: the ioctl failed, a final answer
         assert answers == []
+
+
+class TestHostCounterRate:
+    """probe_host_counter_hz: the rate of the counter a guest's clock runs on, from an exact
+    source only."""
+
+    @pytest.mark.parametrize(
+        ("flags", "bogomips", "hz"),
+        [
+            pytest.param("fpu tsc constant_tsc tsc_known_freq", "5400.00", 2_700_000_000, id="stated-rate"),
+            pytest.param("fpu tsc constant_tsc tsc_known_freq", "4599.99", 2_299_995_000, id="5-khz-steps"),
+            pytest.param("fpu tsc constant_tsc", "5400.00", None, id="measured-at-boot"),
+        ],
+    )
+    def test_x86_rate_only_when_the_cpu_states_it(self, flags: str, bogomips: str, hz: int | None) -> None:
+        """BogoMIPS is tsc_khz / 500 when the CPU or the hypervisor states the TSC rate
+        (tsc_known_freq); without that flag the kernel measured the rate at its boot."""
+        cpuinfo = f"processor\t: 0\nvendor_id\t: GenuineIntel\nflags\t\t: {flags}\nbogomips\t: {bogomips}\n"
+        assert system_probes._bogomips_hz(cpuinfo) == hz  # pyright: ignore[reportPrivateUsage]
+
+    @pytest.mark.parametrize(("error", "answer"), [(errno.EACCES, None), (errno.EPERM, None), (errno.EINVAL, OSError)])
+    def test_a_refused_executable_page_is_no_source(
+        self, monkeypatch: pytest.MonkeyPatch, error: int, answer: type[OSError] | None
+    ) -> None:
+        """A host that refuses executable memory (SELinux execmem, PaX): no exact source, an
+        answer (None), not an error; the page closes with no buffer export left (BufferError
+        before). Another mprotect error raises OSError. The code page never runs here."""
+
+        def refused(*_args: object) -> int:
+            ctypes.set_errno(error)
+            return -1
+
+        monkeypatch.setattr(system_probes.ctypes, "CDLL", lambda *_a, **_k: SimpleNamespace(mprotect=refused))
+        if answer is None:
+            assert system_probes._read_cntfrq_el0() is None  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(OSError, check=lambda e: e.errno == error):
+                system_probes._read_cntfrq_el0()  # pyright: ignore[reportPrivateUsage]
+
+    @skip_unless_aarch64
+    @skip_unless_linux
+    async def test_arm_linux_reads_cntfrq_el0(self) -> None:
+        """The generic timer rate, as the kernel computes BogoMIPS from it (rate / 500000)."""
+        hz = await system_probes.probe_host_counter_hz()
+        bogomips = next(line for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("BogoMIPS"))
+        assert hz is not None
+        assert f"{hz / 500_000:.2f}" == bogomips.split(":")[1].strip()
+
+    @skip_unless_macos_arm64
+    @skip_unless_hwaccel
+    async def test_hvf_rate_is_the_timebase(self) -> None:
+        """Apple chips: HVF guests read a 24 MHz counter (hw.tbfrequency)."""
+        assert await system_probes.probe_host_counter_hz() == 24_000_000
+
+
+class TestHostCpuId:
+    """probe_host_cpu_id: the host CPU an ARM64 -cpu host guest sees."""
+
+    def test_linux_distinct_parts_sorted(self, tmp_path: Path) -> None:
+        """One entry per distinct (MIDR, REVIDR) pair, sorted: big.LITTLE hosts list both kinds."""
+        for cpu, midr in enumerate(["0x00000000410fd4f1", "0x00000000410fd4f1", "0x00000000410fd050"]):
+            folder = tmp_path / f"cpu{cpu}" / "regs" / "identification"
+            folder.mkdir(parents=True)
+            (folder / "midr_el1").write_text(f"{midr}\n")
+            (folder / "revidr_el1").write_text("0x0000000000000017\n")
+        (tmp_path / "cpufreq").mkdir()  # not a CPU
+        assert system_probes._linux_arm_cpu_id(tmp_path) == (  # pyright: ignore[reportPrivateUsage]
+            "midr_el1=0x00000000410fd050,revidr_el1=0x0000000000000017;"
+            "midr_el1=0x00000000410fd4f1,revidr_el1=0x0000000000000017"
+        )
+
+    def test_linux_without_the_registers(self, tmp_path: Path) -> None:
+        assert system_probes._linux_arm_cpu_id(tmp_path) is None  # pyright: ignore[reportPrivateUsage]
+
+    async def test_x86_has_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """x86 guests run a fixed CPU model: no host identity."""
+        monkeypatch.setattr(system_probes, "detect_host_arch", lambda: HostArch.X86_64)
+        assert await system_probes.probe_host_cpu_id() is None
+
+    @skip_unless_macos_arm64
+    @skip_unless_hwaccel
+    async def test_hvf_feature_registers(self) -> None:
+        """The registers QEMU's -cpu host takes under HVF, read with no entitlement."""
+        cpu_id = await system_probes.probe_host_cpu_id()
+        assert cpu_id is not None
+        names = [part.split("=")[0] for part in cpu_id.split(",")]
+        assert names[:9] == ["dfr0", "dfr1", "isar0", "isar1", "mmfr0", "mmfr1", "mmfr2", "pfr0", "pfr1"]
+        assert all(re.fullmatch(r"[a-z0-9]+=0x[0-9a-f]{16}", part) for part in cpu_id.split(","))
+
+
+class TestGuestCpu:
+    """require_guest_cpu: the x86 guest CPU on a paused real QEMU (qemu-system-x86_64 under
+    TCG runs on every host that has it)."""
+
+    @pytest.fixture(autouse=True)
+    def x86_qemu(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        binary = shutil.which("qemu-system-x86_64")
+        if binary is None:
+            pytest.skip("no qemu-system-x86_64")
+        monkeypatch.setattr(system_probes, "detect_host_arch", lambda: HostArch.X86_64)
+        monkeypatch.setenv("EXEC_SANDBOX_QEMU_BIN_X86", binary)
+
+    @pytest.mark.parametrize(
+        "cpu",
+        [
+            "qemu64-v1,+avx2,+fma,vendor=GenuineIntel,family=6,model=60,stepping=4,enforce",
+            "qemu64-v1,vendor=  Shanghai  ,enforce",
+        ],
+        ids=["intel-signature", "zhaoxin-vendor"],
+    )
+    async def test_a_cpu_tcg_runs(self, cpu: str) -> None:
+        """QEMU starts it; TCG gives no TSC rate (the guest's TSC is the host's)."""
+        assert await system_probes.require_guest_cpu(cpu, accel="tcg") is None
+
+    async def test_a_cpu_the_host_cannot_run_names_qemu_reasons(self) -> None:
+        """enforce and a flag TCG lacks (AVX-512): HOST_DEPENDENCY with QEMU's lines, before
+        any VM, and the refusal is not kept (a fixed host runs it on the next start)."""
+        cpu = "qemu64-v1,+avx512f,enforce"
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc:
+            await system_probes.require_guest_cpu(cpu, accel="tcg")
+        assert "avx512f" in exc.value.message
+        assert exc.value.context == {"binary": shutil.which("qemu-system-x86_64"), "accel": "tcg", "cpu": cpu}
+        assert system_probes.probe_cache.guest_cpu == {}
+
+    async def test_the_answer_is_kept(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        cpu = "qemu64-v1,enforce"
+        assert await system_probes.require_guest_cpu(cpu, accel="tcg") is None
+        monkeypatch.setattr(system_probes, "run_probe", AsyncMock(side_effect=AssertionError("ran again")))
+        assert await system_probes.require_guest_cpu(cpu, accel="tcg") is None
+
+
+class TestKvmTscScaling:
+    """probe_kvm_tsc_scaling: KVM_CAP_TSC_CONTROL on /dev/kvm; no /dev/kvm is an answer (kept),
+    a limit is not (asked again)."""
+
+    @pytest.fixture
+    def kvm(self, monkeypatch: pytest.MonkeyPatch) -> list[object]:
+        """Answers of the ioctl on a stand-in /dev/kvm (an open of /dev/null), one per call."""
+        answers: list[object] = []
+        real_open = Path.open
+        monkeypatch.setattr(
+            Path,
+            "open",
+            lambda self, *a, **k: real_open(Path(os.devnull) if str(self) == "/dev/kvm" else self, *a, **k),
+        )
+
+        def ioctl(_fd: int, request: int, arg: int) -> int:
+            assert (request, arg) == (0xAE03, 60)  # KVM_CHECK_EXTENSION, KVM_CAP_TSC_CONTROL
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return cast("int", answer)
+
+        monkeypatch.setattr(system_probes.fcntl, "ioctl", ioctl)
+        return answers
+
+    @pytest.mark.parametrize(("answer", "scaling"), [(1, True), (0, False)], ids=["scaling", "no-scaling"])
+    async def test_the_capability(self, kvm: list[object], answer: int, scaling: bool) -> None:
+        kvm.append(answer)
+        assert await system_probes.probe_kvm_tsc_scaling() is scaling
+        assert await system_probes.probe_kvm_tsc_scaling() is scaling  # kept: no second ioctl
+
+    async def test_no_kvm_is_kept(self, kvm: list[object]) -> None:
+        kvm.append(OSError(errno.ENOENT, "No such file or directory"))
+        assert await system_probes.probe_kvm_tsc_scaling() is False
+        assert await system_probes.probe_kvm_tsc_scaling() is False
+
+    async def test_a_limit_is_asked_again(self, kvm: list[object]) -> None:
+        """EMFILE (a file-handle limit) is no answer: TransientError LOCAL_DISK now (a False
+        would refuse loads this worker can serve), and the next call asks KVM."""
+        kvm.extend([OSError(errno.EMFILE, "Too many open files"), 1])
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+            await system_probes.probe_kvm_tsc_scaling()
+        assert await system_probes.probe_kvm_tsc_scaling() is True
+
+
+class TestGuestCpuFailures:
+    """require_guest_cpu with a stand-in QEMU (a shell script): only QEMU's CPU feature
+    refusal is HOST_DEPENDENCY; other failures can pass (QEMU_CRASHED) and nothing is kept."""
+
+    @pytest.fixture
+    def qemu(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.setattr(system_probes, "detect_host_arch", lambda: HostArch.X86_64)
+        binary = tmp_path / "qemu-system-x86_64"
+        monkeypatch.setenv("EXEC_SANDBOX_QEMU_BIN_X86", str(binary))
+        return binary
+
+    @staticmethod
+    def _script(binary: Path, body: str) -> None:
+        binary.write_text(f"#!/bin/sh\n{body}\n")
+        binary.chmod(0o755)
+
+    async def test_a_feature_refusal_is_the_host(self, qemu: Path) -> None:
+        self._script(
+            qemu,
+            "echo 'qemu-system-x86_64: warning: host doesn'\"'\"'t support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx2 [bit 5]' >&2\n"
+            "echo 'qemu-system-x86_64: Host doesn'\"'\"'t support requested features' >&2\nexit 1",
+        )
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc:
+            await system_probes.require_guest_cpu("m,+avx2,enforce", accel="kvm")
+        assert "EBX.avx2" in exc.value.message
+        assert exc.value.hint is not None and "x86-64-v3" in exc.value.hint
+
+    async def test_another_qemu_error_can_pass(self, qemu: Path) -> None:
+        """KVM out of memory: QEMU_CRASHED with QEMU's line; not kept, the next start probes."""
+        self._script(
+            qemu, "echo 'qemu-system-x86_64: ioctl(KVM_CREATE_VM) failed: 12 Cannot allocate memory' >&2\nexit 1"
+        )
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc:
+            await system_probes.require_guest_cpu("m,enforce", accel="kvm")
+        assert exc.value.message.endswith("ioctl(KVM_CREATE_VM) failed: 12 Cannot allocate memory")
+        assert system_probes.probe_cache.guest_cpu == {}
+
+    async def test_a_signal_can_pass(self, qemu: Path) -> None:
+        self._script(qemu, "kill -KILL $$")
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED):
+            await system_probes.require_guest_cpu("m,enforce", accel="kvm")
+        assert system_probes.probe_cache.guest_cpu == {}
+
+    async def test_no_answer_in_time_can_pass(self, qemu: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(system_probes, "_PROBE_TIMEOUT_SECONDS", 0.2)
+        self._script(qemu, "exec sleep 30")
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED):
+            await system_probes.require_guest_cpu("m,enforce", accel="kvm")
+
+    async def test_a_binary_this_user_cannot_run(self, qemu: Path) -> None:
+        """The spawn fails (EACCES): HOST_DEPENDENCY naming the binary, through the probe errors
+        of every QEMU probe (_qemu_probe_failure)."""
+        qemu.write_text("#!/bin/sh\nexit 0\n")
+        qemu.chmod(0o644)
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc:
+            await system_probes.require_guest_cpu("m,enforce", accel="kvm")
+        assert exc.value.context == {"binary": str(qemu)}
+
+    async def test_the_kvm_rate(self, qemu: Path) -> None:
+        """Under KVM the vCPU's TSC rate is the qom-get answer (an int); quit's {} is not one."""
+        self._script(
+            qemu,
+            "cat >/dev/null\n"
+            'echo \'{"QMP": {"version": {}}}\'\necho \'{"return": {}}\'\necho \'{"return": 2700000000}\'\necho \'{"return": {}}\'',
+        )
+        assert await system_probes.require_guest_cpu("m,enforce", accel="kvm") == 2_700_000_000
+
+
+class TestHostReadLimits:
+    """The counter rate and CPU identity reads: a host limit is TransientError LOCAL_DISK and
+    is not kept (the next call reads again); another read error is no source (None, kept)."""
+
+    @pytest.fixture(autouse=True)
+    def linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(system_probes, "detect_host_os", lambda: HostOS.LINUX)
+
+    async def test_counter_read_at_a_limit_is_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(system_probes, "detect_host_arch", lambda: HostArch.X86_64)
+        cpuinfo = "flags\t\t: fpu tsc tsc_known_freq\nbogomips\t: 5400.00\n"
+        answers: list[object] = [OSError(errno.EMFILE, "Too many open files"), cpuinfo]
+
+        def read_text(_self: Path) -> str:
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return cast("str", answer)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+            await system_probes.probe_host_counter_hz()
+        assert await system_probes.probe_host_counter_hz() == 2_700_000_000
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError(errno.EAGAIN, "Resource temporarily unavailable"),
+            OSError(errno.ENOMEM, "Cannot allocate memory"),
+            OSError(errno.EMFILE, "Too many open files"),
+            OSError(errno.ENFILE, "Too many open files in system"),
+            TimeoutError(),
+        ],
+        ids=["eagain", "enomem", "emfile", "enfile", "timeout"],
+    )
+    async def test_each_limit_can_pass(self, monkeypatch: pytest.MonkeyPatch, error: OSError) -> None:
+        """macOS reads the rate with sysctl: a limit at its spawn, or no answer in time."""
+        monkeypatch.setattr(system_probes, "detect_host_os", lambda: HostOS.MACOS)
+        monkeypatch.setattr(system_probes, "detect_host_arch", lambda: HostArch.AARCH64)
+        monkeypatch.setattr(system_probes, "run_probe", AsyncMock(side_effect=error))
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+            await system_probes.probe_host_counter_hz()
+
+    async def test_counter_unreadable_is_no_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(system_probes, "detect_host_arch", lambda: HostArch.X86_64)
+        reads: list[Path] = []
+
+        def read_text(self: Path) -> str:
+            reads.append(self)
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+        assert await system_probes.probe_host_counter_hz() is None
+        assert await system_probes.probe_host_counter_hz() is None
+        assert reads == [Path("/proc/cpuinfo")]  # kept
+
+    @pytest.mark.parametrize(
+        ("error", "limit"),
+        [(OSError(errno.ENFILE, "Too many open files in system"), True), (PermissionError(errno.EACCES, "no"), False)],
+        ids=["limit", "unreadable"],
+    )
+    async def test_cpu_id_read(self, monkeypatch: pytest.MonkeyPatch, error: OSError, limit: bool) -> None:
+        monkeypatch.setattr(system_probes, "detect_host_arch", lambda: HostArch.AARCH64)
+
+        def fails(_cpus: Path) -> str | None:
+            raise error
+
+        monkeypatch.setattr(system_probes, "_linux_arm_cpu_id", fails)
+        if limit:
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+                await system_probes.probe_host_cpu_id()
+        else:
+            assert await system_probes.probe_host_cpu_id() is None  # guest_cpu_id: HOST_DEPENDENCY
