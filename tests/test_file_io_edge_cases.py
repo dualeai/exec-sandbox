@@ -223,11 +223,13 @@ class TestListFiles:
 
     async def test_list_empty_root(self, scheduler: Scheduler) -> None:
         """list_files on a fresh sandbox root gives the entries that os.listdir gives in the
-        guest, sorted by name."""
+        guest, sorted by name. The exec comes first: the first REPL start writes the REPL's own
+        files there, and a VM that boots cold (no memory snapshot, no warm pool) starts its REPL
+        only at its first exec."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            files = await session.list_files()
             result = await session.exec("import json, os; print(json.dumps(sorted(os.listdir('/home/user'))))")
             assert result.exit_code == 0, result.stderr
+            files = await session.list_files()
             assert [f.name for f in files] == json.loads(result.stdout)
 
     async def test_list_nonexistent_directory(self, scheduler: Scheduler) -> None:
