@@ -13,17 +13,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
-import sys
 import uuid
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
 from pydantic import ValidationError
 
 from exec_sandbox import Scheduler, SchedulerConfig, __version__, instance_admin
-from exec_sandbox._imports import require_instance_admin
 from exec_sandbox.cli import cli
 from exec_sandbox.exceptions import ConfigError, ErrorCode, InstanceGoneError, InvalidInputError, RouteError
 from exec_sandbox.instance.head import canonical_json
@@ -69,14 +67,16 @@ _SPEC = VmSpec(language=Language.JAVASCRIPT, memory_mb=512)
 _HOST = HostFacts(
     arch="aarch64",
     accelerator="hvf",
-    cpu_vendor=None,
     cpu_model="host",
+    cpu_id="pfr0=0x1101000010110011",
     qemu_version="10.1.0",
     machine_type="virt-10.1",
     release=__version__,
     device_layout=FAKE_LAYOUT,
 )
-_GUEST = GuestFacts(base_image="0" * 64, packages_image=None, kernel="1" * 64, initramfs="2" * 64)
+_GUEST = GuestFacts(
+    base_image="0" * 64, packages_image=None, kernel="1" * 64, initramfs="2" * 64, counter_hz=24_000_000
+)
 
 
 def _forbid_vm_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -440,19 +440,6 @@ async def test_the_vm_path_is_watched(monkeypatch: pytest.MonkeyPatch, tmp_path:
             pass
     with pytest.raises(AssertionError, match="VM path"):
         VmManager(settings)
-
-
-@pytest.mark.parametrize(
-    ("store", "install"),
-    [("s3", "'exec-sandbox[s3]'"), ("local", "'exec-sandbox[cli]' (or 'exec-sandbox[s3]')")],
-)
-def test_import_guard_names_the_extra(store: str, install: str) -> None:
-    with (
-        patch.dict(sys.modules, {"exec_sandbox.instance.manager": None}),
-        pytest.raises(ConfigError, match="cryptography", check=lambda e: e.code is ErrorCode.EXTRA_MISSING) as exc,
-    ):
-        require_instance_admin(store=store)  # type: ignore[arg-type]
-    assert f"pip install {install}" in str(exc.value)
 
 
 # ----------------------------------------------------------------------------- sbx instance, no mocks

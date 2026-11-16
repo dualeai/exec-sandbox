@@ -16,10 +16,10 @@ These tests are regression canaries: if hardening (/proc/sys read-only, device
 node removal, UID 1000, noexec on /dev/shm, etc.) inadvertently blocks any of
 the system paths Dask needs, these tests will catch it.
 
-Note: Dask's scheduler='processes' (ProcessPoolExecutor, spawn mode) is
-incompatible with the REPL wrapper's set_start_method("fork") — spawned
-children re-execute _repl.py and hit "context already set".  Fork-based
-multiprocessing is tested separately in test_multiprocessing.py.
+Note: Dask's scheduler='processes' (ProcessPoolExecutor, spawn mode) does not
+work in the REPL: a spawned child runs _repl.py again, which starts its own
+command loop instead of the task, so the pool waits until the exec timeout.
+Fork-based multiprocessing is tested separately in test_multiprocessing.py.
 
 See:
 - https://github.com/dask/dask/blob/main/dask/system.py
@@ -30,9 +30,7 @@ See:
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
-from tests.conftest import run_once
-
-from .conftest import skip_unless_hwaccel
+from tests.conftest import run_once, skip_unless_hwaccel
 
 DASK_PACKAGES = ["dask==2026.1.2"]
 
@@ -40,7 +38,7 @@ DASK_PACKAGES = ["dask==2026.1.2"]
 # =============================================================================
 # System context detection — dask.system reads /proc/*, /sys/fs/cgroup/*
 # =============================================================================
-@skip_unless_hwaccel  # Snapshot creation (pip install dask + deps) routinely exceeds 940s under TCG
+@skip_unless_hwaccel  # under TCG the install of dask and its dependencies (the L2 snapshot) times out
 class TestDaskSystemContext:
     """dask.system CPU/memory detection works inside the hardened VM.
 
@@ -69,13 +67,13 @@ print(f'DASK_CPU:{cpu_count()} CONST:{CPU_COUNT}')
 # =============================================================================
 # Scheduler backends — synchronous, threaded
 # =============================================================================
-@skip_unless_hwaccel  # pip install dask + 29 deps exceeds 308s per-attempt timeout under TCG
+@skip_unless_hwaccel  # under TCG the install of dask and its dependencies (the L2 snapshot) times out
 class TestDaskSchedulers:
     """Dask scheduler backends produce correct results.
 
     Tests synchronous and threaded schedulers.  The processes scheduler
-    (ProcessPoolExecutor, spawn mode) is incompatible with the REPL
-    wrapper's set_start_method("fork") — see module docstring.
+    (ProcessPoolExecutor, spawn mode) does not work in the REPL: see the
+    module docstring.
     """
 
     async def test_synchronous_scheduler(self, scheduler: Scheduler) -> None:
@@ -126,7 +124,7 @@ print(f'RESULT:{result}')
 # =============================================================================
 # Dask.delayed — task graph API
 # =============================================================================
-@skip_unless_hwaccel  # pip install dask + 29 deps exceeds 308s per-attempt timeout under TCG
+@skip_unless_hwaccel  # under TCG the install of dask and its dependencies (the L2 snapshot) times out
 class TestDaskDelayed:
     """dask.delayed builds and executes task graphs."""
 
@@ -175,7 +173,7 @@ print(f'RESULT:{result}')
 # =============================================================================
 # Realistic application patterns
 # =============================================================================
-@skip_unless_hwaccel  # pip install dask + 29 deps exceeds 308s per-attempt timeout under TCG
+@skip_unless_hwaccel  # under TCG the install of dask and its dependencies (the L2 snapshot) times out
 class TestDaskRealisticUsage:
     """Simulate how real applications use Dask for parallel computing."""
 

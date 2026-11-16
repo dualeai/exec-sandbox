@@ -33,7 +33,8 @@ from exec_sandbox.instance import manager as instance_manager
 from exec_sandbox.instance.keyring import Keyring
 from exec_sandbox.models import InstanceRef, Language
 from exec_sandbox.platform_utils import detect_host_arch
-from exec_sandbox.qemu_cmd import resolve_machine_type
+from exec_sandbox.qemu_cmd import counter_rate, guest_cpu_id, resolve_machine_type
+from exec_sandbox.system_probes import detect_accel_type
 from tests.conftest import skip_unless_hwaccel
 from tests.instance_support import await_until, disk_full_once, new_keyring
 from tests.s3_faults import BUCKET, After, Bucket, DropAfter, Edit, Fail, Hold, Request, Response, S3Proxy
@@ -210,7 +211,7 @@ class TestSaveFailures:
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
                 await vm.save()
             assert exc.value.action == "RETRY"
-            assert down.hits >= 1
+            assert down.hits == 1  # one upload attempt: no SDK retry (AWS_MAX_ATTEMPTS=1), no second upload
             assert s3_proxy.count("PUT_IF", _HEAD, since=mark) == 0  # no head write
             down.remove()
             assert not vm.closed
@@ -528,6 +529,12 @@ class TestAdmin:
             hashlib.sha256(Path(images.kernel).read_bytes()).hexdigest(),
             hashlib.sha256(Path(images.initramfs).read_bytes()).hexdigest(),
         )
+        # The counter rate the VM booted with (this worker's, read at its start) and this host's
+        # CPU identity, from the probes themselves
+        arch = detect_host_arch()
+        accel = await detect_accel_type(force_emulation=scheduler._vm_manager.settings.force_emulation)  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage]
+        assert info.guest.counter_hz == (await counter_rate(arch, accel)).hz
+        assert info.host.cpu_id == await guest_cpu_id(arch, accel)
         # The machine type this QEMU resolved for the new VM (virt-11.1 for QEMU 11.1 on arm64)
         assert info.host.machine_type == await resolve_machine_type(detect_host_arch(), None)
         assert info.host.machine_type not in {None, "virt"}
@@ -622,7 +629,9 @@ class TestAssets:
             key = f"{prefix}assets/sha256/{info.guest.base_image}"
             s3.delete_object(Bucket=BUCKET, Key=key)  # type: ignore[attr-defined]
             await vm.save()
-        assert s3.head_object(Bucket=BUCKET, Key=key)["ContentLength"] > 0  # type: ignore[attr-defined]
+        # The whole image is back: its bytes hash to the digest that names its key
+        stored = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()  # type: ignore[attr-defined]
+        assert hashlib.sha256(stored).hexdigest() == info.guest.base_image
 
     async def test_damaged_store_copy_routes(
         self,

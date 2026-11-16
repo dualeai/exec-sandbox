@@ -403,7 +403,7 @@ class LocalInstanceStore(InstanceStore):
         the last one (a symlink is ELOOP); all closed at exit. `make`: make missing
         folders (0700), each flushed into its parent (under the flock). Else the
         chain stops before the first missing folder."""
-        chain = [_open_dir(".", dir_fd=self._root_fd)]  # not the root fd itself: a scan moves the offset of its fd
+        chain = [os.open(".", _DIR_FLAGS, dir_fd=self._root_fd)]  # not the root fd itself: a scan moves its offset
         try:
             for part in parts:
                 child = _make_child(chain[-1], part) if make else _open_child(chain[-1], part)
@@ -608,15 +608,11 @@ def _remove_stale_staging(staging: int) -> None:
 # ---------------------------------------------------------------------- names in open folders
 
 
-def _open_dir(name: str, *, dir_fd: int) -> int:
-    return os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
-
-
 def _open_child(folder: int, name: str) -> int | None:
     """A new fd on the folder `name` in `folder`, or None when it is missing or a file.
     A symlink is ELOOP: O_DIRECTORY | O_NOFOLLOW gives ENOTDIR for it (Linux, macOS)."""
     try:
-        return _open_dir(name, dir_fd=folder)
+        return os.open(name, _DIR_FLAGS, dir_fd=folder)
     except FileNotFoundError:
         return None
     except NotADirectoryError:

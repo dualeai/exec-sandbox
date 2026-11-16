@@ -15,8 +15,8 @@ result (exec()); teardown is the close() time measured here:
 - teardown: close() (destroy + cleanup)
 
 Usage:
-    uv run python scripts/benchmark_latency.py           # Quick benchmark
-    uv run python scripts/benchmark_latency.py -n 20    # More iterations
+    uv run python scripts/benchmark_latency.py           # Quick benchmark: 10 VMs at once
+    uv run python scripts/benchmark_latency.py -n 20    # 20 VMs at once: more samples
     uv run python scripts/benchmark_latency.py --pool N # With warm pool of N VMs/language
 """
 
@@ -231,10 +231,10 @@ async def benchmark_concurrent(
 # ============================================================================
 
 
-def _percentile(sorted_vals: list[float], p: float) -> float:
-    """Return the p quantile (p in (0, 1]) of sorted values by the nearest-rank method."""
-    idx = min(math.ceil(len(sorted_vals) * p) - 1, len(sorted_vals) - 1)
-    return sorted_vals[idx]
+def _median_p95(values: list[float]) -> tuple[float, float]:
+    """Median and p95 (nearest-rank method) of `values`, at least one."""
+    ordered = sorted(values)
+    return statistics.median(ordered), ordered[math.ceil(len(ordered) * 0.95) - 1]
 
 
 def fmt_stats(values: list[float]) -> str:
@@ -243,9 +243,7 @@ def fmt_stats(values: list[float]) -> str:
         return "-"
     if len(values) == 1:
         return f"{values[0]:.0f}"
-    sorted_vals = sorted(values)
-    median = statistics.median(sorted_vals)
-    p95 = _percentile(sorted_vals, 0.95)
+    median, p95 = _median_p95(values)
     return f"{median:.0f} / {p95:.0f}"
 
 
@@ -325,10 +323,7 @@ def print_comparison(cold_boot_results: dict[Language, TimingStats]) -> None:
     for lang, stats in cold_boot_results.items():
         if not stats.e2e:
             continue
-        sorted_vals = sorted(stats.e2e)
-        median = statistics.median(sorted_vals)
-        p95 = _percentile(sorted_vals, 0.95)
-        entries.append((lang, median, p95))
+        entries.append((lang, *_median_p95(stats.e2e)))
 
     if len(entries) < 2:
         return
@@ -356,8 +351,8 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                            Quick benchmark (10 iterations, cold boot only)
-  %(prog)s -n 20                      More iterations for stable results
+  %(prog)s                            Quick benchmark (10 VMs at once per language, cold boot only)
+  %(prog)s -n 20                      20 VMs at once: more samples for stable results
   %(prog)s --pool N                   Enable warm pool with N pre-warmed VMs per language
   %(prog)s --network                  Benchmark with network enabled (gvproxy overhead)
   %(prog)s --lang javascript          Benchmark JS only

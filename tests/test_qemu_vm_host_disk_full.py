@@ -33,10 +33,10 @@ from exec_sandbox.models import Language
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType, VmState
-from tests.conftest import time_with
+from tests.conftest import fake_qmp_server, time_with
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Callable
 
 _GREETING = b'{"QMP": {"version": {"qemu": {"micro": 3, "minor": 1, "major": 11}}, "capabilities": []}}\n'
 
@@ -152,6 +152,7 @@ async def _fake_vm(
     process = MagicMock()
     process.wait = AsyncMock(side_effect=qemu_exits.wait)
     process.returncode = None
+    # No command monitor: a test that uses it serves its own (fake_qmp_server)
     workdir = MagicMock(qmp_events_socket=paths["qmp-events"], home_disk=Path("/disks/vm.img"), use_qemu_vm_user=False)
     channel = DualPortChannel(str(paths["cmd"]), str(paths["event"]), expected_uid=os.getuid())
     vm = QemuVM(
@@ -232,8 +233,8 @@ async def test_full_host_disk_fails_the_exec_in_flight_then_every_exec(
         drop_first=False,
     )
     async with fake as (vm, _):
-        await vm.transition_state(VmState.BOOTING)
-        await vm.transition_state(VmState.READY)
+        vm.transition_state(VmState.BOOTING)
+        vm.transition_state(VmState.READY)
         # A missed event ends the exec at its 2 s host deadline, without this text.
         with pytest.raises(OutcomeUnknownError, match="host disk is full"):
             await vm.execute(
@@ -248,7 +249,9 @@ async def test_full_host_disk_fails_the_exec_in_flight_then_every_exec(
 async def test_full_host_disk_fails_the_write_in_flight_then_every_write(
     short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The event comes after the guest got file_end: the write waits for its ack."""
+    """The event comes after the guest got file_end: the write waits for its ack. That write
+    sets the home disk limits back (QEMU, paused, still answers); the next one fails before
+    its header and sets nothing."""
     monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 2)  # a missed event fails in 2 s, not 120 s
     nospace = _block_io_error(nospace=True, action="stop", reason="No space left on device")
     fake = _fake_vm(
@@ -261,14 +264,19 @@ async def test_full_host_disk_fails_the_write_in_flight_then_every_write(
         hold_query_answer=False,
         drop_first=False,
     )
+    requests: list[dict[str, Any]] = []
     async with fake as (vm, _):
-        # A missed event ends the write at the 2 s timeout, without this text.
-        with pytest.raises(OutcomeUnknownError, match="host disk is full"):
-            await vm.write_file("a.txt", io.BytesIO(b"data"))  # the paused guest never acks
+        vm.workdir.qmp_socket = short_tmp_dir / "limits.sock"
+        async with await fake_qmp_server(vm.workdir.qmp_socket, status="running", status_line=None, requests=requests):
+            # A missed event ends the write at the 2 s timeout, without this text.
+            with pytest.raises(OutcomeUnknownError, match="host disk is full"):
+                await vm.write_file("a.txt", io.BytesIO(b"data"), make_executable=False)  # the paused guest never acks
 
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
-            await vm.write_file("a.txt", io.BytesIO(b"data"))
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+                await vm.write_file("a.txt", io.BytesIO(b"data"), make_executable=False)
         assert vm.state is VmState.DESTROYING
+    limits = [r["arguments"]["bps"] for r in requests if r["execute"] == "block_set_io_throttle"]
+    assert limits == [0, constants.DISK_BPS_LIMIT]  # the lift, then the restore
 
 
 async def test_full_host_disk_during_boot_ends_the_boot_wait(short_tmp_dir: Path) -> None:
@@ -398,8 +406,8 @@ class TestEventWatch:
             drop_first=False,
         )
         async with fake as (vm, _):
-            await vm.transition_state(VmState.BOOTING)
-            await vm.transition_state(VmState.READY)
+            vm.transition_state(VmState.BOOTING)
+            vm.transition_state(VmState.READY)
             start = asyncio.get_running_loop().time()
             # A missed event ends the exec at its 2 s host deadline, without this text.
             with pytest.raises(OutcomeUnknownError, match="closed its port guest-cmd"):
@@ -407,20 +415,6 @@ class TestEventWatch:
                     "sleep 60", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None
                 )  # the guest dropped the request
             assert asyncio.get_running_loop().time() - start < 0.5
-
-
-def _paused_vm_monitor(status: str) -> Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]:
-    """A QEMU command monitor whose query-status answers `status`."""
-
-    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        writer.write(_GREETING)
-        while line := await reader.readline():
-            request = json.loads(line)
-            result = {"status": status, "running": False} if request["execute"] == "query-status" else {}
-            writer.write(json.dumps({"return": result, "id": request["id"]}).encode() + b"\n")
-        writer.close()
-
-    return serve
 
 
 class TestStopNotSeenByTheWatch:
@@ -447,8 +441,7 @@ class TestStopNotSeenByTheWatch:
         )
         async with fake as (vm, watch_closed):
             vm.workdir.qmp_socket = short_tmp_dir / "qmp.sock"  # the fake workdir has no command monitor
-            server = await asyncio.start_unix_server(_paused_vm_monitor(status), path=str(vm.qmp_socket))
-            async with server:
+            async with await fake_qmp_server(vm.qmp_socket, status=status, status_line=None, requests=[]):
                 in_flight = asyncio.create_task(vm.list_files(""))  # the paused guest never answers
                 await asyncio.wait_for(watch_closed.wait(), timeout=1)  # the guest got the request
                 if full:
@@ -530,8 +523,8 @@ class TestGuestPortClosed:
 
     @staticmethod
     async def _ready(vm: QemuVM) -> None:
-        await vm.transition_state(VmState.BOOTING)
-        await vm.transition_state(VmState.READY)
+        vm.transition_state(VmState.BOOTING)
+        vm.transition_state(VmState.READY)
 
     async def test_close_fails_the_exec_in_flight_and_not_the_next_call(
         self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -704,7 +697,7 @@ class TestGuestPortClosed:
         )
         async with fake as (vm, _):
             if end == "destroy":
-                await vm.begin_destroy()
+                vm.begin_destroy()
             with caplog.at_level(logging.DEBUG, logger="exec_sandbox"):
                 assert await vm.list_files("") == []
             assert [r.levelno for r in caplog.records if "closed its port" in r.getMessage()] == [logging.DEBUG] * 2

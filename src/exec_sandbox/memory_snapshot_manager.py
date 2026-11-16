@@ -1,11 +1,11 @@
 """L1 memory snapshot cache manager.
 
-Captures full VM state (CPU + RAM + device state) after REPL warm-up and
-package import. On restore, the VM resumes at the exact instruction — ~50-60 ms
+Captures full VM state (CPU + RAM + device state) after the REPL warm-up (a new
+REPL runs a no-op). On restore, the VM resumes at the exact instruction — ~50-60 ms
 regardless of packages.
 
 Cache structure (the names next to the vmstate: memory_snapshot_files):
-    {cache_dir}/{key}.vmstate       # QEMU migration stream: device state only (x-ignore-shared, ~100 KB-1 MB); the RAM is {key}.ram
+    {cache_dir}/{key}.vmstate       # QEMU migration stream: device state and small RAM blocks (x-ignore-shared; data: ~3 MB aarch64, ~50 KB x86_64); the RAM is {key}.ram
     {cache_dir}/{key}.vmstate.meta  # JSON metadata sidecar
     {cache_dir}/{key}.vmstate.lock  # flock for cross-process deduplication of saves
     {cache_dir}/{key}.vmstate.use.lock  # record lock (fcntl) each restored VM holds shared (no eviction)
@@ -14,7 +14,8 @@ Cache structure (the names next to the vmstate: memory_snapshot_files):
 
 Cache key includes ALL parameters that affect VM state:
     sha256 fingerprint(language, *sorted_packages, exec_sandbox_version, img_hash,
-          qemu_version, arch, accel_type, cpu_model, memory_mb, cpu_cores, disk_mb,
+          qemu_version, the machine facts (arch, accelerator, cpu_model, cpu_id: as a save
+          records them), counter_hz, memory_mb, cpu_cores, disk_mb,
           network_device, device_layout (with the migration capabilities), kernel_hash, initramfs_hash
           [, l2_image_hash when there are packages])
 
@@ -28,13 +29,13 @@ import contextlib
 import errno
 import functools
 import hashlib
+import logging
 import os
 import time
 import weakref
 from typing import TYPE_CHECKING, ClassVar, Final
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox._version import __version__
 from exec_sandbox.aio_utils import run_stoppable, run_to_end
 from exec_sandbox.base_cache_manager import BaseCacheManager
@@ -59,11 +60,10 @@ from exec_sandbox.memory_snapshot_files import (
     open_live_ram_dir,
     ram_path_from_vmstate,
 )
-from exec_sandbox.migration_client import MigrationClient, migration_timeout, qemu_refusal
+from exec_sandbox.migration_client import MigrationClient, migration_timeout, refusal_cause
 from exec_sandbox.permission_utils import get_expected_socket_uid, grant_qemu_vm_acl, probe_qemu_as_qemu_vm
-from exec_sandbox.platform_utils import detect_host_arch
-from exec_sandbox.qemu_cmd import guest_cpu_model
-from exec_sandbox.system_probes import detect_accel_type, require_qemu_version
+from exec_sandbox.system_probes import require_qemu_version
+from exec_sandbox.worker_facts import machine_facts
 
 if TYPE_CHECKING:
     import threading
@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     from exec_sandbox.vm_manager import VmManager
     from exec_sandbox.vm_spec import VmSpec
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 _BLOCK = 64 * 1024
@@ -107,7 +107,7 @@ def _vmstate_digest(path: Path) -> str:
     """SHA-256 hex digest of the file's size, then of each non-zero 64 KiB block
     with its offset (the size fixes each block's length).
 
-    A mapped-ram vmstate is sparse (a 140 MB file can hold 3 MB of data): holes
+    A mapped-ram vmstate is sparse (an aarch64 file of 140 MB holds 3 MB of data): holes
     are skipped (SEEK_DATA), not read. A hole and a zero block hash alike, so a
     copy that changes the hole layout keeps the digest. Without SEEK_DATA every
     block is read. Sync: callers use asyncio.to_thread.
@@ -268,10 +268,12 @@ class MemorySnapshotManager(BaseCacheManager):
         """Compute L1 cache key. Includes ALL parameters that affect VM state.
 
         memory_mb IS in L1 key (unlike L2) because the migration stream
-        encodes physical address layout. qemu_version and accel_type are included
-        because different QEMU versions produce incompatible migration streams and
-        different accelerators (KVM/HVF/TCG) have different CPU state; the -cpu value
-        too (a restore onto other CPU features fails).
+        encodes physical address layout. qemu_version and the machine facts
+        (worker_facts.machine_facts: arch, accelerator, -cpu value, the host CPU's identity on
+        ARM64 with KVM or HVF) are included because different QEMU versions produce
+        incompatible migration streams, different accelerators (KVM/HVF/TCG) have different
+        CPU state, and a restore onto other CPU features fails. counter_hz too: the guest
+        calibrated its clock at the template's boot.
         The network device (network access or exposed ports) is included because
         it changes device topology (-nic none vs -device virtio-net).
         `l2_path` is the L2 layer the VM boots with (None without packages).
@@ -279,17 +281,19 @@ class MemorySnapshotManager(BaseCacheManager):
         Raises:
             ConfigError: ASSET_NOT_FOUND: the base image of `spec` is missing; HOST_DEPENDENCY:
                 this host cannot run the QEMU binary, or its version or accelerators cannot be
-                read (the QEMU probes), or ARM64 TCG with a QEMU below 9.0.4 (restore_layout)
-            TransientError: LOCAL_DISK: an image of the key cannot be read (images.key_part);
-                QEMU_CRASHED: a QEMU probe hit a process, memory or file-handle limit, the
-                binary was being written, a signal ended it, or it gave no answer in time; or
-                the QEMU binary came or went during the build (VmManager.restore_layout)
+                read (the QEMU probes), or the host CPU's identity cannot be read (ARM64 with KVM
+                or HVF: qemu_cmd.guest_cpu_id), or ARM64 TCG with a QEMU below 9.0.4
+                (restore_layout)
+            TransientError: LOCAL_DISK: an image of the key cannot be read (images.key_part), or
+                the read of the host CPU's identity hit a host limit; QEMU_CRASHED: a QEMU probe
+                hit a process, memory or file-handle limit, the binary was being written, a
+                signal ended it, or it gave no answer in time; or the QEMU binary came or went
+                during the build (VmManager.restore_layout)
         """
         version_parts = __version__.split(".")
         version = f"{version_parts[0]}.{version_parts[1]}"
 
         # Collect all state-affecting parameters
-        arch = detect_host_arch()
         # Base image, then the kernel + initramfs QEMU actually boots
         guest = self.vm_manager.images
         images = [guest.base_image(spec.language), guest.kernel, guest.initramfs]
@@ -301,8 +305,11 @@ class MemorySnapshotManager(BaseCacheManager):
         # One worker-thread job for every digest (a stat each once known, a full read the first time)
         img_hash, *boot_and_l2_hashes = await asyncio.to_thread(lambda: [key_part(path) for path in images])
         qemu_version = await require_qemu_version()
-        accel_type = await detect_accel_type(force_emulation=self.settings.force_emulation)
-        cpu_model = await guest_cpu_model(arch, accel_type)
+        # The facts a save records (worker_facts.machine_facts), and the counter rate the
+        # restored guest keeps: a restore from an entry passes no boot, so it gets the rate of
+        # this VmManager's boots, as the template's boot did
+        facts = await machine_facts(force_emulation=self.settings.force_emulation)
+        counter_hz = self.vm_manager.counter_hz
 
         parts = [
             str(spec.language.value),
@@ -310,9 +317,8 @@ class MemorySnapshotManager(BaseCacheManager):
             str(__version__),
             img_hash,
             ".".join(str(v) for v in qemu_version),
-            arch.name,
-            accel_type.value,
-            cpu_model,
+            *(f"{key}={value}" for key, value in facts.items()),
+            f"counter_hz={counter_hz}",
             str(spec.memory_mb),
             str(spec.cpu_cores),
             f"disk{spec.disk_mb}",
@@ -435,8 +441,10 @@ class MemorySnapshotManager(BaseCacheManager):
             if vm.use_qemu_vm_user:
                 await _grant_entry_files([tmp_path], perms="rw", key=key)
 
-            # VM Templating: with x-ignore-shared, migration saves only device
-            # state (~340KB). RAM stays in the memory-backend-file (share=on).
+            # VM Templating: with x-ignore-shared, migration saves device state and
+            # the RAM blocks outside the memory-backend-file (~3 MB of data on aarch64:
+            # flash and ACPI tables; ~50 KB on x86_64). The guest RAM stays in the
+            # memory-backend-file (share=on).
             async with MigrationClient(vm.qmp_socket, expected_uid) as client:
                 await client.save_snapshot(
                     tmp_path,
@@ -505,29 +513,20 @@ class MemorySnapshotManager(BaseCacheManager):
             )
             return None
 
-        except BaseException as e:
-            # Catch BaseException (not just Exception) to handle CancelledError too.
-            # Prevents orphaned partial files on SIGTERM / task cancellation.
-            if not isinstance(e, Exception):
-                logger.info("L1 snapshot save cancelled, cleaning up", extra={"key": key})
-            else:
-                logger.warning(
-                    "L1 snapshot save failed",
-                    extra={"key": key, "error": str(e)},
-                    exc_info=True,
-                )
+        except Exception as e:
+            logger.warning(
+                "L1 snapshot save failed",
+                extra={"key": key, "error": str(e)},
+                exc_info=True,
+            )
             await run_to_end(discard)
-            if isinstance(e, Exception):
-                return None
+            return None
+
+        except BaseException:
+            # CancelledError too (SIGTERM, task cancellation): no partial file stays
+            logger.info("L1 snapshot save cancelled, cleaning up", extra={"key": key})
+            await run_to_end(discard)
             raise
-
-    async def can_save(self) -> bool:
-        """QEMU on this host can save L1 templates (at or above the migration floor).
-
-        Checked before booting a sacrificial VM: below the floor every save fails.
-        """
-        qemu_version = await require_qemu_version()
-        return qemu_version >= constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION
 
     async def lease(self, key: str) -> EntryLease | None:
         """A lease on the L1 entry `key` (compute_cache_key), or None: no entry, or its use
@@ -556,12 +555,12 @@ class MemorySnapshotManager(BaseCacheManager):
         returns: the VM, if any, holds its own share.
 
         None on a miss (a broken entry) or on any failed restore: the caller cold boots
-        with the same reservation. An entry QEMU refused (incompatible or corrupt:
-        MIGRATION_REJECTED or MIGRATION_UNSUPPORTED in the cause chain), or whose guest
-        never answered after its state loaded or could not reseed its kernel random source
-        (GUEST_SILENT_AFTER_RESTORE), is removed with all its files, as an eviction removes
-        one (BaseCacheManager._remove_broken: not while another lease holds it); otherwise
-        every later restore of it fails again. A host problem (no access to a file or a
+        with the same reservation. An entry that this worker cannot run (migration_client.
+        refusal_cause: QEMU refused it or died while it loaded it, or its guest panicked right
+        after), or whose guest never answered after its state loaded or could not reseed its
+        kernel random source (GUEST_SILENT_AFTER_RESTORE), is removed with all its files, as
+        an eviction removes one (BaseCacheManager._remove_broken: not while another lease
+        holds it); otherwise every later restore of it fails again. A host problem (no access to a file or a
         socket) keeps the entry. A guest that could not reseed also stops the L1 saves of
         the key in this process (schedule_background_save).
 
@@ -608,7 +607,7 @@ class MemorySnapshotManager(BaseCacheManager):
             },
         )
         logger.debug("L1 restore traceback", exc_info=failure)
-        refused = qemu_refusal(failure) is not None or (
+        refused = refusal_cause(failure) is not None or (
             isinstance(failure, SandboxError) and failure.code is ErrorCode.GUEST_SILENT_AFTER_RESTORE
         )
         if refused and checked is not None:
@@ -643,14 +642,15 @@ class MemorySnapshotManager(BaseCacheManager):
         layer before its VM opens it.
         Returns the background task handle so callers can optionally await or
         monitor completion. Returns None (no-op) when QEMU is below the migration
-        floor (can_save), the entry exists, a save of the key runs in this process, or a
-        restore of the key in this process found a guest that could not reseed (restore).
+        floor (checked before a save VM boots: below it every save fails), the entry
+        exists, a save of the key runs in this process, or a restore of the key in this
+        process found a guest that could not reseed (restore).
 
         Used by the scheduler after a cold boot, and by the warm pool at start.
         The save lock prevents duplicate work: while another process saves the
         same key, the task skips (BlockingIOError, logged at debug level).
         """
-        if key in self._no_save_keys or not await self.can_save():
+        if key in self._no_save_keys or await require_qemu_version() < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
             return None
         if await self.check_cache(key):
             return None
@@ -709,7 +709,6 @@ class MemorySnapshotManager(BaseCacheManager):
                             direct_write_target=None,
                             snapshot_drive=layer.path if layer is not None else None,
                             cache_leases=(layer,) if layer is not None else (),
-                            retry_profile=constants.RETRY_BACKGROUND,
                             mem_path=str(live_ram.path),
                         ) as vm:
                             # Warm REPL (the interpreter start: 0.2-0.7 s with KVM or HVF, 3-5 s

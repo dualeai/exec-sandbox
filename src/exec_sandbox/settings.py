@@ -28,8 +28,10 @@ class QemuBinaries(BaseSettings):
 class Settings(QemuBinaries):
     """Runtime configuration from environment variables.
 
-    All settings can be overridden via environment variables with EXEC_SANDBOX_ prefix.
-    Example: EXEC_SANDBOX_FORCE_EMULATION=true
+    Each field reads EXEC_SANDBOX_<FIELD> (for example EXEC_SANDBOX_FORCE_EMULATION=true);
+    a value given to the constructor wins. The Scheduler gives the three image folders
+    (base_images_dir, kernel_path, base_images_download_dir) and the SchedulerConfig fields
+    set in code (scheduler.settings_from_config).
     """
 
     # From QemuBinaries: the QEMU binaries and model_config (EXEC_SANDBOX_ prefix)
@@ -87,9 +89,9 @@ class Settings(QemuBinaries):
     host_memory_mb: float | None = None
     host_cpu_count: float | None = None
 
-    # Runtime available-memory floor (Gate 3, always-on)
-    # Gate 3 rejects when system_available - requested_memory < floor.
-    # 0 (default) = reject only when system literally can't fit the VM.
+    # Runtime available-memory floor (admission gate 3a, always on)
+    # Gate 3a holds a request while system_available - requested_memory < floor.
+    # 0 (default) = hold it only when the system cannot fit the VM.
     # >0 = additionally reserve this much headroom (e.g. 512 for OS safety).
     available_memory_floor_mb: int = 0
     disk_free_floor_mb: int = Field(default=1024, ge=0)  # Free space admission keeps on the home disk filesystem

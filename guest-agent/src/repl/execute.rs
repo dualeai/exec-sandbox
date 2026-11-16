@@ -149,51 +149,45 @@ fn stderr_frame(chunk: String) -> GuestResponse {
     GuestResponse::Stderr { chunk }
 }
 
-/// Send `buffer` (emptied) in `frame` messages.
+/// Send `buffer` in `frame` messages (empty after Ok). Cancel-safe: a piece leaves the buffer only
+/// once its queue slot is reserved, so a cancel (the exec's deadline) loses no text, and what
+/// is left goes out with the flush after the loop.
 async fn flush_output_buffer(
     writer: &ResponseWriter,
     buffer: &mut String,
     frame: fn(String) -> GuestResponse,
 ) -> Result<(), CmdError> {
-    if buffer.is_empty() {
-        return Ok(());
-    }
-    let data = std::mem::take(buffer);
-    // At most MAX_BUFFER_SIZE_BYTES of text per frame, cut on a character boundary: JSON
-    // writes a control character as \u00XX (6 bytes), so each frame stays below the host's
-    // line limit (guest_channel.STREAM_BUFFER_LIMIT, 512 KB) whatever the output holds. A
-    // buffer can pass that size: a stderr line before the sentinel, the stdout drained after it.
-    if data.len() <= MAX_BUFFER_SIZE_BYTES {
-        return writer.send(&frame(data)).await; // one frame: no copy
-    }
-    let mut rest = data.as_str();
-    while !rest.is_empty() {
-        let mut end = rest.len().min(MAX_BUFFER_SIZE_BYTES);
-        while !rest.is_char_boundary(end) {
-            end -= 1;
-        }
-        let (piece, tail) = rest.split_at(end);
-        writer.send(&frame(piece.to_string())).await?;
-        rest = tail;
+    while !buffer.is_empty() {
+        let permit = writer.reserve().await?;
+        // At most MAX_BUFFER_SIZE_BYTES of text per frame, cut on a character boundary: JSON
+        // writes a control character as \u00XX (6 bytes), so each frame stays below the host's
+        // line limit (guest_channel.STREAM_BUFFER_LIMIT, 512 KB) whatever the output holds. A
+        // buffer can pass that size: a stderr line before the sentinel, the stdout drained after it.
+        let piece = if buffer.len() <= MAX_BUFFER_SIZE_BYTES {
+            std::mem::take(buffer) // one frame: no copy
+        } else {
+            let mut end = MAX_BUFFER_SIZE_BYTES;
+            while !buffer.is_char_boundary(end) {
+                end -= 1;
+            }
+            let piece = buffer[..end].to_owned();
+            buffer.replace_range(..end, ""); // one move of the rest, no walk of its characters
+            piece
+        };
+        permit.send(&frame(piece))?;
     }
     Ok(())
 }
 
-/// Send both output buffers, stdout first, but a capped stream's (it sends
-/// nothing more). A send error is left to the next send, which meets it too.
+/// Send both output buffers, stdout first: they hold only output that may go out.
+/// A send error is left to the next send, which meets it too.
 async fn flush_both(
     writer: &ResponseWriter,
     stdout_buffer: &mut String,
-    stdout_capped: bool,
     stderr_buffer: &mut String,
-    stderr_capped: bool,
 ) {
-    if !stdout_capped {
-        let _ = flush_output_buffer(writer, stdout_buffer, stdout_frame).await;
-    }
-    if !stderr_capped {
-        let _ = flush_output_buffer(writer, stderr_buffer, stderr_frame).await;
-    }
+    let _ = flush_output_buffer(writer, stdout_buffer, stdout_frame).await;
+    let _ = flush_output_buffer(writer, stderr_buffer, stderr_frame).await;
 }
 
 /// True when nothing was sent in the last FLUSH_INTERVAL_MS: the first output
@@ -335,11 +329,17 @@ impl StdoutEnd {
         std::mem::replace(&mut self.pending, rest)
     }
 
-    /// The held-back bytes: an incomplete character, then a tail when no marker came
-    /// (user code closed or redirected fd 1).
+    /// The held-back bytes: an incomplete character, then a tail that may start the marker.
+    fn held(&self) -> Vec<u8> {
+        [self.utf8_tail.as_slice(), self.pending.as_slice()].concat()
+    }
+
+    /// The held-back bytes, taken: the end of the output when no marker came (user code
+    /// closed or redirected fd 1).
     fn finish(&mut self) -> Vec<u8> {
-        let mut rest = std::mem::take(&mut self.utf8_tail);
-        rest.append(&mut self.pending);
+        let rest = self.held();
+        self.utf8_tail.clear();
+        self.pending.clear();
         rest
     }
 }
@@ -363,6 +363,11 @@ fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
     0
 }
 
+/// `bytes` without an incomplete UTF-8 character at its end (incomplete_utf8_tail).
+fn whole_characters(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.len() - incomplete_utf8_tail(bytes)]
+}
+
 /// Fallback after the sentinel when the stdout marker has not come: stop once
 /// stdout is idle for this long (user code that closed or redirected fd 1).
 ///
@@ -372,17 +377,29 @@ fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
 /// timeout boundary while data is still in the pipe buffer.
 const DRAIN_IDLE_MS: u64 = 40;
 
+/// Count `output` (stdout after its end marker is removed) into `stdout_total`, and
+/// keep it in `stdout_buffer` while the total stays at MAX_STDOUT_BYTES or under: the cap
+/// rule of all stdout that may go out (a read that crosses the cap is dropped).
+fn keep_under_stdout_cap(output: &[u8], stdout_total: &mut usize, stdout_buffer: &mut String) {
+    *stdout_total += output.len();
+    if *stdout_total <= MAX_STDOUT_BYTES {
+        stdout_buffer.push_str(&String::from_utf8_lossy(output));
+    }
+}
+
 /// Read stdout until its end marker (`end`), an idle window of DRAIN_IDLE_MS,
-/// or the cumulative `deadline_ms`, whichever comes first. The held-back tail
-/// stays in `end`: the caller adds it (`end.finish()`) when it keeps the output.
+/// or the cumulative `deadline_ms`, whichever comes first, counting each read
+/// into `stdout_total` (keep_under_stdout_cap). The held-back tail stays in
+/// `end`: the caller adds it (`end.finish()`) when it keeps the output.
 async fn drain_stdout(
     stdout: &mut tokio::process::ChildStdout,
     end: &mut StdoutEnd,
     stdout_buffer: &mut String,
+    stdout_total: &mut usize,
     deadline_ms: u64,
 ) {
     let total_deadline = Instant::now() + Duration::from_millis(deadline_ms);
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; OUTPUT_READ_BYTES];
     while !end.seen {
         let total_remaining = total_deadline.saturating_duration_since(Instant::now());
         if total_remaining.is_zero() {
@@ -391,7 +408,7 @@ async fn drain_stdout(
         let window = total_remaining.min(Duration::from_millis(DRAIN_IDLE_MS));
         match tokio::time::timeout(window, stdout.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
-                stdout_buffer.push_str(&String::from_utf8_lossy(&end.feed(&buf[..n])));
+                keep_under_stdout_cap(&end.feed(&buf[..n]), stdout_total, stdout_buffer);
             }
             // EOF, read error, idle window elapsed, or total deadline hit.
             _ => break,
@@ -399,43 +416,236 @@ async fn drain_stdout(
     }
 }
 
-/// Read the output left after a timeout's graceful_terminate_process_group, at
-/// most 200 ms: stdout to its end, stderr to its end or the sentinel (a REPL
-/// that handled SIGTERM writes it). The group has ended, so both pipes end at
-/// once, unless a process that left the group holds one. Returns the sentinel
-/// exit code if found.
-async fn drain_after_sigterm(
-    stdout: &mut tokio::process::ChildStdout,
-    stderr: &mut tokio::process::ChildStderr,
-    stdout_end: &mut StdoutEnd,
-    stdout_buffer: &mut String,
-    stderr_buffer: &mut String,
-    stderr_line_buf: &mut Vec<u8>,
-    sentinel_prefix: &str,
-) -> Option<i32> {
-    let mut sentinel_exit_code: Option<i32> = None;
-    let stdout_part = async {
-        let mut buf = [0u8; 8192];
-        while let Ok(n @ 1..) = stdout.read(&mut buf).await {
-            stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.feed(&buf[..n])));
-        }
-    };
-    let stderr_part = async {
-        let mut buf = [0u8; 8192];
-        while sentinel_exit_code.is_none()
-            && let Ok(n @ 1..) = stderr.read(&mut buf).await
-        {
-            sentinel_exit_code =
-                process_stderr_chunk(&buf[..n], stderr_line_buf, sentinel_prefix, stderr_buffer);
-        }
-    };
-    let _ = tokio::time::timeout(Duration::from_millis(200), async {
-        tokio::join!(stdout_part, stderr_part)
-    })
-    .await;
+/// How the read loop of an exec ended. A sentinel read wins over a deadline that cut the
+/// loop after it (inside a flush): the code ran to its end, and its REPL can serve again.
+#[derive(Debug, PartialEq)]
+enum LoopEnd {
+    Sentinel(i32),
+    /// Both pipes ended with no sentinel: the REPL is gone
+    ReplDied,
+    Timeout,
+}
 
-    stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.finish()));
-    sentinel_exit_code
+impl LoopEnd {
+    fn of(timed_out: bool, sentinel_exit_code: Option<i32>) -> Self {
+        match (sentinel_exit_code, timed_out) {
+            (Some(exit_code), _) => Self::Sentinel(exit_code),
+            (None, false) => Self::ReplDied,
+            (None, true) => Self::Timeout,
+        }
+    }
+}
+
+/// The output of one exec after its read loop: the unsent buffers, the stdout end marker and
+/// the byte totals. Every way an exec ends settles it with the loop's rules: a stream past its
+/// cap (MAX_STDOUT_BYTES, MAX_STDERR_BYTES) keeps nothing more, and ends the exec with
+/// OUTPUT_LIMIT unless the exec timed out or the VM must retire (137); stdout goes out up to
+/// its cap (its held tail counted), stderr up to its cap and the lines of the read that
+/// crosses it. The buffers hold only output that may go out: the cap rules apply as text
+/// enters a buffer, before any await (stderr: the lines past the cap leave it in the same
+/// step), and every flush sends what they hold (also the text that a deadline left
+/// there, cutting a flush). A stream is capped when its total is past its cap: no flag to keep
+/// in step.
+struct ExecOutput {
+    stdout_buffer: String,
+    stdout_end: StdoutEnd,
+    stdout_total: usize,
+    stderr_buffer: String,
+    stderr_line_buf: Vec<u8>,
+    stderr_total: usize,
+}
+
+impl ExecOutput {
+    fn stdout_capped(&self) -> bool {
+        self.stdout_total > MAX_STDOUT_BYTES
+    }
+
+    fn stderr_capped(&self) -> bool {
+        self.stderr_total > MAX_STDERR_BYTES
+    }
+
+    /// Read the stdout that trails the sentinel (drain_stdout, at most `deadline_ms`). Most
+    /// execs read the stdout marker before the sentinel; under TCG (~8x slower) or after a JS
+    /// back-pressure yield, stdout can trail it. The reads past the cap are dropped
+    /// (keep_under_stdout_cap); flush_rest sends what was kept.
+    async fn drain_trailing_stdout(
+        &mut self,
+        stdout: &mut tokio::process::ChildStdout,
+        deadline_ms: u64,
+    ) {
+        drain_stdout(
+            stdout,
+            &mut self.stdout_end,
+            &mut self.stdout_buffer,
+            &mut self.stdout_total,
+            deadline_ms,
+        )
+        .await;
+    }
+
+    /// The flush after the loop, by how it ended (`end`). An exec that ended (a sentinel or the
+    /// REPL's death) adds the held stdout tail, counted (keep_under_stdout_cap), and the
+    /// partial stderr line of a stream at its cap or under. After a timeout both stay for the
+    /// drain (finish_after_sigterm): when the sentinel follows, a marker, a sentinel line or a
+    /// character split at the deadline comes out whole. Then both buffers go out.
+    async fn flush_rest(&mut self, writer: &ResponseWriter, end: &LoopEnd) {
+        if *end != LoopEnd::Timeout {
+            let tail = self.stdout_end.finish();
+            keep_under_stdout_cap(&tail, &mut self.stdout_total, &mut self.stdout_buffer);
+            if !self.stderr_capped() {
+                let partial = std::mem::take(&mut self.stderr_line_buf);
+                self.stderr_buffer
+                    .push_str(&String::from_utf8_lossy(&partial));
+            }
+        }
+        self.flush(writer).await;
+    }
+
+    /// Send both buffers: they hold only output that may go out.
+    async fn flush(&mut self, writer: &ResponseWriter) {
+        flush_both(writer, &mut self.stdout_buffer, &mut self.stderr_buffer).await;
+    }
+
+    /// After a timeout's graceful_terminate_process_group: drain_after_sigterm. When the drain
+    /// reads the sentinel (the exec ended at the deadline, or its code handled SIGTERM), what
+    /// was kept goes out (a stream capped before the drain keeps nothing more). With none, only
+    /// the text held at the deadline goes out (held_at_deadline), not the drain's reads; the
+    /// caller then ends the exec (the timeout error, or 137 when the VM must retire). Returns
+    /// the sentinel exit code if found.
+    async fn finish_after_sigterm(
+        &mut self,
+        writer: &ResponseWriter,
+        stdout: &mut tokio::process::ChildStdout,
+        stderr: &mut tokio::process::ChildStderr,
+        sentinel_prefix: &str,
+    ) -> Option<i32> {
+        let (mut stdout_held, mut stderr_held) = self.held_at_deadline();
+        let sentinel_exit_code = self
+            .drain_after_sigterm(stdout, stderr, sentinel_prefix)
+            .await;
+        if sentinel_exit_code.is_some() {
+            self.flush(writer).await;
+        } else {
+            flush_both(writer, &mut stdout_held, &mut stderr_held).await;
+        }
+        sentinel_exit_code
+    }
+
+    /// The text read before a timeout's deadline that waits for the drain to end it: stdout's
+    /// held tail and the partial stderr line, each under the cap rules (the tail counted with
+    /// keep_under_stdout_cap; the line goes while stderr is at its cap or under) and without an
+    /// incomplete last character (its rest came after the deadline). With no sentinel after
+    /// the drain, it is the end of the output (a progress line with no newline); a tail that
+    /// starts the marker is then user output, as the REPL writes the marker just before its
+    /// sentinel.
+    fn held_at_deadline(&self) -> (String, String) {
+        let mut stdout_total = self.stdout_total;
+        let mut stdout_held = String::new();
+        keep_under_stdout_cap(
+            whole_characters(&self.stdout_end.held()),
+            &mut stdout_total,
+            &mut stdout_held,
+        );
+        let stderr_held = if self.stderr_capped() {
+            String::new()
+        } else {
+            String::from_utf8_lossy(whole_characters(&self.stderr_line_buf)).into_owned()
+        };
+        (stdout_held, stderr_held)
+    }
+
+    /// Read the output left after a timeout's graceful_terminate_process_group, at most
+    /// 200 ms: stdout to its end, stderr to its end or the sentinel (a REPL that handled
+    /// SIGTERM writes it). The group has ended, so both pipes end at once, unless a process
+    /// that left the group holds one. Each read counts with the loop's rules: stdout past
+    /// MAX_STDOUT_BYTES is dropped (keep_under_stdout_cap, the held tail too); stderr keeps
+    /// the lines up to and with the read that crosses MAX_STDERR_BYTES, then nothing, and the
+    /// partial line is kept while stderr is at its cap or under. Returns the sentinel exit
+    /// code if found.
+    async fn drain_after_sigterm(
+        &mut self,
+        stdout: &mut tokio::process::ChildStdout,
+        stderr: &mut tokio::process::ChildStderr,
+        sentinel_prefix: &str,
+    ) -> Option<i32> {
+        let Self {
+            stdout_buffer,
+            stdout_end,
+            stdout_total,
+            stderr_buffer,
+            stderr_line_buf,
+            stderr_total,
+        } = self;
+        let mut sentinel_exit_code: Option<i32> = None;
+        let stdout_part = async {
+            let mut buf = [0u8; OUTPUT_READ_BYTES];
+            while let Ok(n @ 1..) = stdout.read(&mut buf).await {
+                keep_under_stdout_cap(&stdout_end.feed(&buf[..n]), stdout_total, stdout_buffer);
+            }
+        };
+        let stderr_part = async {
+            let mut buf = [0u8; OUTPUT_READ_BYTES];
+            // The buffer's length after the read that crossed the cap; already past it at the
+            // start, nothing more is kept (the buffer holds only output that may go out)
+            let mut kept = (*stderr_total > MAX_STDERR_BYTES).then_some(stderr_buffer.len());
+            while sentinel_exit_code.is_none()
+                && let Ok(n @ 1..) = stderr.read(&mut buf).await
+            {
+                sentinel_exit_code = process_stderr_chunk(
+                    &buf[..n],
+                    stderr_line_buf,
+                    sentinel_prefix,
+                    stderr_buffer,
+                );
+                *stderr_total += n;
+                if let Some(len) = kept {
+                    stderr_buffer.truncate(len);
+                } else if *stderr_total > MAX_STDERR_BYTES {
+                    kept = Some(stderr_buffer.len());
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(200), async {
+            tokio::join!(stdout_part, stderr_part)
+        })
+        .await;
+
+        keep_under_stdout_cap(&stdout_end.finish(), stdout_total, stdout_buffer);
+        if *stderr_total <= MAX_STDERR_BYTES {
+            stderr_buffer.push_str(&String::from_utf8_lossy(&std::mem::take(stderr_line_buf)));
+        }
+        sentinel_exit_code
+    }
+
+    /// The result of an exec whose REPL died with `exit_code`: output past a cap is
+    /// OUTPUT_LIMIT here too (a new REPL serves the next exec), unless the VM must retire
+    /// (137, which the host must see).
+    fn death_result(&self, exit_code: i32) -> Result<i32, CmdError> {
+        match self.limit_message() {
+            Some(message) if exit_code != 137 => Err(CmdError::output_limit(format!(
+                "{message}; the REPL then exited with code {exit_code}"
+            ))),
+            _ => Ok(exit_code),
+        }
+    }
+
+    /// The OUTPUT_LIMIT text of the capped streams, or None.
+    fn limit_message(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.stdout_capped() {
+            parts.push(format!(
+                "stdout {} bytes exceeds {} limit",
+                self.stdout_total, MAX_STDOUT_BYTES
+            ));
+        }
+        if self.stderr_capped() {
+            parts.push(format!(
+                "stderr {} bytes exceeds {} limit",
+                self.stderr_total, MAX_STDERR_BYTES
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
 }
 
 /// Generate a unique sentinel ID and its prefix for matching on stderr.
@@ -675,7 +885,7 @@ async fn warm_exercise_repl(
             // Read the no-op's stdout up to its end marker, so no byte of it
             // reaches the next exec. 250 ms: TCG slack for the fallback.
             let mut end = StdoutEnd::new(&sentinel_id);
-            drain_stdout(&mut repl.stdout, &mut end, &mut String::new(), 250).await;
+            drain_stdout(&mut repl.stdout, &mut end, &mut String::new(), &mut 0, 250).await;
             log_info!(
                 "[repl-readiness] phase={PHASE} language={} action=ready",
                 language.as_str()
@@ -771,8 +981,8 @@ pub(crate) async fn execute_code_streaming(
     let mut stdout_buffer = String::new();
     let mut stderr_buffer = String::new();
     let mut stderr_line_buf = Vec::new();
-    let mut stdout_bytes = [0u8; 8192];
-    let mut stderr_bytes = [0u8; 8192];
+    let mut stdout_bytes = [0u8; OUTPUT_READ_BYTES];
+    let mut stderr_bytes = [0u8; OUTPUT_READ_BYTES];
     let mut flush_timer = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
     // Time of the last output sent (flush_due); None until the first.
     let mut last_flush: Option<Instant> = None;
@@ -786,22 +996,22 @@ pub(crate) async fn execute_code_streaming(
     // output left after the end marker is removed, stderr the raw pipe bytes.
     // When a stdout read crosses the limit, its whole chunk is dropped (the host
     // may get up to about 8 KiB less than the limit). The complete lines of the
-    // stderr read that crosses it are still sent (up to about 8 KiB more).
+    // stderr read that crosses it are still sent (up to about 8 KiB more). A
+    // stream is capped once its total passes its cap (no flag: ExecOutput, after
+    // the loop, uses the same rule). The drains after the loop (drain_stdout,
+    // drain_after_sigterm) count with the same rules: the host stops a stream
+    // past its cap and one read.
     let mut stdout_total: usize = 0;
     let mut stderr_total: usize = 0;
-    let mut stdout_capped = false;
-    let mut stderr_capped = false;
 
     let loop_result = tokio::time::timeout_at(deadline, async {
         loop {
             tokio::select! {
                 _ = flush_timer.tick() => {
-                    if (!stdout_capped && !stdout_buffer.is_empty())
-                        || (!stderr_capped && !stderr_buffer.is_empty())
-                    {
+                    if !stdout_buffer.is_empty() || !stderr_buffer.is_empty() {
                         last_flush = Some(Instant::now());
                     }
-                    flush_both(writer, &mut stdout_buffer, stdout_capped, &mut stderr_buffer, stderr_capped).await;
+                    flush_both(writer, &mut stdout_buffer, &mut stderr_buffer).await;
                 }
 
                 result = repl.stdout.read(&mut stdout_bytes), if !stdout_done => {
@@ -818,25 +1028,17 @@ pub(crate) async fn execute_code_streaming(
                                 );
                             }
                             // The marker is found before the cap: a capped exec still ends at it.
+                            // Past the cap the pipe is still read (the child never blocks), and dropped.
                             let output = stdout_end.feed(&stdout_bytes[..n]);
-                            stdout_total += output.len();
-                            if stdout_total > MAX_STDOUT_BYTES {
-                                if !stdout_capped {
-                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, stdout_frame).await;
-                                    stdout_capped = true;
-                                }
-                                // Keep reading pipe (prevent child blocking) but discard
-                            } else {
-                                stdout_buffer.push_str(&String::from_utf8_lossy(&output));
-                                if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
-                                    last_flush = Some(Instant::now());
-                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, stdout_frame).await;
-                                } else if !stdout_buffer.is_empty() && flush_due(last_flush) {
-                                    // Both buffers, as the tick does: stderr output that waits
-                                    // for the tick goes out with this stdout
-                                    last_flush = Some(Instant::now());
-                                    flush_both(writer, &mut stdout_buffer, stdout_capped, &mut stderr_buffer, stderr_capped).await;
-                                }
+                            keep_under_stdout_cap(&output, &mut stdout_total, &mut stdout_buffer);
+                            if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
+                                last_flush = Some(Instant::now());
+                                let _ = flush_output_buffer(writer, &mut stdout_buffer, stdout_frame).await;
+                            } else if !stdout_buffer.is_empty() && flush_due(last_flush) {
+                                // Both buffers, as the tick does: stderr output that waits
+                                // for the tick goes out with this stdout
+                                last_flush = Some(Instant::now());
+                                flush_both(writer, &mut stdout_buffer, &mut stderr_buffer).await;
                             }
                         }
                         Err(_) => stdout_done = true,
@@ -868,11 +1070,12 @@ pub(crate) async fn execute_code_streaming(
                             ) {
                                 sentinel_exit_code = Some(code);
                             }
+                            let was_capped = stderr_total > MAX_STDERR_BYTES;
                             stderr_total += n;
                             if stderr_total > MAX_STDERR_BYTES {
-                                if !stderr_capped {
+                                if !was_capped {
+                                    // The crossing read: its lines and what came before go out
                                     let _ = flush_output_buffer(writer, &mut stderr_buffer, stderr_frame).await;
-                                    stderr_capped = true;
                                 }
                                 stderr_buffer.clear(); // discard parsed-but-over-limit data
                             } else if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
@@ -881,7 +1084,7 @@ pub(crate) async fn execute_code_streaming(
                             } else if !stderr_buffer.is_empty() && flush_due(last_flush) {
                                 // Both buffers, in the tick's order
                                 last_flush = Some(Instant::now());
-                                flush_both(writer, &mut stdout_buffer, stdout_capped, &mut stderr_buffer, stderr_capped).await;
+                                flush_both(writer, &mut stdout_buffer, &mut stderr_buffer).await;
                             }
                         }
                         Err(_) => stderr_done = true,
@@ -899,35 +1102,19 @@ pub(crate) async fn execute_code_streaming(
     })
     .await;
 
-    if loop_result.is_ok()
-        && sentinel_exit_code.is_some()
-        && !crate::oom_guard::retirement_required()
-    {
-        // Most execs read the stdout marker before the sentinel: no wait.
-        // Else read up to it; 500 ms: under TCG (~8× slower) or after a JS
-        // back-pressure yield, stdout can trail the sentinel.
-        drain_stdout(&mut repl.stdout, &mut stdout_end, &mut stdout_buffer, 500).await;
+    let end = LoopEnd::of(loop_result.is_err(), sentinel_exit_code);
+    let mut out = ExecOutput {
+        stdout_buffer,
+        stdout_end,
+        stdout_total,
+        stderr_buffer,
+        stderr_line_buf,
+        stderr_total,
+    };
+    if matches!(end, LoopEnd::Sentinel(_)) && !crate::oom_guard::retirement_required() {
+        out.drain_trailing_stdout(&mut repl.stdout, 500).await;
     }
-
-    // Flush residual buffers (skip capped streams)
-    if !stdout_capped {
-        stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.finish()));
-    }
-    // Taken, not copied: after a timeout, the drain below adds to the line
-    // buffer, and the partial line sent here must not go out a second time.
-    if !stderr_capped {
-        stderr_buffer.push_str(&String::from_utf8_lossy(&std::mem::take(
-            &mut stderr_line_buf,
-        )));
-    }
-    flush_both(
-        writer,
-        &mut stdout_buffer,
-        stdout_capped,
-        &mut stderr_buffer,
-        stderr_capped,
-    )
-    .await;
+    out.flush_rest(writer, &end).await;
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let process_ms = Some(process_start.elapsed().as_millis() as u64);
@@ -938,10 +1125,8 @@ pub(crate) async fn execute_code_streaming(
         process_ms,
     };
 
-    match loop_result {
-        Ok(()) if sentinel_exit_code.is_some() => {
-            let exit_code = sentinel_exit_code.unwrap();
-
+    match end {
+        LoopEnd::Sentinel(exit_code) => {
             // A terminal pressure decision can race with buffered sentinel
             // delivery. Do not pool the REPL or report a non-terminal result
             // once that decision is visible (see reconcile_retirement_exit).
@@ -953,26 +1138,13 @@ pub(crate) async fn execute_code_streaming(
 
             idle_repls().insert(language, repl);
 
-            if stdout_capped || stderr_capped {
-                let mut parts = Vec::new();
-                if stdout_capped {
-                    parts.push(format!(
-                        "stdout {} bytes exceeds {} limit",
-                        stdout_total, MAX_STDOUT_BYTES
-                    ));
-                }
-                if stderr_capped {
-                    parts.push(format!(
-                        "stderr {} bytes exceeds {} limit",
-                        stderr_total, MAX_STDERR_BYTES
-                    ));
-                }
-                return Err(CmdError::output_limit(parts.join(", ")));
+            if let Some(message) = out.limit_message() {
+                return Err(CmdError::output_limit(message));
             }
 
             writer.send(&complete(exit_code)).await?;
         }
-        Ok(()) => {
+        LoopEnd::ReplDied => {
             // Both pipes closed without a sentinel: the REPL has most likely
             // exited. One that still runs after KILL_WAIT (its code closed
             // fd 1 and 2) is killed.
@@ -992,9 +1164,10 @@ pub(crate) async fn execute_code_streaming(
                 exit_code
             );
 
+            let exit_code = out.death_result(exit_code)?;
             writer.send(&complete(exit_code)).await?;
         }
-        Err(_) => {
+        LoopEnd::Timeout => {
             log_repl_timeout_diagnostics(repl.child.id(), first_io_logged);
             log_warn!(
                 "REPL for {} timed out after {}s, sending SIGTERM",
@@ -1005,30 +1178,12 @@ pub(crate) async fn execute_code_streaming(
 
             // Drain stdout/stderr after SIGTERM — the process may have printed
             // output (e.g. Python SIGTERM handler) and emitted a sentinel.
-            let sigterm_exit_code = drain_after_sigterm(
-                &mut repl.stdout,
-                &mut repl.stderr,
-                &mut stdout_end,
-                &mut stdout_buffer,
-                &mut stderr_buffer,
-                &mut stderr_line_buf,
-                &sentinel_prefix,
-            )
-            .await;
+            let sigterm_exit_code = out
+                .finish_after_sigterm(writer, &mut repl.stdout, &mut repl.stderr, &sentinel_prefix)
+                .await;
 
             // If sentinel was found during post-SIGTERM drain, treat as graceful exit
             if let Some(exit_code) = sigterm_exit_code {
-                if !stderr_line_buf.is_empty() && !stderr_capped {
-                    stderr_buffer.push_str(&String::from_utf8_lossy(&stderr_line_buf));
-                }
-                flush_both(
-                    writer,
-                    &mut stdout_buffer,
-                    stdout_capped,
-                    &mut stderr_buffer,
-                    stderr_capped,
-                )
-                .await;
                 // No output-limit error here: the REPL got SIGTERM and is not
                 // pooled, so the sentinel code is the result.
                 let exit_code = crate::oom_guard::reconcile_retirement_exit(exit_code);
@@ -1088,6 +1243,468 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_stdout_cap_keeps_up_to_its_last_byte() {
+        let (mut total, mut buffer) = (MAX_STDOUT_BYTES - 3, String::new());
+        keep_under_stdout_cap(b"abc", &mut total, &mut buffer);
+        assert_eq!((total, buffer.as_str()), (MAX_STDOUT_BYTES, "abc")); // at the cap: kept
+        keep_under_stdout_cap(b"d", &mut total, &mut buffer);
+        keep_under_stdout_cap(b"e", &mut total, &mut buffer);
+        assert_eq!((total, buffer.as_str()), (MAX_STDOUT_BYTES + 2, "abc"));
+    }
+
+    #[tokio::test]
+    async fn a_drain_past_the_stdout_cap_keeps_only_the_reads_under_it() {
+        // stdout that trails the sentinel: 60,000 B in the pipe (written whole before the
+        // drain: no idle window ends it early), 10,000 B left under the cap
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "head -c 60000 /dev/zero | tr '\\0' x"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let mut end = StdoutEnd::new("1_2");
+        let (mut total, mut buffer) = (MAX_STDOUT_BYTES - 10_000, String::new());
+
+        drain_stdout(&mut stdout, &mut end, &mut buffer, &mut total, 5_000).await;
+
+        assert_eq!(total, MAX_STDOUT_BYTES - 10_000 + 60_000); // every read counted, to the end
+        assert_eq!(buffer, "x".repeat(8_192)); // the one read under the cap, then nothing
+    }
+
+    /// An ExecOutput with `stdout_total` and `stderr_total` counted before, nothing buffered
+    /// (the stdout marker of exec "1_0").
+    fn output_at(stdout_total: usize, stderr_total: usize) -> ExecOutput {
+        ExecOutput {
+            stdout_buffer: String::new(),
+            stdout_end: StdoutEnd::new("1_0"),
+            stdout_total,
+            stderr_buffer: String::new(),
+            stderr_line_buf: Vec::new(),
+            stderr_total,
+        }
+    }
+
+    /// A ResponseWriter, and the receiver of the lines it queues.
+    fn writer() -> (ResponseWriter, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (ResponseWriter::new(tx, None), rx)
+    }
+
+    /// The (type, chunk) of each message queued in `rx`.
+    fn sent(rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Vec<(String, String)> {
+        let mut messages = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            let value: serde_json::Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
+            let chunk = value["chunk"].as_str().unwrap_or_default().to_string();
+            messages.push((value["type"].as_str().unwrap().to_string(), chunk));
+        }
+        messages
+    }
+
+    /// A child that wrote `script`'s output and ended: its two pipes, at their end.
+    async fn ended_pipes(
+        script: &str,
+    ) -> (tokio::process::ChildStdout, tokio::process::ChildStderr) {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pipes = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+        assert!(child.wait().await.unwrap().success());
+        pipes
+    }
+
+    #[tokio::test]
+    async fn the_timeout_drain_keeps_each_stream_under_its_cap() {
+        // stdout 60,000 B with 10,000 B left under its cap; stderr 20 lines of 1,000 B with
+        // 5,000 B left under its cap, then the sentinel. All of it is in the pipes before the
+        // drain (under 64 KiB each), so each read is 8,192 B.
+        let (mut stdout, mut stderr) = ended_pipes(
+            "head -c 60000 /dev/zero | tr '\\0' x; i=0; while [ $i -lt 20 ]; do printf '%0999d\\n' 0 >&2; \
+             i=$((i+1)); done; printf '__SENTINEL_1_0_7__\\n' >&2",
+        )
+        .await;
+        let mut out = output_at(MAX_STDOUT_BYTES - 10_000, MAX_STDERR_BYTES - 5_000);
+
+        let result = out
+            .drain_after_sigterm(&mut stdout, &mut stderr, "__SENTINEL_1_0_")
+            .await;
+
+        assert_eq!(result, Some(7));
+        assert_eq!(out.stdout_total, MAX_STDOUT_BYTES - 10_000 + 60_000);
+        assert_eq!(out.stdout_buffer, "x".repeat(8_192)); // the one read under the cap
+        assert_eq!(out.stderr_total, MAX_STDERR_BYTES - 5_000 + 20_000 + 19);
+        // the whole lines of the read that crosses the cap (8 of its 8,192 B), then nothing
+        assert_eq!(
+            out.stderr_buffer,
+            format!("{}\n", "0".repeat(999)).repeat(8)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_timeout_drain_under_the_cap_keeps_the_partial_line() {
+        let (mut stdout, mut stderr) =
+            ended_pipes("printf 'late line\\n__SENTINEL_1_0_0__\\npartial' >&2").await;
+        let mut out = output_at(0, 0);
+        let result = out
+            .drain_after_sigterm(&mut stdout, &mut stderr, "__SENTINEL_1_0_")
+            .await;
+        assert_eq!(
+            (
+                result,
+                out.stderr_buffer.as_str(),
+                out.stderr_line_buf.len()
+            ),
+            (Some(0), "late line\npartial", 0)
+        );
+    }
+
+    #[test]
+    fn a_stream_is_capped_past_its_cap() {
+        // From the totals: the only cap state
+        let past = output_at(MAX_STDOUT_BYTES + 1, MAX_STDERR_BYTES + 1);
+        assert_eq!((past.stdout_capped(), past.stderr_capped()), (true, true));
+        let at = output_at(MAX_STDOUT_BYTES, MAX_STDERR_BYTES);
+        assert_eq!((at.stdout_capped(), at.stderr_capped()), (false, false));
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_crosses_the_cap_sends_what_came_before() {
+        // 10,000 B left under the cap, "pre" not sent yet; 60,000 B trail the sentinel
+        let (writer, mut rx) = writer();
+        let (mut stdout, _stderr) = ended_pipes("head -c 60000 /dev/zero | tr '\\0' x").await;
+        let mut out = output_at(MAX_STDOUT_BYTES - 10_000, 0);
+        out.stdout_buffer.push_str("pre");
+
+        out.drain_trailing_stdout(&mut stdout, 5_000).await;
+        out.flush_rest(&writer, &LoopEnd::Sentinel(0)).await;
+
+        let before = format!("pre{}", "x".repeat(8_192)); // the one read under the cap
+        assert_eq!(sent(&mut rx), [("stdout".to_string(), before)]);
+        assert!(out.stdout_capped());
+    }
+
+    #[tokio::test]
+    async fn a_character_split_at_the_deadline_comes_out_whole() {
+        // A read ended inside "é" of "café": the timeout flush leaves the partial line to
+        // the drain, which reads the rest of the character
+        let (writer, mut rx) = writer();
+        let (mut stdout, mut stderr) =
+            ended_pipes("printf '\\251\\n__SENTINEL_1_0_0__\\n' >&2").await;
+        let mut out = output_at(0, 0);
+        out.stderr_line_buf.extend_from_slice(b"caf\xc3");
+
+        out.flush_rest(&writer, &LoopEnd::Timeout).await;
+        assert_eq!(sent(&mut rx), Vec::<(String, String)>::new());
+        let result = out
+            .finish_after_sigterm(&writer, &mut stdout, &mut stderr, "__SENTINEL_1_0_")
+            .await;
+
+        assert_eq!(
+            (result, sent(&mut rx)),
+            (Some(0), vec![("stderr".to_string(), "café\n".to_string())])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sentinel_line_split_at_the_deadline_still_ends_the_drain() {
+        // The REPL wrote its sentinel; the deadline cut its line: no piece of it goes out
+        let (writer, mut rx) = writer();
+        let (mut stdout, mut stderr) = ended_pipes("printf '0__\\n' >&2").await;
+        let mut out = output_at(0, 0);
+        out.stderr_line_buf.extend_from_slice(b"__SENTINEL_1_0_");
+
+        out.flush_rest(&writer, &LoopEnd::Timeout).await;
+        let result = out
+            .finish_after_sigterm(&writer, &mut stdout, &mut stderr, "__SENTINEL_1_0_")
+            .await;
+
+        assert_eq!((result, sent(&mut rx)), (Some(0), vec![]));
+    }
+
+    #[rstest]
+    #[case::at_the_cap(MAX_STDERR_BYTES, "kept\npart")]
+    #[case::past_the_cap(MAX_STDERR_BYTES + 1, "kept\n")]
+    #[tokio::test]
+    async fn an_ended_exec_sends_stderr_and_its_partial_line_up_to_the_cap(
+        #[case] stderr_total: usize,
+        #[case] expected: &str,
+    ) {
+        // The buffer holds what may go out (also past the cap: the crossing read's lines);
+        // the partial line goes with it only while stderr is at its cap or under
+        let (writer, mut rx) = writer();
+        let mut out = output_at(0, stderr_total);
+        out.stderr_buffer.push_str("kept\n");
+        out.stderr_line_buf.extend_from_slice(b"part");
+        out.flush_rest(&writer, &LoopEnd::Sentinel(0)).await;
+        assert_eq!(
+            sent(&mut rx),
+            [("stderr".to_string(), expected.to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_timeout_drain_keeps_the_partial_line_up_to_the_cap() {
+        // 26 B read: the sentinel line (19 B) and "partial" (7 B) after it
+        let text = "printf '__SENTINEL_1_0_0__\\npartial' >&2";
+        for (left, kept) in [(26, "partial"), (25, "")] {
+            let (mut stdout, mut stderr) = ended_pipes(text).await;
+            let mut out = output_at(0, MAX_STDERR_BYTES - left);
+            out.drain_after_sigterm(&mut stdout, &mut stderr, "__SENTINEL_1_0_")
+                .await;
+            assert_eq!(out.stderr_buffer, kept, "{left} B left under the cap");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_timeout_drain_counts_its_held_tail() {
+        // 4 B left under the cap: "ab" is kept, the held "__STDOUT_EN" (no marker after it) is not
+        let (mut stdout, mut stderr) = ended_pipes("printf 'ab__STDOUT_EN'").await;
+        let mut out = output_at(MAX_STDOUT_BYTES - 4, 0);
+        out.drain_after_sigterm(&mut stdout, &mut stderr, "__SENTINEL_1_0_")
+            .await;
+        assert_eq!(
+            (out.stdout_buffer.as_str(), out.stdout_capped()),
+            ("ab", true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_flush_leaves_a_split_marker_to_the_drain() {
+        // The deadline cut the marker "__STDOUT_END_1_0__\n": its start is held
+        let (writer, mut rx) = writer();
+        let mut out = output_at(0, 0);
+        let output = out.stdout_end.feed(b"abc__STDOUT_END_1_");
+        out.stdout_buffer
+            .push_str(&String::from_utf8_lossy(&output));
+
+        out.flush_rest(&writer, &LoopEnd::Timeout).await;
+
+        assert_eq!(sent(&mut rx), [("stdout".to_string(), "abc".to_string())]);
+        assert!(out.stdout_end.feed(b"0__\n").is_empty() && out.stdout_end.seen); // the drain's read ends it
+    }
+
+    #[tokio::test]
+    async fn an_ended_exec_counts_its_held_tail() {
+        // 4 B left under the cap: "ab" goes out, the held "__STDOUT_EN" (11 B: no marker after it) does not
+        let (writer, mut rx) = writer();
+        let mut out = output_at(MAX_STDOUT_BYTES - 4, 0);
+        let output = out.stdout_end.feed(b"ab__STDOUT_EN");
+        keep_under_stdout_cap(&output, &mut out.stdout_total, &mut out.stdout_buffer);
+
+        out.flush_rest(&writer, &LoopEnd::ReplDied).await;
+
+        assert_eq!(sent(&mut rx), [("stdout".to_string(), "ab".to_string())]);
+        assert_eq!(
+            out.limit_message().as_deref(),
+            Some(
+                format!(
+                    "stdout {} bytes exceeds {} limit",
+                    MAX_STDOUT_BYTES + 9,
+                    MAX_STDOUT_BYTES
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn the_limit_message_names_each_capped_stream() {
+        assert_eq!(
+            output_at(MAX_STDOUT_BYTES, MAX_STDERR_BYTES).limit_message(),
+            None
+        );
+        let out = output_at(MAX_STDOUT_BYTES + 5, MAX_STDERR_BYTES + 7);
+        assert_eq!(
+            out.limit_message().unwrap(),
+            format!(
+                "stdout {} bytes exceeds {} limit, stderr {} bytes exceeds {} limit",
+                MAX_STDOUT_BYTES + 5,
+                MAX_STDOUT_BYTES,
+                MAX_STDERR_BYTES + 7,
+                MAX_STDERR_BYTES
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn after_a_timeout_a_drain_that_crosses_the_caps_sends_what_it_kept() {
+        // 10,000 B left under the stdout cap, 5,000 under the stderr cap; the REPL handled
+        // SIGTERM: its sentinel ends the drain
+        let (writer, mut rx) = writer();
+        let (mut stdout, mut stderr) = ended_pipes(
+            "head -c 60000 /dev/zero | tr '\\0' x; i=0; while [ $i -lt 20 ]; do printf '%0999d\\n' 0 >&2; \
+             i=$((i+1)); done; printf '__SENTINEL_1_0_7__\\n' >&2",
+        )
+        .await;
+        let mut out = output_at(MAX_STDOUT_BYTES - 10_000, MAX_STDERR_BYTES - 5_000);
+
+        let result = out
+            .finish_after_sigterm(&writer, &mut stdout, &mut stderr, "__SENTINEL_1_0_")
+            .await;
+
+        assert_eq!(result, Some(7));
+        assert_eq!(
+            sent(&mut rx),
+            [
+                ("stdout".to_string(), "x".repeat(8_192)),
+                (
+                    "stderr".to_string(),
+                    format!("{}\n", "0".repeat(999)).repeat(8)
+                ),
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::under_the_caps(0, b"Progress [__", 0, b"Processing...", vec![("stdout", "__"), ("stderr", "Processing...")])]
+    #[case::split_characters(0, b"caf\xc3", 0, b"caf\xc3", vec![("stderr", "caf")])]
+    #[case::at_the_caps(MAX_STDOUT_BYTES - 2, b"__", MAX_STDERR_BYTES, b"Processing...", vec![("stdout", "__"), ("stderr", "Processing...")])]
+    #[case::past_the_caps(MAX_STDOUT_BYTES - 1, b"__", MAX_STDERR_BYTES + 1, b"Processing...", vec![])]
+    #[tokio::test]
+    async fn after_a_timeout_with_no_sentinel_the_text_held_at_the_deadline_goes_out(
+        #[case] stdout_total: usize,
+        #[case] stdout_read: &[u8],
+        #[case] stderr_total: usize,
+        #[case] stderr_line: &[u8],
+        #[case] expected: Vec<(&str, &str)>,
+    ) {
+        // No SIGTERM handler, so no sentinel: the text held at the deadline goes out (the
+        // stdout tail that may start the marker, the partial stderr line), the drain's reads
+        // ("late", "more") do not. A character whose rest came after the deadline does not.
+        let (writer, mut rx) = writer();
+        let (mut stdout, mut stderr) = ended_pipes("printf late; printf 'more\\n' >&2").await;
+        let mut out = output_at(stdout_total, stderr_total);
+        out.stdout_end.feed(stdout_read); // the loop sent what this returns
+        out.stderr_line_buf.extend_from_slice(stderr_line);
+        let result = out
+            .finish_after_sigterm(&writer, &mut stdout, &mut stderr, "__SENTINEL_1_0_")
+            .await;
+        let expected: Vec<(String, String)> = expected
+            .into_iter()
+            .map(|(t, c)| (t.to_string(), c.to_string()))
+            .collect();
+        assert_eq!((result, sent(&mut rx)), (None, expected));
+    }
+
+    #[tokio::test]
+    async fn after_a_timeout_with_no_sentinel_nothing_goes_out() {
+        let (writer, mut rx) = writer();
+        let (mut stdout, mut stderr) = ended_pipes("printf out; printf 'late line\\n' >&2").await;
+        let mut out = output_at(0, 0);
+        let result = out
+            .finish_after_sigterm(&writer, &mut stdout, &mut stderr, "__SENTINEL_1_0_")
+            .await;
+        assert_eq!((result, sent(&mut rx)), (None, vec![]));
+    }
+
+    #[rstest]
+    #[case::past_the_cap(MAX_STDERR_BYTES + 1, vec![("stdout", "out")])]
+    #[case::at_the_cap(MAX_STDERR_BYTES, vec![("stdout", "out"), ("stderr", "late line\n")])]
+    #[tokio::test]
+    async fn after_a_timeout_the_drain_keeps_stderr_up_to_the_read_that_crosses_its_cap(
+        #[case] stderr_total: usize,
+        #[case] expected: Vec<(&str, &str)>,
+    ) {
+        // At the cap the drain's first read crosses it: its lines are kept, then nothing
+        let (writer, mut rx) = writer();
+        let (mut stdout, mut stderr) =
+            ended_pipes("printf out; printf 'late line\\n__SENTINEL_1_0_0__\\n' >&2").await;
+        let mut out = output_at(0, stderr_total);
+        let result = out
+            .finish_after_sigterm(&writer, &mut stdout, &mut stderr, "__SENTINEL_1_0_")
+            .await;
+        let expected: Vec<(String, String)> = expected
+            .into_iter()
+            .map(|(t, c)| (t.to_string(), c.to_string()))
+            .collect();
+        assert_eq!((result, sent(&mut rx)), (Some(0), expected));
+    }
+
+    #[tokio::test]
+    async fn text_under_the_cap_goes_out_after_the_stream_crosses_it() {
+        // "abc" waited for a flush (or a deadline cut one) when a later read crossed the cap
+        let (writer, mut rx) = writer();
+        let mut out = output_at(MAX_STDOUT_BYTES + 1, 0);
+        out.stdout_buffer.push_str("abc");
+        out.flush_rest(&writer, &LoopEnd::Sentinel(0)).await;
+        assert_eq!(sent(&mut rx), [("stdout".to_string(), "abc".to_string())]);
+        assert_eq!(
+            out.limit_message().unwrap(),
+            format!(
+                "stdout {} bytes exceeds {} limit",
+                MAX_STDOUT_BYTES + 1,
+                MAX_STDOUT_BYTES
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flush_cut_by_a_cancel_keeps_its_text() {
+        // A full queue (one slot, taken) and the exec's deadline at 50 ms
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let writer = ResponseWriter::new(tx, None);
+        writer
+            .send(&stdout_frame("fill".to_string()))
+            .await
+            .unwrap();
+        let mut buffer = "kept".to_string();
+
+        let flush = flush_output_buffer(&writer, &mut buffer, stdout_frame);
+        let cut = tokio::time::timeout(Duration::from_millis(50), flush)
+            .await
+            .is_err();
+
+        assert!(cut);
+        assert_eq!(buffer, "kept"); // not taken: the flush after the loop sends it
+        assert_eq!(sent(&mut rx), [("stdout".to_string(), "fill".to_string())]);
+        flush_output_buffer(&writer, &mut buffer, stdout_frame)
+            .await
+            .unwrap();
+        assert_eq!(sent(&mut rx), [("stdout".to_string(), "kept".to_string())]);
+    }
+
+    #[rstest]
+    #[case::past_the_cap(
+        true,
+        3,
+        Err("stdout 1000001 bytes exceeds 1000000 limit; the REPL then exited with code 3")
+    )]
+    #[case::retire_137(true, 137, Ok(137))] // the VM must retire: the host sees 137
+    #[case::under_the_cap(false, 3, Ok(3))]
+    fn the_result_of_a_repl_that_died(
+        #[case] past_cap: bool,
+        #[case] exit_code: i32,
+        #[case] expected: Result<i32, &str>,
+    ) {
+        let out = output_at(MAX_STDOUT_BYTES + usize::from(past_cap), 0);
+        let result = out.death_result(exit_code).map_err(|error| match error {
+            CmdError::Reply {
+                message,
+                error_type,
+            } => {
+                assert_eq!(error_type, "output_limit_error");
+                message
+            }
+            other => panic!("{other:?}"),
+        });
+        assert_eq!(result, expected.map_err(String::from));
+    }
+
+    #[test]
+    fn a_sentinel_read_before_the_deadline_ends_the_exec() {
+        assert_eq!(LoopEnd::of(true, Some(0)), LoopEnd::Sentinel(0)); // the deadline cut a flush after it
+        assert_eq!(LoopEnd::of(false, Some(3)), LoopEnd::Sentinel(3));
+        assert_eq!(LoopEnd::of(false, None), LoopEnd::ReplDied);
+        assert_eq!(LoopEnd::of(true, None), LoopEnd::Timeout);
+    }
+
     #[tokio::test]
     async fn group_members_shows_where_a_member_waits() {
         // A leader that waits for its member, as a REPL waits for the command of an exec
@@ -1101,7 +1718,8 @@ mod tests {
         let mut members = String::new();
         for _ in 0..100 {
             members = group_members_diagnostic(pid);
-            if members.contains(" sleep ") {
+            // Its state is R for a moment after the exec: wait for the sleep itself
+            if members.contains(" sleep S ") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1437,7 +2055,7 @@ mod tests {
         let chunk: &[u8] = &[0xFF, b'\n'];
         let result = process_stderr_chunk(chunk, &mut line_buf, "__SENTINEL_1_0_", &mut stderr_buf);
         assert_eq!(result, None);
-        assert!(stderr_buf.contains('\u{FFFD}'));
+        assert_eq!(stderr_buf, "\u{FFFD}\n");
     }
 
     #[test]
@@ -1563,14 +2181,16 @@ mod tests {
         let mut stderr_buf = String::new();
         let prefix = "__SENTINEL_1_0_";
         let chunk = vec![b'x'; 256 * 1024];
-        // Many chunks, never a newline: the tail must stay bounded, not grow.
+        // Many chunks, never a newline: the tail keeps its last 100000 bytes (the stderr
+        // limit) and the length of a sentinel prefix, and grows no more.
         for _ in 0..40 {
             assert_eq!(
                 process_stderr_chunk(&chunk, &mut line_buf, prefix, &mut stderr_buf),
                 None
             );
+            assert_eq!(line_buf.len(), 100_000 + 15);
         }
-        assert!(line_buf.len() <= MAX_STDERR_BYTES + prefix.len());
+        assert_eq!(stderr_buf, "");
     }
 
     #[test]
@@ -1713,31 +2333,33 @@ mod tests {
         assert_eq!(incomplete_utf8_tail(bytes), tail);
     }
 
-    // 100000 bytes of a control character with no newline (a stderr line before the
+    // 100,003 bytes of a control character with no newline (a stderr line before the
     // sentinel can hold that much): frames of at most 64 KB of text, each line below the
     // host's 512 KB limit, the text whole and in order
     #[tokio::test]
     async fn a_large_buffer_goes_out_in_frames_below_the_host_limit() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let writer = ResponseWriter::new(tx, Some("op".into()));
-        let mut buffer = format!("{}中", "\u{1}".repeat(100_000));
+        // "中" (3 B) across byte 65,536: the frame edge walks back to its start
+        let text = format!("{}中{}", "\u{1}".repeat(65_535), "\u{1}".repeat(34_465));
+        let mut buffer = text.clone();
         flush_output_buffer(&writer, &mut buffer, stderr_frame)
             .await
             .unwrap();
         drop(writer);
         assert!(buffer.is_empty());
-        let mut text = String::new();
-        let mut frames = 0;
+        let mut sent_text = String::new();
+        let mut frame_sizes = Vec::new();
         while let Some(line) = rx.recv().await {
             assert!(line.len() < 512 * 1024, "a frame of {} bytes", line.len());
             let value: serde_json::Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
             assert_eq!(value["type"], "stderr");
             let chunk = value["chunk"].as_str().unwrap();
             assert!(chunk.len() <= MAX_BUFFER_SIZE_BYTES);
-            text.push_str(chunk);
-            frames += 1;
+            sent_text.push_str(chunk);
+            frame_sizes.push(chunk.len());
         }
-        assert_eq!(frames, 2);
-        assert_eq!(text, format!("{}中", "\u{1}".repeat(100_000)));
+        assert_eq!(frame_sizes, [65_535, 34_468]); // the edge before "中", not inside it
+        assert_eq!(sent_text, text);
     }
 }

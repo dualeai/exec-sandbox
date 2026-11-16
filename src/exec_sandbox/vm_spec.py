@@ -3,12 +3,14 @@
 One frozen object holds everything that shapes the guest: the L1 memory
 snapshot cache key holds the fields that change the guest state (the domain
 list and the port numbers stay on the host side, so they are not in it), and a
-saved instance stores it, so a load makes the same VM again. Values of one launch only (vm id, work paths, host ports
-picked at launch, timeouts) are not part of it.
+saved instance stores it, so a load makes the same VM again. Values of one
+launch only (vm id, work paths, host ports picked at launch, timeouts) are not
+part of it.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -93,8 +95,8 @@ class VmSpec(BaseModel):
     def _check_host_ports(cls, ports: tuple[PortMapping, ...]) -> tuple[PortMapping, ...]:
         # gvproxy takes the forwards as one JSON object keyed by host port and protocol: a
         # host port given twice would keep one forward and drop the other with no error
-        given = [(p.external, p.protocol) for p in ports if p.external is not None]
-        twice = sorted({key for key in given if given.count(key) > 1})
+        given = Counter((p.external, p.protocol) for p in ports if p.external is not None)
+        twice = sorted(key for key, count in given.items() if count > 1)
         if twice:
             raise ValueError(f"Host port given twice: {', '.join(f'{port}/{protocol}' for port, protocol in twice)}")
         return ports

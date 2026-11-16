@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import io
+import logging
 import os
 import stat
 import warnings
@@ -43,7 +44,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Self, cast
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import run_to_end
 from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS, SIGKILL_EXIT_CODE
 from exec_sandbox.exceptions import (
@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     from exec_sandbox.vm_manager import VmManager
     from exec_sandbox.vm_spec import VmSpec
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Codes of a failed migration: save() closes the session on them unless the VM runs again.
 _MIGRATION_CODES = frozenset({ErrorCode.MIGRATION_FAILED, ErrorCode.MIGRATION_UNSUPPORTED})  # what a save raises
@@ -91,8 +91,9 @@ class Session:
     until close(). To keep the state after close(), call save() first.
 
     The calls of one session (exec, the file calls, save) run one at a time, in the order
-    they reach the session (write_file first opens a local Path source). One exception: the calls made after a save() run once its VM runs again, while
-    the save stores the state (save() still returns only once the store committed it).
+    they reach the session (write_file first opens a local Path source). One exception: the
+    calls made after a save() run once its VM runs again, while the save stores the state
+    (save() still returns only once the store committed it).
     """
 
     def __init__(
@@ -174,7 +175,8 @@ class Session:
         """The saved instance this session continues: set by reuse() and by each
         successful save() (save(instance_id=...) moves it to the new instance); None for a
         session from new() that was never saved."""
-        return _ref(self._instance)  # the header stays in memory after close removes the files
+        state = self._instance  # the header stays in memory after close removes the files
+        return None if state is None else InstanceRef(instance_id=state.instance_id, generation=state.header.generation)
 
     @property
     def exec_count(self) -> int:
@@ -234,10 +236,10 @@ class Session:
                 raise _session_closed("Session closed while waiting for lock")
             if self._vm.state in (VmState.DESTROYING, VmState.DESTROYED) or self._vm.process.returncode is not None:
                 # QEMU died while the session was idle: the process-exit
-                # watcher (armed lazily on first execute) publishes DESTROYING;
-                # before that first execute, death is visible only via
-                # returncode. Fail fast instead of letting every operation
-                # time out one transient error at a time.
+                # watcher (armed by a cold boot's guest wait, else by the first
+                # execute) publishes DESTROYING; a restored VM before its first
+                # execute shows its death only through returncode. Fail fast instead
+                # of letting every operation time out one transient error at a time.
                 await self._close_for_failure()
                 raise _session_closed("Session VM was retired")
             self._busy += 1
@@ -288,7 +290,8 @@ class Session:
             )
 
     async def _resolve_content(self, content: bytes | Path | IO[bytes]) -> tuple[IO[bytes], bool]:
-        """Convert content to a readable binary stream with size validation.
+        """Convert content to a readable binary stream; check the size of bytes and of a Path
+        (QemuVM.write_file measures a stream).
 
         Called BEFORE _guard() so local disk I/O doesn't hold the exec lock.
 
@@ -330,14 +333,8 @@ class Session:
             raise _bad_argument("Stream content is a text stream: open it in binary mode")
         if probe:  # a stream that ignores the read size: these bytes are already lost
             raise _bad_argument("Stream content returned bytes for a zero-byte read")
-        # Validate size only if the stream is seekable.
-        if content.seekable():
-            pos = content.tell()
-            content.seek(0, 2)
-            size = content.tell()
-            content.seek(pos)
-            if size - pos > MAX_FILE_SIZE_BYTES:
-                raise _bad_argument(f"Stream content is {size - pos} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
+        # Its size is measured once, by QemuVM.write_file in a worker thread: a seek to the end
+        # can read the whole stream (a gzip reader) or wait for a server (a network file)
         return content, False
 
     # -------------------------------------------------------------------------
@@ -419,7 +416,8 @@ class Session:
                 )
             except InvalidInputError:
                 # Caller bugs (bad input, output above the guest limit), not VM
-                # failures: the REPL is preserved and the session stays alive.
+                # failures: the session stays alive (a REPL that exited after its output went
+                # past the limit is replaced at the next exec).
                 raise
             except Exception:
                 # VM failure — auto-close session. CancelledError is handled by
@@ -462,15 +460,21 @@ class Session:
                 Bytes are not copied; a Path or a stream is read in 128 KiB chunks.
                 The encoded chunks that wait to be sent use at most about 13.5 MiB per
                 write in progress, whatever the file size.
-                An IO[bytes] stream stays yours: exec-sandbox does not close it.
+                An IO[bytes] stream stays yours: exec-sandbox does not close it. When the
+                call raises (a cancel too), a seekable stream is back at the position where the
+                call found it (unless the seek back itself fails); a non-seekable stream must be
+                passed again from its start.
+                The file needs its full size free on the home disk, also when it replaces
+                a file. While the call runs, code in the VM sees that size as used when it
+                is known (bytes, and a Path or a seekable stream that can seek to its end),
+                unless an earlier exec-sandbox release started the VM.
             make_executable: Give the file mode 0o755 (else 0o644).
 
         Raises:
             TransientError: GUEST_UNAVAILABLE when the transport failed before the call was sent (you can retry).
                 LOCAL_DISK when this host cannot open the Path source now (I/O error, out
-                of file handles or memory), or a source read fails during the write: nothing
-                was written, the session stays open; a seekable stream is set back to its
-                position, a non-seekable stream must be passed again from its start.
+                of file handles or memory), or a seek or read of the source fails during the
+                call: the file was not written, the session stays open.
                 LOCAL_DISK also when QEMU stopped the VM because the host disk under its
                 home disk is full: the session closes.
             OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the transport is lost after
@@ -483,7 +487,10 @@ class Session:
                 a Path source is not a regular file (a folder, a FIFO, a device) or cannot
                 be opened for a reason the caller can fix (missing, no read access, a file
                 in its path, a symlink loop, a NUL byte); PATH_INVALID or GUEST_IO on guest
-                agent validation or write failure. The session stays open.
+                agent validation or write failure; GUEST_IO also when the content does not
+                fit in the free space of the home disk (with a known size, before the guest
+                writes any of it, unless an earlier exec-sandbox release started the VM). The
+                file was not written; the session stays open.
             InternalError: GUEST_PROTOCOL: the guest broke the protocol or sent a wrong answer.
         """
         self._check_open()
@@ -896,8 +903,3 @@ def _open_source(path: Path) -> IO[bytes]:
             raise
     except (OSError, ValueError) as e:
         raise local_path_error(e, failure="Source file cannot be opened", path=path, context={}) from e
-
-
-def _ref(state: InstanceState | None) -> InstanceRef | None:
-    """The public InstanceRef of `state` (None when there is no saved instance)."""
-    return None if state is None else InstanceRef(instance_id=state.instance_id, generation=state.header.generation)

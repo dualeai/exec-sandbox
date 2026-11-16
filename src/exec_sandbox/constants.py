@@ -97,8 +97,8 @@ backoff, fewer attempts and a shorter boot timeout: no user request waits on the
 
 GUEST_NETWORK_SUBNET: Final = "192.168.127.0/24"
 """The guest network of gvproxy-wrapper (passed as -subnet). The guest agent sets the guest
-side at its boot (guest-agent/src/init.rs: GUEST_IP/24, its default route to the gateway):
-change both together. A saved VM keeps the network of its boot."""
+side at its boot (guest-agent/src/init.rs setup_network: GUEST_IP/24, its default route to
+the gateway): change both together. A saved VM keeps the network of its boot."""
 GUEST_GATEWAY_IP: Final = "192.168.127.1"
 """Gateway and DNS server of the guest network (gvproxy-wrapper -gateway-ip)."""
 GUEST_GATEWAY_MAC: Final = "5a:94:ef:e4:0c:dd"
@@ -176,7 +176,7 @@ PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 300
 """Timeout for package installation in guest VM.
 
 Sent to the guest agent via InstallPackagesRequest.timeout field.
-The guest enforces this as the tokio::time::timeout for the package manager process.
+The guest stops the package manager process at this deadline (a timeout_error).
 Also used host-side to compute hard_timeout (+ EXECUTION_TIMEOUT_MARGIN_SECONDS + 8s
 first-op network gate allowance, see disk_snapshot_manager)."""
 
@@ -229,6 +229,26 @@ ENV_VAR_FORBIDDEN_CONTROL_CHARS: Final[frozenset[int]] = frozenset(
 
 
 # ============================================================================
+# Exec output
+# ============================================================================
+
+MAX_STDOUT_BYTES: Final[int] = 1_000_000
+"""The guest's stdout cap for one exec (guest-agent constants.rs), then OUTPUT_LIMIT (a
+timeout or exit code 137 keeps its own result). A package install sends less
+(MAX_PACKAGE_OUTPUT_BYTES, 50 KB per stream)."""
+
+MAX_STDERR_BYTES: Final[int] = 100_000
+"""The guest's stderr cap for one exec, as MAX_STDOUT_BYTES."""
+
+GUEST_OUTPUT_READ_BYTES: Final[int] = 8192
+"""The guest reads the exec's pipes this much at a time (guest-agent constants.rs
+OUTPUT_READ_BYTES; test_guest_agent_protocol ties the copies) and counts the bytes it reads: it
+sends at most its stdout cap, and its stderr cap and the lines of the read that crosses it. A
+character takes at least one byte, so the host stops a stream past its cap and one read of
+characters (consume_stream): only a guest that breaks its caps goes past it."""
+
+
+# ============================================================================
 # File I/O
 # ============================================================================
 
@@ -253,7 +273,8 @@ until sent, with the partly sent frame of the batch before."""
 
 MAX_FILE_PATH_LENGTH: Final[int] = 4096
 """Maximum relative file path length (POSIX PATH_MAX): the guest counts bytes; the
-host check (guest_agent_protocol, QemuVM.write_file) counts characters.
+host check (guest_agent_protocol, QemuVM._check_path for write, read and list)
+counts characters.
 
 Individual filename components are limited to 255 bytes (NAME_MAX) by the
 guest agent's validate_file_path(). This constant covers the full relative path.
@@ -303,16 +324,39 @@ lines before init starts.
 # ============================================================================
 
 DISK_BPS_LIMIT: Final[int] = 50 * 1024 * 1024  # 50 MB/s
-"""Sustained disk bandwidth limit in bytes/second (prevent noisy neighbor)."""
+"""Sustained bandwidth, in bytes per second, of a VM's rootfs overlay and of its home disk
+(each; reads and writes together), so that one VM cannot use all the bandwidth of the host
+disk. While a write_file runs, the home disk's bandwidth has no limit (QemuVM.write_file);
+setting the limits again at its end starts a new burst."""
 
-DISK_BPS_BURST: Final[int] = 100 * 1024 * 1024  # 100 MB/s
-"""Burst disk bandwidth limit in bytes/second (package downloads)."""
+DISK_BPS_BURST: Final[int] = 100 * 1024 * 1024  # 100 MB
+"""Burst of the same drives (QEMU bps_max, with its default burst length of 1 s): a drive
+takes about this many bytes at full speed before DISK_BPS_LIMIT applies (package installs)."""
 
 DISK_IOPS_LIMIT: Final[int] = 1000
-"""Sustained IOPS limit (typical code execution workload)."""
+"""Sustained I/O requests per second of the same drives (typical code execution workload)."""
 
 DISK_IOPS_BURST: Final[int] = 2000
-"""Burst IOPS limit (npm install, pip install)."""
+"""Burst of the same drives (QEMU iops_max, with its default burst length of 1 s): a drive
+takes about this many requests at full speed before DISK_IOPS_LIMIT applies (npm install,
+pip install)."""
+
+DISK_IO_LIMITS: Final[dict[str, int]] = {
+    "bps": DISK_BPS_LIMIT,
+    "bps_max": DISK_BPS_BURST,
+    "iops": DISK_IOPS_LIMIT,
+    "iops_max": DISK_IOPS_BURST,
+}
+"""The I/O limits of the rootfs overlay and of the home disk, by the names that a -drive
+option and QMP block_set_io_throttle both take: qemu_cmd builds the command line from it,
+and QemuVM.write_file lifts the home disk's bandwidth limit and sets it back from it."""
+
+HOME_DRIVE_ID: Final[str] = "hd2"
+"""The -drive id of the home disk (qemu_cmd), which QMP block_set_io_throttle names."""
+
+DISK_LIMITS_QMP_TIMEOUT_SECONDS: Final[float] = 1.0
+"""Bound on each QMP block_set_io_throttle of write_file (one short connection: about
+1 ms for a healthy QEMU)."""
 
 VIRTIO_QUEUE_SIZE: Final[int] = 64
 """Queue depth (entries per virtqueue) of each virtio-blk device (qemu_cmd: queue-size).
@@ -428,7 +472,9 @@ PORT_FORWARD_BIND_HOST: Final[str] = "127.0.0.1"
 # ============================================================================
 
 FILE_TRANSFER_CHUNK_SIZE: Final[int] = 128 * 1024  # 128KB
-"""Raw chunk size for streaming file transfers (before zstd compression).
+"""Chunk size of file transfers: the raw chunk that write_file compresses, the read of
+the guest's compressed stream for read_file (guest-agent file_io.rs), and the largest
+output of one read_file decompress step on the host.
 
 128KB halves the frames of 64KB chunks (syscalls, JSON parses, base64
 encodes and decodes). On-wire size after base64+JSON is ~175KB per frame.
@@ -507,14 +553,16 @@ Fixed value, not a ratio — host infrastructure has roughly constant CPU consum
 regardless of host size. 0.5 cores covers typical observed usage with headroom."""
 
 DEFAULT_VM_CPU_CORES: Final[int] = 1
-"""CPU cores allocated per VM. Flows to three places:
+"""Default guest vCPUs of a VM (VmSpec.cpu_cores). The VmSpec value flows to three places:
 - QEMU -smp (guest-visible vCPU count)
 - cgroup cpu.max quota (host-side CPU time enforcement)
 - Admission controller budget (capacity planning)"""
 
 DEFAULT_DISK_MB: Final[int] = 1024
 """Default size of a VM's home disk (/home/user, ext4 on a raw sparse file).
-Only blocks the guest writes take host space; usable space is ~95% of it."""
+Only blocks the guest writes take host space. The guest sees less free space than
+disk_mb on a new disk: ext4 keeps 6.3% of it at 1024 MB (6.7% at 512 MB, 3.5% at
+4096 MB)."""
 
 MIN_DISK_MB: Final[int] = 128
 """Smallest home disk: the ext4 journal, the REPL files and the files of a few
@@ -552,8 +600,9 @@ Measured breakdown:
   - Combined total                          : ~13-33% of a core
 
 0.25 lies inside the measured range: like DEFAULT_VM_MEMORY_OVERHEAD_MB, it is a
-tight value, not the worst case. The gvproxy share applies only when gvproxy runs in the cgroup (network on); without
-it the overhead is ~5-10% of a core, but every VM gets 0.25 (one value is simpler)."""
+tight value, not the worst case. The gvproxy share applies only when gvproxy runs in
+the cgroup (network on); without it the overhead is ~5-10% of a core, but every VM
+gets 0.25 (one value is simpler)."""
 
 DEFAULT_TCG_TB_CACHE_SIZE_MB: Final[int] = 128
 """TCG translation block cache size in MB (tb-size in qemu_cmd.py). The cap, the most
@@ -566,6 +615,12 @@ translation (no per-block eviction), and the code is translated again. Measured 
 execs 37-44 MB, with 0 flushes. Forced smaller caps at boot: 16 MB 1 flush (+20 ms),
 8 MB 6 (+135 ms), 4 MB 23 (+360 ms). 128 MB is about three times that use, and an eighth
 of QEMU's 1 GiB default in the budget."""
+
+ARM_TCG_COUNTER_HZ: Final[int] = 62_500_000
+"""Rate of the ARM generic timer of ARM64 TCG guests (qemu_cmd: cntfrq of the guest CPU): the
+rate QEMU gives that model today, pinned. QEMU picks 62.5 MHz or 1 GHz by the model and the
+machine-type version, and a load under another rate is accepted with no error (the guest
+clock then runs 16 times too fast or too slow)."""
 
 RESOURCE_ADMISSION_TIMEOUT_SECONDS: Final[float] = 120.0
 """Timeout for resource admission acquire (seconds). Blocks waiting for

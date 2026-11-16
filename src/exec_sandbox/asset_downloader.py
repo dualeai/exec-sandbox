@@ -12,6 +12,7 @@ import asyncio
 import functools
 import hashlib
 import http
+import logging
 import os
 import sys
 from typing import TYPE_CHECKING, BinaryIO
@@ -21,7 +22,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import run_stoppable, run_to_end
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.files.disk import create_file
@@ -30,7 +30,7 @@ from exec_sandbox.hash_utils import file_hash, parse_hash_spec
 from exec_sandbox.permission_utils import make_cache_dir, setting_folder_error
 from exec_sandbox.platform_utils import get_os_name
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Chunk size for streaming decompression (64KB)
 CHUNK_SIZE = 64 * 1024
@@ -44,6 +44,10 @@ _ASSET_MODE = 0o644
 """Mode of a downloaded or decompressed asset: QEMU as qemu-vm reads the kernel, the
 initramfs and the base images (nothing else grants it the kernel and the initramfs). No
 group write: under `sg qemu-vm` and umask 002, open() would give 0664, group qemu-vm."""
+
+_CACHE_SETTING = "EXEC_SANDBOX_CACHE_DIR"
+"""The setting that chooses the download cache (assets.images_download_dir is under it): its
+errors name it."""
 
 # Retry settings
 MAX_RETRIES = 3
@@ -60,7 +64,7 @@ connection in 10 s, or no byte in 30 s. The retry loop then tries again."""
 RETRY_DELAY = 1.0  # seconds, doubled at each attempt
 
 
-async def retrieve(url: str, known_hash: str, *, path: Path, setting: str, decompress: bool) -> Path:
+async def retrieve(url: str, known_hash: str, *, path: Path, decompress: bool) -> Path:
     """
     Download a file and cache it locally (async version of pooch.retrieve).
 
@@ -72,7 +76,6 @@ async def retrieve(url: str, known_hash: str, *, path: Path, setting: str, decom
         url: URL to download from
         known_hash: Expected hash in format "sha256:abc123..."
         path: Local cache directory
-        setting: The setting that chose `path`, named by its errors
         decompress: Unpack the download (a .zst) with decompress_zstd
 
     Returns:
@@ -83,22 +86,22 @@ async def retrieve(url: str, known_hash: str, *, path: Path, setting: str, decom
             LOCAL_DISK: a host error on the files of `path` (disk full, quota, I/O error), at
             once (no retry)
         ConfigError: SETTING_INVALID: `path` is not a private folder of this user, or this
-            user cannot make it or write its files (setting_folder_error); it names `setting`
+            user cannot make it or write its files (setting_folder_error); it names
+            EXEC_SANDBOX_CACHE_DIR
 
     Example:
         fname = await retrieve(
             url="https://github.com/dualeai/exec-sandbox/releases/download/v0.1.0/vmlinuz-x86_64.zst",
             known_hash="sha256:abc123...",
             path=cache_dir,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             decompress=True,
         )
     """
-    make_cache_dir(path, setting=setting)  # 0700 whatever the umask and group (sg qemu-vm, umask 002)
+    make_cache_dir(path, setting=_CACHE_SETTING)  # 0700 whatever the umask and group (sg qemu-vm, umask 002)
     try:
         return await _retrieve_into(url, known_hash, path=path, decompress=decompress)
     except OSError as e:  # an existing folder this user cannot write, a full disk
-        raise setting_folder_error(e, path=path, failure="cannot hold the download", setting=setting) from e
+        raise setting_folder_error(e, path=path, failure="cannot hold the download", setting=_CACHE_SETTING) from e
 
 
 async def _retrieve_into(url: str, known_hash: str, *, path: Path, decompress: bool) -> Path:
@@ -138,7 +141,8 @@ async def _retrieve_into(url: str, known_hash: str, *, path: Path, decompress: b
 
 
 async def _verify_hash(path: Path, expected_hash: str) -> bool:
-    """Verify file hash matches expected value."""
+    """Whether the file's digest is `expected_hash` ("algorithm:digest"). An empty
+    `expected_hash` (a release asset with no digest) always matches."""
     if not expected_hash:
         return True
 
@@ -264,25 +268,22 @@ class AsyncPooch:
             path=images_download_dir(),
             base_url="https://github.com/dualeai/exec-sandbox/releases/download/v{version}",
             version=__version__,
-            setting="EXEC_SANDBOX_CACHE_DIR",
         )
         await ASSETS.load_registry_from_github("dualeai", "exec-sandbox", f"v{__version__}")
 
         kernel_path = await ASSETS.fetch("vmlinuz-x86_64.zst", decompress=True)
     """
 
-    def __init__(self, path: Path, base_url: str, version: str, *, setting: str) -> None:
+    def __init__(self, path: Path, base_url: str, version: str) -> None:
         """
         Initialize AsyncPooch registry: empty until load_registry_from_github fills it.
 
         Args:
-            path: Local cache directory
+            path: Local cache directory (under EXEC_SANDBOX_CACHE_DIR, which its errors name)
             base_url: Base URL template with {version} placeholder
             version: Current version string (used as fallback if GitHub API not called)
-            setting: The setting that chose `path`, for its errors
         """
         self.path = path
-        self.setting = setting
         self.base_url = base_url
         self.version = version
         self.registry: dict[str, str] = {}  # file name -> hash ("sha256:abc123...")
@@ -332,7 +333,6 @@ class AsyncPooch:
             url=url,
             known_hash=known_hash,
             path=self.path,
-            setting=self.setting,
             decompress=decompress,
         )
 

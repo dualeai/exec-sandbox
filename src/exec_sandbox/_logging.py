@@ -23,6 +23,7 @@ References:
 """
 
 import contextlib
+import copy
 import logging
 import logging.handlers
 import os
@@ -112,8 +113,12 @@ class _NonBlockingHandler(logging.handlers.QueueHandler):
         self._listener.start()
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
-        """Skip serialization -- same-process queue, no pickle needed."""
-        return record
+        """A shallow copy of the record, for the listener thread: Formatter.format writes
+        message and asctime into the record it formats, while the record's other handlers
+        format it in the caller's thread. A field that one thread adds to a shared record
+        while ExtrasFormatter iterates the fields in the other raises RuntimeError there
+        (free-threaded Python). No pickle: the queue stays in this process."""
+        return copy.copy(record)
 
     def enqueue(self, record: logging.LogRecord) -> None:
         if self._listener is None:  # closed: no thread drains the queue
@@ -127,15 +132,6 @@ class _NonBlockingHandler(logging.handlers.QueueHandler):
         if listener is not None:
             listener.stop()
         super().close()
-
-
-def get_logger(name: str) -> logging.Logger:
-    """Get a logger for the given module name.
-
-    All exec_sandbox modules should use this instead of logging.getLogger()
-    directly for consistent logger hierarchy.
-    """
-    return logging.getLogger(name)
 
 
 def configure_logging(

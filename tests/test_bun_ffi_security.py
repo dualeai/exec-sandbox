@@ -1,9 +1,10 @@
 """Tests for Bun FFI attack surface inside the guest VM.
 
-Validates that user-submitted JavaScript code inside the REPL sandbox
+Shows that user-submitted JavaScript code inside the REPL sandbox
 can use bun:ffi to call arbitrary libc functions. The VM boundary (QEMU)
 is the containment layer, not the JS runtime sandbox. These tests
-document the attack surface and verify containment holds.
+document the attack surface; other tests check the containment (UID 1000,
+no_new_privs, the read-only rootfs: test_nonroot_repl.py).
 
 bun:ffi is accessible to user code via both require() and dynamic
 import(). The REPL wrapper (js_repl.mjs) passes unfiltered `require` to the
@@ -102,8 +103,8 @@ class TestBunFfiLibcIo:
     User code can bypass Bun's file API entirely and call libc directly.
     This gives access to any file readable by UID 1000 inside the VM.
 
-    Mitigations: EROFS rootfs is read-only, /home/user is ephemeral
-    tmpfs, VM boundary prevents host file access.
+    Mitigations: EROFS rootfs is read-only, /home/user is the VM's own
+    home disk, VM boundary prevents host file access.
     """
 
     async def test_ffi_read_etc_hostname(self, dual_scheduler: Scheduler) -> None:

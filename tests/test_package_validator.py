@@ -211,11 +211,8 @@ class TestJavaScriptEdgeCases:
     """Test JavaScript/npm specific edge cases."""
 
     async def test_scoped_package_not_supported(self, tmp_path: Path) -> None:
-        """Test that scoped packages (@org/pkg) are NOT supported by current regex.
-
-        This is a known limitation - the regex pattern ^([a-zA-Z0-9_\\-\\.]+)[@=<>~]
-        doesn't match package names starting with @.
-        """
+        """A scoped package (@org/pkg) is refused, even when the catalog lists it: a name
+        cannot start with @ (a known limit)."""
         npm_catalog = tmp_path / "npm.json"
         pypi_catalog = tmp_path / "pypi.json"
         npm_catalog.write_text(json.dumps(["@types/node"]))
@@ -575,15 +572,16 @@ class TestSecurityCases:
                 validator.validate([f"{typo}==2.0.0"], language=Language.PYTHON)
 
     async def test_homoglyph_attack(self, validator: PackageValidator) -> None:
-        """Test homoglyph/lookalike character attacks."""
-        # These use characters that look similar but are different
-        # Most will fail on invalid spec since they use non-ASCII
+        """A name with a lookalike non-ASCII letter is not a name: the spec is refused as one
+        with no version, never matched to the allowed package it looks like."""
         homoglyphs = [
             "pаndas==2.0.0",  # noqa: RUF001, RUF003 - Intentional Cyrillic 'а'
             "pandаs==2.0.0",  # noqa: RUF001, RUF003 - Intentional Cyrillic 'а'
         ]
         for attack in homoglyphs:
-            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
+            with pytest.raises(
+                InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version(attack)
+            ):
                 validator.validate([attack], language=Language.PYTHON)
 
     async def test_allowlist_bypass_case_sensitivity(self, tmp_path: Path) -> None:
@@ -609,21 +607,15 @@ class TestSecurityCases:
         # pandas>=2.0.0,<3.0.0 - the package name is correctly extracted as 'pandas'
         validator.validate(["pandas>=2.0.0,<3.0.0"], language=Language.PYTHON)
 
-    async def test_url_in_package_spec(self, validator: PackageValidator) -> None:
-        """Test URL-based package specs are rejected."""
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
-            validator.validate(
-                ["https://evil.com/malware.tar.gz"],
-                language=Language.PYTHON,
-            )
-
-    async def test_git_url_in_package_spec(self, validator: PackageValidator) -> None:
-        """Test git URL package specs are rejected."""
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
-            validator.validate(
-                ["git+https://github.com/user/repo.git"],
-                language=Language.PYTHON,
-            )
+    @pytest.mark.parametrize(
+        "spec", ["https://evil.com/malware.tar.gz", "git+https://github.com/user/repo.git"], ids=["url", "git-url"]
+    )
+    async def test_url_in_package_spec(self, validator: PackageValidator, spec: str) -> None:
+        """A URL (an archive or a git repository) is not a name with a version: refused."""
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=_no_version(spec)
+        ):
+            validator.validate([spec], language=Language.PYTHON)
 
 
 # =============================================================================
@@ -673,7 +665,9 @@ class TestPackageValidatorCreate:
         )
 
         # With empty catalog, ALL packages should fail
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED):
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match=_not_allowed("pandas")
+        ):
             validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
 
     async def test_create_with_invalid_json_raises(self, tmp_path: Path) -> None:
@@ -689,14 +683,13 @@ class TestPackageValidatorCreate:
                 npm_allow_list_path=npm_catalog,
             )
 
-    async def test_create_uses_default_paths(self) -> None:
-        """With no paths, create() loads the catalogs shipped in the package."""
-        # Should not raise - uses default bundled catalogs
+    async def test_create_with_the_bundled_catalogs(self) -> None:
+        """The catalogs shipped in the package (BUNDLED_PYPI_ALLOW_LIST, BUNDLED_NPM_ALLOW_LIST)
+        load, and allow pandas and lodash."""
         validator = await PackageValidator.create(
             pypi_allow_list_path=BUNDLED_PYPI_ALLOW_LIST, npm_allow_list_path=BUNDLED_NPM_ALLOW_LIST
         )
 
-        # Should have loaded real packages from catalogs
         validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
         validator.validate(["lodash@4.17.21"], language=Language.JAVASCRIPT)
 

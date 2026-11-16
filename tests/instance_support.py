@@ -24,6 +24,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import secrets
 import uuid
 from dataclasses import dataclass, field
@@ -57,6 +58,7 @@ from exec_sandbox.instance.models import (
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import Applied
 from exec_sandbox.models import ExecutionResult, Language, StartupTiming, TimingBreakdown
+from exec_sandbox.qemu_cmd import CounterRate
 from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType, VmState
@@ -69,6 +71,7 @@ if TYPE_CHECKING:
     from exec_sandbox.files.locks import EntryLease
     from exec_sandbox.instance.manager import InstanceState
     from exec_sandbox.instance.store import InstanceStore
+    from exec_sandbox.platform_utils import HostArch
     from tests.s3_faults import Bucket, S3Proxy
 
 FAKE_MACHINE_TYPE = "virt-11.0"
@@ -79,6 +82,8 @@ FAKE_KERNEL = "1" * 64
 """Digest of the kernel a fake VM booted (GuestFacts.kernel)."""
 FAKE_INITRAMFS = "2" * 64
 """Digest of the initramfs a fake VM booted (GuestFacts.initramfs)."""
+FAKE_COUNTER_HZ = 24_000_000
+"""Counter rate a fake VM booted with (GuestFacts.counter_hz), and the worker's (fake_counter_rate)."""
 
 BLOCK = BLOCK_BYTES
 """Block size of instance streams (64 KiB): the unit a pack stores."""
@@ -124,6 +129,11 @@ def descriptors_of(path: Path) -> list[tuple[int, int]]:
 
 
 # ----------------------------------------------------------------------------- guest streams
+
+
+def exact_key(key: str) -> str:
+    """The S3 proxy key regex that matches `key` and nothing else."""
+    return f"^{re.escape(key)}$"
 
 
 def random_block(rng: random.Random) -> bytes:
@@ -323,6 +333,7 @@ class FakeVm:
         self.device_layout: str | None = FAKE_LAYOUT  # QemuVM.device_layout
         self.kernel_digest: str | None = FAKE_KERNEL  # the files of its (fake) boot
         self.initramfs_digest: str | None = FAKE_INITRAMFS
+        self.counter_hz: int | None = FAKE_COUNTER_HZ
         self.machine_type: str | None = FAKE_MACHINE_TYPE  # QemuVM.machine_type: the type the fake QEMU runs
         self.egress_domains = resolved_domains(spec.allowed_domains, spec.language)  # as VmManager sets it
         self.use_qemu_vm_user = False
@@ -401,11 +412,18 @@ class FakeVmManager:
         return self.layout
 
     async def check_fits(
-        self, spec: VmSpec, *, vm_id: str, target: Mapping[RouteKey, str]
+        self,
+        spec: VmSpec,
+        *,
+        vm_id: str,
+        required: Mapping[RouteKey, str],
+        found: Mapping[RouteKey, str | None],
     ) -> tuple[dict[RouteKey, str], dict[RouteKey, str | None]]:
         use_tcg = self.settings.force_emulation  # as VmManager.check_fits: TCG adds its translation cache
         if self.budget is not None:
-            return self.budget.check_fits(vm_id, spec.memory_mb, spec.cpu_cores, use_tcg=use_tcg, target=target)
+            return self.budget.check_fits(
+                vm_id, spec.memory_mb, spec.cpu_cores, use_tcg=use_tcg, required=required, found=found
+            )
         return budget_need(spec.memory_mb, spec.cpu_cores, use_tcg=use_tcg), dict.fromkeys(BUDGET_KEYS)
 
     def _base_image(self, language: object) -> Path:
@@ -484,6 +502,12 @@ def qemu_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for variable in ("EXEC_SANDBOX_QEMU_BIN_X86", "EXEC_SANDBOX_QEMU_BIN_ARM"):
         monkeypatch.setenv(variable, str(binary))
     return binary
+
+
+async def fake_counter_rate(_arch: HostArch, _accel: AccelType) -> CounterRate:
+    """Stand-in for the counter rate of this worker: the rate fake VMs boot with, whatever
+    the host running the tests has (x86 KVM would start QEMU for it)."""
+    return CounterRate(hz=FAKE_COUNTER_HZ, any_rate=False)
 
 
 async def qemu_floor() -> tuple[int, int, int]:

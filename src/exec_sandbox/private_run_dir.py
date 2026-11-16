@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import logging
 import os
 import re
 import secrets
@@ -50,7 +51,6 @@ from pathlib import Path
 from typing import Final
 
 from exec_sandbox import cgroup, constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.files.disk import make_private_dir
 from exec_sandbox.permission_utils import (
@@ -61,7 +61,7 @@ from exec_sandbox.permission_utils import (
 )
 from exec_sandbox.platform_utils import child_env
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _FORBIDDEN: Final = stat.S_IWGRP | stat.S_IWOTH
@@ -387,10 +387,8 @@ def _end(endings: list[_Ending], *, root_fd: int) -> None:
     may still be in use; the next sweep tries again).
     A folder whose recorded folder cannot be removed keeps only its lock and the records
     still pending; the next sweep tries them again."""
-    cgroups = [path for ending in endings for path in ending.cgroups.values()]
-    left: set[Path] = (
-        {each.path for each in cgroup.Cgroup.end_all([cgroup.Cgroup(path) for path in cgroups])} if cgroups else set()
-    )
+    cgroups = [cgroup.Cgroup(path) for ending in endings for path in ending.cgroups.values()]
+    left = {each.path for each in cgroup.Cgroup.end_all(cgroups)}
     sudo = _Sudo(usable=True)  # one for all the folders of this call
     for ending in endings:
         where = {"folder": ending.name}

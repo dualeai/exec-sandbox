@@ -4,13 +4,14 @@ Builds QEMU command arguments based on platform capabilities, acceleration type,
 and VM configuration.
 """
 
+import logging
 import re
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.images import GuestImages
 from exec_sandbox.permission_utils import QEMU_VM_SUDO
@@ -20,9 +21,13 @@ from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
     probe_drive_direct_io,
+    probe_host_counter_hz,
+    probe_host_cpu_id,
     probe_io_uring_support,
+    probe_kvm_tsc_scaling,
     probe_unshare_support,
     qemu_system_binary,
+    require_guest_cpu,
     require_qemu_machine_types,
     require_qemu_sandbox_support,
     require_qemu_version,
@@ -31,7 +36,7 @@ from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # x86 guests see one fixed CPU, not the host's, so a saved instance loads on
 # any host that has these flags: an AVX2-level (x86-64-v3) flag list on a
@@ -41,7 +46,8 @@ logger = get_logger(__name__)
 # than Haswell / Zen 1 cannot run it. +hypervisor lets the guest find KVM
 # (kvm-clock, see the kernel command line). -svm,-vmx: no nested virtualization
 # (CVE-2024-50115).
-# rdrand/rdseed: entropy without a host round trip (TCG emulates both).
+# rdrand: entropy without a host round trip (TCG emulates it). No rdseed: Haswell
+# lacks it (Broadwell and later have it), and the guest kernel seeds from RDRAND.
 # aes/pclmulqdq: AES-NI and carry-less multiply (every AVX2-level host has both).
 # Without them the guest runs AES-GCM in software: TLS 1.3 measured 122 -> 1466 MB/s
 # on KVM, 12.8 -> 56.5 MB/s on TCG (QEMU maps both to host instructions).
@@ -49,10 +55,21 @@ logger = get_logger(__name__)
 # no xsaveopt hangs before the first console line (measured, QEMU 11.1.3).
 _X86_CPU_FLAGS = (
     "qemu64-v1,+avx,+avx2,+bmi1,+bmi2,+f16c,+fma,+abm,+movbe,+xsave,+xsaveopt,+cx16,+lahf_lm,"
-    "+popcnt,+sse4.1,+sse4.2,+ssse3,+aes,+pclmulqdq,+rdrand,+rdseed,+hypervisor,-svm,-vmx"
+    "+popcnt,+sse4.1,+sse4.2,+ssse3,+aes,+pclmulqdq,+rdrand,+hypervisor,-svm,-vmx"
 )
+# The CPU signature of a GenuineIntel guest: qemu64's own (family 15, model 107: AMD K8)
+# reads as a Pentium 4 with that vendor, and code that picks its routines by family and
+# model takes SSE3 ones (OpenBLAS: numpy matmul 2.3 times slower under KVM, 2.9 under TCG,
+# measured). QEMU's Haswell model has this one: the oldest Intel CPU with every flag above.
+# Other vendors keep qemu64's (OpenBLAS goes by the flags for AuthenticAMD).
+_X86_INTEL_SIGNATURE = "family=6,model=60,stepping=4"
+# ARM64 TCG guest CPU (guest_cpu_model), its timer rate pinned (constants.ARM_TCG_COUNTER_HZ)
+_ARM_TCG_CPU = f"neoverse-v1,pauth=off,cntfrq={constants.ARM_TCG_COUNTER_HZ}"
 # Hypercall paravirt features that named models leave off (KVM only).
 _X86_KVM_PV_FLAGS = "+kvm-pv-ipi,+kvm-pv-tlb-flush,+kvm-pv-sched-yield,+kvm-poll-control,+kvm-asyncpf-int"
+# I/O limits of the rootfs overlay and home disk -drives (constants.DISK_IO_LIMITS; QemuVM
+# sets the home disk back to them after write_file lifts its bandwidth limit)
+_DISK_IO_LIMITS = ",".join(f"{name}={value}" for name, value in constants.DISK_IO_LIMITS.items())
 
 
 def _qmp_monitor(chardev: str, *, qemu_version: tuple[int, int, int]) -> list[str]:
@@ -70,7 +87,10 @@ def _x86_cpu(accel_type: AccelType, *, tsc_deadline: bool) -> str:
         parts.append(_X86_KVM_PV_FLAGS)
     if tsc_deadline:
         parts.append("+tsc-deadline")
-    parts += [f"vendor={detect_host_x86_vendor()}", "enforce"]
+    vendor = detect_host_x86_vendor()
+    if vendor == "GenuineIntel":
+        parts.append(_X86_INTEL_SIGNATURE)
+    parts += [f"vendor={vendor}", "enforce"]
     return ",".join(parts)
 
 
@@ -216,12 +236,12 @@ def command_properties(cmd: list[str], *, binary: str) -> list[tuple[str, str, l
         n += 2 if value is not None else 1
         parts = value.split(",") if value is not None else []
         driver = parts[0] if parts and "=" not in parts[0] else ""
-        pairs = [tuple(part.split("=", 1)) if "=" in part else (part, "") for part in parts[1 if driver else 0 :]]
+        pairs = [(key, value) for key, _, value in (part.partition("=") for part in parts[1 if driver else 0 :])]
         if option == "-M":
             driver = re.sub(r"-\d+\.\d+$", "", driver)
         elif option == "-object" and driver.startswith("memory-backend-"):  # ram or file (an L1 template)
             driver = "memory-backend"
-        found.append((option, driver, [(key, value) for key, value in pairs]))
+        found.append((option, driver, pairs))
     return found
 
 
@@ -269,8 +289,8 @@ async def guest_cpu_model(arch: HostArch, accel_type: AccelType) -> str:
     a restore needs the CPU it was saved on.
 
     ARM64 hardware accel: "host".
-    ARM64 TCG: "neoverse-v1,pauth=off" (ARMv8.4 with SVE; the model and its pauth
-    property are in QEMU 9.0.0, below the 9.0.4 floor of ARM TCG): the newest model
+    ARM64 TCG: "neoverse-v1,pauth=off,cntfrq=62500000" (ARMv8.4 with SVE; the model and its
+    pauth property are in QEMU 9.0.0, below the 9.0.4 floor of ARM TCG): the newest model
     without BTI (the ARMv9 models have it, and QEMU cannot turn it off), with pointer
     authentication off. These two features cost most to emulate.
     With PAC every kernel function signs and checks its return address,
@@ -299,7 +319,67 @@ async def guest_cpu_model(arch: HostArch, accel_type: AccelType) -> str:
         # TCG and HVF never provide TSC_DEADLINE (check_tsc_deadline); KVM may lack it in nested VMs
         tsc_deadline = accel_type is AccelType.KVM and await check_tsc_deadline()
         return _x86_cpu(accel_type, tsc_deadline=tsc_deadline)
-    return "host" if accel_type in (AccelType.HVF, AccelType.KVM) else "neoverse-v1,pauth=off"
+    return "host" if accel_type in (AccelType.HVF, AccelType.KVM) else _ARM_TCG_CPU
+
+
+async def guest_cpu_id(arch: HostArch, accel_type: AccelType) -> str | None:
+    """Identity of the host CPU a VM of this host sees (probe_host_cpu_id): ARM64 under KVM
+    or HVF, where the guest CPU is "host". None where the guest CPU is a fixed model (x86,
+    ARM64 TCG): the model is the identity.
+
+    Raises:
+        ConfigError: HOST_DEPENDENCY: ARM64 KVM or HVF, and the identity could not be read
+            (a save without it would load on any CPU)
+        TransientError: LOCAL_DISK: as probe_host_cpu_id (ARM64 KVM or HVF)
+    """
+    if arch != HostArch.AARCH64 or accel_type not in (AccelType.KVM, AccelType.HVF):
+        return None
+    if (cpu_id := await probe_host_cpu_id()) is None:
+        raise ConfigError(
+            "The identity of this host's CPU could not be read (Linux: "
+            "/sys/devices/system/cpu/cpu*/regs/identification; macOS: the Hypervisor.framework "
+            "feature registers): a VM saved here could load on another CPU.",
+            code=ErrorCode.HOST_DEPENDENCY,
+            context={"accel": accel_type.value},
+            hint="Give this process read access to /sys/devices/system/cpu (in a container, mount the host's /sys).",
+            instance_id=None,
+        )
+    return cpu_id
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CounterRate:
+    """The counter a VM's clock runs on, on this host (x86 TSC, ARM generic timer). A guest
+    calibrates its clock against the rate once, at its boot: loaded on a host with another
+    rate, its time runs fast or slow by their ratio."""
+
+    hz: int | None
+    """The rate in Hz a guest that boots here gets; None: no exact source on this host (a
+    TSC rate the kernel measures at each boot)."""
+    any_rate: bool
+    """x86 KVM with TSC scaling: a guest loaded here keeps the rate it booted with, whatever
+    it is (QEMU sets the saved rate)."""
+
+
+async def counter_rate(arch: HostArch, accel_type: AccelType) -> CounterRate:
+    """The counter rate of a VM of this host. ARM64 TCG: the pinned rate of the guest CPU
+    (constants.ARM_TCG_COUNTER_HZ). x86 KVM: the rate KVM gives a new vCPU (require_guest_cpu),
+    when this host's rate is exact (probe_host_counter_hz), and whether KVM scales a loaded
+    guest's TSC (probe_kvm_tsc_scaling). Else this host's counter (probe_host_counter_hz): a
+    KVM or HVF guest reads it, and an x86 TCG guest's TSC is the host's.
+
+    Raises:
+        ConfigError, TransientError: as require_guest_cpu (x86 KVM)
+        TransientError: LOCAL_DISK: as probe_host_counter_hz (all but ARM64 TCG) and
+            probe_kvm_tsc_scaling (x86 KVM)
+    """
+    if arch == HostArch.AARCH64 and accel_type == AccelType.TCG:
+        return CounterRate(hz=constants.ARM_TCG_COUNTER_HZ, any_rate=False)
+    host_hz = await probe_host_counter_hz()
+    if arch == HostArch.X86_64 and accel_type == AccelType.KVM:
+        kvm_hz = await require_guest_cpu(await guest_cpu_model(arch, accel_type), accel=accel_type.value)
+        return CounterRate(hz=None if host_hz is None else kvm_hz, any_rate=await probe_kvm_tsc_scaling())
+    return CounterRate(hz=host_hz, any_rate=False)
 
 
 async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
@@ -442,10 +522,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                 instance_id=None,
             )
 
-    tsc_available = False  # x86 only: set below from the TSC_DEADLINE probe
     if arch == HostArch.AARCH64:
         # highmem=off: Keep all RAM below 4GB for simpler memory mapping (faster boot)
-        # gic-version=3: Explicit GIC version for TCG (ITS not modeled in TCG)
+        # gic-version=3: an explicit GIC version (GICv3), the same under every accelerator
         # virtualization=off: Disable nested virt emulation (not needed, faster TCG)
         # its=off: Disable GICv3 ITS (Interrupt Translation Service) — we use virtio-mmio
         #   (not PCI), so MSI-X translation is unused; skips kernel ITS init (1-3ms)
@@ -478,8 +557,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # replaces PIT as the timer source). Without TSC_DEADLINE, PIT/PIC
         # must remain enabled or the kernel hangs (no timer/interrupt source).
         # TCG and HVF never provide TSC_DEADLINE (check_tsc_deadline); KVM may lack it in nested VMs.
-        if accel_type is AccelType.KVM:
-            tsc_available = await check_tsc_deadline()
+        tsc_available = accel_type is AccelType.KVM and await check_tsc_deadline()
 
         # Build the -M value from components
         parts = [machine_type or base_machine_type(arch), "acpi=off", "x-option-roms=off"]
@@ -829,10 +907,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             f"werror=report,"
             f"rerror=report,"
             f"copy-on-read=off,"
-            f"bps={constants.DISK_BPS_LIMIT},"
-            f"bps_max={constants.DISK_BPS_BURST},"
-            f"iops={constants.DISK_IOPS_LIMIT},"
-            f"iops_max={constants.DISK_IOPS_BURST},"
+            f"{_DISK_IO_LIMITS},"
             # Disable QEMU file locking to allow concurrent VMs sharing same backing file.
             # On Linux, QEMU uses OFD (Open File Descriptor) locks which cause "Failed to
             # get shared write lock" errors when multiple VMs access the same base image.
@@ -896,8 +971,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Home disk (serial=home): raw sparse file of spec.disk_mb, private to this
     # VM, formatted by tiny-init and mounted on /home/user. Every VM has one (one
-    # VM shape). Same I/O limits as the base drive; default file locking (unlike
-    # the shared base and L2 files, nothing else opens it).
+    # VM shape). Same I/O limits as the base drive (QemuVM.write_file lifts its bandwidth
+    # limit while it runs); default file locking (unlike the shared base and L2 files,
+    # nothing else opens it).
     # werror=enospc: a write that finds the host disk full pauses the VM (other
     # write errors still go to the guest). The guest never gets the error (no
     # EIO, no ext4 error), and BLOCK_IO_ERROR carries nospace=true only for a
@@ -910,19 +986,17 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             f"file={workdir.home_disk},"
             f"format=raw,"
             f"if=none,"
-            f"id=hd2,"
+            f"id={constants.HOME_DRIVE_ID},"
             f"{await written_drive_cache(workdir.home_disk.parent)}"
             f"aio={aio_mode},"
             f"discard=unmap,"
             f"detect-zeroes=unmap,"
             f"werror=enospc,"
             f"rerror=report,"
-            f"bps={constants.DISK_BPS_LIMIT},"
-            f"bps_max={constants.DISK_BPS_BURST},"
-            f"iops={constants.DISK_IOPS_LIMIT},"
-            f"iops_max={constants.DISK_IOPS_BURST}",
+            f"{_DISK_IO_LIMITS}",
             "-device",
-            f"virtio-blk-device,drive=hd2,serial=home{device_iothread},num-queues=1,queue-size={qs},event_idx=off",
+            f"virtio-blk-device,drive={constants.HOME_DRIVE_ID},serial=home{device_iothread},num-queues=1,"
+            f"queue-size={qs},event_idx=off",
         ]
     )
 
@@ -1127,8 +1201,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Event-only QMP monitor: QemuVM.start_event_watch keeps one connection for the
     # VM's life (BLOCK_IO_ERROR, VSERPORT_CHANGE, SHUTDOWN). The monitor above serves
-    # one client at a time, and saves and diagnostics need it. QEMU makes the socket
-    # (as qemu-vm when sudo starts it).
+    # one client at a time, and saves, diagnostics and write_file's home disk limits need
+    # it. QEMU makes the socket (as qemu-vm when sudo starts it).
     qemu_args.extend(
         [
             "-chardev",
@@ -1156,7 +1230,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     #
     # NOTE (non-adoption): -run-with chroot=/user= are not used. Both require a
     # privileged launcher (QEMU starts root, then drops), which conflicts with our
-    # unprivileged model — sudo -u qemu-vm + fd-passing (socket-activated QMP).
+    # unprivileged model: QEMU as this user with inherited sockets, or as qemu-vm through sudo
+    # (sudo closes inherited fds: QEMU makes its sockets).
     # unshare --mount (Linux, when probe_unshare_support passes) gives QEMU a private copy of
     # the host mounts; it does not limit which files QEMU can open: file access follows the
     # uid QEMU runs as (see the TODO (security) below).

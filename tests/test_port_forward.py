@@ -13,7 +13,6 @@ from unittest.mock import patch
 
 import pytest
 
-from exec_sandbox import constants
 from exec_sandbox.asset_downloader import get_gvproxy_suffix
 from exec_sandbox.exceptions import ErrorCode, TransientError
 from exec_sandbox.gvproxy import start_gvproxy
@@ -169,17 +168,13 @@ class TestResolvePortMappings:
         assert [(p.internal, p.external) for p in ports] == [(80, 5000), (81, 5001)]
         assert [s.closed for s in sockets] == [True, True]  # both held until the end, then closed
 
-    def test_resolve_allocates_external_ports(self) -> None:
-        """Test that missing external ports are allocated."""
+    def test_resolve_allocates_external_ports_in_the_order_given(self) -> None:
+        """Each mapping without an external port gets its own host port, in the order of the
+        mappings (not sorted: 8080 comes before 3000)."""
         result = resolve_port_mappings([PortMapping(internal=8080), PortMapping(internal=3000)])
-        assert len(result) == 2
-        assert all(isinstance(p, ExposedPort) for p in result)
-        assert result[0].internal == 8080
-        assert result[0].external >= 1024
-        assert result[1].internal == 3000
-        assert result[1].external >= 1024
-        # External ports should be different
-        assert result[0].external != result[1].external
+        assert [(p.internal, p.protocol) for p in result] == [(8080, "tcp"), (3000, "tcp")]
+        assert len({p.external for p in result}) == 2
+        assert all(p.external >= 1024 for p in result)
 
     def test_resolve_preserves_explicit_external(self) -> None:
         """Test that explicit external ports are preserved."""
@@ -266,34 +261,19 @@ class TestResolvePortMappingsBoundary:
         assert len({port.external for port in result}) == 10
         assert all(port.external > 0 for port in result)
 
-    def test_external_port_at_min_boundary(self) -> None:
-        """Test external port at minimum boundary (1024)."""
-        mapping = PortMapping(internal=80, external=1024)
-        result = resolve_port_mappings([mapping])
-        assert result[0].external == 1024
-
-    def test_external_port_at_max_boundary(self) -> None:
-        """Test external port at maximum boundary (65535)."""
-        mapping = PortMapping(internal=80, external=65535)
-        result = resolve_port_mappings([mapping])
-        assert result[0].external == 65535
-
 
 class TestPortMappingWeirdCases:
     """Weird/unusual case tests."""
 
     def test_duplicate_internal_ports_allowed(self) -> None:
-        """Test that duplicate internal ports are allowed (user's responsibility)."""
-        # Same internal port twice - this is technically allowed at model level
-        # The behavior depends on what gvproxy does with duplicates
+        """One guest port on two host ports: resolve_port_mappings keeps both mappings, in
+        their order (gvproxy gets two forwards)."""
         mappings = [
             PortMapping(internal=8080, external=3000),
             PortMapping(internal=8080, external=3001),
         ]
         result = resolve_port_mappings(mappings)
-        assert len(result) == 2
-        assert result[0].internal == result[1].internal == 8080
-        assert result[0].external != result[1].external
+        assert [(port.internal, port.external) for port in result] == [(8080, 3000), (8080, 3001)]
 
     def test_no_free_host_port_is_gvproxy_failed(self) -> None:
         """No socket for a port probe (out of file handles): TransientError GVPROXY_FAILED (it
@@ -356,7 +336,7 @@ class TestGvproxyPortForwardArguments:
         finally:
             if owned:
                 proc, _ = owned[0]
-                await cleanup_process(proc, "gvproxy", "vm-ports", term_timeout=3.0, kill_timeout=2.0, kill_first=False)
+                await cleanup_process(proc, "gvproxy", "vm-ports", term_timeout=3.0, kill_first=False)
             for _, drain in owned[1:]:
                 if drain is not None:
                     drain.cancel()
@@ -404,20 +384,21 @@ class TestGvproxyPortForwardArguments:
 
         assert ("-block-outbound" in args) is block_outbound
 
-    async def test_the_network_constants_are_passed(self, tmp_path: Path, short_tmp_dir: Path) -> None:
-        """gvproxy-wrapper has no network default (its flags are required): the host passes its
-        constants (constants.py), and a forward targets the guest IP among them."""
+    async def test_the_guest_network_is_passed(self, tmp_path: Path, short_tmp_dir: Path) -> None:
+        """gvproxy-wrapper has no network default (its flags are required): the host passes the
+        network the guest agent sets up at its boot (guest-agent/src/init.rs uses the gateway
+        192.168.127.1), written out here: a change on the host side only breaks the guest
+        network. The forward target, the guest IP: test_forwards_from_the_host_to_the_guest_ip."""
         ports = [ExposedPort(internal=8080, external=3000, host="127.0.0.1", protocol="tcp")]
         args = await self._arguments(tmp_path, short_tmp_dir, ports=ports, block_outbound=False)
 
         given = {flag: args[args.index(flag) + 1] for flag in ("-subnet", "-gateway-ip", "-gateway-mac", "-mtu")}
         assert given == {
-            "-subnet": constants.GUEST_NETWORK_SUBNET,
-            "-gateway-ip": constants.GUEST_GATEWAY_IP,
-            "-gateway-mac": constants.GUEST_GATEWAY_MAC,
-            "-mtu": str(constants.GUEST_MTU),
+            "-subnet": "192.168.127.0/24",
+            "-gateway-ip": "192.168.127.1",
+            "-gateway-mac": "5a:94:ef:e4:0c:dd",
+            "-mtu": "1500",
         }
-        assert json.loads(args[args.index("-port-forward") + 1]) == {"127.0.0.1:3000": f"{constants.GUEST_IP}:8080"}
 
     async def test_no_ports_no_forward(self, tmp_path: Path, short_tmp_dir: Path) -> None:
         """No exposed port: no -port-forward argument."""

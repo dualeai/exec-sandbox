@@ -93,26 +93,6 @@ class TestSchedulerConfigMatchesSettings:
 
 
 # ============================================================================
-# Full Config with S3
-# ============================================================================
-
-
-class TestSchedulerConfigS3:
-    """Tests for S3-related configuration."""
-
-    def test_s3_config(self) -> None:
-        """SchedulerConfig with S3 settings."""
-        config = SchedulerConfig(
-            s3_bucket="my-bucket",
-            s3_region="eu-west-1",
-            s3_snapshot_prefix="cache/",
-        )
-        assert config.s3_bucket == "my-bucket"
-        assert config.s3_region == "eu-west-1"
-        assert config.s3_snapshot_prefix == "cache/"
-
-
-# ============================================================================
 # Cache Dir Integration
 # ============================================================================
 

@@ -10,7 +10,8 @@ from collections.abc import Sequence
 
 from exec_sandbox.constants import NPM_PACKAGE_DOMAINS, PYTHON_PACKAGE_DOMAINS
 
-# Security: Domain validation pattern (RFC 1035 compliant)
+# Security: Domain validation pattern (RFC 1035 labels; as RFC 1123 allows, a label can
+# start with a digit)
 # Prevents ReDoS attacks and regex injection via malicious domain input
 # Labels: alphanumeric, can contain hyphens (not at start/end), 1-63 chars each
 # TLD: letters only (no digits)
@@ -20,7 +21,8 @@ _DOMAIN_MAX_LENGTH = 253
 
 
 def validate_domain(domain: str) -> None:
-    """Validate domain is RFC 1035 compliant.
+    """Validate domain is an RFC 1035 name (a label can start with a digit: RFC 1123) of at
+    least 2 labels, with an alphabetic TLD; one final dot (the FQDN form) is allowed.
 
     Prevents regex injection and ReDoS attacks by ensuring domains contain
     only valid characters before using them in regex patterns.

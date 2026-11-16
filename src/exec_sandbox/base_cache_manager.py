@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 from collections import deque
 from typing import TYPE_CHECKING, ClassVar
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.files.disk import allocated_bytes, file_stamp
 from exec_sandbox.files.locks import CacheEntry
 from exec_sandbox.permission_utils import make_cache_dir
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
     from exec_sandbox.files.locks import EntryLease
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class EvictionOrder:
@@ -240,9 +240,8 @@ class BaseCacheManager:
         return [(path, stamp) for _, path, stamp in sorted(entries)]
 
     def entry_paths(self) -> list[Path]:
-        """The primary file of each entry now in the cache folder, oldest access first.
-        Blocking: a listing."""
-        return [path for path, _ in self._oldest_first()]
+        """The primary file of each entry now in the cache folder. Blocking: a listing."""
+        return list(self.cache_dir.glob(f"*{self._cache_ext}"))
 
     async def reclaimable_bytes(self, *, held: frozenset[Path]) -> int:
         """Bytes of the entries that evictions of this process can give back once its VMs are

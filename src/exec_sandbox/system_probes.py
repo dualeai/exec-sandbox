@@ -8,8 +8,12 @@ raise_nproc_limit) and warns about unsafe host settings (warn_*).
 
 import asyncio
 import contextlib
+import ctypes
 import errno
+import fcntl
 import functools
+import logging
+import mmap
 import os
 import platform
 import re
@@ -26,19 +30,26 @@ from pathlib import Path
 from typing import Any, ClassVar, Final, ParamSpec, TypeVar, cast
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_cancellation_safe
 from exec_sandbox.cgroup import CGROUP_V2_BASE_PATH, cgroup_v2_available, resolve_self_cgroup_v2
-from exec_sandbox.exceptions import ConfigError, ErrorCode, SandboxError, TransientError, spawn_error
+from exec_sandbox.exceptions import (
+    HOST_LIMIT_ERRNOS,
+    ConfigError,
+    ErrorCode,
+    SandboxError,
+    TransientError,
+    spawn_error,
+)
 from exec_sandbox.files.disk import LINUX_MEMORY_FILESYSTEMS, OVERLAYFS_SUPER_MAGIC, overlay_upper, statfs_type
 from exec_sandbox.platform_utils import HostArch, HostOS, child_env, detect_host_arch, detect_host_os
+from exec_sandbox.qmp_client import parse_qmp_line
 from exec_sandbox.settings import QemuBinaries
 from exec_sandbox.vm_types import AccelType
 
 P = ParamSpec("P")
 T = TypeVar("T")
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # Recommended System Limit Thresholds
@@ -122,7 +133,7 @@ def warn_overcommit() -> None:
     Empirically, switching from mode 0 to 1 reduced 100-VM burst failures
     from 14 % to 1 % on a 16-core / 32 GB EC2 instance.
 
-    Called once during Scheduler startup on Linux only.  No-op on macOS.
+    Called once during Scheduler startup, on every OS: a no-op off Linux.
     """
     if (overcommit := _kernel_int("/proc/sys/vm/overcommit_memory")) == 0:
         logger.warning(
@@ -187,7 +198,7 @@ def warn_max_map_count() -> None:
     This is a well-known limit also raised by Elasticsearch, Docker, and
     Kata Containers.
 
-    Called once during Scheduler startup on Linux only. No-op on macOS.
+    Called once during Scheduler startup, on every OS: a no-op off Linux.
     """
     max_map_count = _kernel_int("/proc/sys/vm/max_map_count")
     if max_map_count is not None and max_map_count < _MIN_RECOMMENDED_MAX_MAP_COUNT:
@@ -211,7 +222,7 @@ def warn_threads_max() -> None:
     reached before per-UID ``RLIMIT_NPROC``, causing ``pthread_create`` failures
     across all processes — not just QEMU.
 
-    Called once during Scheduler startup on Linux only. No-op on macOS.
+    Called once during Scheduler startup, on every OS: a no-op off Linux.
     """
     threads_max = _kernel_int("/proc/sys/kernel/threads-max")
     if threads_max is not None and threads_max < _MIN_RECOMMENDED_THREADS_MAX:
@@ -237,7 +248,7 @@ def warn_cgroup_pids_limit() -> None:
 
     Only the tightest ancestor is reported to avoid log spam.
 
-    Called once during Scheduler startup on Linux only. No-op on macOS.
+    Called once during Scheduler startup, on every OS: a no-op off Linux.
     """
     cgroup_root = Path(CGROUP_V2_BASE_PATH)
     if not cgroup_v2_available():
@@ -247,47 +258,30 @@ def warn_cgroup_pids_limit() -> None:
     if cgroup_rel is None:
         return
 
-    # Walk from current cgroup up to root, find the tightest pids.max
-    tightest_limit: int | None = None
-    tightest_path: str | None = None
-
+    # Each pids.max from this process's cgroup up to the mount root
     current = cgroup_root / cgroup_rel.lstrip("/")
-    while current != current.parent:  # Stop at filesystem root (safety bound)
-        try:
-            content = (current / "pids.max").read_text().strip()
-            if content != "max":
-                limit = int(content)
-                if tightest_limit is None or limit < tightest_limit:
-                    tightest_limit = limit
-                    tightest_path = str(current.relative_to(cgroup_root))
-        except (OSError, ValueError):
-            pass  # File doesn't exist or isn't readable at this level
-
-        if current == cgroup_root:
+    limits: list[tuple[int, Path]] = []
+    for folder in (current, *current.parents):
+        with contextlib.suppress(OSError, ValueError):  # no file at this level, or "max"
+            limits.append((int((folder / "pids.max").read_text()), folder))
+        if folder == cgroup_root:
             break
-        current = current.parent
 
-    if tightest_limit is not None and tightest_limit < _MIN_RECOMMENDED_CGROUP_PIDS:
+    # The innermost of the tightest (min keeps the first)
+    tightest = min(limits, key=lambda limit: limit[0], default=None)
+    if tightest is not None and tightest[0] < _MIN_RECOMMENDED_CGROUP_PIDS:
         logger.warning(
             "cgroup pids.max is low — container/systemd PID limit may cause thread creation failures. "
             "Fix with: docker run --pids-limit=-1, or systemd TasksMax=infinity",
             extra={
-                "current": tightest_limit,
-                "cgroup": tightest_path,
+                "current": tightest[0],
+                "cgroup": str(tightest[1].relative_to(cgroup_root)),
                 "recommended_min": _MIN_RECOMMENDED_CGROUP_PIDS,
             },
         )
 
 
 _ZSWAP_PARAM_BASE: Final[str] = "/sys/module/zswap/parameters"
-
-
-def _read_zswap_param(name: str) -> str | None:
-    """Read a zswap sysfs parameter, or None if unavailable (not Linux, no zswap module)."""
-    try:
-        return Path(f"{_ZSWAP_PARAM_BASE}/{name}").read_text().strip()
-    except (OSError, ValueError):
-        return None
 
 
 def _kernel_int(path: str) -> int | None:
@@ -318,11 +312,12 @@ def warn_zswap() -> None:
     better for interactive VM workloads.  40% pool allows 2-3x effective
     memory capacity under pressure.
 
-    Called once during Scheduler startup on Linux only.  No-op on macOS.
+    Called once during Scheduler startup, on every OS: a no-op off Linux.
     """
-    enabled = _read_zswap_param("enabled")
-    if enabled is None:
-        return  # zswap module not loaded or /sys unavailable
+    try:
+        enabled = Path(f"{_ZSWAP_PARAM_BASE}/enabled").read_text().strip()
+    except (OSError, ValueError):
+        return  # zswap module not loaded or /sys unavailable (not Linux)
 
     if enabled != "Y":
         logger.warning(
@@ -352,7 +347,7 @@ def warn_damon() -> None:
     providing continuous host-driven reclamation without guest cooperation.
     This supplements ``memory.reclaim`` with proactive kernel-driven reclaim.
 
-    Called once during Scheduler startup on Linux only.  No-op on macOS.
+    Called once during Scheduler startup, on every OS: a no-op off Linux.
     """
     if detect_host_os() != HostOS.LINUX:
         return
@@ -379,6 +374,8 @@ NOT_CACHED: Any = object()
 # See: linux/kvm.h - these are stable ABI
 _KVM_GET_API_VERSION = 0xAE00
 _KVM_API_VERSION_EXPECTED = 12  # Stable since Linux 2.6.38
+_KVM_CHECK_EXTENSION = 0xAE03
+_KVM_CAP_TSC_CONTROL = 60
 
 
 @dataclass(frozen=True)
@@ -402,12 +399,16 @@ class ProbeCache:
 
     __slots__ = (
         "_locks",
+        "cpu_id",
         "direct_io",
         "drive_direct_io",
         "failures",
+        "guest_cpu",
+        "host_counter_hz",
         "hvf",
         "io_uring",
         "kvm",
+        "kvm_tsc_scaling",
         "qemu_accels",
         "qemu_as_qemu_vm",
         "qemu_machine_types",
@@ -421,11 +422,16 @@ class ProbeCache:
     _RESULTS: ClassVar[tuple[str, ...]] = tuple(name for name in __slots__ if name != "_locks")
 
     def __init__(self) -> None:
+        self.cpu_id: str | None = NOT_CACHED  # the host CPU a -cpu host guest sees (ARM64)
         self.direct_io: dict[int, bool] = {}  # per device (st_dev): its filesystem takes O_DIRECT
         self.drive_direct_io: dict[Path, bool] = {}  # per folder: VM drive files there use O_DIRECT
+        # Per (QEMU binary stamp, accelerator, -cpu value): the guest TSC rate QEMU reads (require_guest_cpu)
+        self.guest_cpu: dict[tuple[tuple[str, int, int, int, int] | None, str, str], int | None] = {}
+        self.host_counter_hz: int | None = NOT_CACHED  # the clock counter rate, where exact
         self.hvf: bool | None = NOT_CACHED
         self.io_uring: bool | None = NOT_CACHED
         self.kvm: bool | None = NOT_CACHED
+        self.kvm_tsc_scaling: bool = NOT_CACHED  # KVM_CAP_TSC_CONTROL
         # The QEMU probes keep the binary's stamp with their result (_Stamped): a new binary
         # at the same path (a package upgrade) runs them again
         self.qemu_accels: _Stamped[set[str]] = NOT_CACHED  # Accelerators available in QEMU binary
@@ -624,22 +630,27 @@ _PROBE_TIMEOUT_SECONDS: Final = 5.0
 """Upper bound of a probe command (sysctl, `qemu -accel help`, a sudo): each ends in ms."""
 
 
-async def run_probe(cmd: Sequence[str], *, stdout: int, stderr: int) -> tuple[int, bytes, bytes]:
-    """Run the probe command `cmd` to its end (stdin /dev/null, child_env()), at most
-    _PROBE_TIMEOUT_SECONDS: (exit status, stdout, stderr). On the timeout or a cancel, the
-    command is killed and reaped before the call ends: no probe leaves a process behind.
-    stdout and stderr: asyncio.subprocess.PIPE or DEVNULL.
+async def run_probe(cmd: Sequence[str], *, stdin: bytes | None, stdout: int, stderr: int) -> tuple[int, bytes, bytes]:
+    """Run the probe command `cmd` to its end (child_env()), at most _PROBE_TIMEOUT_SECONDS:
+    (exit status, stdout, stderr). On the timeout or a cancel, the command is killed and
+    reaped before the call ends: no probe leaves a process behind. `stdin`: the bytes the
+    command reads, then end of file; None: /dev/null. stdout and stderr:
+    asyncio.subprocess.PIPE or DEVNULL.
 
     Raises:
         OSError: the command did not start (FileNotFoundError: not found)
         TimeoutError: it did not end within the bound
     """
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=stdout, stderr=stderr, env=child_env()
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE,
+        stdout=stdout,
+        stderr=stderr,
+        env=child_env(),
     )
     try:
         async with asyncio.timeout(_PROBE_TIMEOUT_SECONDS):
-            out, err = await proc.communicate()
+            out, err = await proc.communicate(stdin)
     except BaseException:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
@@ -671,7 +682,7 @@ async def probe_qemu_accelerators() -> set[str]:
 
     try:
         returncode, stdout, _ = await run_probe(
-            (qemu_bin, "-accel", "help"), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            (qemu_bin, "-accel", "help"), stdin=None, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
 
         if returncode != 0:
@@ -719,7 +730,7 @@ async def probe_qemu_version() -> tuple[int, int, int] | None:
 
     try:
         returncode, stdout, _ = await run_probe(
-            (qemu_bin, "--version"), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+            (qemu_bin, "--version"), stdin=None, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
         )
 
         if returncode != 0:
@@ -794,7 +805,7 @@ def _qemu_probe_failure(cache_attr: str, what: str, args: str, *, expected: str)
             hint=None,
             instance_id=None,
         )
-    if isinstance(error, OSError) and error.errno in (errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE):
+    if isinstance(error, OSError) and error.errno in HOST_LIMIT_ERRNOS:
         return spawn_error(error, binary=binary, code=ErrorCode.QEMU_CRASHED, context={}, hint=None)
     return _qemu_probe_error(what, args, expected=expected)
 
@@ -849,7 +860,10 @@ async def probe_qemu_machine_types() -> dict[str, str]:
     qemu_bin = _probed_qemu_binary()
     try:
         returncode, stdout, _ = await run_probe(
-            (qemu_bin, "-machine", "help"), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+            (qemu_bin, "-machine", "help"),
+            stdin=None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
     except OSError as e:  # TimeoutError too; require_qemu_machine_types raises it
         logger.warning("QEMU machine type probe failed", extra={"qemu_bin": qemu_bin, "error": str(e)})
@@ -873,7 +887,9 @@ program (ENOEXEC; EBADARCH on macOS)."""
 
 
 _SANDBOX_PROBE_TIMEOUT_SECONDS: Final = 10.0
-"""Upper bound for the QMP greeting of the sandbox probe; it arrives in ~10 ms."""
+"""Bound of each wait of the sandbox probe: the QMP greeting (it arrives in ~10 ms), QEMU's
+exit after a stdout EOF, and the reap after the kill. A probe takes at most about twice this
+(three times when a process that left QEMU's group holds its pipes)."""
 
 
 @async_cached_probe("qemu_sandbox", per_qemu_binary=True)
@@ -897,9 +913,10 @@ async def probe_qemu_sandbox_support() -> bool | None:
         _SANDBOX_PROBE_TIMEOUT_SECONDS or wrote a line over the stream limit (assumed: an
         unknown option or a failed filter exits at once). False off Linux, or if QEMU ended
         before its greeting with a seccomp error (built without seccomp, a filter the kernel
-        refuses) or its filter's SIGSYS. Both are kept. None: no answer (the probe did not start, a signal other than SIGSYS
-        killed it, a limit, or another exit), nothing cached (require_qemu_sandbox_support
-        raises).
+        refuses) or its filter's SIGSYS. Both are kept. None: no answer (the probe did not
+        start, a signal other than SIGSYS ended it, also the probe's own kill of a QEMU that
+        closed stdout and still ran at the bound, a limit, another exit, or pipes still held
+        after the kill), nothing cached (require_qemu_sandbox_support raises).
     """
     # Seccomp is a Linux kernel feature — skip the subprocess on macOS.
     if detect_host_os() != HostOS.LINUX:
@@ -923,35 +940,57 @@ async def probe_qemu_sandbox_support() -> bool | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=child_env(),
+            process_group=0,  # its own group: the kill reaches a QEMU that a wrapper did not exec
         )
         assert proc.stdout is not None and proc.stderr is not None  # noqa: S101 - PIPE above
         # stderr drains while the probe waits: a full pipe would block QEMU before its greeting
         stderr_task = asyncio.create_task(proc.stderr.read())
-        running = True  # still running at the bound, without a greeting
         try:
+            running = True  # still running at the bound, without a greeting
+            try:
+                async with asyncio.timeout(_SANDBOX_PROBE_TIMEOUT_SECONDS):
+                    while line := await proc.stdout.readline():
+                        if line.startswith(b'{"QMP"'):
+                            break
+                    else:
+                        running = False  # stdout EOF: QEMU exited before its greeting
+            except (TimeoutError, ValueError):  # ValueError: a line over the stream limit, not the greeting
+                logger.warning(
+                    "QEMU sandbox probe: no QMP greeting, assuming supported",
+                    extra={"qemu_bin": qemu_bin, "timeout_seconds": _SANDBOX_PROBE_TIMEOUT_SECONDS},
+                )
+            finally:
+                # A QEMU that closed stdout gets the bound to exit. Its group is killed when QEMU
+                # still runs or a member still holds the pipes (a wrapper's QEMU), also when a cancel
+                # ends that wait: the probe never leaves a QEMU behind. killpg, not Popen.kill: that
+                # polls first, and on a QEMU that exited its waitpid would take the exit status from
+                # asyncio's child watcher, which then reports 255, not SIGSYS
+                exited = False
+                try:
+                    if not running:
+                        with contextlib.suppress(TimeoutError):
+                            async with asyncio.timeout(_SANDBOX_PROBE_TIMEOUT_SECONDS):
+                                await proc.wait()
+                                exited = True
+                finally:
+                    if not exited or not stderr_task.done():
+                        with contextlib.suppress(ProcessLookupError, PermissionError):  # the group ended
+                            os.killpg(proc.pid, signal.SIGKILL)
+            # The reap, after the finally: a cancel goes up as it is (in the finally, the reap's
+            # TimeoutError would replace it). Bounded: a process that left the group can hold the
+            # pipes (TimeoutError is an OSError: no answer)
             async with asyncio.timeout(_SANDBOX_PROBE_TIMEOUT_SECONDS):
-                while line := await proc.stdout.readline():
-                    if line.startswith(b'{"QMP"'):
-                        break
-                else:
-                    running = False  # stdout EOF: QEMU exited before its greeting
-        except (TimeoutError, ValueError):  # ValueError: a line over the stream limit, not the greeting
-            logger.warning(
-                "QEMU sandbox probe: no QMP greeting, assuming supported",
-                extra={"qemu_bin": qemu_bin, "timeout_seconds": _SANDBOX_PROBE_TIMEOUT_SECONDS},
-            )
-        finally:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()  # every path: the probe never leaves a QEMU behind
-            returncode = await proc.wait()
-            stderr = await stderr_task
-        if running:
-            # The greeting comes after start-up, which installs the filter. A silent QEMU that
-            # still runs accepted -sandbox (an unknown option or a failed filter exits at once).
-            logger.debug("QEMU sandbox probe: supported (-sandbox on, QEMU started)")
-            return True
+                returncode = await proc.wait()
+                stderr = await stderr_task
+            if running:
+                # The greeting comes after start-up, which installs the filter. A silent QEMU that
+                # still runs accepted -sandbox (an unknown option or a failed filter exits at once).
+                logger.debug("QEMU sandbox probe: supported (-sandbox on, QEMU started)")
+                return True
 
-        return _sandbox_answer(qemu_bin, returncode, stderr.decode(errors="replace").strip() if stderr else "")
+            return _sandbox_answer(qemu_bin, returncode, stderr.decode(errors="replace").strip() if stderr else "")
+        finally:
+            stderr_task.cancel()  # after a cancel or a reap past the bound: no reader left behind
 
     except OSError as e:
         logger.warning("QEMU sandbox probe failed", extra={"qemu_bin": qemu_bin, "error": str(e)})
@@ -965,12 +1004,12 @@ def _sandbox_answer(qemu_bin: str, returncode: int, stderr_text: str) -> bool:
     on it)."""
     log = {"qemu_bin": qemu_bin, "returncode": returncode, "stderr": stderr_text[:200]}
     if returncode < 0 and -returncode != signal.SIGSYS:
-        logger.warning("QEMU sandbox probe killed", extra=log)  # the OOM killer, a process limit
+        logger.warning("QEMU sandbox probe killed", extra=log)  # OOM, a process limit, the probe's kill
         raise _Uncached(result=None, error=_exit_error(returncode))
     if returncode == -signal.SIGSYS:
         logger.info("QEMU sandbox not available (its seccomp filter killed QEMU)", extra=log)
         return False
-    if (limit := _limit_errno(stderr_text)) is not None:
+    if (limit := next((number for text, number in _LIMIT_TEXTS.items() if text in stderr_text), None)) is not None:
         logger.warning("QEMU sandbox probe hit a limit", extra=log)
         raise _Uncached(result=None, error=OSError(limit, stderr_text[:200]))
     # QEMU names the option in each -sandbox error: "-sandbox on,...: There is no option group
@@ -990,11 +1029,6 @@ _LIMIT_TEXTS: Final = {
     os.strerror(errno.ENFILE): errno.ENFILE,
 }
 """QEMU's text of a memory, process or file limit (error_setg_errno appends strerror)."""
-
-
-def _limit_errno(stderr_text: str) -> int | None:
-    """The errno of a limit that QEMU's error text names (_LIMIT_TEXTS), else None."""
-    return next((number for text, number in _LIMIT_TEXTS.items() if text in stderr_text), None)
 
 
 async def require_qemu_sandbox_support() -> bool:
@@ -1100,6 +1134,7 @@ async def check_kvm_available() -> bool | None:
                 "-c",
                 f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
             ),
+            stdin=None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -1166,6 +1201,7 @@ async def check_hvf_available() -> bool:
         # sysctl kern.hv_support returns 1 if Hypervisor.framework is available
         returncode, stdout, _ = await run_probe(
             ("/usr/sbin/sysctl", "-n", "kern.hv_support"),
+            stdin=None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -1235,6 +1271,277 @@ async def check_tsc_deadline() -> bool:
         else "TSC_DEADLINE not available (keeping PIT/PIC enabled)"
     )
     return has_tsc
+
+
+@async_cached_probe("kvm_tsc_scaling", per_qemu_binary=False)
+async def probe_kvm_tsc_scaling() -> bool:
+    """KVM runs each guest's TSC at the rate the guest booted with, whatever this host's TSC
+    rate is (KVM_CAP_TSC_CONTROL: Intel TSC scaling, AMD TSC ratio; cached): a state saved on
+    a host with another rate loads here with its clock right (QEMU sets the saved rate).
+    False without /dev/kvm.
+
+    See: https://docs.kernel.org/virt/kvm/api.html (KVM_CAP_TSC_CONTROL, KVM_SET_TSC_KHZ)
+
+    Raises:
+        TransientError: LOCAL_DISK: a file-handle or memory limit (nothing kept)
+    """
+
+    def ask() -> bool:
+        with Path("/dev/kvm").open("rb") as kvm:
+            return fcntl.ioctl(kvm.fileno(), _KVM_CHECK_EXTENSION, _KVM_CAP_TSC_CONTROL) > 0
+
+    try:
+        return await asyncio.to_thread(ask)
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ENXIO, errno.ENODEV, errno.EACCES, errno.EPERM):
+            return False  # no /dev/kvm, or no access: no KVM guest here to scale
+        # A limit: TransientError, nothing kept; another error (EIO, EBUSY): False, kept and logged
+        _no_host_source(e, what="KVM TSC scaling")
+        return False
+
+
+def _no_host_source(error: OSError, *, what: str) -> None:
+    """A cached probe's failed read of the host's `what`. An error other than a limit (a file
+    this user may not read, for example) is logged, and the probe keeps its answer for no
+    source: the None this returns (probe_kvm_tsc_scaling keeps False).
+
+    Raises:
+        TransientError: LOCAL_DISK: a limit (file handles, memory, processes) or no answer in
+            time: nothing is kept, the next call reads again
+    """
+    if isinstance(error, TimeoutError) or error.errno in HOST_LIMIT_ERRNOS:
+        raise TransientError(
+            f"The {what} of this host could not be read now ({error.strerror or 'no answer in time'}).",
+            code=ErrorCode.LOCAL_DISK,
+            context={"errno": error.errno},
+            hint=None,
+            instance_id=None,
+        ) from error
+    logger.warning(f"The {what} of this host could not be read: none is used", extra={"error": str(error)})
+
+
+_CNTFRQ_EL0_READ: Final = bytes.fromhex("00e03bd5c0035fd6")
+"""arm64 code: mrs x0, cntfrq_el0; ret."""
+
+
+def _read_cntfrq_el0() -> int | None:
+    """CNTFRQ_EL0, the rate of the ARM generic timer as the firmware set it: user space reads
+    it with one instruction (not trapped), run here from a page made executable. None: this
+    host refuses executable memory (SELinux execmem, PaX MPROTECT), so no exact source.
+
+    Raises:
+        OSError: mprotect failed for another reason
+    """
+    with mmap.mmap(-1, mmap.PAGESIZE, prot=mmap.PROT_READ | mmap.PROT_WRITE) as page:
+        page.write(_CNTFRQ_EL0_READ)
+        # The c_char view goes at once: no buffer export is left when the page closes
+        address = ctypes.addressof(ctypes.c_char.from_buffer(page))
+        mprotect = ctypes.CDLL(None, use_errno=True).mprotect
+        mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        if mprotect(address, mmap.PAGESIZE, mmap.PROT_READ | mmap.PROT_EXEC) != 0:
+            if (error := ctypes.get_errno()) in (errno.EACCES, errno.EPERM):
+                return None
+            raise OSError(error, "mprotect of the CNTFRQ_EL0 read")
+        return ctypes.CFUNCTYPE(ctypes.c_uint64)(address)()
+
+
+def _bogomips_hz(cpuinfo: str) -> int | None:
+    """The x86 TSC rate in Hz from the first BogoMIPS line, when the CPU or the hypervisor
+    states the rate (flag tsc_known_freq): the kernel then sets loops_per_jiffy from tsc_khz,
+    and prints it as BogoMIPS with two decimals, tsc_khz / 500 (CONFIG_HZ 100, 250 or 1000):
+    the rate in steps of 5 kHz. None without that flag: the kernel measured the rate at its
+    boot, and it differs from boot to boot."""
+    lines = cpuinfo.splitlines()
+    flags = next((line for line in lines if line.startswith("flags")), "")
+    bogomips = next((line for line in lines if line.startswith("bogomips")), None)
+    if "tsc_known_freq" not in flags.split() or bogomips is None:
+        return None
+    match = re.fullmatch(r"bogomips\s*:\s*(\d+)\.(\d\d)", bogomips.strip())
+    return None if match is None else (int(match[1]) * 100 + int(match[2])) * 5000
+
+
+@async_cached_probe("host_counter_hz", per_qemu_binary=False)
+async def probe_host_counter_hz() -> int | None:
+    """Rate in Hz of the counter a guest's clock runs on here, from an exact source (cached);
+    None: this host has none. A guest calibrates its clock against this rate once, at its
+    boot: on a host with another rate its time runs fast or slow.
+
+    - Linux x86: the TSC rate when the CPU or the hypervisor states it (_bogomips_hz).
+    - Linux ARM64: CNTFRQ_EL0 (a KVM guest reads the same register).
+    - macOS ARM64: sysctl hw.tbfrequency (24 MHz on Apple chips: the rate HVF guests see).
+    - macOS x86: sysctl machdep.tsc.frequency.
+
+    Raises:
+        TransientError: LOCAL_DISK: the read hit a host limit or got no answer in time
+            (_no_host_source: nothing kept)
+    """
+    arch, host_os = detect_host_arch(), detect_host_os()
+    try:
+        if host_os == HostOS.MACOS:
+            name = "hw.tbfrequency" if arch == HostArch.AARCH64 else "machdep.tsc.frequency"
+            returncode, stdout, _ = await run_probe(
+                ("/usr/sbin/sysctl", "-n", name),
+                stdin=None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return int(stdout) if returncode == 0 and stdout.strip().isdigit() else None
+        if arch == HostArch.AARCH64:
+            if (hz := await asyncio.to_thread(_read_cntfrq_el0)) is None:
+                logger.warning("No exact clock counter rate: this host refuses executable memory (CNTFRQ_EL0 read)")
+            return hz
+        # In a worker thread: the kernel builds this file for every CPU
+        return _bogomips_hz(await asyncio.to_thread(Path("/proc/cpuinfo").read_text))
+    except OSError as e:  # TimeoutError too
+        return _no_host_source(e, what="clock counter rate")
+
+
+_HVF_ID_REGISTERS: Final = (
+    ("dfr0", 0),
+    ("dfr1", 1),
+    ("isar0", 2),
+    ("isar1", 3),
+    ("mmfr0", 4),
+    ("mmfr1", 5),
+    ("mmfr2", 6),
+    ("pfr0", 7),
+    ("pfr1", 8),
+    ("smfr0", 12),
+    ("zfr0", 13),
+)
+"""(name, hv_feature_reg_t) of the ID_AA64 registers QEMU's -cpu host takes under HVF
+(target/arm/hvf/hvf.c); smfr0 and zfr0 only where macOS has them (15.2 and later)."""
+
+
+def _hvf_cpu_id() -> str | None:
+    """The HVF guest's CPU feature registers (hv_vcpu_config_get_feature_reg, no
+    entitlement needed), as name=0x<16 hex digits> joined by commas; None when none reads
+    (a Mac with no HVF, such as a macOS VM)."""
+    hv = ctypes.CDLL("/System/Library/Frameworks/Hypervisor.framework/Hypervisor")
+    hv.hv_vcpu_config_create.restype = ctypes.c_void_p
+    hv.hv_vcpu_config_get_feature_reg.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
+    hv.hv_vcpu_config_get_feature_reg.restype = ctypes.c_int32
+    config = hv.hv_vcpu_config_create()  # one per process (the probe is cached): not released
+    parts: list[str] = []
+    for name, register in _HVF_ID_REGISTERS:
+        value = ctypes.c_uint64()
+        if hv.hv_vcpu_config_get_feature_reg(config, register, ctypes.byref(value)) == 0:  # HV_SUCCESS
+            parts.append(f"{name}=0x{value.value:016x}")
+    return ",".join(parts) or None
+
+
+def _linux_arm_cpu_id(cpus: Path) -> str | None:
+    """The distinct midr_el1 and revidr_el1 of the CPUs under `cpus` (sysfs), sorted, as
+    midr_el1=0x...,revidr_el1=0x... joined by semicolons (one entry on a server whose cores
+    are all alike); None without them. AIDR_EL1 is left out: Linux lists it from 6.16 only."""
+    found: set[str] = set()
+    for folder in cpus.glob("cpu[0-9]*/regs/identification"):
+        midr, revidr = ((folder / name).read_text().strip() for name in ("midr_el1", "revidr_el1"))
+        found.add(f"midr_el1={midr},revidr_el1={revidr}")
+    return ";".join(sorted(found)) or None
+
+
+@async_cached_probe("cpu_id", per_qemu_binary=False)
+async def probe_host_cpu_id() -> str | None:
+    """Identity of the host CPU as an ARM64 guest with -cpu host sees it (cached): the CPU
+    part and revision on Linux (_linux_arm_cpu_id), the HVF feature registers on macOS
+    (_hvf_cpu_id). A state saved on one CPU loads only on the same one: QEMU refuses
+    another after the download, or HVF loads it into other features. None on x86 (the guest
+    CPU is a fixed model) and when the registers cannot be read.
+
+    Raises:
+        TransientError: LOCAL_DISK: the read hit a host limit (_no_host_source: nothing kept)
+    """
+    if detect_host_arch() != HostArch.AARCH64:
+        return None
+    try:
+        if detect_host_os() == HostOS.MACOS:
+            return await asyncio.to_thread(_hvf_cpu_id)
+        return await asyncio.to_thread(_linux_arm_cpu_id, Path("/sys/devices/system/cpu"))
+    except OSError as e:  # TimeoutError too
+        return _no_host_source(e, what="CPU identity")
+
+
+_GUEST_CPU_QMP: Final = (
+    b'{"execute": "qmp_capabilities"}\n'
+    b'{"execute": "qom-get", "arguments": {"path": "/machine/unattached/device[0]", "property": "tsc-frequency"}}\n'
+    b'{"execute": "quit"}\n'
+)
+"""The QMP commands of require_guest_cpu: the vCPU's TSC rate (QEMU reads it from KVM when it
+creates the vCPU; 0 under TCG), then quit."""
+
+
+async def require_guest_cpu(cpu: str, *, accel: str) -> int | None:
+    """Start this QEMU once, paused, with the x86 guest CPU `cpu` (a -cpu value) under `accel`
+    (a -accel value) on the microvm machine (QEMU 11 runs no x86 CPU on the 'none' machine),
+    and read the vCPU's TSC rate: cached per QEMU binary, accelerator and CPU. VmManager.start
+    asks it, so a host that cannot run the guest CPU (enforce: a flag it lacks) fails there,
+    with QEMU's reasons, not at each VM start.
+
+    Returns: the guest TSC rate in Hz under KVM (the rate KVM gives a new vCPU); None under
+    TCG and HVF.
+
+    Raises:
+        ConfigError: HOST_DEPENDENCY: QEMU refused the CPU (its lines name the features this
+            host lacks), or there is no QEMU binary or it cannot run here
+        TransientError: QEMU_CRASHED: another QEMU error (its lines), a process, memory or
+            file-handle limit, a signal, the binary being written, or no answer in time
+            (nothing is kept: the next call probes again)
+    """
+    stamp = _qemu_binary_stamp()
+    key = (stamp, accel, cpu)
+    if key in probe_cache.guest_cpu:
+        return probe_cache.guest_cpu[key]
+    async with probe_cache.get_lock("guest_cpu"):
+        if key in probe_cache.guest_cpu:
+            return probe_cache.guest_cpu[key]
+        binary = _probed_qemu_binary()
+        args = (
+            "-M", "microvm,acpi=off,x-option-roms=off,isa-serial=off", "-accel", accel, "-cpu", cpu,
+            "-m", "16", "-nodefaults", "-no-user-config", "-display", "none", "-S", "-qmp", "stdio",
+        )  # fmt: skip
+        try:
+            returncode, stdout, stderr = await run_probe(
+                (binary, *args), stdin=_GUEST_CPU_QMP, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+        except OSError as e:  # TimeoutError too
+            probe_cache.failures["guest_cpu"] = e
+            raise _qemu_probe_failure("guest_cpu", "guest CPU", f"-cpu {cpu}", expected="a QMP greeting") from None
+        if returncode < 0:
+            probe_cache.failures["guest_cpu"] = _exit_error(returncode)
+            raise _qemu_probe_failure("guest_cpu", "guest CPU", f"-cpu {cpu}", expected="a QMP greeting")
+        if returncode != 0:
+            reasons = " ".join(line.strip() for line in stderr.decode(errors="replace").splitlines() if line.strip())
+            context = {"binary": binary, "accel": accel, "cpu": cpu}
+            if "doesn't support requested feature" in reasons:  # enforce: KVM's or TCG's refusal
+                raise ConfigError(
+                    f"This host cannot run the guest CPU ({binary} -accel {accel} -cpu {cpu}): {reasons}",
+                    code=ErrorCode.HOST_DEPENDENCY,
+                    context=context,
+                    hint="x86 guests need an x86-64-v3 host CPU (Intel Haswell or AMD Zen 1, or newer) "
+                    "that passes these flags to its VMs.",
+                    instance_id=None,
+                )
+            # Another QEMU error (KVM_CREATE_VM out of memory, for example): it can pass, and
+            # nothing is kept, so the next start probes again
+            raise TransientError(
+                f"QEMU did not start the guest CPU ({binary} -accel {accel} -cpu {cpu}, exit code "
+                f"{returncode}): {reasons or 'no reason given'}",
+                code=ErrorCode.QEMU_CRASHED,
+                context=context,
+                hint=None,
+                instance_id=None,
+            )
+        rates: list[int] = []
+        for line in stdout.splitlines():
+            if line.startswith(b"{"):
+                with contextlib.suppress(ValueError):  # a line QEMU should not send (parse_qmp_line): no rate
+                    reply = parse_qmp_line(line)
+                    if isinstance(reply, dict) and isinstance(rate := cast("dict[str, Any]", reply).get("return"), int):
+                        rates.append(rate)
+        rate = rates[0] if rates and rates[0] > 0 and accel == "kvm" else None
+        probe_cache.guest_cpu[key] = rate
+        return rate
 
 
 def can_access(path: Path | str, mode: int) -> bool:
@@ -1423,7 +1730,10 @@ except Exception:
     sys.exit(3)  # Error
 """
         returncode, _, _ = await run_probe(
-            (sys.executable, "-c", probe_script), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+            (sys.executable, "-c", probe_script),
+            stdin=None,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
 
         if returncode == 0:
@@ -1488,6 +1798,7 @@ async def probe_unshare_support() -> bool:
                 "--",
                 "/usr/bin/true",
             ),
+            stdin=None,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1521,6 +1832,7 @@ async def probe_setpriv_pdeathsig() -> bool:
         # The launch form: setpriv, then /bin/sh (subprocess_utils._launch_command)
         returncode, _, stderr = await run_probe(
             ("setpriv", "--pdeathsig", "KILL", "--", "/bin/sh", "-c", ":"),
+            stdin=None,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1572,7 +1884,7 @@ async def detect_accel_type(*, force_emulation: bool) -> AccelType:
     Raises:
         TransientError: QEMU_CRASHED, or ConfigError HOST_DEPENDENCY: the host has the
             accelerator, but the QEMU accelerator probe gave no answer (check_kvm_available,
-            check_hvf_available)
+            check_hvf_available), or the /dev/kvm check gave no answer (_kvm_check_failure)
     """
     if force_emulation:
         return AccelType.TCG

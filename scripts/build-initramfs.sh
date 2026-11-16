@@ -8,20 +8,14 @@ set -euo pipefail
 # No kernel modules needed — saves ~10s build time + ~400KB.
 #
 # Features:
-# - tiny-init: single static Rust binary (~50-100KB vs 1MB busybox)
+# - tiny-init: single static Rust binary (~0.5 MB vs 1MB busybox)
 # - zstd compression (~30% smaller than LZ4)
-# - Size: ~80-100KB
+# - Size: ~220 KB
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGES_DIR="$SCRIPT_DIR/../images"
-DEFAULT_OUTPUT_DIR="$IMAGES_DIR/dist"
+OUTPUT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/images/dist"  # absolute: the archive is made from the temp folder
 
 ARCH="${1:-x86_64}"
-OUTPUT_DIR="${2:-$DEFAULT_OUTPUT_DIR}"
-
-# Convert OUTPUT_DIR to absolute path
-mkdir -p "$OUTPUT_DIR"
-OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 # Map architecture names
 case "$ARCH" in

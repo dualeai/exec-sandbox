@@ -53,6 +53,7 @@ import contextlib
 import ctypes
 import fcntl
 import functools
+import logging
 import math
 import os
 import shutil
@@ -61,12 +62,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Final, Protocol, TypeVar, cast
 from uuid import uuid4
 
 import psutil
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.cgroup import (
     detect_cgroup_cpu_limit,
     detect_cgroup_memory_limit_mb,
@@ -85,9 +85,7 @@ from exec_sandbox.platform_utils import HostOS, detect_host_os
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-logger = get_logger(__name__)
-
-CapacitySource = Literal["manual", "cgroup", "psutil", "none", "unknown"]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -165,6 +163,7 @@ class _DiskSpace:
     needed_mb: float
     """Reserve of the requested disk (nothing written yet): requested_mb / the ratio."""
     floor_mb: int
+    """Free space gate 4 keeps (disk_free_floor_mb)."""
 
     @property
     def shortfall_mb(self) -> float:
@@ -450,8 +449,8 @@ def _syncfs(path: Path) -> None:
 # Sentinel for "no limit" of a dimension that no probe sizes
 _UNLIMITED: Final[float] = float("inf")
 
-# Probe cache TTL: collapses repeated probes into 1 when
-# self-wake timer or stop() wakes multiple waiters simultaneously
+# Probe cache TTL: collapses repeated probes into 1 when one wake-up (a release, the
+# self-wake timer) wakes several waiters at once
 _PROBE_CACHE_TTL_SECONDS: Final[float] = 0.1
 
 # Linux PSI threshold: percentage of last 10s ALL tasks were stalled on memory.
@@ -540,7 +539,7 @@ def budget_need(memory_mb: float, cpu_cores: float, *, use_tcg: bool) -> dict[Ro
 
 class ResourceAdmissionController:
     """Resource-aware admission controller for VM lifecycle: the gates of the module docstring
-    (gate 3a: system_available - requested >= floor). With floor=0 (default), 3a rejects only
+    (gate 3a: system_available - requested >= floor). With floor=0 (the setting's default), 3a rejects only
     when the system cannot fit the requested VM: backpressure across processes.
     """
 
@@ -578,9 +577,6 @@ class ResourceAdmissionController:
         self._memory_budget_mb: float = _UNLIMITED
         self._cpu_budget: float = _UNLIMITED
 
-        # Where the memory size came from (the CPU count has its own source; logs only)
-        self._capacity_source: CapacitySource = "unknown"
-
         # Current allocations (protected by _condition's lock)
         self._allocated_memory_mb: float = 0.0
         self._allocated_cpu: float = 0.0
@@ -607,6 +603,7 @@ class ResourceAdmissionController:
         # blocks makes room again (_make_room: a listing of each cache) only then, not at each
         # wake-up
         self._room_version = 0
+        # Set by stop(): acquire() waiters raise at once, and a pass waiting for a syncfs ends
         self._stop_event = asyncio.Event()
         # reservation id -> the reserve (MB) of each request that gate 4 blocks: a pass evicts
         # for all of them at once (on ZFS, one transaction sync then shows the space of all)
@@ -621,9 +618,6 @@ class ResourceAdmissionController:
         # Condition for blocking acquire / signaling release
         self._condition = asyncio.Condition()
         self._started = False
-        self._start_lock = asyncio.Lock()
-
-        # Shutdown flag: set by stop() to unblock acquire() waiters immediately
 
         # Self-wake timer: periodically notifies blocked waiters so Gate 3
         # re-probes system memory (closes wakeup gap for external recovery)
@@ -631,7 +625,6 @@ class ResourceAdmissionController:
 
         # If host resources were provided at construction, compute budgets now
         if host_memory_mb is not None and host_cpu_count is not None:
-            self._capacity_source = "manual"
             self._compute_budgets()
             self._started = True
             logger.warning(
@@ -652,86 +645,82 @@ class ResourceAdmissionController:
 
         Safe to call multiple times (idempotent after first probe).
         If all probes fail, degrades gracefully to unlimited budgets.
-        Serialized via asyncio.Lock to prevent concurrent probe races.
         """
-        async with self._start_lock:
-            # Start self-wake timer if not already running (idempotent); none after stop(),
-            # which would not end it
-            if self._self_wake_task is None and not self._stop_event.is_set():
-                self._self_wake_task = asyncio.create_task(self._self_wake_loop())
-            if self._started:
-                return
+        # Start self-wake timer if not already running (idempotent); none after stop(),
+        # which would not end it
+        if self._self_wake_task is None and not self._stop_event.is_set():
+            self._self_wake_task = asyncio.create_task(self._self_wake_loop())
+        if self._started:
+            return
 
-            # --- L1: a given override, else the cgroup limit ---
-            known_mem = self._given_memory_mb
-            if known_mem is not None:
-                self._capacity_source = "manual"
-            elif (known_mem := detect_cgroup_memory_limit_mb()) is not None:
-                self._host_memory_mb = known_mem
-                self._capacity_source = "cgroup"
-                logger.info(
-                    "Using cgroup memory limit for admission budget",
-                    extra={"cgroup_memory_mb": round(known_mem)},
-                )
-
-            known_cpu = self._given_cpu_count
-            if known_cpu is None and (known_cpu := detect_cgroup_cpu_limit()) is not None:
-                self._host_cpu_count = known_cpu
-                logger.info(
-                    "Using cgroup CPU limit for admission budget",
-                    extra={"cgroup_cpus": round(known_cpu, 2)},
-                )
-
-            # --- Fallback to psutil for any missing dimension, each probe on its own: one that
-            # fails leaves the other's dimension sized ---
-            loop = asyncio.get_running_loop()
-            if known_mem is None:
-                try:
-                    vmem = await loop.run_in_executor(None, psutil.virtual_memory)
-                    known_mem = self._host_memory_mb = vmem.total / (1024 * 1024)
-                    self._capacity_source = "psutil"
-                except (OSError, AttributeError):
-                    logger.debug("The psutil memory probe failed", exc_info=True)
-            if known_cpu is None:
-                try:
-                    cpu_count = await loop.run_in_executor(None, psutil.cpu_count)
-                except (OSError, AttributeError):
-                    logger.debug("The psutil CPU probe failed", exc_info=True)
-                else:
-                    if cpu_count:  # None: psutil cannot count them (unsized, not 1 CPU)
-                        known_cpu = self._host_cpu_count = float(cpu_count)
-
-            self._compute_budgets()
-            # A dimension that no probe sized has no limit, as when every probe fails: never a
-            # budget computed from a host size of 0
-            unsized = [name for name, size in (("memory", known_mem), ("cpu", known_cpu)) if size is None]
-            if known_mem is None:
-                self._memory_budget_mb = _UNLIMITED
-                self._capacity_source = "none"
-            if known_cpu is None:
-                self._cpu_budget = _UNLIMITED
-            if unsized:
-                logger.warning(
-                    "Resource probes failed: no admission limit for these resources",
-                    extra={"unsized": unsized},
-                )
+        # --- L1: a given override, else the cgroup limit ---
+        known_mem = self._given_memory_mb
+        source = "none" if known_mem is None else "manual"  # where the memory size came from (log only)
+        if known_mem is None and (known_mem := detect_cgroup_memory_limit_mb()) is not None:
+            self._host_memory_mb = known_mem
+            source = "cgroup"
             logger.info(
-                "Host resources detected",
-                extra={
-                    "capacity_source": self._capacity_source,
-                    "host_memory_mb": round(self._host_memory_mb),
-                    "host_cpu_count": self._host_cpu_count,
-                    "host_memory_reserve_ratio": self._host_memory_reserve_ratio,
-                    "host_memory_reserve_mb": round(self._host_memory_mb * self._host_memory_reserve_ratio),
-                    "memory_budget_mb": self._memory_budget_mb,
-                    "cpu_budget": self._cpu_budget,
-                    "memory_overcommit_ratio": self._memory_overcommit_ratio,
-                    "cpu_overcommit_ratio": self._cpu_overcommit_ratio,
-                    "disk_overcommit_ratio": self._disk_overcommit_ratio,
-                },
+                "Using cgroup memory limit for admission budget",
+                extra={"cgroup_memory_mb": round(known_mem)},
             )
 
-            self._started = True
+        known_cpu = self._given_cpu_count
+        if known_cpu is None and (known_cpu := detect_cgroup_cpu_limit()) is not None:
+            self._host_cpu_count = known_cpu
+            logger.info(
+                "Using cgroup CPU limit for admission budget",
+                extra={"cgroup_cpus": round(known_cpu, 2)},
+            )
+
+        # --- Fallback to psutil for any missing dimension, each probe on its own: one that
+        # fails leaves the other's dimension sized ---
+        loop = asyncio.get_running_loop()
+        if known_mem is None:
+            try:
+                vmem = await loop.run_in_executor(None, psutil.virtual_memory)
+                known_mem = self._host_memory_mb = vmem.total / (1024 * 1024)
+                source = "psutil"
+            except (OSError, AttributeError):
+                logger.debug("The psutil memory probe failed", exc_info=True)
+        if known_cpu is None:
+            try:
+                cpu_count = await loop.run_in_executor(None, psutil.cpu_count)
+            except (OSError, AttributeError):
+                logger.debug("The psutil CPU probe failed", exc_info=True)
+            else:
+                if cpu_count:  # None: psutil cannot count them (unsized, not 1 CPU)
+                    known_cpu = self._host_cpu_count = float(cpu_count)
+
+        self._compute_budgets()
+        # A dimension that no probe sized has no limit, as when every probe fails: never a
+        # budget computed from a host size of 0
+        unsized = [name for name, size in (("memory", known_mem), ("cpu", known_cpu)) if size is None]
+        if known_mem is None:
+            self._memory_budget_mb = _UNLIMITED
+        if known_cpu is None:
+            self._cpu_budget = _UNLIMITED
+        if unsized:
+            logger.warning(
+                "Resource probes failed: no admission limit for these resources",
+                extra={"unsized": unsized},
+            )
+        logger.info(
+            "Host resources detected",
+            extra={
+                "capacity_source": source,
+                "host_memory_mb": round(self._host_memory_mb),
+                "host_cpu_count": self._host_cpu_count,
+                "host_memory_reserve_ratio": self._host_memory_reserve_ratio,
+                "host_memory_reserve_mb": round(self._host_memory_mb * self._host_memory_reserve_ratio),
+                "memory_budget_mb": self._memory_budget_mb,
+                "cpu_budget": self._cpu_budget,
+                "memory_overcommit_ratio": self._memory_overcommit_ratio,
+                "cpu_overcommit_ratio": self._cpu_overcommit_ratio,
+                "disk_overcommit_ratio": self._disk_overcommit_ratio,
+            },
+        )
+
+        self._started = True
 
     async def stop(self) -> None:
         """Stop the admission controller and unblock all waiting acquire() callers.
@@ -787,14 +776,17 @@ class ResourceAdmissionController:
         Note:
             We opened https://github.com/giampaolo/psutil/issues/2725 to add
             cross-platform memory-pressure metrics to psutil. Once merged,
-            replace ``_probe_psi_linux`` / ``_probe_pressure_macos`` /
-            ``_read_macos_memory_pressure_level`` with a single psutil call.
+            replace ``_probe_psi_linux`` and ``_read_macos_memory_pressure_level``
+            with a single psutil call.
         """
         host_os = detect_host_os()
         if host_os is HostOS.LINUX:
             return self._probe_psi_linux()
         if host_os is HostOS.MACOS:
-            return self._probe_pressure_macos()
+            # CRITICAL only (a failed sysctl admits): WARN is common during normal operation
+            # (active compressor, many apps open), and blocking at WARN makes the tool unusable
+            # on most dev machines
+            return _read_macos_memory_pressure_level() == _MACOS_PRESSURE_CRITICAL
         return False
 
     @staticmethod
@@ -812,15 +804,6 @@ class ResourceAdmissionController:
         except (OSError, ValueError):
             pass
         return False
-
-    @staticmethod
-    def _probe_pressure_macos() -> bool:
-        """Read kernel memory pressure level via sysctl (macOS): True at CRITICAL (reject),
-        False otherwise (NORMAL, WARN, an unknown level, a failed sysctl)."""
-        level = _read_macos_memory_pressure_level()
-        # CRITICAL only: WARN is common during normal operation (active compressor, many apps
-        # open), and blocking at WARN makes the tool unusable on most dev machines
-        return level == _MACOS_PRESSURE_CRITICAL
 
     async def _self_wake_loop(self) -> None:
         """Periodically notify blocked waiters so Gate 3 re-probes.
@@ -904,7 +887,7 @@ class ResourceAdmissionController:
         """
         # Budgets are static: a request above the whole budget can never be
         # admitted, so fail now instead of after `timeout`.
-        self.check_fits(vm_id, memory_mb, cpu_cores, use_tcg=use_tcg, target={})
+        self.check_fits(vm_id, memory_mb, cpu_cores, use_tcg=use_tcg, required={}, found={})
         total_memory_mb, total_cpu = _vm_totals(memory_mb, cpu_cores, use_tcg=use_tcg)
         reservation = ResourceReservation(
             vm_id=vm_id,
@@ -1019,13 +1002,20 @@ class ResourceAdmissionController:
             self._condition.notify(1)
 
     def check_fits(
-        self, vm_id: str, memory_mb: float, cpu_cores: float, *, use_tcg: bool, target: Mapping[RouteKey, str]
+        self,
+        vm_id: str,
+        memory_mb: float,
+        cpu_cores: float,
+        *,
+        use_tcg: bool,
+        required: Mapping[RouteKey, str],
+        found: Mapping[RouteKey, str | None],
     ) -> tuple[dict[RouteKey, str], dict[RouteKey, str | None]]:
         """The budget facts a VM of this size needs (budget_need) and this budget's (None: no
         limit), as a RouteError's `required` and `found` give them. Raise when the VM, with
-        its overheads, is larger than the whole budget: it can never be admitted. `target`:
-        route facts the caller checked before (this worker has them), added to the error's
-        `required` and `found`.
+        its overheads, is larger than the whole budget: it can never be admitted. `required`
+        and `found`: route facts the caller checked before and this worker's values for them
+        (they hold), added to the error's `required` and `found`.
 
         Raises:
             RouteError: CAPACITY_NEVER_FITS
@@ -1049,8 +1039,8 @@ class ResourceAdmissionController:
             f"{need[RouteKey.CPU]} CPU; total budget {mem_budget_str}MB memory, "
             f"{cpu_budget_str} CPU.",
             code=ErrorCode.CAPACITY_NEVER_FITS,
-            required={**target, **need},
-            found={**target, **have},
+            required={**required, **need},
+            found={**found, **have},
             context={
                 "vm_id": vm_id,
                 "requested_memory_mb": need[RouteKey.MEMORY_MB],
@@ -1071,20 +1061,14 @@ class ResourceAdmissionController:
             None if math.isinf(self._cpu_budget) else math.floor(round(self._cpu_budget * 100, 6)) / 100,
         )
 
-    def _budget_texts(self) -> tuple[str, str]:
-        """The memory budget (whole MB) and the CPU budget (0.1 core) as error texts;
-        "unlimited" for a dimension that no probe sized."""
-        return (
-            "unlimited" if math.isinf(self._memory_budget_mb) else str(round(self._memory_budget_mb)),
-            "unlimited" if math.isinf(self._cpu_budget) else str(round(self._cpu_budget, 1)),
-        )
-
     def _timeout_error(
         self, reservation: ResourceReservation, *, timeout: float, blocked: _Gate | None
     ) -> TransientError:
         """TransientError CAPACITY of a request that waited `timeout`: the gate that
-        blocked it last, the budgets, and the disk figures."""
-        mem_budget_str, cpu_budget_str = self._budget_texts()
+        blocked it last, the budgets (whole MB, 0.1 core; "unlimited" for a dimension that no
+        probe sized), and the disk figures."""
+        mem_budget_str = "unlimited" if math.isinf(self._memory_budget_mb) else str(round(self._memory_budget_mb))
+        cpu_budget_str = "unlimited" if math.isinf(self._cpu_budget) else str(round(self._cpu_budget, 1))
         floor_info = ""
         system_avail = self._probe_available_memory()
         if system_avail is not None:
@@ -1193,7 +1177,7 @@ class ResourceAdmissionController:
 
         Args:
             memory_mb: Total memory needed (guest + overhead)
-            cpu_cores: CPU cores needed
+            cpu_cores: CPU cores needed (guest + overhead)
             disk_mb: Home disk size needed
 
         Returns:

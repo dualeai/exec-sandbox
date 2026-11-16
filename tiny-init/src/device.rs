@@ -10,6 +10,8 @@ pub(crate) const CONSOLE_DEVICES: &[&str] = &["/dev/hvc0", "/dev/ttyS0", "/dev/t
 pub(crate) const CONSOLE_DEVICES_WITH_FALLBACK: &[&str] =
     &["/dev/hvc0", "/dev/ttyAMA0", "/dev/ttyS0", "/dev/console"];
 
+/// Run `check` until it returns true: once before each delay of `delays_us` (in µs),
+/// and once after the last one. Returns the result of the last check.
 pub(crate) fn poll_backoff(delays_us: &[u64], mut check: impl FnMut() -> bool) -> bool {
     for &delay_us in delays_us {
         if check() {
@@ -125,7 +127,6 @@ pub(crate) fn setup_virtio_ports() {
 }
 
 /// Set file mode on multiple paths using libc::chmod (no fork/exec overhead).
-/// Mirrors guest-agent's `chmod_paths` utility for consistent pattern.
 pub(crate) fn chmod_paths(mode: libc::mode_t, paths: &[&str]) {
     for path in paths {
         if let Ok(cpath) = CString::new(*path)
@@ -241,32 +242,15 @@ mod tests {
         }
     }
 
-    // Console device constant tests
-
+    // The consoles in the order open_console tries them: virtio-console first (both
+    // architectures), and /dev/console last in the fallback list only
     #[test]
-    fn console_devices_all_start_with_dev() {
-        for &dev in CONSOLE_DEVICES.iter().chain(CONSOLE_DEVICES_WITH_FALLBACK) {
-            assert!(dev.starts_with("/dev/"), "invalid device: {}", dev);
-        }
-    }
-
-    #[test]
-    fn console_fallback_includes_dev_console() {
-        assert!(CONSOLE_DEVICES_WITH_FALLBACK.contains(&"/dev/console"));
-    }
-
-    #[test]
-    fn console_devices_not_empty() {
-        assert!(!CONSOLE_DEVICES.is_empty());
-        assert!(!CONSOLE_DEVICES_WITH_FALLBACK.is_empty());
-    }
-
-    #[test]
-    fn console_devices_no_null_bytes() {
-        // CString::new would fail on null bytes
-        for &dev in CONSOLE_DEVICES.iter().chain(CONSOLE_DEVICES_WITH_FALLBACK) {
-            assert!(!dev.contains('\0'), "null byte in device path: {}", dev);
-        }
+    fn console_devices_in_order() {
+        assert_eq!(CONSOLE_DEVICES, ["/dev/hvc0", "/dev/ttyS0", "/dev/ttyAMA0"]);
+        assert_eq!(
+            CONSOLE_DEVICES_WITH_FALLBACK,
+            ["/dev/hvc0", "/dev/ttyAMA0", "/dev/ttyS0", "/dev/console"]
+        );
     }
 
     // open_console tests
@@ -324,15 +308,25 @@ mod tests {
         let path_str = tmp.to_str().unwrap();
 
         let saved = unsafe { libc::dup(1) };
+        assert!(saved >= 0, "dup(1) failed");
         let result = open_console(&["/dev/nonexistent_xxx", path_str], libc::O_WRONLY, &[1]);
+        // fd 1 is the second console now: a write through it lands in its file
+        let written = unsafe { libc::write(1, b"through fd 1".as_ptr().cast(), 12) };
 
         // Restore stdout and clean up BEFORE asserting
         unsafe {
             libc::dup2(saved, 1);
             libc::close(saved);
         }
+        let content = std::fs::read(&tmp).unwrap_or_default();
         let _ = std::fs::remove_file(&tmp);
         assert!(result);
+        // Contains, not equals: the test harness may print to fd 1 meanwhile (other tests)
+        assert_eq!(written, 12);
+        assert!(
+            content.windows(12).any(|w| w == b"through fd 1"),
+            "{content:?}"
+        );
     }
 
     #[test]

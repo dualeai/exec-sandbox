@@ -294,22 +294,25 @@ class TestTamper:
         return body + sealed + len(body).to_bytes(8, "big") + len(sealed).to_bytes(4, "big") + PACK_MAGIC
 
     @pytest.mark.parametrize(
-        "change",
+        ("change", "message"),
         [
-            pytest.param(lambda r: r[1:], id="dropped"),
-            pytest.param(lambda r: [r[0], *r], id="extra"),
-            pytest.param(lambda r: [r[0], r[2], r[1]], id="swapped"),
+            pytest.param(lambda r: r[1:], "object records overrun the index", id="dropped"),
+            pytest.param(lambda r: [r[0], *r], "object has records the index does not list", id="extra"),
+            pytest.param(lambda r: [r[0], r[2], r[1]], "a stored block failed authentication", id="swapped"),
         ],
     )
-    def test_reordered_records_fail(self, tmp_path: Path, change: Callable[[list[bytes]], list[bytes]]) -> None:
+    def test_reordered_records_fail(
+        self, tmp_path: Path, change: Callable[[list[bytes]], list[bytes]], message: str
+    ) -> None:
         """The index is authenticated and each record's AAD binds its offset: dropping,
-        adding or swapping records (offsets fixed, so the object is well formed) fails."""
+        adding or swapping records (offsets fixed, so the object is well formed) fails, each
+        at the check that sees it: the record lengths the index lists, or the record's AAD."""
         obj, commit = self._object(tmp_path)
         records, sealed = self._split(obj, commit)
         obj.write_bytes(self._join(change(records), sealed))
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_INTEGRITY) as exc:
             self._apply(tmp_path, obj, commit)
-        assert "out of bounds" not in str(exc.value)
+        assert str(exc.value) == f"Instance {_ID}: {message}."
 
     def test_object_of_another_commit_fails(self, tmp_path: Path) -> None:
         obj, _ = self._object(tmp_path)

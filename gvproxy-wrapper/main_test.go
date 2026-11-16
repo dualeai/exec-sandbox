@@ -108,8 +108,10 @@ func TestRequireNetwork(t *testing.T) {
 		{"gateway-mac", "192.168.127.0/24", "192.168.127.1", "", 1500},
 		{"mtu", "192.168.127.0/24", "192.168.127.1", "5a:94:ef:e4:0c:dd", 0},
 	} {
-		if err := requireNetwork(missing.subnet, missing.gateway, missing.mac, missing.mtu); err == nil {
-			t.Errorf("no -%s: want an error", missing.name)
+		err := requireNetwork(missing.subnet, missing.gateway, missing.mac, missing.mtu)
+		want := "-subnet, -gateway-ip, -gateway-mac and -mtu are required (the host passes its network constants)"
+		if err == nil || err.Error() != want {
+			t.Errorf("no -%s: got %v, want %q", missing.name, err, want)
 		}
 	}
 }

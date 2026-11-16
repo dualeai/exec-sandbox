@@ -41,6 +41,7 @@ import asyncio
 import contextlib
 import errno
 import functools
+import logging
 import os
 import select
 import shlex
@@ -52,7 +53,6 @@ from typing import TYPE_CHECKING, Final, Self
 
 import psutil
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_cancellation_safe, run_to_end
 from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.files.disk import make_dirs
@@ -61,7 +61,7 @@ from exec_sandbox.platform_utils import HostOS, child_env, detect_host_os
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Constants
@@ -80,10 +80,12 @@ CGROUP_APP_NAMESPACE: Final[str] = "code-exec"
 CGROUP_PIDS_LIMIT: Final[int] = 256
 """Maximum PIDs in cgroup (fork bomb prevention).
 
-256 provides ample headroom for QEMU + gvproxy threads in both aio=io_uring
-(~38 peak) and aio=threads (~102 peak) modes, while still preventing fork
-bombs (thousands of processes).  Guest code runs inside the VM and does NOT
-count toward this host cgroup limit.
+256 leaves wide headroom over what one VM uses, and still stops a fork bomb (thousands of
+processes). Measured on x86 KVM (QEMU 11.1.3, 2026-11-16), pids.peak of one VM cgroup under
+disk and network I/O, 1 and 2 vCPUs: 17-19 tasks with aio=io_uring and 13-16 with
+aio=threads without the network; 31-32 and 26-29 with it (gvproxy joins the cgroup). The
+QEMU thread pools are capped at 8 (thread-pool-max in qemu_cmd). Guest code runs inside the
+VM and does NOT count toward this host cgroup limit.
 
 Note: pids.max limits both processes AND threads (including goroutines)."""
 
@@ -285,8 +287,14 @@ def _cgroup_can_swap(cgroup_path: Path) -> bool:
     to the mount root sets memory.swap.max to 0. A container started without swap sees the
     host's swap (psutil.swap_memory), but its cgroup namespace root (the mount root, as the
     container sees it) forbids swap."""
-    if not _host_has_swap() or _swappiness() == 0:
+    try:
+        if psutil.swap_memory().total == 0:  # SwapTotal: where anon pages above memory.high can go
+            return False
+    except OSError:  # no /proc/meminfo
         return False
+    with contextlib.suppress(OSError, ValueError):  # an unreadable vm.swappiness is not 0
+        if int(_SWAPPINESS.read_text()) == 0:
+            return False
     base = Path(CGROUP_V2_BASE_PATH)
     for folder in cgroup_path.parents:
         if folder != base and base not in folder.parents:
@@ -297,23 +305,6 @@ def _cgroup_can_swap(cgroup_path: Path) -> bool:
         except OSError:
             continue  # no swap controller file at this level
     return True
-
-
-def _swappiness() -> int | None:
-    """vm.swappiness, or None if it cannot be read."""
-    try:
-        return int(_SWAPPINESS.read_text().strip())
-    except (OSError, ValueError):
-        return None
-
-
-def _host_has_swap() -> bool:
-    """Whether the host has swap (psutil.swap_memory: SwapTotal > 0): where anon pages above a
-    cgroup's memory.high can go."""
-    try:
-        return psutil.swap_memory().total > 0
-    except OSError:  # no /proc/meminfo
-        return False
 
 
 def _write_cgroup_optional(path: Path, value: str) -> None:

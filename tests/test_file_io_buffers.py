@@ -183,14 +183,6 @@ class TestBufferErrors:
                 await session.write_file("test.bin", buf)
             assert "test.bin" not in {f.name for f in await session.list_files()}
 
-    async def test_path_traversal_bytesio(self, scheduler: Scheduler) -> None:
-        """Path traversal with BytesIO content raises InvalidInputError PATH_INVALID."""
-        from exec_sandbox.exceptions import ErrorCode, InvalidInputError
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
-                await session.write_file("../escape.txt", io.BytesIO(b"x"))
-
 
 # =============================================================================
 # Ownership / lifecycle

@@ -37,6 +37,18 @@ def test_closed_handler_keeps_no_record() -> None:
     assert handler.queue.qsize() == 0
 
 
+def test_the_listener_formats_a_copy_of_the_record() -> None:
+    """The listener thread formats its own copy of a record: the record that the caller's
+    handlers format gets no field from it (asctime, which pytest's default log format does not
+    use). On one shared record, a field that the listener adds while ExtrasFormatter iterates
+    the fields in the caller's thread raises RuntimeError (free-threaded Python)."""
+    handler = _configured()
+    record = _record(extra={"vm_id": "vm-1"}, exc_info=False)
+    handler.handle(record)
+    handler.close()  # the listener formats every queued record before it stops
+    assert "asctime" not in vars(record)
+
+
 def _record(*, extra: dict[str, object], exc_info: bool) -> logging.LogRecord:
     """A WARNING record of the library logger with `extra`, as logger.warning(..., extra=) makes it."""
     try:

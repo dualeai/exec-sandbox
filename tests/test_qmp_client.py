@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from exec_sandbox.qmp_client import QmpClient
+from exec_sandbox.qmp_client import QmpClient, parse_qmp_line
+from tests.conftest import NESTED_QMP_LINE
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 
 _EVENT = b'{"event": "BLOCK_IO_ERROR", "data": {"nospace": false}, "timestamp": {"seconds": 0, "microseconds": 0}}\n'
 _GREETING = b'{"QMP": {"version": {}, "capabilities": []}}\n'
+_CAPABILITIES_OK = b'{"return": {}, "id": "qmp-capabilities"}\n'
 
 
 async def _run(qemu_sends: bytes, act: Callable[[QmpClient], Awaitable[Any]]) -> tuple[Any, list[dict[str, Any]]]:
@@ -120,13 +122,49 @@ class TestExecute:
         )
         assert result == {"return": {}, "id": "q-1"}
 
-    async def test_skipped_events_still_hit_the_limit(self) -> None:
+    @pytest.mark.parametrize(
+        ("skipped", "expected"),
+        [
+            (63, {"return": {}, "id": "q-1"}),
+            (64, (ConnectionResetError, "Too many QMP messages without a matching command response")),
+        ],
+        ids=["under-the-limit", "at-the-limit"],
+    )
+    async def test_skipped_messages_limit(self, skipped: int, expected: object) -> None:
+        """Up to 63 skipped messages (events with no on_event, a stale reply) before the
+        response: 64 is the error_factory's error (a QEMU that floods its monitor), not an
+        endless read."""
+        stale = b'{"return": {}, "id": "q-0"}\n'
         result, _ = await _run(
-            _EVENT * 100 + b'{"return": {}, "id": "q-1"}\n',
+            _EVENT * (skipped - 1) + stale + b'{"return": {}, "id": "q-1"}\n',
             lambda client: client.execute("query-block", arguments=None, timeout=5, on_event=None),
         )
-        assert type(result) is ConnectionResetError
-        assert str(result) == "Too many QMP messages without a matching command response"
+        assert (result if isinstance(result, dict) else (type(result), str(result))) == expected
+
+
+@pytest.mark.usefixtures("qmp_parser_too_deep")
+@pytest.mark.parametrize("stage", ["greeting", "answer"])
+async def test_a_line_nested_too_deep_is_a_value_error(stage: str) -> None:
+    """A line nested too deep for the JSON parser raises ValueError from its RecursionError, as
+    a line that is not JSON does: every caller handles ValueError."""
+    sends = NESTED_QMP_LINE if stage == "greeting" else _GREETING + _CAPABILITIES_OK + NESTED_QMP_LINE
+
+    async def act(client: QmpClient) -> None:
+        await client.start(timeout=5)
+        await client.execute("query-status", arguments=None, timeout=5, on_event=None)
+
+    with pytest.raises(ValueError, match=r"^QMP line of 60001 bytes nested too deep for the JSON parser$") as exc_info:
+        await _run(sends, act)
+    assert isinstance(exc_info.value.__cause__, RecursionError)
+
+
+@pytest.mark.parametrize(
+    ("line", "value"),
+    [(b'{"return": {}}\n', {"return": {}}), (b"[1]\n", [1])],
+    ids=["object", "array"],
+)
+def test_parse_qmp_line_reads_json(line: bytes, value: object) -> None:
+    assert parse_qmp_line(line) == value
 
 
 async def test_connect_closes_a_connection_that_fails_to_start(short_tmp_dir: Path) -> None:

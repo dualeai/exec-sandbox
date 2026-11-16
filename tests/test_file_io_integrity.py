@@ -2,7 +2,7 @@
 
 Tests that the file I/O APIs correctly handle:
 1. Roundtrip integrity across various sizes (SHA256 verification)
-2. Content types (ASCII, binary, UTF-8, null bytes, all byte values)
+2. Every byte value, and the CRLF, CR and LF line ends (a transfer copies bytes, no translation)
 3. Cross-operation verification (file I/O <-> exec interoperability)
 4. Basic operations (list, subdirectory, overwrite, executable permissions)
 
@@ -53,7 +53,7 @@ class TestFileIoRoundtrip:
     )
     async def test_roundtrip_integrity(self, scheduler: Scheduler, size: int, label: str, tmp_path: Path) -> None:
         """Write random bytes, read back, verify SHA256 hash matches."""
-        content = os.urandom(size) if size > 0 else b""
+        content = os.urandom(size)
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / f"roundtrip_{label}.bin"
 
@@ -71,64 +71,24 @@ class TestFileIoRoundtrip:
 
 
 # =============================================================================
-# TestFileContentTypes - Various content encodings and byte patterns
+# TestFileContentTypes - Every byte value and line end
 # =============================================================================
 
 
 class TestFileContentTypes:
-    """Tests for various content types surviving the write/read roundtrip."""
+    """Every byte value and every line end survives the write/read roundtrip. A transfer
+    copies bytes, so this case holds ASCII, UTF-8 and NUL too."""
 
-    async def test_ascii_roundtrip(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Plain ASCII text survives roundtrip."""
-        content = b"Hello, World! The quick brown fox jumps over the lazy dog. 0123456789"
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("ascii.txt", content)
-            await session.read_file("ascii.txt", destination=tmp_path / "ascii.txt")
-
-        assert (tmp_path / "ascii.txt").read_bytes() == content
-
-    async def test_utf8_emoji_and_cjk(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """UTF-8 content with emoji and CJK characters survives roundtrip."""
-        text = "Hello World cafe\u0301 \u00f1 \u4f60\u597d \U0001f389\U0001f680\U0001f30d \u3053\u3093\u306b\u3061\u306f \ud55c\uad6d\uc5b4"
-        content = text.encode("utf-8")
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("utf8.txt", content)
-            await session.read_file("utf8.txt", destination=tmp_path / "utf8.txt")
-
-        assert (tmp_path / "utf8.txt").read_bytes() == content
-
-    async def test_null_bytes_in_content(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Content containing null bytes survives roundtrip."""
-        content = b"before\x00middle\x00\x00after\x00"
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("nulls.bin", content)
-            await session.read_file("nulls.bin", destination=tmp_path / "nulls.bin")
-
-        assert (tmp_path / "nulls.bin").read_bytes() == content
-
-    async def test_all_256_byte_values(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """All 256 possible byte values survive roundtrip."""
-        content = bytes(range(256))
+    async def test_all_byte_values_and_line_ends(self, scheduler: Scheduler, tmp_path: Path) -> None:
+        """All 256 byte values, then CRLF, a lone CR and a lone LF, survive the roundtrip in
+        order: a translation of line ends (CRLF or CR to LF, LF to CRLF) changes the bytes."""
+        content = bytes(range(256)) + b"a\r\nb\rc\nd"
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("all_bytes.bin", content)
             await session.read_file("all_bytes.bin", destination=tmp_path / "all_bytes.bin")
 
         assert (tmp_path / "all_bytes.bin").read_bytes() == content
-
-    async def test_newline_variants_survive(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        r"""Various newline styles (\n, \r\n, \r) survive roundtrip unchanged."""
-        content = b"unix\nwindows\r\nold-mac\rtrailing\n"
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("newlines.txt", content)
-            await session.read_file("newlines.txt", destination=tmp_path / "newlines.txt")
-
-        # Byte-equal: no newline translation
-        assert (tmp_path / "newlines.txt").read_bytes() == content
 
 
 # =============================================================================

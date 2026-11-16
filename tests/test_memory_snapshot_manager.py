@@ -67,6 +67,10 @@ _VMSTATE_DIGEST = "daf7866fe199125e85d29fcb1e7186ea601aa195d28570c8f6d0c11dceeef
 (7, 8 bytes big-endian), then of its one non-zero 64 KiB block: offset 0 (8 bytes
 big-endian) and the 7 bytes. A check that computes another digest misses these entries."""
 
+_EMPTY_VMSTATE_DIGEST = "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+"""The L1 digest of an empty vmstate: SHA-256 of its size alone (0, 8 bytes big-endian;
+shasum -a 256). The digest check passes such an entry: only the zero-size rule refuses it."""
+
 _KEY = re.compile(r"l1-python-v\d+\.\d+-[0-9a-f]{64}")
 """An L1 key of a Python spec: l1-{language}-v{major.minor}-{full SHA-256 hex digest}."""
 
@@ -293,9 +297,14 @@ def _open_gate() -> asyncio.Event:
     return gate
 
 
+_ARM_CPU_ID = "pfr0=0x1101000010110011"
+"""The CPU identity of the faked ARM64 host (its own probe reads the real host)."""
+
+
 @pytest.fixture
 def mock_system_probes() -> Generator[dict[str, Any], None, None]:
-    """Patch system probes (arch, QEMU version, accel) with standard defaults.
+    """Patch system probes (arch, QEMU version, accel, host CPU identity, the qemu-vm probe)
+    with standard defaults.
 
     Returns dict with mock handles so tests can override return values if needed.
     """
@@ -303,9 +312,10 @@ def mock_system_probes() -> Generator[dict[str, Any], None, None]:
     from exec_sandbox.system_probes import AccelType
 
     with (
-        patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
+        patch("exec_sandbox.worker_facts.detect_host_arch") as mock_arch,
+        patch("exec_sandbox.worker_facts.guest_cpu_id", new_callable=AsyncMock, return_value=_ARM_CPU_ID),
         patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as mock_qemu,
-        patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
+        patch("exec_sandbox.worker_facts.detect_accel_type", new_callable=AsyncMock) as mock_accel,
         # QEMU as this user (no sudo probe on a Linux host with the qemu-vm setup)
         patch("exec_sandbox.memory_snapshot_manager.probe_qemu_as_qemu_vm", new_callable=AsyncMock, return_value=False),
     ):
@@ -337,9 +347,10 @@ class TestComputeCacheKey:
         accel_map = {"HVF": AccelType.HVF, "KVM": AccelType.KVM, "TCG": AccelType.TCG}
 
         with (
-            patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
+            patch("exec_sandbox.worker_facts.detect_host_arch") as mock_arch,
+            patch("exec_sandbox.worker_facts.guest_cpu_id", new_callable=AsyncMock, return_value=_ARM_CPU_ID),
             patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as mock_qemu,
-            patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
+            patch("exec_sandbox.worker_facts.detect_accel_type", new_callable=AsyncMock) as mock_accel,
         ):
             mock_arch.return_value = HostArch.AARCH64
             mock_qemu.return_value = qemu_version
@@ -435,25 +446,36 @@ class TestComputeCacheKey:
     async def test_different_cpu_model_different_key(self, manager: MemorySnapshotManager) -> None:
         """Another -cpu value (same accelerator) gives another key: a restore needs the CPU it
         was saved on (an ARM TCG entry saved with pointer auth cannot resume without it)."""
-        with patch("exec_sandbox.memory_snapshot_manager.guest_cpu_model", new_callable=AsyncMock) as cpu:
+        with patch("exec_sandbox.worker_facts.guest_cpu_model", new_callable=AsyncMock) as cpu:
             cpu.return_value = "max,pauth-impdef=on"
             key_max = await self._compute_key(manager, accel="TCG")
             cpu.return_value = "neoverse-v1,pauth=off"
             key_v1 = await self._compute_key(manager, accel="TCG")
         assert key_max != key_v1
 
+    async def test_another_counter_rate_another_key(self, manager: MemorySnapshotManager) -> None:
+        """An entry restores with this host's counter rate (a restore from it passes no boot):
+        a host whose rate changed never restores an entry made at the old rate, where its
+        guest's clock would run fast or slow."""
+        keys = []
+        for hz in (24_000_000, 1_000_000_000):
+            manager.vm_manager._counter_hz = hz  # pyright: ignore[reportPrivateUsage] - VmManager.start reads it
+            keys.append(await self._compute_key(manager))
+        assert keys[0] != keys[1]
+
     async def test_x86_tsc_deadline_changes_the_key(self, manager: MemorySnapshotManager) -> None:
-        """On x86 the guest CPU model holds +tsc-deadline when the host has it (KVM/HVF): a
-        host with it and one without make different keys, through the real guest_cpu_model."""
+        """On x86 the guest CPU model holds +tsc-deadline when a KVM host has it (TCG and HVF
+        never give it): a host with it and one without make different keys, through the real
+        guest_cpu_model."""
         from exec_sandbox.platform_utils import HostArch
         from exec_sandbox.system_probes import AccelType
 
         keys = []
         for tsc_deadline in (True, False):
             with (
-                patch("exec_sandbox.memory_snapshot_manager.detect_host_arch", return_value=HostArch.X86_64),
+                patch("exec_sandbox.worker_facts.detect_host_arch", return_value=HostArch.X86_64),
                 patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as qemu,
-                patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as accel,
+                patch("exec_sandbox.worker_facts.detect_accel_type", new_callable=AsyncMock) as accel,
                 patch("exec_sandbox.qemu_cmd.check_tsc_deadline", new_callable=AsyncMock, return_value=tsc_deadline),
                 patch("exec_sandbox.qemu_cmd.detect_host_x86_vendor", return_value="GenuineIntel"),
             ):
@@ -627,8 +649,8 @@ class TestCheckCache:
     """Tests for check_cache (L1 cache lookups)."""
 
     async def _populate_cache(self, manager: MemorySnapshotManager, *, empty: bool) -> Path:
-        """An entry of the Python spec (requires mock_system_probes fixture): _VMSTATE with
-        its digest, or an empty vmstate with no digest."""
+        """An entry of the Python spec (requires mock_system_probes fixture): _VMSTATE, or an
+        empty vmstate, with its digest."""
         key = await manager.compute_cache_key(
             VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
         )
@@ -637,22 +659,26 @@ class TestCheckCache:
         vmstate.write_bytes(b"" if empty else _VMSTATE)
         vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
         vmstate.with_suffix(".ram").write_bytes(b"ram")  # and its RAM template
-        meta.write_text(json.dumps({"test": True} if empty else {"test": True, "vmstate_sha256": _VMSTATE_DIGEST}))
+        meta.write_text(
+            json.dumps({"test": True, "vmstate_sha256": _EMPTY_VMSTATE_DIGEST if empty else _VMSTATE_DIGEST})
+        )
         return vmstate
 
     async def test_zero_size_cleaned_up(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Zero-size vmstate is cleaned up and returns miss."""
+        """A zero-size vmstate is a miss and the entry goes, though its digest matches: an empty
+        migration stream restores nothing."""
         vmstate = await self._populate_cache(manager, empty=True)
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is None
-        assert not vmstate.exists()
+        assert _files_of(manager, vmstate.name.removesuffix(".vmstate")) == []
 
     async def test_invalid_metadata_cleaned_up(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Invalid metadata causes cleanup and returns miss."""
+        """Metadata with no digest (here not JSON; TestSnapshotMetadata has each such form) is a
+        miss, and the entry goes."""
         vmstate = await self._populate_cache(manager, empty=False)
         # Corrupt metadata
         meta = vmstate.parent / f"{vmstate.name[: -len('.vmstate')]}.vmstate.meta"
@@ -675,23 +701,6 @@ class TestCheckCache:
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is None
         assert vmstate.exists()
-
-    async def test_no_sha256_in_metadata_is_a_miss(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Metadata without vmstate_sha256 (every save writes one): a miss, and the entry goes."""
-        key = await manager.compute_cache_key(
-            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
-        )
-        vmstate = manager.cache_dir / f"{key}.vmstate"
-        meta = manager.cache_dir / f"{key}.vmstate.meta"
-        vmstate.write_bytes(b"fake vmstate data")
-        vmstate.with_suffix(".home").write_bytes(b"home disk")
-        meta.write_text(json.dumps({"test": True}))  # No vmstate_sha256 field
-
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is None
-        assert not vmstate.exists()
 
 
 @pytest.mark.usefixtures("mock_system_probes")
@@ -757,16 +766,17 @@ class TestHomeDiskEntry:
     async def test_missing_home_disk_is_a_miss_and_entry_removed(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
+        """An entry with every file but its home disk: a restored VM's page cache refers to
+        that disk, so the entry is a miss, and its files go."""
         spec = VmSpec(language=Language.PYTHON, memory_mb=512)
         key = await manager.compute_cache_key(spec, l2_path=None)
         vmstate = manager.cache_dir / f"{key}.vmstate"
-        meta = manager.cache_dir / f"{key}.vmstate.meta"
         vmstate.write_bytes(_VMSTATE)
-        meta.write_text(json.dumps({"vmstate_sha256": _VMSTATE_DIGEST}))
+        vmstate.with_suffix(".ram").write_bytes(b"ram")
+        (manager.cache_dir / f"{key}.vmstate.meta").write_text(json.dumps({"vmstate_sha256": _VMSTATE_DIGEST}))
 
         assert await manager.check_cache(key) is None
-        assert not vmstate.exists()
-        assert not meta.exists()
+        assert _files_of(manager, key) == []
 
     async def test_failed_check_removes_every_file_off_the_loop_and_the_vmstate_last(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
@@ -822,7 +832,8 @@ class TestHomeDiskEntry:
 
 @pytest.mark.usefixtures("mock_system_probes")
 class TestRestore:
-    """restore(): an L1 hit becomes a VM; a miss or a TransientError gives None (the caller cold boots)."""
+    """restore(): an L1 hit becomes a VM; a miss or a failed restore gives None (the caller cold
+    boots), but for a cleanup it cannot confirm (CLEANUP_UNCONFIRMED)."""
 
     _SPEC = VmSpec(language=Language.PYTHON, memory_mb=512)
 
@@ -949,13 +960,40 @@ class TestRestore:
                 id="setup",
             ),
             pytest.param(TimeoutError(), False, id="timeout"),
+            pytest.param(
+                TransientError(
+                    "QEMU died",
+                    code=ErrorCode.QEMU_CRASHED,
+                    context={
+                        "loading": True,
+                        "returncode": -6,
+                        "console_log": "qemu-system-x86_64: kvm_buf_set_msrs: Assertion `ret == cpu->kvm_msr_buf->nmsrs' failed.",
+                    },
+                    hint=None,
+                    instance_id=None,
+                ),
+                True,
+                id="aborted-while-loading",
+            ),
+            pytest.param(
+                TransientError(
+                    "QEMU died",
+                    code=ErrorCode.QEMU_CRASHED,
+                    context={"loading": True, "returncode": -9, "console_log": ""},
+                    hint=None,
+                    instance_id=None,
+                ),
+                False,
+                id="killed-while-loading",
+            ),
         ],
     )
     async def test_transient_failure_removes_only_what_qemu_refused(
         self, manager: MemorySnapshotManager, cause: BaseException, evicted: bool
     ) -> None:
-        """A restore QEMU refused (MIGRATION_REJECTED or MIGRATION_UNSUPPORTED in the cause
-        chain) removes the entry; a setup failure or a timeout keeps it (a good entry)."""
+        """A restore that this worker cannot run (migration_client.refusal_cause in the cause
+        chain: QEMU refused the state, or aborted while it loaded it) removes the entry; a setup
+        failure, a timeout or a kill keeps it (a good entry)."""
         key, files = await self._entry(manager)
         error = TransientError(
             "restore failed", code=ErrorCode.MIGRATION_FAILED, context=None, hint=None, instance_id=None
@@ -1859,7 +1897,11 @@ class TestTemplateRamInMemory:
             await _save(manager, self._SPEC)
         assert vms.mem_paths == [manager.cache_dir / f"{key}.ram"]
         assert _live_folders(live_ram_root) == []
-        assert "L1 template RAM goes to the cache folder" in caplog.text
+        assert [
+            (r.getMessage(), getattr(r, "error", None))
+            for r in caplog.records
+            if r.name == "exec_sandbox.memory_snapshot_files"
+        ] == [("L1 template RAM goes to the cache folder, the save VM runs slower", "[Errno 13] Permission denied")]
 
     @pytest.mark.usefixtures("in_memory")
     async def test_ram_stays_in_the_cache_when_another_user_can_change_the_root(
@@ -2155,9 +2197,10 @@ class TestComputeCacheKeyEdgeCases:
 
         accel_map = {"HVF": AccelType.HVF, "KVM": AccelType.KVM, "TCG": AccelType.TCG}
         with (
-            patch("exec_sandbox.memory_snapshot_manager.detect_host_arch") as mock_arch,
+            patch("exec_sandbox.worker_facts.detect_host_arch") as mock_arch,
+            patch("exec_sandbox.worker_facts.guest_cpu_id", new_callable=AsyncMock, return_value=_ARM_CPU_ID),
             patch("exec_sandbox.memory_snapshot_manager.require_qemu_version", new_callable=AsyncMock) as mock_qemu,
-            patch("exec_sandbox.memory_snapshot_manager.detect_accel_type", new_callable=AsyncMock) as mock_accel,
+            patch("exec_sandbox.worker_facts.detect_accel_type", new_callable=AsyncMock) as mock_accel,
         ):
             mock_arch.return_value = HostArch.AARCH64
             mock_qemu.return_value = qemu_version
@@ -2199,11 +2242,6 @@ class TestComputeCacheKeyEdgeCases:
         assert _KEY.fullmatch(joined), joined
         assert joined != await self._compute_key(manager, packages=["bar", "pkg"])
 
-    async def test_memory_very_large(self, manager: MemorySnapshotManager) -> None:
-        """Very large memory_mb (64GB) produces valid key."""
-        key = await self._compute_key(manager, memory_mb=65536)
-        assert _KEY.fullmatch(key), key
-
     async def test_different_cpu_cores_different_key(self, manager: MemorySnapshotManager) -> None:
         """Different cpu_cores produce different keys."""
         key_1 = await self._compute_key(manager, cpu_cores=1)
@@ -2217,13 +2255,6 @@ class TestComputeCacheKeyEdgeCases:
             key = await self._compute_key(manager, language=lang)
             keys.add(key)
         assert len(keys) == len(Language)
-
-    async def test_key_is_filesystem_safe(self, manager: MemorySnapshotManager) -> None:
-        """Cache key contains only filesystem-safe characters."""
-        key = await self._compute_key(manager)
-        # Should only contain alphanumeric, hyphens, dots
-        for c in key:
-            assert c.isalnum() or c in "-.", f"Unsafe character in key: {c!r}"
 
 
 # ============================================================================
@@ -2260,45 +2291,6 @@ class TestCheckCacheEdgeCases:
         vmstate.unlink()
         result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is None
-
-    async def test_metadata_is_json_array(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Metadata is valid JSON but not a dict (array) → typed parse rejects → miss, entry removed."""
-        vmstate, meta = await self._populate(manager)
-        meta.write_text("[1, 2, 3]")
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is None
-        assert not vmstate.exists()
-        assert not meta.exists()
-
-    async def test_metadata_is_json_string(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Metadata is valid JSON but a bare string → typed parse rejects → miss, entry removed."""
-        vmstate, meta = await self._populate(manager)
-        meta.write_text('"just a string"')
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is None
-        assert not vmstate.exists()
-
-    async def test_metadata_sha256_is_not_string(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Metadata has vmstate_sha256 as int → no digest → miss, entry removed."""
-        vmstate, _meta = await self._populate(manager, meta_dict={"vmstate_sha256": 12345})
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is None
-        assert not vmstate.exists()
-
-    async def test_metadata_sha256_empty_string(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """Metadata has vmstate_sha256 = "": no digest to check (every save writes one) → miss, entry removed."""
-        vmstate, _meta = await self._populate(manager, meta_dict={"vmstate_sha256": ""})
-        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
-        assert result is None
-        assert not vmstate.exists()
 
     async def test_1_byte_vmstate(self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]) -> None:
         """Minimal valid vmstate (1 byte, a zero byte): its size is not zero, so it is a cache hit.

@@ -26,6 +26,7 @@ _MAX = 1024 * 1024
 _PART = s3_parts.PART_BYTES
 """Multipart part and ranged-GET size of the S3 store, read from the code (a tuning value: no setting
 gives it). A larger object is a multipart upload and a download of several ranges (the round trip checks it)."""
+_GET_WITHOUT_ETAG = "Instance store GET k: answer without a usable ETag."
 
 
 @pytest.fixture
@@ -356,10 +357,9 @@ class TestSizes:
 
         proxy.add(first, "^k$", Edit(response=zero))
         mark = len(proxy.log)
-        with pytest.raises(
-            TransientError, match="0 bytes", check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE
-        ):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
             await store.download("k", dest=tmp_path / "dest", max_bytes=size, expected_size=size)
+        assert str(exc.value) == f"Instance store HEAD k: size 0 bytes, {size} expected."
         assert self._asked(proxy, mark) == asked
         assert not (tmp_path / "dest").exists()
 
@@ -514,8 +514,7 @@ class TestStoreAnswers:
         proxy.add("GET", "^k$", Fail(status, code))
         with pytest.raises(error[0], check=lambda e: e.code is error[1]) as exc:
             await store.get("k", max_bytes=_MAX)
-        assert text in str(exc.value)
-        assert "\n" not in str(exc.value)
+        assert str(exc.value) == f"Instance store GET k failed: {text}."  # not the server's message
 
     async def test_archived_object_names_the_storage_class(self, proxied: tuple[InstanceStore, S3Proxy]) -> None:
         """A GET of an object a lifecycle rule moved to an archive class (403 InvalidObjectState):
@@ -524,12 +523,15 @@ class TestStoreAnswers:
         proxy.add("GET", "^k$", Fail(403, "InvalidObjectState"))
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFIG) as exc:
             await store.get("k", max_bytes=_MAX)
-        assert "the object is in an archive storage class" in str(exc.value)
-        assert exc.value.hint is not None
-        assert exc.value.hint.startswith(
-            "Lifecycle rules must not move objects under the instance prefix to an archive storage class"
+        assert str(exc.value) == (
+            "Instance store GET k failed: InvalidObjectState: the object is in an archive storage class "
+            "(Glacier Flexible Retrieval, Glacier Deep Archive or an Intelligent-Tiering archive tier), "
+            "which a load cannot read."
         )
-        assert "s3:GetObject" not in exc.value.hint
+        assert exc.value.hint == (
+            "Lifecycle rules must not move objects under the instance prefix to an archive storage class: "
+            "remove that transition, then restore the object (S3 RestoreObject) or remove the instance."
+        )
 
     async def test_get_answer_without_etag(self, proxied: tuple[InstanceStore, S3Proxy]) -> None:
         store, proxy = proxied
@@ -539,10 +541,9 @@ class TestStoreAnswers:
             resp.headers.popall("ETag")
 
         proxy.add("GET", "^k$", Edit(response=stripped))
-        with pytest.raises(
-            TransientError, match="ETag", check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE
-        ):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
             await store.get("k", max_bytes=_MAX)
+        assert str(exc.value) == _GET_WITHOUT_ETAG
 
     @pytest.mark.parametrize("etag", ['""', '"' + "a" * 2048 + '"'], ids=["empty", "oversized"])
     async def test_unusable_etags(self, proxied: tuple[InstanceStore, S3Proxy], etag: str) -> None:
@@ -555,10 +556,9 @@ class TestStoreAnswers:
             resp.headers["ETag"] = etag
 
         proxy.add("GET", "^k$", Edit(response=swap))
-        with pytest.raises(
-            TransientError, match="ETag", check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE
-        ):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
             await store.get("k", max_bytes=_MAX)
+        assert str(exc.value) == _GET_WITHOUT_ETAG
         proxy.add("PUT_IF", "^k2$", Edit(response=swap))
         assert await store.put_if_absent("k2", data=b"y") == NotApplied(maybe_applied=True)
 
@@ -795,9 +795,12 @@ class TestUnsupportedConditionalWrites:
         assert exc.value.action == "FIX_CONFIG"
 
     async def test_probe_reports_it_at_start(self, proxied: tuple[InstanceStore, S3Proxy], tmp_path: Path) -> None:
+        """The probe raises the store's own error (its 501), not a failed step of its own."""
         store, proxy = proxied
         proxy.add("PUT_IF", "", Fail(501, "NotImplemented"), times=None)
-        with pytest.raises(
-            ConfigError, match="conditional writes", check=lambda e: e.code is ErrorCode.INSTANCE_CONFIG
-        ):
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFIG) as exc:
             await probe(store, scratch=tmp_path)
+        assert re.fullmatch(
+            r"Instance store PUT probe/[0-9a-f]{32}/k1: the store does not support conditional writes \(HTTP 501\)\.",
+            str(exc.value),
+        )

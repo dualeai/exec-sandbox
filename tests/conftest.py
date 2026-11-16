@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import logging
 import os
 import random
@@ -19,7 +20,7 @@ import boto3
 import pytest
 from _pytest.runner import runtestprotocol
 
-from exec_sandbox import constants, subprocess_utils
+from exec_sandbox import constants, qmp_client, subprocess_utils
 from exec_sandbox._logging import LIBRARY_LOGGER_NAME, ExtrasFormatter
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
@@ -294,12 +295,7 @@ skip_unless_aarch64 = pytest.mark.skipif(
     reason="This test requires ARM64/aarch64 architecture",
 )
 
-# Combined markers for specific platform+arch combinations
-skip_unless_macos_x86_64 = pytest.mark.skipif(
-    not (detect_host_os() == HostOS.MACOS and detect_host_arch() == HostArch.X86_64),
-    reason="This test requires macOS on Intel (x86_64)",
-)
-
+# Combined marker for a platform+arch combination
 skip_unless_macos_arm64 = pytest.mark.skipif(
     not (detect_host_os() == HostOS.MACOS and detect_host_arch() == HostArch.AARCH64),
     reason="This test requires macOS on Apple Silicon (ARM64)",
@@ -322,6 +318,57 @@ skip_on_python_312_subprocess_bug = pytest.mark.skipif(
 # ============================================================================
 # Common Paths and Config Fixtures
 # ============================================================================
+
+
+NESTED_QMP_LINE = b"[" * 60_000 + b"\n"
+"""A QMP line nested too deep for the JSON parser (with the qmp_parser_too_deep fixture)."""
+
+
+async def fake_qmp_server(
+    path: Path, *, status: str | None, status_line: bytes | None, requests: list[dict[str, Any]]
+) -> asyncio.Server:
+    """A QMP server on `path` in place of QEMU's command monitor: the greeting, then a reply
+    per command, each command recorded in `requests` (query-status: `status`, or
+    `status_line` as the whole answer when set; any other command: an empty return).
+    status=None never greets."""
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if status is None:
+            await reader.read()  # silent until the client hangs up
+            writer.close()
+            return
+        writer.write(b'{"QMP": {"version": {}, "capabilities": []}}\n')
+        while line := await reader.readline():
+            request = json.loads(line)
+            requests.append(request)
+            result: dict[str, Any] = {}
+            if request["execute"] == "query-status":
+                if status_line is not None:
+                    writer.write(status_line)
+                    await writer.drain()
+                    continue
+                result = {"status": status, "running": status == "running"}
+            writer.write(json.dumps({"return": result, "id": request["id"]}).encode() + b"\n")
+            await writer.drain()
+        writer.close()
+
+    return await asyncio.start_unix_server(serve, path=str(path))
+
+
+@pytest.fixture
+def qmp_parser_too_deep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The JSON parser of qmp_client raises RecursionError on NESTED_QMP_LINE, on every Python.
+    3.12 and 3.13 raise at about 10,000 levels; on 3.14 the C stack sets the depth, which
+    depends on the build (52,069 to 116,220 levels measured with an 8 MB stack): a build that
+    parses 60,000 reports the arrays that never close (JSONDecodeError). The tests check the
+    readers' handling of the parser's RecursionError."""
+
+    def loads(data: bytes) -> object:
+        if data == NESTED_QMP_LINE:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+        return json.loads(data)
+
+    monkeypatch.setattr(qmp_client, "json", SimpleNamespace(loads=loads, dumps=json.dumps))
 
 
 @pytest.fixture
@@ -451,7 +498,8 @@ async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
 @pytest.fixture
 async def running_vm(vm_manager: VmManager) -> AsyncGenerator[QemuVM]:
     """A cold-booted Python VM, outside any session: for tests that send raw requests to the
-    guest agent (model_construct requests, pings) and read its replies."""
+    guest agent (model_construct requests, pings) and read its replies, or that call QemuVM
+    with no session (calls at the same time, a cancel that keeps the VM)."""
     vm = await vm_manager.create_vm(
         VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
         tenant_id="test",
@@ -870,13 +918,15 @@ async def instance_env(
     """Saved instances without QEMU (tests/instance_support.py): yields an InstanceEnv, the real
     InstanceManager on a store behind `s3_proxy`, fake VMs whose QMP sockets live under a short
     path, and the bytes each commit saved. The host probes of the manager are replaced: the QEMU
-    version (no binary needed) and the accelerator (probed once for the worker)."""
-    from tests.instance_support import InstanceEnv, accelerator_probe, fake_machine_types, qemu_floor
+    version (no binary needed), the accelerator (probed once for the worker) and the counter
+    rate (the fake VMs')."""
+    from tests.instance_support import InstanceEnv, accelerator_probe, fake_counter_rate, fake_machine_types, qemu_floor
 
     monkeypatch.setattr("exec_sandbox.instance.manager.require_qemu_version", qemu_floor)
     monkeypatch.setattr("exec_sandbox.worker_facts.require_qemu_version", qemu_floor)
     monkeypatch.setattr("exec_sandbox.instance.manager.require_qemu_machine_types", fake_machine_types)
     monkeypatch.setattr("exec_sandbox.worker_facts.detect_accel_type", accelerator_probe(host_accelerator))
+    monkeypatch.setattr("exec_sandbox.worker_facts.counter_rate", fake_counter_rate)
     async with InstanceEnv.open(proxy=s3_proxy, root=short_tmp_dir, tmp=tmp_path) as env:
         yield env
 
@@ -905,7 +955,7 @@ class LoopTimer:
 
 class LoopClock:
     """The session's loop timers on a test clock, with no real wait: session.py's own
-    `asyncio` name gives a loop whose call_later (the idle deadline) runs on this clock, and
+    `asyncio` name gives a loop whose time() and call_later (the idle deadline) run on this clock, and
     every other call goes to the real loop. The loop itself is not patched: its clock and
     timers stay those of every other task (tests/test_patch_targets.py). Create it before
     the session: the session arms its deadline at creation."""
@@ -917,6 +967,9 @@ class LoopClock:
         clock = self
 
         class _SessionLoop:
+            def time(self) -> float:  # exec() measures its call with it
+                return clock._now
+
             def call_later(self, delay: float, callback: Callable[..., object], *args: object) -> LoopTimer:
                 timer = LoopTimer(clock._now + delay, callback, args)
                 clock._timers.append(timer)

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Print the project version: the latest git tag without its "v" prefix, or
-# 0.0.0.dev0 when the repository has no tag.
+# Print the project version: the nearest tag reachable from HEAD (git describe)
+# without its "v" prefix, or 0.0.0.dev0 when there is none.
 #
 # Usage: cicd/version.sh [-g <repo dir>] [-c] [-m]
 #   -g  repository directory (default: .)

@@ -14,7 +14,9 @@ Run with: make test-slow
 import asyncio
 import contextlib
 import gc
+import io
 import os
+import time
 import tracemalloc
 from pathlib import Path
 from typing import Any, Self
@@ -64,24 +66,15 @@ finally:
 """
 
 
-@pytest.fixture
-def scheduler_config(images_dir: Path) -> SchedulerConfig:
-    """Base scheduler config shared across memory tests (no warm pool)."""
-    return SchedulerConfig(images_dir=images_dir, warm_pool_size=0)
-
-
-async def _warmup_and_baseline(
-    config: SchedulerConfig,
-    *,
-    code: str = "print('warmup')",
-    allow_network: bool = False,
-) -> tuple[psutil.Process, int]:
-    """Run a warmup Scheduler cycle, gc.collect, and return (process, baseline_rss).
+async def _warmup_and_baseline(config: SchedulerConfig, *, allow_network: bool) -> tuple[psutil.Process, int]:
+    """Run a warmup Scheduler cycle (the network code when allow_network), gc.collect, and
+    return (process, baseline_rss).
 
     Absorbs one-time init costs (Scheduler, Pydantic, psutil, mimalloc arenas)
     before taking the RSS baseline.  See test_no_memory_leak_without_network
     docstring for full rationale.
     """
+    code = _NETWORK_TEST_CODE if allow_network else "print('warmup')"
     async with Scheduler(config) as scheduler:
         await run_once(scheduler, VmSpec(language=Language.PYTHON, allow_network=allow_network), code)
     process = psutil.Process()
@@ -90,23 +83,15 @@ async def _warmup_and_baseline(
     return process, baseline_rss
 
 
-def _assert_success_rate(
-    results: list[Any],
-    total: int,
-    *,
-    check_exit_code: bool = False,
-) -> None:
+def _assert_success_rate(results: list[Any]) -> None:
     """Assert >=90% of concurrent results succeeded, logging failures on error.
 
-    Uses int() to floor the threshold so e.g. 4/5 passes (tolerates 1 failure
-    under CI load).  Two modes:
-    - check_exit_code=True: results are ExecutionResult | BaseException
-    - check_exit_code=False: results are None | BaseException
+    A result is an ExecutionResult (a success at exit code 0), None (a success) or the
+    exception. Uses int() to floor the threshold so e.g. 4/5 passes (tolerates 1 failure
+    under CI load).
     """
-    if check_exit_code:
-        failures = [r for r in results if isinstance(r, BaseException) or r.exit_code != 0]
-    else:
-        failures = [r for r in results if isinstance(r, BaseException)]
+    failures = [r for r in results if isinstance(r, BaseException) or (r is not None and r.exit_code != 0)]
+    total = len(results)
     successes = total - len(failures)
     min_required = int(total * 0.9)
     assert successes >= min_required, f"Only {successes}/{total} succeeded (need {min_required}): " + "; ".join(
@@ -114,15 +99,13 @@ def _assert_success_rate(
     )
 
 
-@pytest.fixture(params=[200])
-def iterations(request: pytest.FixtureRequest) -> int:
-    """Parametrized iteration counts for memory leak tests."""
-    return request.param
+_ITERATIONS = 200
+"""VM executions (or file I/O cycles) of each leak test."""
 
 
 @skip_unless_hwaccel
 @pytest.mark.slow
-async def test_no_memory_leak_without_network(iterations: int, scheduler_config: SchedulerConfig) -> None:
+async def test_no_memory_leak_without_network(scheduler_config: SchedulerConfig) -> None:
     """Verify host memory returns to baseline after N VM executions.
 
     Requires hwaccel: 90% success threshold — TCG timeouts cause too many
@@ -135,13 +118,13 @@ async def test_no_memory_leak_without_network(iterations: int, scheduler_config:
     a warm process — a false positive on free-threaded Python, where mimalloc
     per-thread arenas inflate the init cost.
     """
-    process, baseline_rss = await _warmup_and_baseline(scheduler_config)
+    process, baseline_rss = await _warmup_and_baseline(scheduler_config, allow_network=False)
 
     async with Scheduler(scheduler_config) as scheduler:
-        tasks = [run_once(scheduler, VmSpec(language=Language.PYTHON), "print('ok')") for _ in range(iterations)]
+        tasks = [run_once(scheduler, VmSpec(language=Language.PYTHON), "print('ok')") for _ in range(_ITERATIONS)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        _assert_success_rate(results, iterations, check_exit_code=True)
+        _assert_success_rate(results)
 
     gc.collect()
     gc.collect()
@@ -150,13 +133,13 @@ async def test_no_memory_leak_without_network(iterations: int, scheduler_config:
     growth_mb = (final_rss - baseline_rss) / 1024 / 1024
 
     assert growth_mb < _LEAK_THRESHOLD_MB, (
-        f"Memory leak: {growth_mb:.1f}MB growth after {iterations} runs (threshold: {_LEAK_THRESHOLD_MB}MB)"
+        f"Memory leak: {growth_mb:.1f}MB growth after {_ITERATIONS} runs (threshold: {_LEAK_THRESHOLD_MB}MB)"
     )
 
 
 @skip_unless_hwaccel
 @pytest.mark.slow
-async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) -> None:
+async def test_no_memory_leak_with_network(scheduler_config: SchedulerConfig) -> None:
     """Verify no leak with network enabled (gvproxy) over N executions.
 
     Requires hwaccel: same as test_no_memory_leak_without_network, plus
@@ -166,26 +149,16 @@ async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) ->
     docstring for rationale.  The network warmup additionally primes gvproxy binary
     resolution, socket allocation paths, and outbound-allow JSON generation.
     """
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-        default_timeout_seconds=30,
-    )
+    process, baseline_rss = await _warmup_and_baseline(scheduler_config, allow_network=True)
 
-    process, baseline_rss = await _warmup_and_baseline(
-        config,
-        code=_NETWORK_TEST_CODE,
-        allow_network=True,
-    )
-
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         tasks = [
             run_once(scheduler, VmSpec(language=Language.PYTHON, allow_network=True), _NETWORK_TEST_CODE)
-            for _ in range(iterations)
+            for _ in range(_ITERATIONS)
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        _assert_success_rate(results, iterations, check_exit_code=True)
+        _assert_success_rate(results)
 
     gc.collect()
     gc.collect()
@@ -194,7 +167,7 @@ async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) ->
     growth_mb = (final_rss - baseline_rss) / 1024 / 1024
 
     assert growth_mb < _LEAK_THRESHOLD_MB, (
-        f"Memory leak: {growth_mb:.1f}MB growth after {iterations} network runs (threshold: {_LEAK_THRESHOLD_MB}MB)"
+        f"Memory leak: {growth_mb:.1f}MB growth after {_ITERATIONS} network runs (threshold: {_LEAK_THRESHOLD_MB}MB)"
     )
 
 
@@ -284,21 +257,46 @@ _WRITE_BOUND_TEXT = "81 frames in flight of 175,530 B, one frame being built (96
 _WRITE_FRAMES_IN_FLIGHT_MB = {1: 2.3, 10: 14.4}
 
 
-# File sizes of the write peak tests. 32 MiB is above the pipeline capacity
-# (about 10 MiB of chunks): a peak that grows with the file goes over the bound.
-_WRITE_PEAK_SIZES_MB = [1, 10, 32]
+# File sizes of the tracemalloc peak tests. 32 MiB is above the capacity of each
+# pipeline (about 10 MiB of chunks for a write, 8 MiB for a read): a peak that grows
+# with the file goes over the bound.
+_PEAK_SIZES_MB = [1, 10, 32]
 
 # --- Read pipeline bound (tracemalloc) ---
 #
 # read_file(): the operation queue (64 messages) holds the chunk messages of
-# the guest (base64: 4/3 of a 128 KiB chunk each) while the consumer writes
-# each chunk to disk: 64 * 131,072 * 4 / 3 B = 10.67 MiB. 25% headroom: the
-# chunk in hand, the decoder and tracemalloc jitter: 13.33 MiB.
-_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = 13.4
+# the guest while the consumer writes each chunk to its destination. Pydantic
+# decodes the base64 at the parse: a queued message holds one read of the
+# guest's zstd stream into its 128 KiB buffer, at most 131,072 B (random bytes
+# come out as raw blocks, a full read then the 3 B rest of the block: the test
+# content, over 225 values, makes each read one whole block of ~127 KB). A full
+# queue stops the dispatcher, and the StreamReader of the port socket fills:
+# asyncio pauses the transport after the read that takes the buffer over twice
+# its 512 KiB limit, and one read takes up to 262,144 B. The numbers:
+# - the queue: 64 * 131,072 = 8,388,608 B;
+# - the dispatcher: the 65th message, waiting for a slot, and its line (base64
+#   of 131,072 B and the JSON envelope, 174,839 B): 305,911 B;
+# - the consumer: the message in hand and its output (one 128 KiB input piece
+#   of the guest): 262,144 B;
+# - the StreamReader: 2 * 524,288 + 262,144 = 1,310,720 B, allocated with 1/8
+#   more and 6 B (bytearray growth): 1,474,566 B. Reading stops past twice the
+#   limit and starts again only at the limit or under, after a del that shrank
+#   the block to its size: the old block of a growth that copies (after
+#   readuntil() took a line off the front) grew while reading ran, to at most
+#   1,048,576 * 1.125 + 6 = 1,179,654 B. Both blocks and the bytes of the read:
+#   2,916,364 B;
+# - total 11,873,027 B = 11.32 MiB, plus 0.5 MiB of fixed objects: 11.82 MiB.
+# The dispatcher and the consumer are counted at their awaits: the copies that
+# readuntil(), the parse and a decompress step make come when a queue slot is
+# free or the reader holds one block, and those moments stay under the total.
+# Measured at 32 MiB (content over 225 values, both destinations): 10.0-10.7 MiB
+# on HVF (3.12, 3.14t), 10.1-10.8 MiB on x86_64 KVM (3.14).
+_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = 11.9
 
-# The read messages that the operation queue holds for one read_file() (MB), by file size: the
-# base64 of each 128 KiB chunk (4/3 of it), at most 64 queued. 1 MiB: 8 chunks, 1.33 MiB;
-# 10 MiB: 64 of its 80 chunks, 10.67 MiB.
+# The read messages that the operation queue holds for one read_file() (MB), by file size:
+# at most 64 queued, each counted at 4/3 of a 128 KiB chunk (its base64 frame), although a
+# queued message holds the decoded chunk (at most 131,072 B): _FILE_IO_RSS_FIXED_MB was
+# measured with these numbers. 1 MiB: 8 chunks, 1.33 MiB; 10 MiB: 64 of its 80 chunks, 10.67 MiB.
 _READ_MESSAGES_QUEUED_MB = {1: 1.4, 10: 10.7}
 
 # RSS of one write then one read beyond their bounded buffers: interpreter objects, allocator
@@ -348,14 +346,11 @@ async def _file_io_cycle(scheduler: Scheduler, index: int, size_bytes: int, tmp_
 
 @skip_unless_hwaccel
 @pytest.mark.slow
-async def test_no_memory_leak_file_io(
-    iterations: int, file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
-) -> None:
+async def test_no_memory_leak_file_io(file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path) -> None:
     """Verify host memory returns to baseline after repeated file I/O cycles.
 
-    Requires hwaccel: TCG JIT inflates per-VM RSS and L1 restore always
-    fails under software emulation, forcing cold boots every iteration
-    which adds ~50MB overhead across 200 cycles on free-threaded Python.
+    Requires hwaccel: the TCG JIT inflates the RSS of each VM, and 200 cycles
+    under TCG on free-threaded Python grew past the threshold.
 
     Each iteration opens a fresh session, writes a file, reads it back,
     and closes the session.  Threshold reuses _LEAK_THRESHOLD_MB because
@@ -366,7 +361,7 @@ async def test_no_memory_leak_file_io(
     """
     size_bytes = file_io_size_mb * 1024 * 1024
 
-    process, baseline_rss = await _warmup_and_baseline(scheduler_config)
+    process, baseline_rss = await _warmup_and_baseline(scheduler_config, allow_network=False)
 
     async with Scheduler(scheduler_config) as scheduler:
         sem = asyncio.Semaphore(_MAX_CONCURRENT)
@@ -376,11 +371,11 @@ async def test_no_memory_leak_file_io(
                 await _file_io_cycle(scheduler, i, size_bytes, tmp_path)
 
         results = await asyncio.gather(
-            *(guarded(i) for i in range(iterations)),
+            *(guarded(i) for i in range(_ITERATIONS)),
             return_exceptions=True,
         )
 
-        _assert_success_rate(results, iterations)
+        _assert_success_rate(results)
 
     gc.collect()
     gc.collect()
@@ -389,7 +384,7 @@ async def test_no_memory_leak_file_io(
     growth_mb = (final_rss - baseline_rss) / 1024 / 1024
 
     assert growth_mb < _LEAK_THRESHOLD_MB, (
-        f"Memory leak: {growth_mb:.1f}MB growth after {iterations} x {file_io_size_mb}MB "
+        f"Memory leak: {growth_mb:.1f}MB growth after {_ITERATIONS} x {file_io_size_mb}MB "
         f"file I/O cycles (threshold: {_LEAK_THRESHOLD_MB}MB)"
     )
 
@@ -476,7 +471,7 @@ async def test_peak_ram_file_io(file_io_size_mb: int, scheduler_config: Schedule
     """
     size_bytes = file_io_size_mb * 1024 * 1024
 
-    _, baseline_rss = await _warmup_and_baseline(scheduler_config)
+    _, baseline_rss = await _warmup_and_baseline(scheduler_config, allow_network=False)
 
     dest = tmp_path / "peak_test.bin"
 
@@ -517,18 +512,10 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
     growth.  gc.collect() before baseline and before stopping the tracker
     reduces RSS noise from dead objects.
     """
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-        default_timeout_seconds=30 if allow_network else 10,
-    )
+    config = SchedulerConfig(images_dir=images_dir, default_timeout_seconds=30 if allow_network else 10)
 
     # Warmup absorbs one-time init costs (Pydantic, psutil, mimalloc arenas)
-    await _warmup_and_baseline(
-        config,
-        code=_NETWORK_TEST_CODE if allow_network else "print('warmup')",
-        allow_network=allow_network,
-    )
+    await _warmup_and_baseline(config, allow_network=allow_network)
 
     code = _NETWORK_TEST_CODE if allow_network else "print('ok')"
     process = psutil.Process()
@@ -545,7 +532,7 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
             results = await asyncio.gather(*tasks, return_exceptions=True)
             gc.collect()
 
-        _assert_success_rate(results, concurrent_vms, check_exit_code=True)
+        _assert_success_rate(results)
 
     peak_growth_mb = (tracker.peak_rss - baseline_rss) / 1024 / 1024
     per_vm_mb = peak_growth_mb / concurrent_vms
@@ -623,7 +610,7 @@ async def test_peak_ram_concurrent_file_io(
 ) -> None:
     """Measure peak RSS with N sessions each doing write+read concurrently.
 
-    Uses Path input so _resolve_content opens a file handle (no BytesIO copy).
+    Uses Path input: _resolve_content opens a file handle, so the content is not in host memory.
     Source files are created BEFORE baseline measurement, so os.urandom bytes
     are freed and don't pollute the tracked region.
 
@@ -649,7 +636,7 @@ async def test_peak_ram_concurrent_file_io(
         src.write_bytes(os.urandom(size_bytes))
         sources[i] = src
 
-    _, baseline_rss = await _warmup_and_baseline(scheduler_config)
+    _, baseline_rss = await _warmup_and_baseline(scheduler_config, allow_network=False)
 
     async def session_cycle(scheduler: Scheduler, idx: int) -> None:
         src = sources[idx]
@@ -667,7 +654,7 @@ async def test_peak_ram_concurrent_file_io(
                 return_exceptions=True,
             )
 
-        _assert_success_rate(results, concurrent_sessions)
+        _assert_success_rate(results)
 
     peak_growth_mb = (tracker.peak_rss - baseline_rss) / 1024 / 1024
 
@@ -686,9 +673,9 @@ async def test_peak_ram_concurrent_file_io(
 # =============================================================================
 
 
-@pytest.fixture(params=_WRITE_PEAK_SIZES_MB, ids=[f"{s}MB" for s in _WRITE_PEAK_SIZES_MB])
-def write_peak_size_mb(request: pytest.FixtureRequest) -> int:
-    """File size in MB of the write_file peak tests (32 MiB is above the pipeline capacity)."""
+@pytest.fixture(params=_PEAK_SIZES_MB, ids=[f"{s}MB" for s in _PEAK_SIZES_MB])
+def peak_size_mb(request: pytest.FixtureRequest) -> int:
+    """File size in MB of the tracemalloc peak tests (32 MiB is above each pipeline's capacity)."""
     return request.param
 
 
@@ -701,7 +688,7 @@ def _write_bound_message(*, source: str, size_mb: int, peak_mb: float) -> str:
 
 
 @pytest.mark.slow
-async def test_tracemalloc_peak_write_file(write_peak_size_mb: int, scheduler_config: SchedulerConfig) -> None:
+async def test_tracemalloc_peak_write_file(peak_size_mb: int, scheduler_config: SchedulerConfig) -> None:
     """Python allocation peak of write_file with bytes input: under the write pipeline bound.
 
     tracemalloc catches sub-ms spikes that 50 ms psutil sampling misses. The
@@ -712,7 +699,7 @@ async def test_tracemalloc_peak_write_file(write_peak_size_mb: int, scheduler_co
     (_WRITE_PIPELINE_PEAK_MB). One bound for every size: at 32 MiB, a copy of
     the content or a pipeline that grows with the file goes over it.
     """
-    size_bytes = write_peak_size_mb * 1024 * 1024
+    size_bytes = peak_size_mb * 1024 * 1024
 
     async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
@@ -726,20 +713,20 @@ async def test_tracemalloc_peak_write_file(write_peak_size_mb: int, scheduler_co
 
     peak_mb = peak_bytes / 1024 / 1024
     assert peak_mb < _WRITE_PIPELINE_PEAK_MB, _write_bound_message(
-        source="bytes", size_mb=write_peak_size_mb, peak_mb=peak_mb
+        source="bytes", size_mb=peak_size_mb, peak_mb=peak_mb
     )
 
 
 @pytest.mark.slow
 async def test_tracemalloc_peak_write_file_from_path(
-    write_peak_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
+    peak_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
 ) -> None:
     """Python allocation peak of write_file with Path input: the same bound as bytes input.
 
     _resolve_content opens a file handle; write_file reads it chunk by chunk.
     Traced: the frames in flight (_WRITE_PIPELINE_PEAK_MB), whatever the file size.
     """
-    size_bytes = write_peak_size_mb * 1024 * 1024
+    size_bytes = peak_size_mb * 1024 * 1024
     src = tmp_path / "tracemalloc_src.bin"
     src.write_bytes(os.urandom(size_bytes))
 
@@ -753,26 +740,52 @@ async def test_tracemalloc_peak_write_file_from_path(
                 tracemalloc.stop()
 
     peak_mb = peak_bytes / 1024 / 1024
-    assert peak_mb < _WRITE_PIPELINE_PEAK_MB, _write_bound_message(
-        source="Path", size_mb=write_peak_size_mb, peak_mb=peak_mb
-    )
+    assert peak_mb < _WRITE_PIPELINE_PEAK_MB, _write_bound_message(source="Path", size_mb=peak_size_mb, peak_mb=peak_mb)
+
+
+_225_VALUES = bytes(i % 225 for i in range(256))
+"""Random bytes over 225 values compress by ~3 %: zstd writes compressed blocks, not raw ones,
+so each read of the guest's stream is one whole block of ~127 KB (97 % of its 128 KiB buffer;
+raw blocks of random bytes come out as 131,072 B and 3 B in turn: the queue would hold half)."""
+
+
+class _SlowSink(io.RawIOBase):
+    """A read_file destination that keeps nothing (no traced bytes) and takes 5 ms per write:
+    the consumer falls behind, so the operation queue and the StreamReader of the port fill."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.size = 0
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b: Any) -> int:
+        time.sleep(0.005)
+        self.size += len(b)
+        return len(b)
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("destination", ["file", "slow-stream"])
 async def test_tracemalloc_peak_read_file(
-    file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
+    peak_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path, destination: str
 ) -> None:
     """Measure Python-level allocation peak during read_file.
 
-    Read loop: op_queue.get() → base64.b64decode → decompress → disk write,
-    per 128 KB chunk.  Bounded op_queue (64 messages) caps in-flight
-    data at O(queue_capacity).
-    Threshold: 64 messages x chunk wire size + pipeline jitter (hand-computed).
-    Must NOT scale with file size — proves streaming is bounded.
+    Read loop, per 128 KiB chunk: op_queue.get() (pydantic decoded the base64 at
+    the parse) → decompress → destination write. Bounded op_queue (64 messages) caps
+    in-flight data at O(queue_capacity).
+    Threshold: the full queue, the StreamReader buffer and the messages out of the queue
+    (hand-computed: _FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB). One bound for every size: at
+    32 MiB, a read that holds the file goes over it. The content (over 225 values) makes each
+    queued message a whole 128 KiB read; the slow stream keeps the consumer behind, a local
+    file is the common case.
     """
-    size_bytes = file_io_size_mb * 1024 * 1024
-    content = os.urandom(size_bytes)
-    dest = tmp_path / "tracemalloc_read.bin"
+    size_bytes = peak_size_mb * 1024 * 1024
+    content = os.urandom(size_bytes).translate(_225_VALUES)  # each guest read: one whole block (~127 KB)
+    sink = _SlowSink()
+    dest = tmp_path / "tracemalloc_read.bin" if destination == "file" else sink
 
     async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
@@ -785,7 +798,7 @@ async def test_tracemalloc_peak_read_file(
             finally:
                 tracemalloc.stop()
 
-            assert dest.stat().st_size == len(content)
+            assert (dest.stat().st_size if isinstance(dest, Path) else sink.size) == len(content)
 
     peak_mb = peak_bytes / 1024 / 1024
 
@@ -810,7 +823,7 @@ async def test_peak_ram_large_file_io(large_file_mb: int, scheduler_config: Sche
     Requires hwaccel: RSS thresholds are calibrated for KVM/HVF — TCG JIT
     compilation inflates per-VM RSS, causing false positives.
 
-    Uses Path input so _resolve_content opens a file handle (no copy).
+    Uses Path input: _resolve_content opens a file handle, so the content is not in host memory.
     Streaming reads 128 KB chunks; up to about 14.5 MiB of encoded write
     frames are in flight, whatever the file size (both sizes fill the pipeline).
     Baseline is taken before Scheduler creation, so growth includes VM
@@ -826,7 +839,7 @@ async def test_peak_ram_large_file_io(large_file_mb: int, scheduler_config: Sche
     src.write_bytes(os.urandom(size_bytes))
     dest = tmp_path / "large_dest.bin"
 
-    _, baseline_rss = await _warmup_and_baseline(scheduler_config)
+    _, baseline_rss = await _warmup_and_baseline(scheduler_config, allow_network=False)
 
     async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:

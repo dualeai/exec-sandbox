@@ -102,10 +102,19 @@ type _LockKey = tuple[int, int, str]
 _use_locks: dict[_LockKey, _UseLock] = {}
 _use_guard = threading.Condition()
 
-# struct flock for F_GETLK: (l_type, l_whence, l_start, l_len, l_pid) in the field order of the OS
-_FLOCK_FORMAT: Final = "=qqihh" if sys.platform == "darwin" else "=hh4xqqi4x"
 _LOCK_BUSY: Final = frozenset({errno.EACCES, errno.EAGAIN})
 """errno of a record lock held by another process (POSIX allows either)."""
+
+# struct flock in the field order of the OS, the index of its l_type, and the F_GETLK query of
+# _another_process_leases: an exclusive lock over the whole file (l_start and l_len 0)
+if sys.platform == "darwin":
+    _FLOCK_FORMAT: Final = "=qqihh"  # l_start, l_len, l_pid, l_type, l_whence
+    _FLOCK_TYPE: Final = 3
+    _EXCLUSIVE_QUERY: Final = struct.pack(_FLOCK_FORMAT, 0, 0, 0, fcntl.F_WRLCK, os.SEEK_SET)
+else:
+    _FLOCK_FORMAT: Final = "=hh4xqqi4x"  # l_type, l_whence, l_start, l_len, l_pid
+    _FLOCK_TYPE: Final = 0
+    _EXCLUSIVE_QUERY: Final = struct.pack(_FLOCK_FORMAT, fcntl.F_WRLCK, os.SEEK_SET, 0, 0, 0)
 
 
 @dataclass
@@ -217,8 +226,9 @@ def _start_work(key: _LockKey, work: Literal["lease", "evict", "check"]) -> _Use
 
 def _open_use_lock(lock_path: Path) -> IO[bytes] | None:
     """A file on the use lock `lock_path`, or None when no lock can be held: the lock file
-    cannot be made (a read-only disk or folder) and does not exist. Read and write when it
-    can (an exclusive lock needs write), else read (a shared lock needs read only)."""
+    cannot be made (a read-only disk or folder) and does not exist, or this user cannot
+    read it. Read and write when it can (an exclusive lock needs write), else read (a shared
+    lock needs read only)."""
     try:
         return _open_lock_file(lock_path)
     except OSError as e:
@@ -289,20 +299,8 @@ def _another_process_leases(file: IO[bytes]) -> bool:
     F_GETLK places no lock and reads the kernel's lock table only (no disk I/O): it names one
     lock that conflicts with an exclusive one, and the locks of this process never conflict.
     An exclusive one is an eviction: no lease then."""
-    query = struct.pack(_FLOCK_FORMAT, *_flock_fields(fcntl.F_WRLCK))
-    found = struct.unpack(_FLOCK_FORMAT, fcntl.fcntl(file, fcntl.F_GETLK, query))
-    return _flock_type(found) == fcntl.F_RDLCK
-
-
-def _flock_fields(lock_type: int) -> tuple[int, ...]:
-    """A struct flock over the whole file, in _FLOCK_FORMAT's field order."""
-    if sys.platform == "darwin":
-        return (0, 0, 0, lock_type, os.SEEK_SET)  # l_start, l_len, l_pid, l_type, l_whence
-    return (lock_type, os.SEEK_SET, 0, 0, 0)  # l_type, l_whence, l_start, l_len, l_pid
-
-
-def _flock_type(fields: tuple[int, ...]) -> int:
-    return fields[3] if sys.platform == "darwin" else fields[0]
+    found = struct.unpack(_FLOCK_FORMAT, fcntl.fcntl(file, fcntl.F_GETLK, _EXCLUSIVE_QUERY))
+    return found[_FLOCK_TYPE] == fcntl.F_RDLCK
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,8 +416,9 @@ class CacheEntry:
     @contextmanager
     def _try_unused(self) -> Generator[None]:
         """The use lock exclusive, without wait (try_evicting's first lock): BlockingIOError
-        while a lease of the entry is open, in this process or another, or another eviction
-        or check holds it."""
+        while a lease of the entry is open or an eviction holds it, in this process or
+        another, or another thread of this process works on the lock (a lease, a close, a
+        check)."""
         lock_path = _use_lock_path(self.path)
         key = _lock_key(lock_path)
         with _use_guard:

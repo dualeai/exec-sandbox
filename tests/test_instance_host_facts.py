@@ -22,9 +22,11 @@ import pytest
 from exec_sandbox import constants, system_probes
 from exec_sandbox.admission import ResourceAdmissionController
 from exec_sandbox.exceptions import ConfigError, ErrorCode, RouteError, RouteKey, TransientError
+from exec_sandbox.qemu_cmd import CounterRate
 from tests.instance_support import (
     BLOCK,
     BUDGET_KEYS,
+    FAKE_COUNTER_HZ,
     FAKE_LAYOUT,
     NO_VM_TIMEOUT,
     PYTHON,
@@ -107,8 +109,12 @@ async def test_unknown_machine_type_is_not_saved(instance_env: InstanceEnv, tmp_
     store gets nothing (a load starts QEMU with that type)."""
     vm = await _vm_on_a_layer(instance_env, tmp_path)
     vm.machine_type = None
-    with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY, match="machine type"):
+    with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc:
         await instance_env.manager.save(vm, None, new_instance_id=None, resumed=lambda: None)  # type: ignore[arg-type]
+    assert exc.value.message == (
+        f"VM {vm.vm_id}: the QEMU machine type it runs is unknown (this QEMU does not list the "
+        "type it started with). It was not saved."
+    )
     assert await instance_env.store.list_objects("") == []
 
 
@@ -153,10 +159,12 @@ async def test_a_load_without_the_l2_image_routes_to_both_images(instance_env: I
 
 
 async def test_a_vm_above_the_whole_budget_routes_before_the_download(
-    instance_env: InstanceEnv, tmp_path: Path
+    instance_env: InstanceEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A worker whose whole budget can never hold the saved VM: ROUTE (CAPACITY_NEVER_FITS)
-    after the host check and before any download, with the checked facts and the budget."""
+    after the host check and before any download, with the checked facts and the budget.
+    `found` gives this worker's own values: its counter_hz "any" (TSC scaling), not the
+    saved rate it accepted."""
     env = instance_env
     saver = Saver(env, await _vm_on_a_layer(env, tmp_path), manager=env.manager, state=None)
     host = (await saver.save()).body.host
@@ -175,6 +183,10 @@ async def test_a_vm_above_the_whole_budget_routes_before_the_download(
     )
     files = env.work_files()
 
+    async def scaling(_arch: object, _accel: object) -> CounterRate:
+        return CounterRate(hz=FAKE_COUNTER_HZ, any_rate=True)
+
+    monkeypatch.setattr("exec_sandbox.worker_facts.counter_rate", scaling)
     with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS) as exc:
         await env.load(saver.instance_id, manager=env.manager)
 
@@ -182,6 +194,10 @@ async def test_a_vm_above_the_whole_budget_routes_before_the_download(
     assert exc.value.required[RouteKey.MACHINE_TYPE] == host.machine_type
     assert exc.value.required[RouteKey.MEMORY_MB] == "272"  # 192 MB and 80 MB of overhead
     assert exc.value.found[RouteKey.MEMORY_MB] == "90"
+    assert (exc.value.required[RouteKey.COUNTER_HZ], exc.value.found[RouteKey.COUNTER_HZ]) == (
+        str(FAKE_COUNTER_HZ),
+        "any",
+    )
     assert env.work_files() == files  # nothing was downloaded
 
 
@@ -281,7 +297,7 @@ async def test_a_loaded_image_is_never_evicted(instance_env: InstanceEnv, tmp_pa
 
     state = await env.load(saver.instance_id, manager=worker)
     assert guest.packages_image is not None
-    cached = {worker.asset_dir / f"{digest}.img" for digest in (guest.base_image, guest.packages_image)}
+    cached = {worker.assets.cache_dir / f"{digest}.img" for digest in (guest.base_image, guest.packages_image)}
     assert {state.base_image, state.packages_image} == cached
     assert {lease.path for lease in state.asset_leases} == cached
     assert await worker.assets.eviction_order().evict_next() is None  # in use: skipped
@@ -341,7 +357,7 @@ async def test_a_failed_load_releases_the_images_it_leased(instance_env: Instanc
 
     with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH):
         await env.load(saver.instance_id, manager=worker)
-    cached = worker.asset_dir / f"{guest.base_image}.img"
+    cached = worker.assets.cache_dir / f"{guest.base_image}.img"
     assert cached.exists()
     assert (await worker.assets.eviction_order().evict_next() or 0) > 0
     assert not cached.exists()
@@ -360,7 +376,7 @@ async def test_a_check_releases_its_lease(instance_env: InstanceEnv, tmp_path: P
     await worker.check(saver.instance_id, packages_image=no_packages)
     evictions = worker.assets.eviction_order()
     assert [(await evictions.evict_next() or 0) > 0 for _ in range(2)] == [True, True]  # base and L2
-    assert not (worker.asset_dir / f"{guest.base_image}.img").exists()
+    assert not (worker.assets.cache_dir / f"{guest.base_image}.img").exists()
 
 
 async def test_two_loads_of_one_image_download_it_once(instance_env: InstanceEnv, tmp_path: Path) -> None:

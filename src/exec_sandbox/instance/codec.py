@@ -81,21 +81,27 @@ def open_block(cipher: AESGCM, record: bytes, aad: bytes, *, instance_id: str) -
     try:
         block = decompressor.decompress(compressed, max_length=BLOCK_BYTES + 1)
     except zstd.ZstdError:
-        raise other_release(instance_id, what="block") from None
+        raise other_release(instance_id, what="block", writer=None) from None
     if not decompressor.eof or len(block) > BLOCK_BYTES:
-        raise other_release(instance_id, what="block")
+        raise other_release(instance_id, what="block", writer=None)
     return block
 
 
-def other_release(instance_id: str, *, what: str) -> RouteError:
+def other_release(instance_id: str, *, what: str, writer: str | None) -> RouteError:
     """Authenticated data this release cannot read: ROUTE to another release.
 
     The data key authenticated it, so a release of this library wrote it and the
     data is good: never RECREATE, a client would delete it. No format number is
     needed here: authentication already tells "ours, other release" from "damaged".
-    No fact names the release that reads it: `required` is empty.
+    No fact names the release that reads it: `required` is empty. `writer`: the release
+    that wrote it, when the data names one (a head body: head.writer_release), in the
+    message and in context["writer_release"] (describe_instance can raise this error too).
     """
-    return host_mismatch(instance_id=instance_id, required={}, found={}, reason=f"this release cannot read its {what}")
+    reason = f"this release cannot read its {what}" + (f" (exec-sandbox {writer} wrote it)" if writer else "")
+    error = host_mismatch(instance_id=instance_id, required={}, found={}, reason=reason)
+    if writer:
+        error.context["writer_release"] = writer
+    return error
 
 
 def _ids(instance_id: str, commit_id: str) -> bytes:

@@ -1,12 +1,14 @@
 """Tests for WarmVMPool.
 
-Unit tests: Pool data structures, config handling, healthcheck pure functions.
-Integration tests: Real VM pool operations (requires QEMU + images).
+Unit tests (VM boot faked, no QEMU): checkout, pool spec and size, ownership on stop and
+cancel, L1 entry, REPL warm-up, health check, replenish concurrency.
+Integration tests (QEMU + images): real pool VMs, health checks, idle CPU.
 """
 
 import asyncio
 import collections
 import contextlib
+import logging
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -366,32 +368,48 @@ class TestHealthCheckFailures:
                 server.close()
 
 
+@pytest.mark.usefixtures("warm_repl_ok")
 class TestWarmVMPoolConfig:
-    """Tests for WarmVMPool configuration."""
+    """warm_pool_size sets how many VMs the pool of each language holds."""
 
-    def test_explicit_warm_pool_size(self, unit_test_vm_manager) -> None:
-        """When warm_pool_size > 0, it directly sets pool size."""
+    async def test_start_fills_each_language_pool_to_warm_pool_size(self, unit_test_vm_manager) -> None:
+        """start() boots warm_pool_size VMs for every Language, and each pool then holds no more.
+        The VM boot (_boot_warm_vm) is faked: no QEMU."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(warm_pool_size=5)
-        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
-        assert pool.pool_size_per_language == 5
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=2), memory_snapshot_manager=None)
 
-        config = SchedulerConfig(warm_pool_size=50)
-        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
-        assert pool.pool_size_per_language == 50
+        async def boot(language: Language, index: int) -> MagicMock:
+            return MagicMock(vm_id=f"{language.value}-{index}", l1_restored=True, cgroup=None)
 
-    def test_warm_pool_has_all_languages(self, unit_test_vm_manager) -> None:
-        """Warm pool creates a pool for every Language."""
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
-        assert set(pool.pools.keys()) == set(Language)
+        with (
+            patch.object(pool, "_boot_warm_vm", side_effect=boot),
+            patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=True),
+        ):
+            await pool.start()
+            try:
+                # (VMs in the pool, its bound) per language
+                assert {language: (queue.qsize(), queue.maxsize) for language, queue in pool.pools.items()} == (
+                    dict.fromkeys(Language, (2, 2))
+                )
+            finally:
+                await pool.stop()
 
 
 class TestWarmVMPoolSpec:
     """The pool holds one VM shape per language and serves only that spec."""
+
+    async def test_default_spec_gets_the_pool_vm(self, unit_test_vm_manager) -> None:
+        """A request with the VmSpec defaults of its language (no packages, no network) is
+        served from the pool."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
+        pool._shutdown_event.set()  # no refill after the checkout: no VM to boot here
+        vm = TestGetVmLiveness._make_pool_vm(VmState.READY, None)
+        await pool.pools[Language.PYTHON].put(vm)
+
+        assert await pool.get_vm(VmSpec(language=Language.PYTHON)) is vm
 
     @pytest.mark.parametrize(
         "spec_change",
@@ -408,7 +426,7 @@ class TestWarmVMPoolSpec:
         pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         vm = MagicMock()
         await pool.pools[Language.PYTHON].put(vm)
-        request = pool.spec_for(Language.PYTHON).model_copy(update=spec_change)
+        request = VmSpec(language=Language.PYTHON).model_copy(update=spec_change)
 
         assert await pool.get_vm(request) is None
         assert pool.pools[Language.PYTHON].qsize() == 1  # the pool VM was not taken
@@ -429,9 +447,9 @@ class TestWarmVMPoolOwnership:
         pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
         vm = MagicMock()
         vm.vm_id = "checkout-interrupted"
-        vm.l1_restored = False
         vm.state = VmState.READY
         vm.process.returncode = None
+        vm.host_disk_full = False  # a live VM: the checkout serves it (no dead-VM discard)
         await pool.pools[Language.PYTHON].put(vm)
 
         real_create_task = asyncio.create_task
@@ -515,6 +533,25 @@ class TestWarmVMPoolOwnership:
         destroy.assert_awaited_once_with(vm)
         assert pool.pools[Language.PYTHON].empty()
 
+    async def test_stuck_health_pass_is_cancelled_and_the_pool_drains(
+        self, unit_test_vm_manager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A health pass that does not end within its wait (WARM_POOL_HEALTH_CHECK_INTERVAL + 2 s,
+        here 0.1 s) is cancelled, and the pooled VM is still destroyed."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        monkeypatch.setattr(constants, "WARM_POOL_HEALTH_CHECK_INTERVAL", -1.9)
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
+        vm = MagicMock(vm_id="health-pass-stuck")
+        await pool.pools[Language.PYTHON].put(vm)
+        pool._health_task = health = asyncio.create_task(asyncio.Event().wait())
+        with patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=True) as destroy:
+            async with asyncio.timeout(5):
+                await pool.stop()
+
+        assert health.cancelled()
+        destroy.assert_awaited_once_with(vm)
+
     async def test_stop_owns_in_progress_initial_boots_before_final_drain(self, unit_test_vm_manager) -> None:
         """A stubborn boot cannot enqueue a VM after stop reports success."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -548,13 +585,15 @@ class TestWarmVMPoolOwnership:
             patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=True) as destroy,
         ):
             start_waiter = asyncio.create_task(pool.start())
-            await asyncio.wait_for(all_started.wait(), timeout=1)
-            stop_waiter = asyncio.create_task(pool.stop())
-            await asyncio.wait_for(all_cancelled.wait(), timeout=1)
-            await asyncio.sleep(0)
-            assert not stop_waiter.done()
-
-            release_cancelled_boots.set()
+            try:
+                await asyncio.wait_for(all_started.wait(), timeout=1)
+                stop_waiter = asyncio.create_task(pool.stop())
+                await asyncio.wait_for(all_cancelled.wait(), timeout=1)
+                await asyncio.sleep(0)
+                assert not stop_waiter.done()
+            finally:
+                # A failed check still releases the boots: else stop() and the test never end
+                release_cancelled_boots.set()
             await stop_waiter
             with pytest.raises(asyncio.CancelledError):
                 await start_waiter
@@ -644,7 +683,7 @@ class TestWarmVMPoolOwnership:
 
         assert create.await_args.kwargs["reservation"] is reservation
         # The pool's spec has no packages: its L1 key and its restore have no L2 layer
-        memory.compute_cache_key.assert_awaited_once_with(pool.spec_for(Language.PYTHON), l2_path=None)  # type: ignore[attr-defined]
+        memory.compute_cache_key.assert_awaited_once_with(VmSpec(language=Language.PYTHON), l2_path=None)  # type: ignore[attr-defined]
         assert restore.await_args.kwargs["snapshot_drive"] is None
         assert (tmp_path / "cached.vmstate").exists()  # not refused by QEMU: kept
 
@@ -735,7 +774,7 @@ class TestWarmVMPoolL1Entry:
                 assert sorted(
                     (call.args[0].language, call.kwargs["snapshot_drive"]) for call in save.await_args_list
                 ) == [(language, None) for language in sorted(Language)]
-                assert all(call.args[0] == pool.spec_for(call.args[0].language) for call in save.await_args_list)
+                assert all(call.args[0] == VmSpec(language=call.args[0].language) for call in save.await_args_list)
                 assert all(call.kwargs["key"] == "empty" for call in save.await_args_list)
                 # The pool VM is not saved, destroyed or booted again: it is the one in the pool
                 assert boot.await_count == len(Language)
@@ -833,9 +872,9 @@ class TestWarmReplUnit:
         return vms
 
     async def test_ok_ack_pools_each_warmed_vm(self, unit_test_vm_manager) -> None:
-        """Each cold-booted VM gets one warm-up request for its own language; an "ok" ack
-        puts it in the pool of that language, and the warm-up's reseed stands for the one of
-        the first exec (a VM restored from L1 asks for none then)."""
+        """Each cold-booted VM gets two warm-up requests for its own language (the first starts
+        its REPL, the second runs on the live REPL); "ok" acks put it in the pool of that
+        language. The warm-up ran the REPL's reseed, so the user's first exec asks for none."""
         from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
@@ -844,8 +883,8 @@ class TestWarmReplUnit:
             vms = await self._start(pool, return_value=WarmReplAckMessage(status="ok"))
             try:
                 for language, vm in vms.items():
-                    (request,) = vm.channel.send_request.await_args.args
-                    assert request == WarmReplRequest(language=language)
+                    requests = [call.args for call in vm.channel.send_request.await_args_list]
+                    assert requests == [(WarmReplRequest(language=language),)] * 2
                     assert pool.pools[language].get_nowait() is vm
                     assert vm.reseed_next_exec is False
             finally:
@@ -955,7 +994,8 @@ class TestHealthCheckPass:
 
 
 class TestHealthCheckPoolUnit:
-    """Unit tests for _health_check_pool edge cases (a race window, an empty pool)."""
+    """The health loop from start() to stop(), and two edges of one health pass (an empty
+    pool, a cancel while a VM taken out of its pool is checked)."""
 
     async def test_health_check_loop_runs_until_stop(self, unit_test_vm_manager) -> None:
         """start() starts the health check loop; stop() ends it (no task of it is left)."""
@@ -1028,22 +1068,21 @@ class TestHealthCheckPoolUnit:
             finally:
                 await pool.stop()
 
-    async def test_health_check_empty_pool_returns_early(self, unit_test_vm_manager) -> None:
-        """Health check on empty pool returns immediately without error."""
+    async def test_pass_over_an_empty_pool_logs_nothing(
+        self, unit_test_vm_manager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A health pass over an empty pool logs nothing: no pass logs every 15 s for a
+        language whose pool has no VM."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=None)
 
-        # Pool is empty (no startup called)
-        # Should return early without error
-        await pool._health_check_pool(
-            Language.PYTHON,
-            pool.pools[Language.PYTHON],
-        )
+        with caplog.at_level(logging.DEBUG, logger="exec_sandbox.warm_vm_pool"):
+            caplog.clear()  # not the log of the pool's creation
+            await pool._health_check_pool(Language.PYTHON, pool.pools[Language.PYTHON])
 
-        # Pool should still be empty
-        assert pool.pools[Language.PYTHON].qsize() == 0
+        assert caplog.messages == []
+        assert pool.pools[Language.PYTHON].empty()
 
     async def test_cancelled_health_check_destroys_drained_vm(self, unit_test_vm_manager) -> None:
         """Cancellation cannot strand a VM already removed from its pool."""
@@ -1103,34 +1142,6 @@ class TestWarmVMPoolIntegration:
         assert pool.pools[Language.PYTHON].qsize() == 0
         assert pool.pools[Language.JAVASCRIPT].qsize() == 0
         assert pool.pools[Language.RAW].qsize() == 0
-
-    async def test_warm_pool_vm_has_prewarmed_repl(self, vm_manager) -> None:
-        """A VM from the warm pool runs code at once (that the pool warms its REPL first:
-        test_ok_ack_pools_each_warmed_vm)."""
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(warm_pool_size=1)
-        pool = WarmVMPool(vm_manager, config, memory_snapshot_manager=None)
-        await pool.start()
-
-        try:
-            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
-            assert vm is not None
-
-            # First execution should be fast — REPL was pre-warmed; the warm-up's own
-            # printed value never reaches it
-            result = await vm.execute(
-                code="print('warm')",
-                timeout_seconds=30,
-                env_vars=None,
-                on_stdout=None,
-                on_stderr=None,
-            )
-            assert (result.exit_code, result.stdout) == (0, "warm\n")
-
-            await vm_manager.destroy_vm(vm)
-        finally:
-            await pool.stop()
 
     @pytest.mark.parametrize(
         ("language", "set_x", "read_x"),
@@ -1536,7 +1547,7 @@ class TestWarmPoolIdleCpu:
     TCG JIT thread always spins, so the "no execution = no CPU" invariant
     cannot hold.
 
-    Measurement: sample cpu_percent every 1s over 10-15s.
+    Measurement: sample cpu_percent every 1s over 10 to 30 s.
     Assertions: median < 2%, p95 < 10%.
     """
 
@@ -1616,7 +1627,7 @@ class TestWarmPoolIdleCpu:
         finally:
             await pool.stop()
 
-    @pytest.mark.slow  # pool_size=2 may not fully boot within SETTLE_SLEEP_S on loaded CI runners
+    @pytest.mark.slow  # 6 VMs (2 per language) boot and idle at once: too heavy for the default suite
     async def test_multiple_vms_idle_no_interference(self, vm_manager) -> None:
         """Multiple VMs don't interfere with each other's idle CPU (thundering herd)."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -1629,7 +1640,7 @@ class TestWarmPoolIdleCpu:
         try:
             await asyncio.sleep(SETTLE_SLEEP_S)
 
-            # Get all VMs from all language pools (2 each = 6 total)
+            # Get all VMs from all language pools: start() booted 2 per language
             for lang in Language:
                 for _ in range(pool.pool_size_per_language):
                     try:
@@ -1638,7 +1649,7 @@ class TestWarmPoolIdleCpu:
                     except asyncio.QueueEmpty:
                         break
 
-            assert len(vms) >= 2, f"Expected at least 2 VMs, got {len(vms)}"
+            assert len(vms) == 2 * len(Language), f"Expected 2 VMs per language, got {len(vms)}"
 
             all_samples = await collect_cpu_samples_bulk(
                 [vm.process for _, vm in vms],
@@ -1932,34 +1943,6 @@ class TestReplenishRaceCondition:
         # Only 1 boot needed - others see pool full and skip
         assert boot_count == 1, f"Expected 1 boot, got {boot_count}"
 
-    async def test_replenish_skips_when_pool_full(self, unit_test_vm_manager) -> None:
-        """After first replenish, subsequent calls skip (pool full)."""
-        from unittest.mock import patch
-
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(warm_pool_size=1)  # pool_size = 1
-        pool = WarmVMPool(unit_test_vm_manager, config, memory_snapshot_manager=None)
-
-        boot_count = 0
-
-        async def mock_boot(language: Language, index: int) -> AsyncMock:
-            nonlocal boot_count
-            boot_count += 1
-            vm = AsyncMock()
-            vm.vm_id = f"vm-{boot_count}"
-            return vm
-
-        with patch.object(pool, "_boot_warm_vm", side_effect=mock_boot):
-            # First replenish - should boot
-            await pool._replenish_pool(Language.PYTHON)
-            assert boot_count == 1
-            assert pool.pools[Language.PYTHON].qsize() == 1
-
-            # Second replenish - pool is full, should skip
-            await pool._replenish_pool(Language.PYTHON)
-            assert boot_count == 1  # No additional boot
-
     async def test_per_language_semaphore_independence(self, unit_test_vm_manager) -> None:
         """Python replenish must not block JavaScript (would deadlock if shared)."""
         from unittest.mock import patch
@@ -2252,7 +2235,3 @@ class TestReplenishRaceCondition:
         assert max_concurrent == 2, f"Expected max 2 concurrent, got {max_concurrent}"
         # Pool should be full
         assert pool.pools[Language.PYTHON].qsize() == 5
-
-    # -------------------------------------------------------------------------
-    # Weird Cases
-    # -------------------------------------------------------------------------

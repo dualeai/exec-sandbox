@@ -45,7 +45,6 @@ class HostOS(Enum):
     """Unsupported or unrecognized OS."""
 
 
-@cache
 def detect_host_os() -> HostOS:
     """Detect current host operating system using psutil constants.
 
@@ -57,10 +56,10 @@ def detect_host_os() -> HostOS:
         >>> os_type = detect_host_os()
         >>> match os_type:
         ...     case HostOS.LINUX:
-        ...         # Use KVM, ioeventfd, seccomp sandbox
+        ...         # Use KVM and QEMU's seccomp sandbox
         ...         pass
         ...     case HostOS.MACOS:
-        ...         # Use HVF (no ioeventfd, no seccomp)
+        ...         # Use HVF (no seccomp)
         ...         pass
         ...     case HostOS.UNKNOWN:
         ...         raise RuntimeError("Unsupported OS")
@@ -117,7 +116,8 @@ def detect_host_arch() -> HostArch:
 
 @cache
 def detect_host_x86_vendor() -> str:
-    """CPUID vendor of the host CPU ("GenuineIntel" or "AuthenticAMD").
+    """CPUID vendor of the host CPU: its 12 characters, spaces kept ("GenuineIntel",
+    "AuthenticAMD", Zhaoxin's "  Shanghai  "); QEMU refuses a vendor of another length.
 
     x86 guests get the host vendor (KVM runs best with matching vendors). A
     non-x86 host runs x86 guests under TCG and gets qemu64's own vendor.
@@ -132,29 +132,18 @@ def detect_host_x86_vendor() -> str:
             text=True,
             check=True,
             env=child_env(),
-        ).stdout.strip()
+        ).stdout.removesuffix("\n")
     for line in Path("/proc/cpuinfo").read_text().splitlines():
         if line.startswith("vendor_id"):
-            return line.split(":", 1)[1].strip()
+            # The kernel prints "vendor_id\t: <the 12 bytes>"
+            return line.split(": ", 1)[1]
     return "AuthenticAMD"
 
 
 def get_os_name() -> str:
-    """Get OS name string for binary naming conventions.
-
-    Returns:
-        "darwin" for macOS, "linux" for Linux
-
-    Raises:
-        ValueError: If running on unsupported OS
-    """
-    match detect_host_os():
-        case HostOS.MACOS:
-            return "darwin"
-        case HostOS.LINUX:
-            return "linux"
-        case _:
-            raise ValueError("Unsupported OS")
+    """The host OS as binary names spell it: "darwin" for macOS, "linux" for Linux (the import
+    gate of exec_sandbox refuses any other OS)."""
+    return "darwin" if detect_host_os() is HostOS.MACOS else "linux"
 
 
 def get_arch_name() -> str:
@@ -214,7 +203,6 @@ def get_user_dir(*, kind: UserDir) -> Path:
         - macOS: ~/Library/Caches/exec-sandbox/ or ~/Library/Application Support/exec-sandbox/
         - Linux: $XDG_CACHE_HOME/exec-sandbox/ or $XDG_DATA_HOME/exec-sandbox/ when the value is
           an absolute path; else ~/.cache/exec-sandbox/ or ~/.local/share/exec-sandbox/
-        - Other: ~/.cache/exec-sandbox/ or ~/.local/share/exec-sandbox/
 
     "~" is Path.home() (HOME when it is set). Override CACHE with the EXEC_SANDBOX_CACHE_DIR
     environment variable. DATA has no override here: callers take theirs from settings
@@ -239,18 +227,14 @@ def _user_dir(*, kind: UserDir, home: Path, env: Mapping[str, str]) -> Path:
     if override_env and (env_path := env.get(override_env)):
         return Path(env_path)
 
-    match detect_host_os():
-        case HostOS.MACOS:
-            return home.joinpath(*macos_parts, _APP_FOLDER)
-        case HostOS.LINUX:
-            # XDG Base Directory spec: an empty or relative value is invalid and is ignored
-            xdg_home = env.get(xdg_env, "")
-            if Path(xdg_home).is_absolute():
-                return Path(xdg_home) / _APP_FOLDER
-            return home.joinpath(*home_parts, _APP_FOLDER)
-        case _:
-            # Fallback for other platforms
-            return home.joinpath(*home_parts, _APP_FOLDER)
+    if detect_host_os() is HostOS.MACOS:
+        return home.joinpath(*macos_parts, _APP_FOLDER)
+    # Linux (the import gate refuses any other OS). XDG Base Directory spec: an empty or
+    # relative value is invalid and is ignored
+    xdg_home = env.get(xdg_env, "")
+    if Path(xdg_home).is_absolute():
+        return Path(xdg_home) / _APP_FOLDER
+    return home.joinpath(*home_parts, _APP_FOLDER)
 
 
 # psutil errors that mean "this process is gone or not ours to inspect". None of them

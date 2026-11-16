@@ -80,13 +80,7 @@ detect_arch() {
 }
 
 check_deps() {
-    local missing=()
-    command -v docker >/dev/null 2>&1 || missing+=("docker")
-
-    if [ ${#missing[@]} -ne 0 ]; then
-        echo "Missing: ${missing[*]}" >&2
-        exit 1
-    fi
+    command -v docker >/dev/null 2>&1 || { echo "Missing: docker" >&2; exit 1; }
 }
 
 # =============================================================================
@@ -126,11 +120,11 @@ DOCKERFILE
 # Cache helpers - content-addressable build caching via .hash sidecar files
 # =============================================================================
 
-# Compute rootfs hash — everything EXCEPT guest-agent binary.
-# Kept as a component of the full hash for cache-key stability.
-compute_rootfs_hash() {
+# Compute the qcow2 hash: versions, packages, this script and the guest-agent binary.
+compute_qcow2_hash() {
     local variant=$1
     local target_arch=$2
+    local guest_agent=$3
 
     (
         # Version info
@@ -159,22 +153,12 @@ compute_rootfs_hash() {
 
         # Build script itself (invalidate cache when build logic changes)
         cat "$SCRIPT_DIR/build-qcow2.sh" 2>/dev/null || true
-    ) | sha256sum | cut -d' ' -f1
-}
 
-# Compute full hash — rootfs + guest-agent binary.
-# A full hash hit means nothing changed at all.
-compute_qcow2_hash() {
-    local rootfs_hash=$1
-    local guest_agent=$2
-
-    (
-        echo "rootfs=$rootfs_hash"
         sha256sum "$guest_agent" 2>/dev/null | cut -d' ' -f1 || echo "no-agent"
     ) | sha256sum | cut -d' ' -f1
 }
 
-# Check if output is up-to-date (line 1 of .hash matches)
+# Check if output is up-to-date (hash matches)
 cache_hit() {
     local output_file=$1
     local current_hash=$2
@@ -182,7 +166,7 @@ cache_hit() {
 
     if [ -f "$output_file" ] && [ -f "$hash_file" ]; then
         local cached_hash
-        cached_hash=$(head -1 "$hash_file" 2>/dev/null || echo "")
+        cached_hash=$(cat "$hash_file" 2>/dev/null || echo "")
         [ "$cached_hash" = "$current_hash" ]
     else
         return 1
@@ -190,18 +174,10 @@ cache_hit() {
 }
 
 # Save hash after successful build
-# Usage: save_hash <output_file> <full_hash> [rootfs_hash]
 save_hash() {
     local output_file=$1
     local hash=$2
-    local rootfs_hash="${3:-}"
-    local hash_file="${output_file}.hash"
-
-    if [ -n "$rootfs_hash" ]; then
-        printf '%s\n%s\n' "$hash" "$rootfs_hash" > "$hash_file"
-    else
-        echo "$hash" > "$hash_file"
-    fi
+    echo "$hash" > "${output_file}.hash"
 }
 
 # =============================================================================
@@ -269,18 +245,12 @@ find_guest_agent() {
 create_python_rootfs() {
     local rootfs_dir=$1
     local target_arch=$2
-    local docker_platform
+    local docker_platform=$3
     local python_arch
 
     case "$target_arch" in
-        x86_64)
-            docker_platform="linux/amd64"
-            python_arch="x86_64_v3"  # Modern x86-64 (AVX2)
-            ;;
-        aarch64)
-            docker_platform="linux/arm64"
-            python_arch="aarch64"
-            ;;
+        x86_64)  python_arch="x86_64_v3" ;;  # Modern x86-64 (AVX2)
+        aarch64) python_arch="aarch64" ;;
     esac
 
     # Create Alpine rootfs with packages (BuildKit cached)
@@ -295,12 +265,7 @@ create_python_rootfs() {
     # Using musl variant for Alpine Linux compatibility
     local python_url="https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD_DATE}/cpython-${PYTHON_VERSION}%2B${PYTHON_BUILD_DATE}-${python_arch}-unknown-linux-musl-install_only_stripped.tar.gz"
 
-    local uv_arch
-    case "$target_arch" in
-        x86_64)  uv_arch="x86_64" ;;
-        aarch64) uv_arch="aarch64" ;;
-    esac
-    local uv_url="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${uv_arch}-unknown-linux-musl.tar.gz"
+    local uv_url="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${target_arch}-unknown-linux-musl.tar.gz"
 
     # Create temp files for parallel downloads
     local tmp_python="$rootfs_dir/../python.tar.gz"
@@ -378,13 +343,7 @@ create_python_rootfs() {
 # Create rootfs with Node/bun runtime using Docker
 create_node_rootfs() {
     local rootfs_dir=$1
-    local target_arch=$2
-    local docker_platform
-
-    case "$target_arch" in
-        x86_64)  docker_platform="linux/amd64" ;;
-        aarch64) docker_platform="linux/arm64" ;;
-    esac
+    local docker_platform=$2
 
     # Create Alpine rootfs with packages (BuildKit cached)
     echo "  Creating Alpine base + installing packages: $NODE_PKGS"
@@ -409,13 +368,7 @@ create_node_rootfs() {
 # Create raw Alpine rootfs (no runtime)
 create_raw_rootfs() {
     local rootfs_dir=$1
-    local target_arch=$2
-    local docker_platform
-
-    case "$target_arch" in
-        x86_64)  docker_platform="linux/amd64" ;;
-        aarch64) docker_platform="linux/arm64" ;;
-    esac
+    local docker_platform=$2
 
     # Create Alpine rootfs with packages (BuildKit cached)
     echo "  Creating Alpine base + installing packages: $RAW_PKGS"
@@ -459,8 +412,8 @@ build_qcow2() {
     local output_name
 
     # Extract major.minor version
-    local python_minor="${PYTHON_VERSION%.*}"  # 3.14.2 -> 3.14
-    local bun_minor="${BUN_VERSION%.*}"        # 1.3.5 -> 1.3
+    local python_minor="${PYTHON_VERSION%.*}"  # 3.14.10 -> 3.14
+    local bun_minor="${BUN_VERSION%.*}"        # 1.4.4 -> 1.4
 
     case "$variant" in
         python) output_name="python-${python_minor}-base-$target_arch" ;;
@@ -474,20 +427,15 @@ build_qcow2() {
 
     local qcow2_img="$OUTPUT_DIR/$output_name.qcow2"
 
-    # Two-way cache decision (EROFS is read-only, no in-place patching):
-    #   1. Full hash match → skip (nothing changed)
-    #   2. Hash miss → full rebuild
-    local rootfs_hash current_hash
-    rootfs_hash=$(compute_rootfs_hash "$variant" "$target_arch")
-    current_hash=$(compute_qcow2_hash "$rootfs_hash" "$guest_agent")
+    # EROFS is read-only (no in-place patching): a hash match skips the build, a miss rebuilds it whole
+    local current_hash
+    current_hash=$(compute_qcow2_hash "$variant" "$target_arch" "$guest_agent")
 
-    # Case 1: full hash hit — nothing changed
     if cache_hit "$qcow2_img" "$current_hash"; then
         echo "qcow2 up-to-date: $output_name (cache hit)"
         return 0
     fi
 
-    # Case 2: hash miss — full rebuild
     echo "Building $output_name..."
     echo "  Using guest-agent: $guest_agent"
 
@@ -502,10 +450,15 @@ build_qcow2() {
     mkdir -p "$rootfs_dir"
 
     # Create rootfs with appropriate runtime
+    local docker_platform
+    case "$target_arch" in
+        x86_64)  docker_platform="linux/amd64" ;;
+        aarch64) docker_platform="linux/arm64" ;;
+    esac
     case "$variant" in
-        python) create_python_rootfs "$rootfs_dir" "$target_arch" ;;
-        node)   create_node_rootfs "$rootfs_dir" "$target_arch" ;;
-        raw)    create_raw_rootfs "$rootfs_dir" "$target_arch" ;;
+        python) create_python_rootfs "$rootfs_dir" "$target_arch" "$docker_platform" ;;
+        node)   create_node_rootfs "$rootfs_dir" "$docker_platform" ;;
+        raw)    create_raw_rootfs "$rootfs_dir" "$docker_platform" ;;
     esac
 
     # Copy guest-agent
@@ -638,8 +591,7 @@ build_qcow2() {
         "
 
     rm -rf "$tmp_dir"
-    # Save full hash (line 1, the cache key) + rootfs hash (line 2, not read by cache_hit)
-    save_hash "$qcow2_img" "$current_hash" "$rootfs_hash"
+    save_hash "$qcow2_img" "$current_hash"
     echo "Built: $qcow2_img"
 }
 

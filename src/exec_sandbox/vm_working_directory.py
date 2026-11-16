@@ -7,17 +7,17 @@ temporary files (overlay, sockets).
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Self
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled
 from exec_sandbox.exceptions import ErrorCode, TransientError
 from exec_sandbox.permission_utils import sudo_rm
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _WORKDIR_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
 
@@ -41,6 +41,8 @@ class VmWorkingDirectory:
 
     Attributes:
         vm_id: VM identifier for logging
+        use_qemu_vm_user: QEMU runs as qemu-vm (set by VmManager): build_qemu_cmd starts it
+            through sudo, and cleanup() removes its files with sudo
         path: Root directory path (created by mkdtemp with mode 0700). When QEMU
             runs as qemu-vm, it gets group qemu-vm and mode 2770
             (VmManager._apply_overlay_permissions): other users get no access.
@@ -75,7 +77,7 @@ class VmWorkingDirectory:
         """
         self.vm_id = vm_id
         self._path = path
-        # Files owned by qemu-vm (set by VmManager): cleanup needs sudo
+        # QEMU runs as qemu-vm (set by VmManager): it owns the files, so cleanup needs sudo
         self.use_qemu_vm_user = False
         self._cleaned_up = False
         self._cleanup_task: asyncio.Task[bool] | None = None
@@ -119,19 +121,9 @@ class VmWorkingDirectory:
                 abandoned = cls(vm_id, Path(creation_task.result()), home_dir=home_dir)
                 cleanup_task = asyncio.create_task(abandoned.cleanup())
                 await await_settled(cleanup_task)
-                cleanup_confirmed = False
-                if not cleanup_task.cancelled():
-                    try:
-                        cleanup_confirmed = cleanup_task.result()
-                    except Exception:
-                        logger.exception(
-                            "Failed to clean abandoned VM working directory",
-                            extra={"vm_id": vm_id, "path": str(abandoned.path)},
-                        )
-                if not cleanup_confirmed:
+                # cleanup() raises no error of its own (it logs them): only a cancel
+                if cleanup_task.cancelled() or not cleanup_task.result():
                     abandoned._retain_cleanup()
-            elif not creation_task.cancelled():
-                creation_task.exception()
             raise
         except OSError as e:
             raise TransientError(

@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from exec_sandbox.exceptions import ErrorCode, OutcomeUnknownError
+from exec_sandbox.exceptions import ErrorCode, InternalError, OutcomeUnknownError
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     GuestAgentRequest,
@@ -26,9 +26,10 @@ from exec_sandbox.guest_channel import StreamResult, consume_stream
 
 
 class _MockChannel:
-    """Minimal mock implementing DualPortChannel.stream_messages for testing."""
+    """Minimal mock implementing DualPortChannel.stream_messages for testing: yields each
+    message in turn, and raises an exception that stands in the list in its place."""
 
-    def __init__(self, messages: list[StreamingMessage]) -> None:
+    def __init__(self, messages: list[StreamingMessage | BaseException]) -> None:
         self._messages = messages
 
     async def stream_messages(
@@ -37,39 +38,9 @@ class _MockChannel:
         timeout: int,
     ) -> AsyncGenerator[StreamingMessage]:
         for msg in self._messages:
+            if isinstance(msg, BaseException):
+                raise msg
             yield msg
-
-
-class _ErrorAfterMessagesChannel:
-    """Yields predefined messages then raises a given exception."""
-
-    def __init__(self, messages: list[StreamingMessage], error: BaseException) -> None:
-        self._messages = messages
-        self._error = error
-
-    async def stream_messages(
-        self,
-        request: GuestAgentRequest,
-        timeout: int,
-    ) -> AsyncGenerator[StreamingMessage]:
-        for msg in self._messages:
-            yield msg
-        raise self._error
-
-
-class _ImmediateErrorChannel:
-    """Raises immediately without yielding any messages."""
-
-    def __init__(self, error: BaseException) -> None:
-        self._error = error
-
-    async def stream_messages(
-        self,
-        request: GuestAgentRequest,
-        timeout: int,
-    ) -> AsyncGenerator[StreamingMessage]:
-        raise self._error
-        yield  # type: ignore[unreachable]  # make it an async generator
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +64,7 @@ async def _default_handling(_msg: StreamingErrorMessage) -> None:
     """An on_error that returns: the default handling of the error runs."""
 
 
-async def _consume(messages: list[StreamingMessage], **callbacks: Any) -> StreamResult:
+async def _consume(messages: list[StreamingMessage | BaseException], **callbacks: Any) -> StreamResult:
     """Shorthand: build _MockChannel, call consume_stream with test defaults (no output
     callback, _default_handling, but those in `callbacks`)."""
     return await consume_stream(
@@ -102,26 +73,6 @@ async def _consume(messages: list[StreamingMessage], **callbacks: Any) -> Stream
         timeout=10,
         vm_id="test-vm",
         **({"on_stdout": None, "on_stderr": None, "on_error": _default_handling} | callbacks),
-    )
-
-
-async def _consume_error(
-    error: BaseException,
-    messages: list[StreamingMessage] | None = None,
-) -> StreamResult:
-    """Shorthand: build error channel, call consume_stream with test defaults."""
-    if messages:
-        channel: _ErrorAfterMessagesChannel | _ImmediateErrorChannel = _ErrorAfterMessagesChannel(messages, error)
-    else:
-        channel = _ImmediateErrorChannel(error)
-    return await consume_stream(
-        channel,  # type: ignore[arg-type]
-        PingRequest(host_entropy=None),
-        timeout=10,
-        vm_id="test-vm",
-        on_stdout=None,
-        on_stderr=None,
-        on_error=_default_handling,
     )
 
 
@@ -195,6 +146,54 @@ class TestConsumeStreamNormal:
 # ---------------------------------------------------------------------------
 
 
+class TestConsumeStreamOutputCap:
+    """The guest caps stdout at 1,000,000 bytes and stderr at 100,000 (then OUTPUT_LIMIT): it
+    sends at most its stdout cap, and its stderr cap and the 8 KiB read that crosses it. A
+    character takes at least one byte. More characters is a guest that breaks its caps: the
+    host keeps no more of it."""
+
+    @pytest.mark.parametrize(("stream", "cap"), [("stdout", 1_008_192), ("stderr", 108_192)])
+    async def test_the_cap_is_kept_whole(self, stream: str, cap: int) -> None:
+        """Output up to the cap and one read, in characters of 2 bytes (é) and 64 KB chunks:
+        all of it kept."""
+        text = "é" * cap
+        chunks = [text[i : i + 65_536] for i in range(0, cap, 65_536)]
+        result = await _consume([*(OutputChunkMessage(type=stream, chunk=c) for c in chunks), _complete(exit_code=0)])
+
+        assert getattr(result, stream) == text
+
+    async def test_both_streams_at_their_caps_are_kept(self) -> None:
+        """One exec with both streams at their caps and one read, interleaved: each stream has
+        its own count, so all of it is kept."""
+        stdout, stderr = "o" * 1_008_192, "e" * 108_192
+        messages: list[StreamingMessage] = []
+        for i in range(0, 1_008_192, 65_536):
+            messages.append(OutputChunkMessage(type="stdout", chunk=stdout[i : i + 65_536]))
+            if i < 108_192:
+                messages.append(OutputChunkMessage(type="stderr", chunk=stderr[i : i + 65_536]))
+        result = await _consume([*messages, _complete(exit_code=0)])
+
+        assert (result.stdout, result.stderr) == (stdout, stderr)
+
+    @pytest.mark.parametrize(
+        ("stream", "cap", "message"),
+        [
+            ("stdout", 1_008_192, "1008192 characters of stdout (its cap: 1000000 bytes and one 8192-byte read)"),
+            ("stderr", 108_192, "108192 characters of stderr (its cap: 100000 bytes and one 8192-byte read)"),
+        ],
+    )
+    async def test_one_character_more_is_a_protocol_error(self, stream: str, cap: int, message: str) -> None:
+        """One character past the cap raises GUEST_PROTOCOL before the host keeps or passes on
+        that chunk."""
+        seen: list[str] = []
+        messages = [OutputChunkMessage(type=stream, chunk="a" * cap), OutputChunkMessage(type=stream, chunk="b")]
+        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL) as exc_info:
+            await _consume([*messages, _complete(exit_code=0)], **{f"on_{stream}": seen.append})
+
+        assert str(exc_info.value) == f"The guest sent more than {message}"
+        assert seen == ["a" * cap]
+
+
 class TestConsumeStreamCallbackFailures:
     """Callback failure handling tests."""
 
@@ -251,19 +250,6 @@ class TestConsumeStreamCallbackFailures:
 class TestConsumeStreamErrors:
     """StreamingErrorMessage handling tests."""
 
-    async def test_error_with_default_handling(self) -> None:
-        """StreamingErrorMessage, on_error returns: appends to stderr, exit_code=-1."""
-        result = await _consume(
-            [
-                OutputChunkMessage(type="stdout", chunk="partial"),
-                StreamingErrorMessage(error_type="execution", message="process crashed"),
-            ]
-        )
-
-        assert result.exit_code == -1
-        assert result.stdout == "partial"
-        assert result.stderr == "[execution] process crashed"
-
     async def test_error_callback_that_raises_propagates(self) -> None:
         """on_error that raises, also after some output: its exception propagates."""
 
@@ -280,23 +266,27 @@ class TestConsumeStreamErrors:
             )
 
     async def test_error_callback_that_returns_uses_default(self) -> None:
-        """on_error that returns normally: default handling runs."""
-        callback_called = False
+        """on_error gets the error message; when it returns, the default handling runs: the
+        error is appended to stderr as "[type] message", and exit_code stays -1."""
+        error = StreamingErrorMessage(error_type="execution", message="process crashed")
+        received: list[StreamingErrorMessage] = []
 
-        async def logging_callback(msg: StreamingErrorMessage) -> None:
-            nonlocal callback_called
-            callback_called = True
+        async def recording_callback(msg: StreamingErrorMessage) -> None:
+            received.append(msg)
 
         result = await _consume(
             [
-                StreamingErrorMessage(error_type="execution", message="soft error"),
+                OutputChunkMessage(type="stdout", chunk="partial"),
+                OutputChunkMessage(type="stderr", chunk="warn\n"),
+                error,
             ],
-            on_error=logging_callback,
+            on_error=recording_callback,
         )
 
-        assert callback_called
+        assert received == [error]
         assert result.exit_code == -1
-        assert result.stderr == "[execution] soft error"
+        assert result.stdout == "partial"
+        assert result.stderr == "warn\n[execution] process crashed"
 
     async def test_break_after_execution_complete(self) -> None:
         """Messages after ExecutionCompleteMessage are not processed."""
@@ -317,10 +307,9 @@ class TestConsumeStreamErrors:
 # ---------------------------------------------------------------------------
 # Transport / protocol errors — must propagate (not be swallowed)
 #
-# These exceptions propagate through consume_stream() to execute(), which
-# wraps them as TransientError GUEST_UNAVAILABLE. The centralized retry logic then handles
-# retries. Swallowing them here would prevent retry and return a misleading
-# exit_code=-1 result for a dead VM.
+# consume_stream() catches no error of the stream: each one reaches its caller
+# (QemuVM.execute) as it is, and the caller maps it to the error of the call.
+# Swallowed here, it would become a misleading exit_code=-1 result for a dead VM.
 # ---------------------------------------------------------------------------
 
 
@@ -337,13 +326,13 @@ def _unreadable_frame() -> OutcomeUnknownError:
 
 
 class TestConsumeStreamTransportErrors:
-    """Transport and protocol errors propagate for retry by the caller.
+    """Transport and protocol errors reach the caller as they are.
 
     When QEMU dies, the socket breaks, or the guest sends a frame this release cannot read,
-    the exception must propagate through consume_stream() so execute()
-    can wrap it as TransientError GUEST_UNAVAILABLE and the retry infrastructure can act.
-    TimeoutError and CancelledError propagate too: execute() turns a timeout into a
-    TransientError or an OutcomeUnknownError, and a cancel must reach the task.
+    the exception propagates through consume_stream(): QemuVM.execute() maps it to the
+    error of the call (its Raises section). TimeoutError and CancelledError propagate too:
+    execute() turns a timeout into a TransientError or an OutcomeUnknownError, and a cancel
+    must reach the task.
     """
 
     @pytest.mark.parametrize(
@@ -376,5 +365,5 @@ class TestConsumeStreamTransportErrors:
         """The error of the stream reaches the caller as it is, with or without output before it."""
         raised = error()
         with pytest.raises(type(raised)) as caught:
-            await _consume_error(raised, messages=messages)
+            await _consume([*messages, raised])
         assert caught.value is raised

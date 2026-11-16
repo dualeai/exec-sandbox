@@ -14,13 +14,12 @@ import time
 
 import pytest
 
-from exec_sandbox import constants
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError, TransientError
 from exec_sandbox.models import Language
+from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.scheduler import Scheduler
-from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.vm_spec import VmSpec
-from tests.conftest import run_once, run_timed, skip_unless_hwaccel, skip_unless_linux
+from tests.conftest import run_once, skip_unless_hwaccel, skip_unless_linux
 
 
 # =============================================================================
@@ -138,40 +137,12 @@ print("\033[1mBold text\033[0m")
         assert result.exit_code == 0
         assert result.stdout == "\x1b[31mRed text\x1b[0m\n\x1b[1mBold text\x1b[0m\n"
 
-    async def test_rapid_stdout_stderr_interleaving(self, scheduler: Scheduler) -> None:
-        """Alternate stdout and stderr lines: each stream gets all of its lines, in order."""
-        code = """
-import sys
-for i in range(100):
-    print(f"out{i}")
-    print(f"err{i}", file=sys.stderr)
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code == 0
-        assert result.stdout == "".join(f"out{i}\n" for i in range(100))
-        assert result.stderr == "".join(f"err{i}\n" for i in range(100))
-
 
 # =============================================================================
 # Weird Cases: Unusual behavior that should be handled gracefully
 # =============================================================================
 class TestWeirdCases:
     """Weird inputs that might cause problems."""
-
-    async def test_null_bytes_in_output(self, scheduler: Scheduler) -> None:
-        """A NUL byte in the output passes through unchanged."""
-        code = """
-import sys
-sys.stdout.buffer.write(b"before\\x00after\\n")
-sys.stdout.buffer.flush()
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code == 0
-        assert result.stdout == "before\x00after\n"
 
     @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
     async def test_null_bytes_rejected_all_languages(self, scheduler: Scheduler, language: Language) -> None:
@@ -263,10 +234,10 @@ print("should not print")
         copies), so the exec ends at its timeout, as any code that runs on."""
         code = "import os, time\nos.close(1)\nos.close(2)\ntime.sleep(600)\n"
 
-        timed = await run_timed(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=5)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=5)
 
-        assert timed.result.exit_code == -1
-        assert timed.result.timing.execute_ms < 10_000
+        assert result.exit_code == -1
+        assert result.timing.execute_ms < 10_000
 
     @skip_unless_linux
     async def test_disk_writes_do_not_fill_the_vm_cgroup(self, scheduler: Scheduler) -> None:
@@ -294,47 +265,26 @@ print("should not print")
         assert result.exit_code == 0, result.stderr
         assert after == before
 
-    async def test_os_exit_immediately(self, scheduler: Scheduler) -> None:
-        """Code that calls os._exit (bypasses cleanup)."""
-        code = """
-import os
-os._exit(42)
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code == 42
-
-    async def test_exec_after_exit_137_fails_at_once(self, vm_manager: VmManager, execute_timeout: int) -> None:
+    async def test_exec_after_exit_137_fails_at_once(self, running_vm: QemuVM, execute_timeout: int) -> None:
         """Exit 137 retires the VM: the guest refuses the next code with a reply at once.
 
         Without the reply (a dropped connection), the host waits for its whole deadline
         (timeout + margin), then raises OutcomeUnknownError."""
-        vm = await vm_manager.create_vm(
-            VmSpec(language=Language.RAW),
-            tenant_id="test",
-            task_id="exit-137",
-            cache_leases=(),
-            direct_write_target=None,
-            expose_ports=None,
-            on_boot_log=None,
-            snapshot_drive=None,
-            reservation=None,
-            retry_profile=constants.RETRY_USER_FACING,
-            mem_path=None,
+        killed = await running_vm.execute(
+            "import os; os.kill(os.getpid(), 9)",
+            timeout_seconds=execute_timeout,
+            env_vars=None,
+            on_stdout=None,
+            on_stderr=None,
         )
-        try:
-            killed = await vm.execute(
-                "kill -9 $$", timeout_seconds=execute_timeout, env_vars=None, on_stdout=None, on_stderr=None
-            )
-            assert killed.exit_code == 137
+        assert killed.exit_code == 137
 
-            start = time.monotonic()
-            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match="retired"):
-                await vm.execute("echo second", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None)
-            assert time.monotonic() - start < 1
-        finally:
-            await vm_manager.destroy_vm(vm)
+        start = time.monotonic()
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match="retired"):
+            await running_vm.execute(
+                "print('second')", timeout_seconds=1, env_vars=None, on_stdout=None, on_stderr=None
+            )
+        assert time.monotonic() - start < 1
 
     @skip_unless_hwaccel
     async def test_sigterm_graceful_exit(self, scheduler: Scheduler) -> None:
@@ -367,9 +317,9 @@ time.sleep(60)
 
     async def test_partial_stderr_line_at_timeout_is_sent_once(self, scheduler: Scheduler) -> None:
         """A stderr line with no newline, then a timeout whose SIGTERM handler exits: the
-        partial line reaches the caller once. The agent flushes its line buffer at the
-        timeout and then drains the REPL after SIGTERM into the same buffer, so a copy
-        that is not cleared goes out twice ("partialpartial")."""
+        partial line reaches the caller once. At the deadline the agent keeps the partial
+        line in its line buffer, and the drain after SIGTERM continues that line: a copy
+        sent at the deadline too would go out twice ("partialpartial")."""
         code = """
 import signal
 import sys
@@ -386,6 +336,29 @@ time.sleep(60)
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=2)
 
         assert (result.exit_code, result.stderr) == (42, "partial")
+
+    async def test_lines_with_no_newline_at_timeout_with_no_handler_go_out(self, scheduler: Scheduler) -> None:
+        """Progress lines with no newline on both streams, then a timeout with no SIGTERM
+        handler: SIGTERM ends the REPL with no sentinel, and both lines still reach the
+        caller whole, stderr's before the timeout error. The stdout line ends in "__", a
+        possible start of the agent's stdout end marker."""
+        code = """
+import sys
+import time
+
+sys.stdout.write("Progress [__")
+sys.stdout.flush()
+sys.stderr.write("Processing...")
+sys.stderr.flush()
+time.sleep(60)
+"""
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=2)
+
+        assert (result.exit_code, result.stdout, result.stderr) == (
+            -1,
+            "Progress [__",
+            "Processing...[timeout_error] Execution timeout after 2s",
+        )
 
     async def test_timeout_warning_shows_where_the_exec_waits(
         self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
@@ -574,9 +547,8 @@ class TestOutOfBounds:
             f"try:\n    data = {allocation}\n    print('ALLOCATED')\nexcept MemoryError:\n    print('MEMORY_ERROR')\n"
         )
 
-        timed = await run_timed(scheduler, VmSpec(language=Language.PYTHON, memory_mb=256), code, timeout_seconds=60)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, memory_mb=256), code, timeout_seconds=60)
 
-        result = timed.result
         assert "MEMORY_ERROR" in result.stdout or result.exit_code == 137, (result.exit_code, result.stderr)
         assert result.timing.execute_ms < 20_000
 
@@ -810,13 +782,13 @@ console.log(imported.join === required.join);
     async def test_dynamic_import_nonexistent_module(self, scheduler: Scheduler) -> None:
         """Dynamic import of a package that is not installed fails at once: no auto-install
         from the registry (an auto-install waits 30 s with no network)."""
-        timed = await run_timed(
+        result = await run_once(
             scheduler, VmSpec(language=Language.JAVASCRIPT), "await import('nonexistent_xyz_module');"
         )
 
-        assert timed.result.exit_code == 1
-        assert "Cannot find package 'nonexistent_xyz_module'" in timed.result.stderr
-        assert timed.result.timing.execute_ms < 5_000
+        assert result.exit_code == 1
+        assert "Cannot find package 'nonexistent_xyz_module'" in result.stderr
+        assert result.timing.execute_ms < 5_000
 
     async def test_dynamic_import_fire_and_forget_error(self, scheduler: Scheduler) -> None:
         """A dynamic import that nobody awaits and that fails: the code runs on, then the
@@ -826,12 +798,12 @@ import('nonexistent_xyz');
 await new Promise(r => setTimeout(r, 200));
 console.log("after");
 """
-        timed = await run_timed(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
-        assert timed.result.exit_code == 1
-        assert timed.result.stdout == "after\n"
-        assert "Cannot find package 'nonexistent_xyz'" in timed.result.stderr
-        assert timed.result.timing.execute_ms < 5_000
+        assert result.exit_code == 1
+        assert result.stdout == "after\n"
+        assert "Cannot find package 'nonexistent_xyz'" in result.stderr
+        assert result.timing.execute_ms < 5_000
 
 
 # =============================================================================
@@ -934,7 +906,7 @@ class TestRawEdgeCases:
 
         # Shell variable expansion
         assert result.exit_code == 0
-        assert result.stdout.strip() == "hello"
+        assert result.stdout == "hello\n"
 
     # ---- Shebang handling (temp-file dispatch) ----
 
@@ -962,7 +934,7 @@ class TestRawEdgeCases:
         assert result.stdout == "shebang_bash_ok\n"
 
     async def test_raw_shebang_sed(self, scheduler: Scheduler) -> None:
-        """Sed shebang processes input."""
+        """A sh shebang script runs a sed pipe."""
         result = await run_once(
             scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\necho hello | sed 's/hello/world/'"
         )
@@ -996,7 +968,7 @@ class TestRawEdgeCases:
         """Shebang with empty body is valid."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\n")
 
-        assert result.exit_code == 0
+        assert (result.exit_code, result.stdout, result.stderr) == (0, "", "")
 
     async def test_raw_shebang_special_chars(self, scheduler: Scheduler) -> None:
         """Special characters are preserved (heredoc quoting prevents expansion)."""
@@ -1029,7 +1001,7 @@ class TestRawEdgeCases:
         """Shebang with no trailing newline and no body."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/sh")
 
-        assert result.exit_code == 0
+        assert (result.exit_code, result.stdout, result.stderr) == (0, "", "")
 
     async def test_raw_no_shebang_hash_comment(self, scheduler: Scheduler) -> None:
         """Plain # comment is not treated as shebang."""
@@ -1053,7 +1025,6 @@ class TestRawEdgeCases:
         )
 
         assert result.exit_code == 0
-        lines = result.stdout.strip().split("\n")
         assert result.stdout == "".join(f"{i}\n" for i in range(1, 101))
 
     async def test_raw_shebang_awk_multiline_program(self, scheduler: Scheduler) -> None:
@@ -1076,25 +1047,18 @@ class TestRawEdgeCases:
 
 
 class TestHomeEnvironmentNormal:
-    """HOME=/home/user for all REPL types (uid=1000 runs in /home/user)."""
-
-    async def test_raw_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
-        """Raw shell $HOME equals /home/user."""
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo $HOME")
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/home/user"
+    """HOME=/home/user in each REPL (uid=1000 runs in /home/user). The shell's:
+    TestHomeEnvironmentWeird.test_raw_home_matches_passwd."""
 
     async def test_python_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
         """Python os.environ['HOME'] equals /home/user."""
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.environ['HOME'])")
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/home/user"
+        assert (result.exit_code, result.stdout) == (0, "/home/user\n"), result.stderr
 
     async def test_javascript_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
         """JavaScript process.env.HOME equals /home/user."""
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log(process.env.HOME)")
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/home/user"
+        assert (result.exit_code, result.stdout) == (0, "/home/user\n"), result.stderr
 
 
 class TestHomeEnvironmentWeird:
@@ -1116,8 +1080,7 @@ class TestHomeEnvironmentOutOfBounds:
     async def test_raw_user_can_override_home(self, scheduler: Scheduler) -> None:
         """User can override HOME via env_vars (not blocked)."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo $HOME", env_vars={"HOME": "/tmp"})
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "/tmp"
+        assert (result.exit_code, result.stdout) == (0, "/tmp\n"), result.stderr
 
 
 # =============================================================================

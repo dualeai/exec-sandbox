@@ -127,8 +127,8 @@ print(f"EXIT_NOARG:{exit_noarg}")
     async def test_fork_child_exception_parent_continues(self, scheduler: Scheduler) -> None:
         """Child raises ValueError; REPL wrapper catches it, PID guard fires.
 
-        The child's traceback goes to stderr (via traceback.print_exc()).
-        PID guard fires with exit_code=1. Parent continues normally.
+        The wrapper writes the child's traceback to stderr, then the PID guard
+        ends the child with exit_code=1. Parent continues normally.
         """
         code = """
 import os
@@ -267,4 +267,4 @@ os.waitpid(pid, 0)
             after = await vm.exec('print(f"x:{x}")')
 
         assert forked.exit_code == 0, f"Expected exit_code 0, got {forked.exit_code}: {forked.stderr}"
-        assert (after.exit_code, after.stdout.strip()) == (0, "x:42"), f"REPL state lost: {after}"
+        assert (after.exit_code, after.stdout) == (0, "x:42\n"), f"REPL state lost: {after}"

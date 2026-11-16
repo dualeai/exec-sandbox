@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_cancellation_safe, gather_or_cancel
 from exec_sandbox.files.disk import pwrite_all
 
@@ -34,7 +34,7 @@ ABORT_SECONDS = 5.0
 request, tens of ms on a store that answers. A store that does not answer (botocore
 retries: minutes) then holds the error or the cancel of the caller no longer than this."""
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class FileJobs:

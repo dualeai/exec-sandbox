@@ -1,5 +1,7 @@
-"""VM type definitions: states, acceleration types, and transition rules."""
+"""VM type definitions: states, acceleration types, transition rules, and what a guest got at
+its boot."""
 
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -12,6 +14,21 @@ class VmState(Enum):
     EXECUTING = "executing"
     DESTROYING = "destroying"
     DESTROYED = "destroyed"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GuestBoot:
+    """What a guest got at its cold boot and keeps in every saved state (a restore runs the
+    RAM of that boot): a restore passes the saved values (GuestFacts)."""
+
+    kernel: str | None
+    """SHA-256 of the kernel it booted; None: unknown (the file was missing at its start: no
+    save records it)."""
+    initramfs: str | None
+    """SHA-256 of the initramfs it booted; None as for `kernel`."""
+    counter_hz: int | None
+    """Rate in Hz of the counter its clock runs on, as its boot host gave it (qemu_cmd.CounterRate);
+    None: that host had no exact source."""
 
 
 class AccelType(Enum):

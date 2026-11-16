@@ -2,8 +2,8 @@
 
 QmpClient wraps a connected stream (start: the greeting, then qmp_capabilities; execute:
 id-tagged commands; close). QmpClient.connect opens one (peer check, start) for the length of
-a `with` block: the run-state diagnostics and the tests. The migration client and the event
-watch (qmp_events) hold one each.
+a `with` block: the run-state diagnostics, write_file's home disk limits and the tests. The
+migration client and the event watch (qmp_events) hold one each.
 
 QMP echoes the request's ``id`` on every command response (per spec), and interleaves
 asynchronous events (MIGRATION_PASS, STOP, RESUME, ...) on the same stream at any time. A
@@ -22,16 +22,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from typing import TYPE_CHECKING, Any, Self, cast
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.socket_auth import connect_and_verify
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
     from pathlib import Path
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Bounds a stream that floods skipped messages (stale replies, and events with no
 # on_event) faster than the deadline can fire, and the event watch's exchange, which
@@ -40,7 +40,18 @@ logger = get_logger(__name__)
 _MAX_SKIPPED_MESSAGES = 64
 
 QMP_BUFFER_LIMIT = 16 * 1024 * 1024
-"""StreamReader buffer limit of a QMP connection: readuntil() fails on a longer line."""
+"""StreamReader buffer limit of a QMP connection that QmpClient.connect or the migration client
+opens (the event watch's has asyncio's 64 KiB): readline() raises ValueError on a longer line."""
+
+
+def parse_qmp_line(line: bytes) -> object:
+    """One line of a QMP monitor as JSON. Raises ValueError for a line that is not JSON or
+    not UTF-8, and for one nested too deep for the parser (its RecursionError): QEMU sends
+    no such line, and each reader handles them as one."""
+    try:
+        return json.loads(line)
+    except RecursionError as e:
+        raise ValueError(f"QMP line of {len(line)} bytes nested too deep for the JSON parser") from e
 
 
 class QmpClient:
@@ -104,17 +115,18 @@ class QmpClient:
         not miss one queries the state right after).
 
         Raises:
-            Exception: ``error_factory(...)`` on EOF, a first line that is no greeting, or a
-                capabilities error.
+            Exception: ``error_factory(...)`` on EOF, a first line that is no greeting, a
+                capabilities error, or too many skipped messages before its return.
             TimeoutError: No greeting, or no capabilities return, within `timeout`.
-            ValueError: A line that is not JSON.
+            ValueError: A line that is not JSON (parse_qmp_line), or longer than the reader's
+                limit.
             OSError: The connection failed (reset, broken pipe).
         """
         async with asyncio.timeout(timeout):
             line = await self._reader.readline()
         if not line:
             raise self._error_factory("QMP connection closed before the greeting")
-        greeting = json.loads(line)
+        greeting = parse_qmp_line(line)
         if not isinstance(greeting, dict) or "QMP" not in greeting:
             raise self._error_factory(f"QMP greeting expected, got {line[:200]!r}")
         response = await self._exchange(
@@ -139,7 +151,8 @@ class QmpClient:
         Raises:
             Exception: ``error_factory(...)`` on EOF or too many skipped messages.
             TimeoutError: no response within `timeout`.
-            ValueError: A line that is not JSON.
+            ValueError: A line that is not JSON (parse_qmp_line), or longer than the reader's
+                limit.
             OSError: The connection failed (reset, broken pipe).
         """
         self._sequence += 1
@@ -168,7 +181,7 @@ class QmpClient:
                 line = await self._reader.readline()
                 if not line:
                     raise self._error_factory("QMP connection closed unexpectedly")
-                parsed = json.loads(line)
+                parsed = parse_qmp_line(line)
                 if not isinstance(parsed, dict):  # no QMP message (QEMU sends objects only): skipped
                     skipped += 1
                     logger.warning("QMP line that is not an object, skipped", extra={"line": line[:200]})

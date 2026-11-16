@@ -1,26 +1,49 @@
 """Edge case tests for file I/O operations.
 
-Tests path edge cases, content edge cases, input type dispatch,
-and write abort/error recovery (no partial file at the final path).
+Tests path edge cases, content edge cases, input type dispatch, write abort/error
+recovery (no partial file at the final path), the free space of the home disk
+(refusal, reservation), and the home disk I/O limits during a write.
 Requires VM (integration tests).
 """
 
+import ast
 import asyncio
 import errno
+import hashlib
 import io
 import json
+import logging
 import os
+import re
+import threading
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
+from typing import IO, Any, cast
 from uuid import uuid4
 
 import pytest
 
-from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_FILE_SIZE_BYTES
+from exec_sandbox import constants
+from exec_sandbox.constants import (
+    DISK_BPS_BURST,
+    DISK_BPS_LIMIT,
+    DISK_IOPS_BURST,
+    DISK_IOPS_LIMIT,
+    FILE_TRANSFER_CHUNK_SIZE,
+    HOME_DRIVE_ID,
+)
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError, SessionClosedError, TransientError
-from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+from exec_sandbox.guest_agent_protocol import StreamingErrorMessage, WriteFileRequest
 from exec_sandbox.models import Language
+from exec_sandbox.permission_utils import get_expected_socket_uid
+from exec_sandbox.qemu_vm import QemuVM
+from exec_sandbox.qmp_client import QmpClient
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
+
+_FILE_SIZE_LIMIT = 500 * 1024 * 1024
+"""The largest file write_file takes (500 MiB), written out: a change of the limit shows here."""
 
 # ============================================================================
 # Path Edge Cases
@@ -62,7 +85,7 @@ class TestPathEdgeCases:
                 " print('ok')"
             )
 
-        assert (result.exit_code, result.stdout.strip()) == (0, "ok"), result.stderr
+        assert (result.exit_code, result.stdout) == (0, "ok\n"), result.stderr
 
     async def test_hidden_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Hidden files (dot prefix) work."""
@@ -112,13 +135,12 @@ class TestContentEdgeCases:
                 await session.read_file("does_not_exist.txt", destination=tmp_path / "out.bin")
 
     async def test_oversized_content_rejected(self, scheduler: Scheduler) -> None:
-        """Content exceeding MAX_FILE_SIZE_BYTES is rejected at the Session level (ARGUMENT_INVALID)."""
+        """Content over the 500 MiB file size limit is rejected at the Session level (ARGUMENT_INVALID)."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            oversized = b"x" * (MAX_FILE_SIZE_BYTES + 1)
-            with pytest.raises(
-                InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"
-            ):
+            oversized = b"x" * (_FILE_SIZE_LIMIT + 1)
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID) as exc:
                 await session.write_file("big.bin", oversized)
+            assert exc.value.message == "Content is 524288001 bytes, exceeds 524288000"
 
 
 # ============================================================================
@@ -155,13 +177,12 @@ class TestWriteFileInputTypes:
     async def test_write_from_oversized_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """write_file raises InvalidInputError ARGUMENT_INVALID for oversized Path."""
         big_file = tmp_path / "big.bin"
-        big_file.write_bytes(b"x" * (MAX_FILE_SIZE_BYTES + 1))
+        big_file.write_bytes(b"x" * (_FILE_SIZE_LIMIT + 1))
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            with pytest.raises(
-                InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"
-            ):
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID) as exc:
                 await session.write_file("target.bin", big_file)
+            assert exc.value.message == "File big.bin is 524288001 bytes, exceeds 524288000"
 
 
 # ============================================================================
@@ -222,11 +243,13 @@ class TestListFiles:
 
     async def test_list_empty_root(self, scheduler: Scheduler) -> None:
         """list_files on a fresh sandbox root gives the entries that os.listdir gives in the
-        guest, sorted by name."""
+        guest, sorted by name. The exec comes first: the first REPL start writes the REPL's own
+        files there, and a VM that boots cold (no memory snapshot, no warm pool) starts its REPL
+        only at its first exec."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            files = await session.list_files()
             result = await session.exec("import json, os; print(json.dumps(sorted(os.listdir('/home/user'))))")
             assert result.exit_code == 0, result.stderr
+            files = await session.list_files()
             assert [f.name for f in files] == json.loads(result.stdout)
 
     async def test_list_nonexistent_directory(self, scheduler: Scheduler) -> None:
@@ -265,8 +288,6 @@ class TestListFilesSparseDefense:
 
     async def test_binary_file_size(self, scheduler: Scheduler) -> None:
         """Binary file reports exact byte count."""
-        import os
-
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             content = os.urandom(4097)  # Just over one page
             await session.write_file("binary.bin", content)
@@ -423,16 +444,6 @@ os.truncate('/home/user/readable_sparse', 256)
 # ============================================================================
 
 
-def _make_write_header(op_id: str, path: str) -> bytes:
-    """Build a raw write_file JSON frame (every field: the guest refuses a header without one)."""
-    return json.dumps({"action": "write_file", "op_id": op_id, "path": path, "make_executable": False}).encode() + b"\n"
-
-
-def _make_file_end(op_id: str) -> bytes:
-    """Build a raw file_end JSON frame."""
-    return json.dumps({"action": "file_end", "op_id": op_id}).encode() + b"\n"
-
-
 class TestWriteAbortRecovery:
     """A write that does not end with file_end leaves no file at its final path.
 
@@ -453,9 +464,7 @@ class TestWriteAbortRecovery:
         target = "bad_chunk.bin"
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            vm = session._vm
-            channel = vm.channel
-
+            channel = session._vm.channel
             await channel.connect(5)
             op_id = uuid4().hex
 
@@ -463,24 +472,14 @@ class TestWriteAbortRecovery:
             op_queue = channel.register_op(op_id, changes_state=True)
 
             try:
-                # Send header
-                await channel.enqueue_raw(_make_write_header(op_id, target))
-
-                # Send chunk with invalid base64 (not decodeable)
-                invalid_chunk = (
-                    json.dumps(
-                        {
-                            "action": "file_chunk",
-                            "op_id": op_id,
-                            "data": "!!!NOT-VALID-BASE64!!!",
-                        }
-                    ).encode()
-                    + b"\n"
-                )
-                await channel.enqueue_raw(invalid_chunk)
-
-                # Send file_end so the guest agent doesn't hang
-                await channel.enqueue_raw(_make_file_end(op_id))
+                for frame in (
+                    # The header has every field that the guest requires (size is optional): the guest
+                    # refuses a header without one of them
+                    {"action": "write_file", "op_id": op_id, "path": target, "make_executable": False},
+                    {"action": "file_chunk", "op_id": op_id, "data": "!!!NOT-VALID-BASE64!!!"},  # not decodeable
+                    {"action": "file_end", "op_id": op_id},  # so the guest agent doesn't hang
+                ):
+                    await channel.enqueue_raw(json.dumps(frame).encode() + b"\n")
 
                 # Wait for response — should be an error
                 response = await asyncio.wait_for(op_queue.get(), timeout=10)
@@ -524,3 +523,437 @@ class TestWriteAbortRecovery:
             read_back = io.BytesIO()
             await session.read_file("partial.bin", destination=read_back)
             assert read_back.getvalue() == content
+
+
+# ============================================================================
+# Free space of the home disk
+# ============================================================================
+
+
+class VirtualSource(io.RawIOBase):
+    """A write_file source of `size` random bytes, made on read (no host memory or disk), that
+    counts and hashes the bytes read. `end` is its SEEK_END position: when it is not `size`,
+    the host measures a size that the reads do not give; None: not seekable (the host sends
+    no size). With `hold`, the first read sets `held` (an event of the loop that made the
+    source), then waits until release() (a read of 0 bytes is never held)."""
+
+    def __init__(self, size: int, *, end: int | None, hold: bool) -> None:
+        super().__init__()
+        self.size = size
+        self.end = end
+        self.read_bytes = 0
+        self.digest = hashlib.sha256()
+        self.held = asyncio.Event()
+        self._position = 0
+        self._hold = hold
+        self._loop = asyncio.get_running_loop()
+        self._released = threading.Event()
+
+    def release(self) -> None:
+        """Let the held read go on (also before it is held: it is then not held)."""
+        self._released.set()
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return self.end is not None
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if self.end is None:
+            raise io.UnsupportedOperation("seek")
+        base = {os.SEEK_SET: 0, os.SEEK_CUR: self._position, os.SEEK_END: self.end}[whence]
+        self._position = base + offset
+        return self._position
+
+    def tell(self) -> int:
+        return self._position
+
+    def readinto(self, buffer: Any) -> int:
+        if not len(buffer):  # Session's zero-byte probe, on the event loop: never held
+            return 0
+        if self._hold:
+            self._hold = False
+            self._loop.call_soon_threadsafe(self.held.set)
+            self._released.wait()
+        n = max(0, min(len(buffer), self.size - self._position))
+        data = os.urandom(n)
+        buffer[:n] = data
+        self.digest.update(data)
+        self._position += n
+        self.read_bytes += n
+        return n
+
+
+async def _until_held(source: VirtualSource, task: asyncio.Task[None]) -> None:
+    """Wait until the write `task` is held in its first read of `source` (60 s at most); a
+    write that ends first raises its own error."""
+    waiter = asyncio.ensure_future(source.held.wait())
+    try:
+        await asyncio.wait({waiter, task}, timeout=60, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+    if not source.held.is_set():
+        if task.done():
+            task.result()
+            raise AssertionError("the write ended before its first read")
+        raise TimeoutError("the write was not held in 60 s")
+
+
+async def _free_bytes(session: Session) -> int:
+    """The home disk's free bytes, as guest code sees them (f_bavail)."""
+    result = await session.exec("import os; s = os.statvfs('/home/user'); print(s.f_bavail * s.f_frsize)")
+    assert result.exit_code == 0, result.stderr
+    return int(result.stdout)
+
+
+async def _fill(session: Session, *, keep: int) -> int:
+    """Guest code takes the free space of the home disk but `keep` bytes (a reservation, no
+    data written); returns the free bytes left."""
+    result = await session.exec(
+        "import os\n"
+        "s = os.statvfs('/home/user')\n"
+        "fd = os.open('/home/user/.fill', os.O_WRONLY | os.O_CREAT, 0o600)\n"
+        f"os.posix_fallocate(fd, 0, s.f_bavail * s.f_frsize - {keep})\n"
+        "os.close(fd)\n"
+    )
+    assert result.exit_code == 0, result.stderr
+    return await _free_bytes(session)
+
+
+async def _guest_names(session: Session) -> list[str]:
+    """The names in /home/user, sorted, as guest code sees them."""
+    result = await session.exec("import os; print(sorted(os.listdir('/home/user')))")
+    assert result.exit_code == 0, result.stderr
+    return ast.literal_eval(result.stdout)
+
+
+_THROTTLE_KEYS = ("bps", "bps_rd", "bps_wr", "bps_max", "iops", "iops_rd", "iops_wr", "iops_max", "group")
+
+
+def _monitor(vm: QemuVM, *, id_prefix: str) -> AbstractAsyncContextManager[QmpClient]:
+    """A test client of the VM's command monitor, for the length of an `async with` block."""
+    return QmpClient.connect(
+        vm.qmp_socket,
+        expected_uid=get_expected_socket_uid(vm.use_qemu_vm_user),
+        timeout=5.0,
+        error_factory=OSError,
+        id_prefix=id_prefix,
+    )
+
+
+async def _throttle(vm: QemuVM) -> dict[str, dict[str, Any]]:
+    """The I/O limits of each drive of the VM (query-block; QEMU shows them only while set).
+    The connection closes before the call returns: the command monitor serves one client,
+    and QEMU takes a new one only once it saw the last one leave. Until then a connect waits
+    in the listen queue; past one queued connect macOS refuses the next, which this loop
+    retries; past two, Linux fails it at its first read, which it does not (each test leaves
+    one abandoned connect at most)."""
+    async with asyncio.timeout(5.0):
+        while True:
+            try:
+                async with _monitor(vm, id_prefix="test") as qmp:
+                    response = await qmp.execute("query-block", arguments=None, timeout=5.0, on_event=None)
+                break
+            except ConnectionRefusedError:
+                await asyncio.sleep(0.01)
+    return {
+        device["device"]: {key: device["inserted"][key] for key in _THROTTLE_KEYS if key in device["inserted"]}
+        for device in response["return"]
+        if "inserted" in device
+    }
+
+
+_HOME_BOOT_LIMITS = {
+    "bps": DISK_BPS_LIMIT,
+    "bps_rd": 0,
+    "bps_wr": 0,
+    "bps_max": DISK_BPS_BURST,
+    "iops": DISK_IOPS_LIMIT,
+    "iops_rd": 0,
+    "iops_wr": 0,
+    "iops_max": DISK_IOPS_BURST,
+    "group": HOME_DRIVE_ID,
+}
+"""The home disk's limits from the command line, as query-block shows them."""
+
+
+class TestWriteFileSpace:
+    """A write_file whose size is known (bytes, a Path, a seekable stream that can seek to its
+    end) is refused before the guest writes any of it when it does not fit in the free space
+    of the home disk; the guest reserves the space of a write that fits until its commit."""
+
+    async def test_write_larger_than_the_free_space_is_refused_at_the_header(self, scheduler: Scheduler) -> None:
+        """A source larger than the free space is refused at the header with the needed and free
+        bytes: no folder, no temporary file and no space taken; the stream is back at its
+        position, and the session goes on."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            free = await _fill(session, keep=64 * 1024 * 1024)
+            source = VirtualSource(_FILE_SIZE_LIMIT, end=_FILE_SIZE_LIMIT, hold=False)
+            source.seek(7)
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO) as exc_info:
+                await session.write_file("sub/big.bin", cast("IO[bytes]", source))
+            match = re.search(r"No space for 'sub/big\.bin': needs (\d+) bytes, (\d+) bytes free", str(exc_info.value))
+            assert match is not None, str(exc_info.value)
+            assert int(match[1]) == _FILE_SIZE_LIMIT - 7
+            assert int(match[2]) == free
+            assert source.read_bytes < source.size  # the stream stopped at the refusal
+            assert source.tell() == 7  # back where the call found it
+            names = await _guest_names(session)
+            assert "sub" not in names, names  # refused before any folder is made
+            assert not [name for name in names if name.startswith(".wr.")], names
+            assert await _free_bytes(session) == free
+            await session.write_file("small.bin", b"x" * 4096)  # the session goes on
+
+    async def test_header_path_refusal_stops_a_large_source(self, scheduler: Scheduler) -> None:
+        """A path the guest refuses at the header (a file in its parent path) stops the stream
+        too: the refusal does not wait for the whole source. The 500 MiB fit in the default disk,
+        so the free-space check passes first."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            await session.write_file("blocker", b"a file, not a folder")
+            source = VirtualSource(_FILE_SIZE_LIMIT, end=_FILE_SIZE_LIMIT, hold=False)
+            with pytest.raises(
+                InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO, match="Not a directory"
+            ):
+                await session.write_file("blocker/big.bin", cast("IO[bytes]", source))
+            assert source.read_bytes < source.size
+            assert source.tell() == 0
+            assert not session.closed
+
+    async def test_space_check_boundary_and_reservation_refusal(self, scheduler: Scheduler, tmp_path: Path) -> None:
+        """On a new 512 MB disk: a file of the free space plus one byte is
+        refused by the check at the header; a file of exactly the free space passes the check
+        and is refused by the reservation (ext4 needs one more block for its extent tree)."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, disk_mb=512)) as session:
+            free = await _free_bytes(session)
+            # The guest's own fallocate of exactly the free space fails on this layout, else
+            # the reservation step below cannot be checked
+            calibration = await session.exec(
+                "import os\n"
+                "fd = os.open('/home/user/.cal', os.O_WRONLY | os.O_CREAT, 0o600)\n"
+                "try:\n"
+                f"    os.posix_fallocate(fd, 0, {free})\n"
+                "    print('fits')\n"
+                "except OSError as e:\n"
+                "    print(e.errno)\n"
+                "os.close(fd); os.unlink('/home/user/.cal'); os.sync()\n"
+            )
+            assert calibration.stdout.strip() == str(errno.ENOSPC), f"layout changed, recalibrate: {calibration}"
+            free = await _free_bytes(session)
+
+            over = tmp_path / "over.bin"
+            with over.open("wb") as sparse:  # no host disk used
+                sparse.truncate(free + 1)
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO) as over_info:
+                await session.write_file("deep2/fit.bin", over)
+            assert f"No space for 'deep2/fit.bin': needs {free + 1} bytes, {free} bytes free" in str(over_info.value)
+            assert "deep2" not in await _guest_names(session)
+
+            exact = tmp_path / "exact.bin"
+            with exact.open("wb") as sparse:
+                sparse.truncate(free)
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO) as exact_info:
+                await session.write_file("deep/fit.bin", exact)
+            assert f"reserve {free} bytes: No space left on device" in str(exact_info.value)
+            # Its temporary file and its reservation are gone; the folder the write made stays
+            result = await session.exec(
+                "import os; print(sorted(os.listdir('/home/user/deep'))); os.rmdir('/home/user/deep')"
+            )
+            assert result.stdout.strip() == "[]", result
+            assert await _free_bytes(session) == free
+
+    async def test_reserved_space_is_kept_from_guest_code(self, running_vm: QemuVM, execute_timeout: int) -> None:
+        """Guest code that fills the disk once the guest reserved the write's space (after the
+        header, before the first chunk) cannot make the write fail. The write waits in its
+        first source read; outside a session, guest code runs meanwhile."""
+        size = 8 * 1024 * 1024
+        source = VirtualSource(size, end=size, hold=True)
+        task = asyncio.create_task(running_vm.write_file("res.bin", cast("IO[bytes]", source), make_executable=False))
+        try:
+            await _until_held(source, task)
+            filler = await running_vm.execute(
+                "import glob, os, time\n"
+                "for _ in range(60000):\n"
+                "    tmp = glob.glob('/home/user/.wr.*.tmp')\n"
+                f"    if tmp and os.stat(tmp[0]).st_blocks * 512 >= {size}:\n"
+                "        break\n"
+                "    time.sleep(0.001)\n"
+                "else:\n"
+                "    raise SystemExit('TIMEOUT: no reservation')\n"
+                "fd = os.open('/home/user/.fill', os.O_WRONLY | os.O_CREAT, 0o600)\n"
+                "step = 1 << 30\n"
+                "while step >= 4096:\n"
+                "    try:\n"
+                "        os.posix_fallocate(fd, os.fstat(fd).st_size, step)\n"
+                "    except OSError:\n"
+                "        step //= 2\n"
+                "os.close(fd)\n"
+                "s = os.statvfs('/home/user')\n"
+                "print('reserved', s.f_bavail * s.f_frsize)\n",
+                timeout_seconds=execute_timeout,
+                env_vars=None,
+                on_stdout=None,
+                on_stderr=None,
+            )
+        finally:
+            source.release()
+            await task
+        assert filler.exit_code == 0 and filler.stdout.startswith("reserved"), filler
+        assert int(filler.stdout.split()[1]) < 64 * 1024, filler  # the disk is full
+        read_back = io.BytesIO()
+        await running_vm.read_file("res.bin", destination=read_back)
+        assert hashlib.sha256(read_back.getvalue()).digest() == source.digest.digest()
+
+    @pytest.mark.parametrize(
+        ("length", "end", "allocated"),
+        [(10, 4 * 1024 * 1024, 4096), (1024 * 1024, 4096, 1024 * 1024), (1024 * 1024, None, 1024 * 1024)],
+        ids=["reserve-more-than-sent", "size-is-a-hint", "host-sends-no-size"],
+    )
+    async def test_write_keeps_the_blocks_of_its_bytes(
+        self, scheduler: Scheduler, length: int, end: int | None, allocated: int
+    ) -> None:
+        """The file gets the bytes that come before file_end, whatever size the header gives (a
+        source whose end is not where its reads stop); the reserved blocks it did not use are
+        freed at the commit. A source that cannot seek sends no size (as a host of an earlier
+        release) and still writes."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            source = VirtualSource(length, end=end, hold=False)
+            await session.write_file("w.bin", cast("IO[bytes]", source))
+            stat = await session.exec(
+                "import os; os.sync(); s = os.stat('/home/user/w.bin'); print(s.st_size, s.st_blocks * 512)"
+            )
+            assert stat.stdout.split() == [str(length), str(allocated)], stat
+
+    async def test_header_size_over_the_limit_is_refused(self, running_vm: QemuVM, execute_timeout: int) -> None:
+        """A size over the file limit (a host of another release; this host never sends it)
+        is an io_error at the header, and leaves no temporary file."""
+        await running_vm.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+        # model_construct: the host model refuses this size; request_line sends it as it is
+        request = WriteFileRequest.model_construct(path="big.bin", make_executable=False, size=_FILE_SIZE_LIMIT + 1)
+        reply = await running_vm.channel.send_request(request, timeout=30)
+        assert isinstance(reply, StreamingErrorMessage), reply
+        assert (reply.error_type, reply.message) == (
+            "io_error",
+            f"File 'big.bin' is {_FILE_SIZE_LIMIT + 1} bytes, exceeds {_FILE_SIZE_LIMIT}",
+        )
+        names = await running_vm.execute(
+            "import os; print([n for n in os.listdir('/home/user') if n.startswith('.wr.')])",
+            timeout_seconds=execute_timeout,
+            env_vars=None,
+            on_stdout=None,
+            on_stderr=None,
+        )
+        assert names.stdout == "[]\n", names
+
+
+# ============================================================================
+# Home disk I/O limits during a write
+# ============================================================================
+
+
+class TestWriteFileDiskLimits:
+    """From the header to the end of a write_file, the home disk has no bandwidth limit; at the
+    end the command-line limits come back on every path, unless the VM ends (query-block)."""
+
+    async def test_write_lifts_the_bandwidth_limit_and_sets_it_back(self, scheduler: Scheduler) -> None:
+        """While a write runs, the home disk has no bandwidth limit and keeps its IOPS limits,
+        and the other drives keep theirs; at its end every drive has its boot limits again."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            boot = await _throttle(session._vm)
+            assert boot["hd2"] == _HOME_BOOT_LIMITS
+            # The rootfs overlay has the same limits (one string builds both -drive options)
+            assert {key: value for key, value in boot["hd0"].items() if key != "group"} == {
+                key: value for key, value in _HOME_BOOT_LIMITS.items() if key != "group"
+            }
+            source = VirtualSource(4 * 1024 * 1024, end=4 * 1024 * 1024, hold=True)
+            task = asyncio.create_task(session.write_file("u.bin", cast("IO[bytes]", source)))
+            try:
+                await _until_held(source, task)
+                during = await _throttle(session._vm)  # closed before the read goes on
+            finally:
+                source.release()
+                await task
+            after = await _throttle(session._vm)
+        # No bandwidth limit while the write runs; the request limits stay (no drain)
+        assert (during["hd2"]["bps"], during["hd2"].get("bps_max", 0)) == (0, 0), during
+        assert (during["hd2"]["iops"], during["hd2"]["iops_max"]) == (DISK_IOPS_LIMIT, DISK_IOPS_BURST), during
+        assert {name: limits for name, limits in during.items() if name != "hd2"} == {
+            name: limits for name, limits in boot.items() if name != "hd2"
+        }
+        assert after == boot
+
+    async def test_cancelled_write_sets_the_limit_back(self, running_vm: QemuVM) -> None:
+        """A write_file cancelled while the limit is lifted (outside a session, so the VM stays)
+        sets the limits back."""
+        boot = await _throttle(running_vm)
+        source = VirtualSource(4 * 1024 * 1024, end=4 * 1024 * 1024, hold=True)
+        task = asyncio.create_task(running_vm.write_file("c.bin", cast("IO[bytes]", source), make_executable=False))
+        try:
+            await _until_held(source, task)
+            lifted = await _throttle(running_vm)
+        finally:
+            task.cancel()
+            source.release()
+            await asyncio.wait({task})  # the write ends: cancelled, or failed before its read
+        assert task.cancelled(), task
+        assert lifted["hd2"]["bps"] == 0  # cancelled while lifted
+        assert await _throttle(running_vm) == boot
+
+    async def test_failed_lift_keeps_the_limit(
+        self, scheduler: Scheduler, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A test client holds the command monitor (it serves one client) through the lift: the
+        lift gets no answer, and the write goes on at the command-line limits. The call logs
+        one WARNING; its restore, once the client left, sets the same limits again."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            vm = session._vm
+            boot = await _throttle(vm)
+            caplog.clear()  # the boot's own records
+            source = VirtualSource(1024 * 1024, end=1024 * 1024, hold=True)
+            task: asyncio.Task[None] | None = None
+            with caplog.at_level(logging.WARNING, logger="exec_sandbox.qemu_vm"):
+                try:
+                    with monkeypatch.context() as short:
+                        short.setattr(constants, "DISK_LIMITS_QMP_TIMEOUT_SECONDS", 0.2)  # the lift's bound only
+                        async with _monitor(vm, id_prefix="holder"):
+                            task = asyncio.create_task(session.write_file("l.bin", cast("IO[bytes]", source)))
+                            await _until_held(source, task)  # the lift gave up before the first read
+                    during = await _throttle(vm)
+                finally:
+                    source.release()
+                    if task is not None:
+                        await task
+            records = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == "exec_sandbox.qemu_vm"]
+            assert records == [(logging.WARNING, "Home disk bandwidth limit not lifted")]
+            assert during == boot
+            assert await _throttle(vm) == boot
+
+    async def test_failed_restore_logs_an_error_and_the_next_write_restores(
+        self, scheduler: Scheduler, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A restore that gets no answer (a test client holds the command monitor) logs an ERROR
+        and keeps the session; the home disk stays lifted until the next write_file sets the
+        limits back."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            vm = session._vm
+            boot = await _throttle(vm)
+            caplog.clear()  # the boot's own records
+            source = VirtualSource(1024 * 1024, end=1024 * 1024, hold=True)
+            with caplog.at_level(logging.WARNING, logger="exec_sandbox.qemu_vm"):
+                task = asyncio.create_task(session.write_file("h.bin", cast("IO[bytes]", source)))
+                try:
+                    await _until_held(source, task)  # lifted
+                    with monkeypatch.context() as short:
+                        short.setattr(constants, "DISK_LIMITS_QMP_TIMEOUT_SECONDS", 0.2)  # the restore's bound only
+                        async with _monitor(vm, id_prefix="holder"):
+                            source.release()
+                            await task  # its restore gets no answer
+                finally:
+                    source.release()
+                    await task
+            errors = [r for r in caplog.records if r.levelno == logging.ERROR and r.name == "exec_sandbox.qemu_vm"]
+            assert [r.getMessage() for r in errors] == ["Home disk I/O limits not set back"]
+            assert not session.closed
+            assert (await _throttle(vm))["hd2"]["bps"] == 0  # still lifted
+            await session.write_file("next.bin", b"y")
+            assert await _throttle(vm) == boot

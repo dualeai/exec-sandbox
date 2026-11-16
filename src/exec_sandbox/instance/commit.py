@@ -42,7 +42,7 @@ from exec_sandbox.exceptions import (
     RouteError,
     TransientError,
 )
-from exec_sandbox.instance.head import MAX_HEAD_BYTES, authenticate
+from exec_sandbox.instance.head import MAX_HEAD_BYTES, open_header
 from exec_sandbox.instance.store import Applied, head_key
 
 if TYPE_CHECKING:
@@ -106,7 +106,7 @@ async def _resolve(store: InstanceStore, key: str, commit: Commit, base: Base, *
             data, etag = current
             try:
                 # Authenticated: else a store writer could list my commit in a forged head.
-                header = authenticate(data, commit.keyring, instance_id=mine.instance_id)
+                header, _, _ = open_header(data, commit.keyring, instance_id=mine.instance_id)
             except (InstanceGoneError, RouteError, ConfigError) as e:
                 # Forged, damaged, a key this worker lacks or another release: not this save's
                 # head (its own always opens). Conflict when every write was refused, e.g. a
@@ -161,7 +161,7 @@ def _check_absent(mine: HeadHeader, base: Base, *, repaired: bool, maybe_applied
     )
 
 
-# Hint parts of the store errors of a save (here and InstanceManager._save)
+# Hint parts of the conflict, gone and unknown-outcome errors of a save (here and manager.py)
 LANDED_FIRST = (
     "If an earlier save of this session had an unknown outcome, look for its commit id in "
     "describe_instance(id).recent_commits first: it may be the save that is stored. "

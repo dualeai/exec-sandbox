@@ -22,6 +22,7 @@ import ctypes
 import ctypes.util
 import errno
 import grp
+import logging
 import os
 import pwd
 import re
@@ -39,7 +40,6 @@ from typing import BinaryIO, Final, NamedTuple
 import psutil
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.cgroup import can_contain_processes
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.files.disk import make_private_dir
@@ -50,7 +50,7 @@ from exec_sandbox.system_probes import async_cached_probe, posix_acl_xattr, run_
 _ACL_TYPE_EXTENDED = 0x00000100
 _ACL_FIRST_ENTRY = 0
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _AS_QEMU_VM: tuple[str, ...] = ("-u", "qemu-vm", "/bin/sh", "-c", 'umask 007 && exec "$@"', "qemu-vm")
 
@@ -72,34 +72,6 @@ _ACL_PERM_BITS = {"r": 4, "w": 2, "x": 1}
 # =============================================================================
 # Private folders (local instance store, private run folders, cache folders)
 # =============================================================================
-
-
-def make_owned_dir(path: Path, *, setting: str) -> None:
-    """make_private_dir for a folder whose files QEMU uses (caches, assets, overlays), then
-    refuse it unless it is a real folder of this user that group and others cannot write,
-    with no ACL entry, in folders that only root and this user can change
-    (private_tree_problem): a folder made before with another umask or group (`sg qemu-vm`
-    under umask 002 gives 0775 qemu-vm), or such a folder above it, lets QEMU as qemu-vm
-    rename or replace what it holds.
-
-    Raises:
-        ConfigError: SETTING_INVALID, naming `setting` and the fix
-        OSError: the folder cannot be made or opened, or a check cannot run
-    """
-    make_private_dir(path)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        problem = private_tree_problem(path, fd, forbidden=stat.S_IWGRP | stat.S_IWOTH)
-    finally:
-        os.close(fd)
-    if problem:
-        raise ConfigError(
-            f"Folder {path} {problem[0]}",
-            code=ErrorCode.SETTING_INVALID,
-            context={"folder": str(path), "setting": setting},
-            hint=problem[1],
-            instance_id=None,
-        )
 
 
 _FOLDER_SETUP_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOTDIR, errno.ELOOP, errno.EEXIST})
@@ -126,18 +98,36 @@ def setting_folder_error(e: OSError, *, path: Path, failure: str, setting: str) 
 
 
 def make_cache_dir(path: Path, *, setting: str) -> None:
-    """make_owned_dir for a cache folder the library makes itself.
+    """make_private_dir for a cache folder the library makes itself, whose files QEMU uses
+    (caches, assets, overlays), then refuse it unless it is a real folder of this user that
+    group and others cannot write, with no ACL entry, in folders that only root and this user
+    can change (private_tree_problem): a folder made before with another umask or group (`sg
+    qemu-vm` under umask 002 gives 0775 qemu-vm), or such a folder above it, lets QEMU as
+    qemu-vm rename or replace what it holds.
 
     Raises:
         ConfigError: SETTING_INVALID, naming `setting` and the fix: a folder that is not
-            private (make_owned_dir), or that cannot be made (no access, a read-only disk, a
-            file in its path or in its place, a symlink loop)
+            private, or that cannot be made or checked (no access, a read-only disk, a file in
+            its path or in its place, a symlink loop)
         TransientError: LOCAL_DISK: a host error (disk full, quota, I/O error)
     """
     try:
-        make_owned_dir(path, setting=setting)
+        make_private_dir(path)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            problem = private_tree_problem(path, fd, forbidden=stat.S_IWGRP | stat.S_IWOTH)
+        finally:
+            os.close(fd)
     except OSError as e:
         raise setting_folder_error(e, path=path, failure="cannot be made", setting=setting) from e
+    if problem:
+        raise ConfigError(
+            f"Folder {path} {problem[0]}",
+            code=ErrorCode.SETTING_INVALID,
+            context={"folder": str(path), "setting": setting},
+            hint=problem[1],
+            instance_id=None,
+        )
 
 
 def private_dir_problem(root: Path, st: os.stat_result, *, forbidden: int) -> tuple[str, str] | None:
@@ -565,6 +555,7 @@ async def _qemu_vm_path_problem() -> str | None:
     try:
         returncode, stdout, _ = await run_probe(
             ("sudo", "-n", "-k", *_AS_QEMU_VM, "/bin/sh", "-c", "umask; id -g"),
+            stdin=None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -593,7 +584,10 @@ async def _qemu_vm_path_problem() -> str | None:
         ):
             try:
                 returncode, _, _ = await run_probe(
-                    ("sudo", "-n", *run), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                    ("sudo", "-n", *run),
+                    stdin=None,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
                 )
             except OSError:  # TimeoutError too
                 returncode = None
@@ -976,22 +970,6 @@ async def sudo_rm(path: Path) -> bool:
 # =============================================================================
 # High-level Helpers
 # =============================================================================
-
-
-async def grant_qemu_vm_access(path: Path) -> bool:
-    """Grant qemu-vm user read/write access to a file via ACL, for a process that runs QEMU
-    as qemu-vm (probe_qemu_as_qemu_vm: the user exists).
-
-    This is more secure than chmod 666 as it only grants access to
-    the specific user that needs it.
-
-    Args:
-        path: File path (typically a socket)
-
-    Returns:
-        True if ACL was set, False if it failed
-    """
-    return await set_acl_user([path], user="qemu-vm", perms="rw")
 
 
 async def grant_qemu_vm_file_access(path: Path, *, writable: bool) -> bool:

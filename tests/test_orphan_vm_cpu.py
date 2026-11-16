@@ -1,22 +1,21 @@
 """Tests for orphan VM CPU behavior.
 
-These tests verify that orphan VMs (VMs where the host disconnected without
-proper cleanup) consume minimal CPU instead of busy-looping at 100%.
-
-Two components keep it idle:
-1. vm_manager.py: VmManager.destroy_vm() ends the QEMU and gvproxy processes
-2. guest-agent: Detects EPOLLHUP on virtio-serial disconnect and backs off
+These tests verify that orphan VMs (VMs where the host closed its guest ports
+and did not destroy the VM) consume minimal CPU instead of busy-looping at 100%.
 
 Background:
-- When host disconnects from virtio-serial, kernel returns POLLHUP immediately
-- Without backoff, guest-agent would busy-loop consuming 100% CPU
-- The guest agent backs off exponentially (50ms -> 1s), so the CPU can enter
-  WFI (Wait For Interrupt) idle state
+- When the host closes its side of a virtio-serial port, a level-triggered wait
+  on the port returns at once, again and again (the hangup stays)
+- The guest agent waits on a private edge-triggered epoll set instead
+  (guest-agent connection.rs, CommandPort): the host close wakes it once, then
+  it waits for the bytes of the next host, so the vCPU can idle
 
-These tests orphan VMs on purpose, in these cases:
-- Single orphan over ~15 s (no destroy called)
+These tests orphan VMs on purpose (the host closes the guest channel), in these cases:
+- Single orphan over ~15 s (no destroy called while it is sampled)
 - Orphan with network (gvproxy)
 - Multiple concurrent orphans
+
+TestDestroyProcessCleanup: VmManager.destroy_vm() ends the QEMU and gvproxy processes.
 """
 
 import asyncio

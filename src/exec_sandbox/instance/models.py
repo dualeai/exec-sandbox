@@ -74,7 +74,7 @@ class HeadSummary(BaseModel):
 
 class HeadHeader(BaseModel):
     """Public part of a head. Not authenticated until the head body opens
-    (`head.open_head` or `head.authenticate`)."""
+    (`head.open_head` or `head.open_header`)."""
 
     model_config = _STRICT
 
@@ -83,7 +83,7 @@ class HeadHeader(BaseModel):
     commit_id: str = Field(pattern=COMMIT_ID_PATTERN)
     recent_commits: tuple[RecentCommit, ...] = Field(min_length=1, max_length=RECENT_COMMITS)
     """Newest first; the first entry is this head's own commit."""
-    key_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    key_id: str = Field(pattern=_DIGEST_PATTERN)
     """Id of the keyring key that wraps the data key."""
     wrapped_data_key: str = Field(pattern=r"^[0-9a-f]{80}$")
     """AES-KW wrap of the 32-byte data key, hex."""
@@ -101,7 +101,7 @@ class HeadHeader(BaseModel):
 
 class HostFacts(BaseModel):
     """The host of the last save, recomputed at each save. A load on a host with another
-    arch, accelerator, CPU vendor or guest CPU model, or whose QEMU lacks the machine type,
+    arch, accelerator, guest CPU model or CPU identity, or whose QEMU lacks the machine type,
     is refused before any download (ROUTE). qemu_version: QEMU decides at the restore; after
     a refusal it names the QEMU to route to (that version or newer). release: a diagnostic.
 
@@ -114,12 +114,13 @@ class HostFacts(BaseModel):
     """x86_64 or aarch64."""
     accelerator: str
     """kvm, hvf or tcg: a worker that falls back to tcg cannot load an instance saved with kvm."""
-    cpu_vendor: str | None
-    """x86 vendor the CPU model pins; None on ARM."""
     cpu_model: str = Field(min_length=1)
     """-cpu value of the saved VM's QEMU (qemu_cmd.guest_cpu_model): a restore needs the same
     CPU features. On x86 it holds +tsc-deadline when the host has that feature (the VM then
     runs with pit/pic/rtc off)."""
+    cpu_id: str | None = Field(min_length=1)
+    """The host CPU the guest sees under -cpu host (qemu_cmd.guest_cpu_id: ARM64 KVM and HVF);
+    None where the guest CPU is a fixed model (x86, ARM64 TCG)."""
     qemu_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
     """QEMU of the last save, MAJOR.MINOR.PATCH."""
     machine_type: str = Field(min_length=1)
@@ -137,8 +138,9 @@ class HostFacts(BaseModel):
 
 
 class GuestFacts(BaseModel):
-    """The files the guest booted on, set at its cold boot: every save carries them
-    unchanged (a reused VM runs the RAM of that boot, on the same disks). The images are
+    """What the guest got at its cold boot, the files it booted on and the rate of its
+    clock's counter: every save carries them unchanged (a reused VM runs the RAM of that
+    boot, on the same disks). The images are
     matched by digest at a load (a worker without them downloads them from the store); the
     kernel and initramfs only name what runs (a load boots nothing), for a cleanup or a
     vulnerability audit by digest."""
@@ -153,6 +155,11 @@ class GuestFacts(BaseModel):
     """SHA-256 of the kernel the guest booted (it runs in the saved RAM)."""
     initramfs: str = Field(pattern=_DIGEST_PATTERN)
     """SHA-256 of the initramfs the guest booted (its init and agent run in the saved RAM)."""
+    counter_hz: int | None = Field(gt=0)
+    """Rate in Hz of the counter the guest's clock runs on (x86 TSC, ARM generic timer), as the
+    host of its cold boot gave it (qemu_cmd.CounterRate): the guest calibrated its clock
+    against it, so a load needs a worker with this rate or with TSC scaling. None: that host
+    had no exact source (no check)."""
 
 
 class ChainEntry(BaseModel):
@@ -237,12 +244,12 @@ class InstanceInfo(InstanceRef):
     )
     spec: VmSpec | None = Field(description='What the VM is made of (None unless access is "full")')
     host: HostFacts | None = Field(
-        description="Host of the last save: arch, accelerator, CPU vendor, guest CPU model, QEMU version and "
-        'machine type, release, device layout (None unless access is "full")'
+        description="Host of the last save: arch, accelerator, guest CPU model, host CPU identity, QEMU version "
+        'and machine type, release, device layout (None unless access is "full")'
     )
     guest: GuestFacts | None = Field(
-        description="Digests of the files the guest booted on: base and packages images, kernel, initramfs "
-        '(None unless access is "full")'
+        description="What the guest got at its first boot: digests of its base and packages images, kernel, "
+        'initramfs, and the rate of its clock counter (None unless access is "full")'
     )
     egress_domains: tuple[str, ...] | None = Field(
         description="Domains the VM may reach with the network on, as resolved at its last save and applied "

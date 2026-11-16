@@ -15,41 +15,23 @@ from typing import TYPE_CHECKING
 import pytest
 
 from exec_sandbox import constants
-from exec_sandbox.models import Language
-from exec_sandbox.vm_spec import VmSpec
 
 if TYPE_CHECKING:
-    from exec_sandbox.vm_manager import VmManager
+    from exec_sandbox.qemu_vm import QemuVM
 
 _IDLE_SECONDS = 19
 """Longer than 18 s: the idle time after which an agent that resets its ports would close them."""
 
 
 @pytest.mark.slow
-async def test_request_after_a_long_idle_is_answered(vm_manager: VmManager, monkeypatch: pytest.MonkeyPatch) -> None:
-    vm = await vm_manager.create_vm(
-        VmSpec(language=Language.RAW),
-        tenant_id="test",
-        task_id="idle-lossless",
-        cache_leases=(),
-        direct_write_target=None,
-        expose_ports=None,
-        on_boot_log=None,
-        snapshot_drive=None,
-        reservation=None,
-        retry_profile=constants.RETRY_USER_FACING,
-        mem_path=None,
-    )
-    try:
-        await vm.write_file("before.txt", io.BytesIO(b"x"))
-        await asyncio.sleep(_IDLE_SECONDS)
+async def test_request_after_a_long_idle_is_answered(running_vm: QemuVM, monkeypatch: pytest.MonkeyPatch) -> None:
+    await running_vm.write_file("before.txt", io.BytesIO(b"x"), make_executable=False)
+    await asyncio.sleep(_IDLE_SECONDS)
 
-        # A lost request fails in 10 s here, not at the 120 s default.
-        monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 10)
-        await vm.write_file("after.txt", io.BytesIO(b"y"))
+    # A lost request fails in 10 s here, not at the 120 s default.
+    monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 10)
+    await running_vm.write_file("after.txt", io.BytesIO(b"y"), make_executable=False)
 
-        # The agent did not reset its ports while idle (these lines print in quiet mode too).
-        console = "\n".join(vm.console_lines)
-        assert "reopening ports" not in console  # guest-agent main.rs logs it at each port reset
-    finally:
-        await vm_manager.destroy_vm(vm)
+    # The agent did not reset its ports while idle (these lines print in quiet mode too).
+    console = "\n".join(running_vm.console_lines)
+    assert "reopening ports" not in console  # guest-agent main.rs logs it at each port reset

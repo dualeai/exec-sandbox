@@ -7,13 +7,12 @@ and a ticker process that runs on under its pid with its tick lines still 1..n
 reuse again.
 """
 
-import asyncio
-import hashlib
 from pathlib import Path
 
 import pytest
 
 from exec_sandbox import InstanceRef, Language, Scheduler, Session, VmSpec
+from exec_sandbox.hash_utils import file_hash
 from tests.conftest import skip_unless_hwaccel
 from tests.instance_fixtures import (
     L2_PACKAGES,
@@ -66,11 +65,6 @@ async def _walk(scheduler: Scheduler, world: InstanceWorld, session: Session, mo
     return third
 
 
-def _file_sha256(path: Path) -> str:
-    with path.open("rb") as f:
-        return hashlib.file_digest(f, "sha256").hexdigest()
-
-
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize(
     ("language", "packages"),
@@ -114,7 +108,7 @@ async def test_origin_walk(instance_world: InstanceWorld, language: Language, pa
         memory_snapshot_cache_dir=l1_dir, warm_pool_size=0, disk_snapshot_cache_dir=world.private_dir("l2")
     ) as scheduler:
         info = await scheduler.describe_instance(ref.instance_id)
-        assert info.host is not None
+        assert info.guest is not None
         digest = info.guest.packages_image
         assert digest is not None
         downloaded = world.asset_dir / f"{digest}.img"
@@ -124,7 +118,7 @@ async def test_origin_walk(instance_world: InstanceWorld, language: Language, pa
             await assert_packages_import(vm)
             await assert_restored(vm, model)
             await close_unsaved(vm)
-        assert await asyncio.to_thread(_file_sha256, downloaded) == digest
+        assert await file_hash(downloaded, "sha256") == digest
 
 
 @pytest.mark.timeout(300)

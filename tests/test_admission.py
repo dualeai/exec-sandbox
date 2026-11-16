@@ -53,7 +53,6 @@ from exec_sandbox.constants import (
     RESOURCE_ADMISSION_TIMEOUT_SECONDS,
 )
 from exec_sandbox.exceptions import ErrorAction, ErrorCode, InvalidInputError, RouteError, RouteKey, TransientError
-from exec_sandbox.files.disk import overlay_upper
 from exec_sandbox.files.locks import CacheEntry
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 from exec_sandbox.worker_facts import WorkerFacts
@@ -186,8 +185,8 @@ async def test_budget_facts_round_down_and_the_target_rounds_up() -> None:
     """budget_facts (the route facts of the budget) round down and CAPACITY_NEVER_FITS's
     `required` rounds up: a worker whose budget facts are not below `required` admits the
     VM, and the worker that raised the error never satisfies its own `required`.
-    Budgets: 1000 * 0.9 * 1.0 = 900.4 MB is not reachable with whole numbers, so 900.5 MB
-    of host memory gives 810.45 MB; (1.7 - 0.5) * 1.05 = 1.26 cores."""
+    Budgets: 900.5 * 0.9 * 1.0 = 810.45 MB (a fraction: the facts give 810); (1.7 - 0.5) *
+    1.05 = 1.26 cores."""
     ctrl = _make_controller(
         host_memory_mb=900.5,
         reserve_ratio=0.1,
@@ -223,7 +222,7 @@ async def test_a_vm_at_the_budget_fits_whatever_the_float_noise(
     ctrl = _make_controller(
         host_cpu_count=host_cpu_count, cpu_reserve_cores=cpu_reserve_cores, cpu_overcommit=cpu_overcommit
     )
-    need, have = ctrl.check_fits("vm", 256, cpu_cores, use_tcg=False, target={})
+    need, have = ctrl.check_fits("vm", 256, cpu_cores, use_tcg=False, required={}, found={})
     assert need[RouteKey.CPU] == have[RouteKey.CPU] == f"{cpu_cores + 0.25:.2f}"
     with _mock_system_memory(100_000):  # host memory never decides here
         reservation = await ctrl.acquire(
@@ -244,12 +243,14 @@ def test_check_fits_adds_the_checked_target() -> None:
         cpu_overcommit=4.0,
         cpu_reserve_cores=0.5,
     )
-    target = {RouteKey.ARCH: "aarch64", RouteKey.MACHINE_TYPE: "virt-11.1"}
-    ctrl.check_fits("my-vm", 512, 1.0, use_tcg=False, target=target)  # fits: no error
+    # This worker takes every counter rate: `found` gives its own value, not the saved one
+    target = {RouteKey.ARCH: "aarch64", RouteKey.MACHINE_TYPE: "virt-11.1", RouteKey.COUNTER_HZ: "2700000000"}
+    here = {**target, RouteKey.COUNTER_HZ: "any"}
+    ctrl.check_fits("my-vm", 512, 1.0, use_tcg=False, required=target, found=here)  # fits: no error
     with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS) as exc_info:
-        ctrl.check_fits("my-vm", 512, 64.0, use_tcg=False, target=target)
+        ctrl.check_fits("my-vm", 512, 64.0, use_tcg=False, required=target, found=here)
     assert dict(exc_info.value.required) == {**target, "memory_mb": "592", "cpu": "64.25"}
-    assert dict(exc_info.value.found) == {**target, "memory_mb": "21600", "cpu": "30.00"}
+    assert dict(exc_info.value.found) == {**here, "memory_mb": "21600", "cpu": "30.00"}
 
 
 async def test_budget_reserve_ratio_scales() -> None:
@@ -269,7 +270,8 @@ async def test_budget_reserve_ratio_scales() -> None:
 
 
 async def test_memory_gate_blocks_when_budget_exhausted() -> None:
-    """Acquire blocks when memory budget would be exceeded."""
+    """Acquire blocks when memory budget would be exceeded, though the host has memory to
+    spare (gate 3a passes): the gate is "memory_budget". A release admits the waiter."""
     with _mock_system_memory(100_000):  # host memory never decides: the budget gates do
         # 4000 MB host, 10 % reserve, 1.0x overcommit: a budget of 3600 MB. Each VM of 256 MB
         # reserves 336 MB: 10 fit (3360 MB), the 11th (3696 MB) blocks.
@@ -285,6 +287,7 @@ async def test_memory_gate_blocks_when_budget_exhausted() -> None:
                 f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
             )
             reservations.append(r)
+        assert await _blocking_gate_of(ctrl) == "memory_budget"
 
         # Next should block (budget exhausted)
         acquire_task = asyncio.create_task(
@@ -488,7 +491,7 @@ async def test_overcommit_allows_more_cpu_than_physical() -> None:
         pytest.param(
             1_000_000,
             _CPU,
-            {"memory_mb": "1000080", "cpu": f"{_CPU + 0.25:.2f}"},
+            {"memory_mb": "1000080", "cpu": "1.25"},
             {"memory_mb": "21600", "cpu": "30.00"},
             id="memory",
         ),
@@ -540,9 +543,17 @@ async def test_acquire_never_fits_fails_at_once(
 
 
 async def test_acquire_timeout_raises_capacity_error() -> None:
-    """TransientError CAPACITY raised when timeout expires waiting for resources."""
-    # Tight CPU budget: only 1 VM fits (1.5 host CPUs, 0 reserve, each VM 1.25 effective)
-    ctrl = _make_controller(host_cpu_count=1.5, cpu_overcommit=1.0, cpu_reserve_cores=0.0)
+    """TransientError CAPACITY raised when timeout expires waiting for resources. The budgets
+    show in whole MB and 0.1 core."""
+    # Tight CPU budget: only 1 VM fits (1.37 host CPUs, 0 reserve, each VM 1.25 effective)
+    ctrl = _make_controller(
+        host_memory_mb=1000.0,
+        reserve_ratio=0.0,
+        memory_overcommit=1.0,
+        host_cpu_count=1.37,
+        cpu_overcommit=1.0,
+        cpu_reserve_cores=0.0,
+    )
     r1 = await ctrl.acquire(
         "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
     )
@@ -556,7 +567,12 @@ async def test_acquire_timeout_raises_capacity_error() -> None:
             "vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2, use_tcg=False, held=frozenset()
         )
 
-    assert exc_info.value.context["blocking_gate"] == "cpu_budget"
+    context = exc_info.value.context
+    assert (context["blocking_gate"], context["memory_budget_mb"], context["cpu_budget"]) == (
+        "cpu_budget",
+        "1000",
+        "1.4",
+    )
     await ctrl.release(r1)
 
 
@@ -912,6 +928,50 @@ async def test_one_manual_override_stands_and_the_other_is_probed(
 
     assert await _budgets(ctrl) == budgets
     await ctrl.stop()
+
+
+@pytest.mark.parametrize(
+    ("given_mb", "cgroup_mb", "vmem", "source"),
+    [
+        pytest.param(32_000.0, 4096.0, _GIB_VMEM, "manual", id="manual"),
+        pytest.param(None, 4096.0, _GIB_VMEM, "cgroup", id="cgroup"),
+        pytest.param(None, None, _GIB_VMEM, "psutil", id="psutil"),
+        pytest.param(None, None, OSError("no psutil"), "none", id="none"),
+    ],
+)
+async def test_start_logs_where_the_memory_size_came_from(
+    given_mb: float | None,
+    cgroup_mb: float | None,
+    vmem: object,
+    source: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The "Host resources detected" line names the source of the memory size: the given
+    setting, the cgroup limit, psutil, or none (no memory limit). The CPUs are probed."""
+    ctrl = ResourceAdmissionController(
+        disk_dir=_DISK_DIR,
+        disk_free_floor_mb=0,
+        memory_overcommit_ratio=1.0,
+        cpu_overcommit_ratio=1.0,
+        disk_overcommit_ratio=DEFAULT_DISK_OVERCOMMIT_RATIO,
+        host_memory_reserve_ratio=0.1,
+        available_memory_floor_mb=0,
+        host_cpu_reserve_cores=0.5,
+        host_memory_mb=given_mb,
+        host_cpu_count=None,
+    )
+    with (
+        patch("exec_sandbox.admission.detect_cgroup_memory_limit_mb", return_value=cgroup_mb),
+        patch("exec_sandbox.admission.detect_cgroup_cpu_limit", return_value=None),
+        patch("exec_sandbox.admission.psutil.virtual_memory", side_effect=[vmem]),
+        patch("exec_sandbox.admission.psutil.cpu_count", return_value=4),
+        caplog.at_level("INFO", logger="exec_sandbox.admission"),
+    ):
+        await ctrl.start()
+    await ctrl.stop()
+
+    [detected] = [record for record in caplog.records if record.getMessage() == "Host resources detected"]
+    assert detected.capacity_source == source  # pyright: ignore[reportAttributeAccessIssue]
 
 
 # ============================================================================
@@ -1329,7 +1389,8 @@ async def test_n_controllers_converge_to_system_limit(floor_mb: int, expected: i
     Four controllers think they own a 16 GB machine; the system has 2048 MB available, and
     each admitted VM takes its 336 MB from it. Floor 0: 2048, 1712, 1376, 1040, 704, 368 MB
     admit (368 - 336 = 32), 32 MB does not: 6 VMs. Floor 512: a VM needs 848 MB available:
-    4 VMs, then 704 MB refuses. Gates 1-2 would admit 200 VMs per controller.
+    4 VMs, then 704 MB refuses. Gates 1-2 would admit 12 VMs per controller (the CPU
+    budget: (8 - 0.5) * 2 = 15 cores, 1.25 per VM).
     """
     n_controllers = 4
     controllers = [
@@ -1366,34 +1427,6 @@ async def test_n_controllers_converge_to_system_limit(floor_mb: int, expected: i
 
     for ctrl, r in reservations:
         await ctrl.release(r)
-
-
-async def test_gate1_still_limits_single_controller() -> None:
-    """Gate 1/2 still enforces per-controller budget even with plenty of system memory.
-
-    Ensures system memory probe doesn't bypass the per-controller budget —
-    both gates must pass.
-    """
-    # Budget = 1000 MB, per-VM = 336 MB → max 2 VMs
-    ctrl = _make_controller(
-        host_memory_mb=1_000.0,
-        memory_overcommit=1.0,
-        reserve_ratio=0.0,
-    )
-
-    with _mock_system_memory(100_000.0):  # system has plenty
-        r1 = await ctrl.acquire(
-            "vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
-        )
-        r2 = await ctrl.acquire(
-            "vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False, held=frozenset()
-        )
-
-        # Third VM: Gate 3a passes (100GB available) but Gate 1 rejects (672 + 336 > 1000)
-        assert await _blocking_gate_of(ctrl) == "memory_budget"
-
-    await ctrl.release(r1)
-    await ctrl.release(r2)
 
 
 # ============================================================================
@@ -1611,34 +1644,6 @@ class TestDiskGate:
             available_memory_floor_mb=0,
             host_cpu_reserve_cores=DEFAULT_HOST_CPU_RESERVE_CORES,
         )
-
-    @staticmethod
-    async def _default_disks(ctrl: ResourceAdmissionController) -> int:
-        """The VMs with a 1024 MB home disk that gate 4 admits now, one after the other (all
-        released after): each reserves 1024 / ratio of the free space above the floor. The
-        memory and CPU budgets hold far more."""
-        held: list[ResourceReservation] = []
-        try:
-            for _ in range(100):
-                try:
-                    held.append(
-                        await ctrl.acquire(
-                            f"count-{len(held)}",
-                            memory_mb=1,
-                            cpu_cores=_CPU,
-                            disk_mb=1024,
-                            timeout=_REFUSED,
-                            use_tcg=False,
-                            held=frozenset(),
-                        )
-                    )
-                except TransientError as e:
-                    assert e.context["blocking_gate"] == "home_disk_space"
-                    break
-            return len(held)
-        finally:
-            for reservation in held:
-                await ctrl.release(reservation)
 
     @pytest.mark.parametrize(("ratio", "fits"), [(1.0, 1), (8.0, 12)])
     async def test_the_disk_overcommit_ratio_sets_the_reserve(self, tmp_path: Path, ratio: float, fits: int) -> None:
@@ -1871,8 +1876,8 @@ class TestDiskGate:
 
     async def test_a_pass_that_gives_nothing_back_ends_the_evictions_of_the_request(self, tmp_path: Path) -> None:
         """Evicted entries whose blocks stay in use: one pass removes at most what the
-        request lacks, then no wake-up evicts more for it (else each release evicts one more
-        entry: 13 in all, 0 MB back)."""
+        request lacks (1000 MB), then no pass and no wake-up evicts more for it (else the next
+        passes empty both caches: 2000 MB, 0 MB back)."""
         disk = _Disk(1000)
         disk.written_mb = 5000  # VMs of this controller wrote 5000 MB: their end makes room
         caches = [_Cache(tmp_path / name, disk, [100] * 10, gives_back=0) for name in ("l2", "l1")]
@@ -2202,7 +2207,9 @@ class TestDiskGate:
                 )
             )
         assert wrote
-        assert len(cache.evicted) > 1  # the passes after the first one ran
+        # The passes after the first one ran: +150 MB (406 MB lacking), then 2 entries for +300
+        # (106 MB lacking), then 1 entry that makes it fit
+        assert cache.evicted == [300] * 4
 
     async def test_space_that_never_shows_fails_once_it_stops_growing(self, tmp_path: Path) -> None:
         """A clone keeps the evicted blocks on XFS too, where the space is read again after the
@@ -2657,8 +2664,12 @@ class TestDiskGate:
         cache = _Cache(tmp_path / "l2", disk, [300, 300], gives_back=0)
         ctrl.add_cache(cache)
         loop = asyncio.get_running_loop()
-        for step in range(1, 30):  # 0.2 MB every 5 ms: under 1/64 of the pass by its 0.1 s limit
-            loop.call_later(step / 200, lambda: setattr(disk, "free_mb", disk.free_mb + 0.2))
+        # 0.1 MB every 5 ms for 0.2 s: still growing at the pass's 0.1 s limit, and under 1/64
+        # of the pass (300 / 64 = 4.7 MB) even once every step ran (4 MB): a read that a loaded
+        # runner makes late gives the same verdict (with 0.2 MB steps, a read 30 ms late saw
+        # 5.2 MB, and the pass never synced)
+        for step in range(1, 41):
+            loop.call_later(step / 200, lambda: setattr(disk, "free_mb", disk.free_mb + 0.1))
 
         def sync(_path: Path) -> None:
             disk.free_mb += sum(cache.evicted)
@@ -2774,7 +2785,9 @@ class TestDiskGate:
                     "vm-b", memory_mb=1, cpu_cores=_CPU, disk_mb=3000, timeout=2, use_tcg=False, held=frozenset()
                 )
             await ctrl.release(await a)
-        assert sum(clones.evicted) <= 800  # one pass: what B lacked once A's space showed
+        # One pass: the 706 MB B lacked once A's space showed (1300 MB free; floor 1000, A's 256 MB
+        # reserve and B's 750 MB), in whole entries
+        assert clones.evicted == [100] * 8
 
     async def test_space_that_shows_in_one_step_at_a_transaction_sync_admits(self, tmp_path: Path) -> None:
         """ZFS shows a removal in one step at its next transaction sync (4-5 s on EC2), nothing
@@ -3023,7 +3036,9 @@ class TestDiskGate:
             )
         assert all(isinstance(r, TransientError) and r.code is ErrorCode.LOCAL_DISK for r in results)
         assert loop.time() - started < 1.5
-        assert sum(cache.evicted) <= 600  # two passes, each for the requests still waiting
+        # Two passes: the first for the three requests, the second (after a pass of nothing) for
+        # its own request only
+        assert cache.passes == [[100, 100, 100], [100]]
 
     async def test_one_pass_of_nothing_does_not_stop_the_other_requests(self, tmp_path: Path) -> None:
         """The oldest entry is a clone (its removal gives nothing), the next ones give all. A's pass removes
@@ -3651,7 +3666,7 @@ class TestDiskGate:
 
     def test_a_pass_evicts_only_for_the_waiters_that_can_fit(self, tmp_path: Path) -> None:
         """The other waiters' reserves count only when each can fit after this request's
-        listing: a 16 GB disk on a disk with 2 GB to gain adds nothing (a pass evicted
+        listing: a 16 GB reserve on a filesystem with 2 GB to gain adds nothing (a pass evicted
         1899 MB where 829 MB served every request that could fit). The sum is read directly:
         through acquire(), a waiter that cannot fit after the listing of another request has
         counted other room at its own check (other leases in `held`, VMs that ended since), a
@@ -3771,8 +3786,12 @@ class TestDiskGate:
         cache = _Cache(tmp_path / "l2", disk, [300] * 4, gives_back=0)
         ctrl.add_cache(cache)
         loop = asyncio.get_running_loop()
-        for step in range(1, 100):  # 0.2 MB every 10 ms: it grows, under 1/64 of the pass
-            loop.call_later(step / 100, lambda: setattr(disk, "free_mb", disk.free_mb + 0.2))
+        # Reads: the space grows for 1 s (0.2 MB every 10 ms), and the pass reads it to its limit. Sync:
+        # no growth, so the pass gains nothing and syncs; with growth, a loop stall that ends 0.235 s
+        # after the pass's first read makes the gain reach 1/64 of the pass, which skips the sync
+        if slow == "reads":
+            for step in range(1, 100):
+                loop.call_later(step / 100, lambda: setattr(disk, "free_mb", disk.free_mb + 0.2))
         settle = (
             _Settle(quiet=0.15, limit=1.0, sync_once=False, later=0.0, counts_writes=True)
             if slow == "reads"
@@ -3912,12 +3931,6 @@ class TestDiskGate:
             await ctrl.release(first)
             async with asyncio.timeout(1):
                 await ctrl.release(await second)
-
-    async def test_default_disks_fit_by_their_reserve(self, tmp_path: Path) -> None:
-        """10 default disks (1024 MB, a 256 MB reserve each) fit in the 2688 MB above the floor."""
-        ctrl = self._controller(tmp_path, floor_mb=1000)
-        with patch("exec_sandbox.admission.shutil.disk_usage", _Disk(1000 + 2688).usage):
-            assert await self._default_disks(ctrl) == 10
 
 
 # ============================================================================
@@ -4135,50 +4148,6 @@ class TestSettleRemovals:
         ):
             assert _settle_removals(tmp_path) == settled
         assert calls == ([_START_SYNC, _WAIT_SYNC] if upper_type == _BTRFS else [])
-
-    def test_the_upper_folder_of_an_overlay_comes_from_mountinfo(self, tmp_path: Path) -> None:
-        """The line of /proc/self/mountinfo with the device of the folder gives the upperdir
-        option (octal escapes undone). In a container it names a folder of the host: no folder,
-        no upper (_OTHER then)."""
-        upper = tmp_path / "up per"
-        upper.mkdir()
-        dev = tmp_path.stat().st_dev
-        mountinfo = tmp_path / "mountinfo"
-        line = (
-            f"36 25 {os.major(dev)}:{os.minor(dev)} / /merged rw,relatime shared:1 - overlay overlay "
-            f"rw,lowerdir=/lower,upperdir={str(upper).replace(' ', chr(92) + '040')},workdir=/work\n"
-        )
-        mountinfo.write_text("25 1 8:1 / / rw - ext4 /dev/root rw\n" + line)
-        with patch("exec_sandbox.files.disk.MOUNTINFO", mountinfo):
-            assert overlay_upper(tmp_path) == upper
-            upper.rmdir()
-            assert overlay_upper(tmp_path) is None
-
-    def test_mountinfo_lines_of_any_bytes_and_empty_sources_parse(self, tmp_path: Path) -> None:
-        """A mount point that is not UTF-8 and an empty mount source (two spaces) parse: the lines are read as
-        bytes (a text read raises UnicodeDecodeError), the fields split on single spaces (a split on runs of
-        spaces shifts the fields)."""
-        upper = tmp_path / "upper"
-        upper.mkdir()
-        dev = tmp_path.stat().st_dev
-        mountinfo = tmp_path / "mountinfo"
-        mountinfo.write_bytes(
-            b"40 25 0:99 / /tmp/bad\xe9 rw - tmpfs tmpfs rw\n"
-            + f"36 25 {os.major(dev)}:{os.minor(dev)} / /merged rw - overlay  rw,upperdir={upper},workdir=/w\n".encode()
-        )
-        with patch("exec_sandbox.files.disk.MOUNTINFO", mountinfo):
-            assert overlay_upper(tmp_path) == upper
-
-    def test_a_relative_upper_folder_is_no_upper(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A relative upperdir ("u5") would be taken from the current folder, on another
-        filesystem. Only an absolute path names the upper folder."""
-        (tmp_path / "u5").mkdir()
-        monkeypatch.chdir(tmp_path)
-        dev = tmp_path.stat().st_dev
-        mountinfo = tmp_path / "mountinfo"
-        mountinfo.write_text(f"36 25 {os.major(dev)}:{os.minor(dev)} / /merged rw - overlay overlay rw,upperdir=u5\n")
-        with patch("exec_sandbox.files.disk.MOUNTINFO", mountinfo):
-            assert overlay_upper(tmp_path) is None
 
     def test_a_zfs_module_this_user_may_not_see_reads_as_none(self, tmp_path: Path) -> None:
         """A zfs_txg_timeout path this user cannot reach reads as no ZFS module, never as a PermissionError

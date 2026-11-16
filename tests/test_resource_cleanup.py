@@ -4,7 +4,7 @@ import asyncio
 import shlex
 import signal
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.resource_cleanup import cleanup_process
@@ -49,7 +49,6 @@ class TestResourceCleanupProcess:
                 name="graceful-process",
                 context_id="test-ctx",
                 term_timeout=3.0,
-                kill_timeout=2.0,
                 kill_first=False,
             )
             is True
@@ -64,7 +63,7 @@ class TestResourceCleanupProcess:
         start = loop.time()
 
         result = await cleanup_process(
-            proc=proc, name="killed-first", context_id="test-ctx", term_timeout=10.0, kill_timeout=2.0, kill_first=True
+            proc=proc, name="killed-first", context_id="test-ctx", term_timeout=10.0, kill_first=True
         )
 
         assert (result, proc.returncode) == (True, -signal.SIGKILL)
@@ -82,7 +81,6 @@ class TestResourceCleanupProcess:
             name="stubborn-process",
             context_id="test-ctx",
             term_timeout=0.3,
-            kill_timeout=5.0,
             kill_first=False,
         )
 
@@ -99,7 +97,6 @@ class TestResourceCleanupProcess:
                 name="dead-process",
                 context_id="test-ctx",
                 term_timeout=3.0,
-                kill_timeout=2.0,
                 kill_first=False,
             )
             is True
@@ -114,7 +111,6 @@ class TestResourceCleanupProcess:
                 name="null-process",
                 context_id="test-ctx",
                 term_timeout=3.0,
-                kill_timeout=2.0,
                 kill_first=False,
             )
             is True
@@ -132,7 +128,6 @@ class TestResourceCleanupProcess:
                 name="race-condition-process",
                 context_id="test-ctx",
                 term_timeout=3.0,
-                kill_timeout=2.0,
                 kill_first=False,
             )
             is True
@@ -150,14 +145,14 @@ class TestResourceCleanupProcess:
             name="pgid-race-process",
             context_id="test-ctx",
             term_timeout=0.01,
-            kill_timeout=0.01,
             kill_first=False,
         )
 
         assert result is True
 
     async def test_process_that_sigkill_does_not_end_in_time(self) -> None:
-        """SIGKILL that does not end the process within kill_timeout (D state): False."""
+        """SIGKILL that does not end the process in time (D state): False, after term_timeout
+        then the 2 s wait that follows SIGKILL."""
         proc = _stuck_process()
         proc.wait_with_timeout = AsyncMock(side_effect=TimeoutError)
 
@@ -166,11 +161,11 @@ class TestResourceCleanupProcess:
             name="stubborn-process",
             context_id="test-ctx",
             term_timeout=0.01,
-            kill_timeout=0.01,
             kill_first=False,
         )
 
         assert (result, proc.kill.await_count) == (False, 1)
+        assert proc.wait_with_timeout.await_args_list == [call(timeout=0.01), call(timeout=2.0)]
 
     async def test_cleanup_process_unexpected_exception(self) -> None:
         """An unexpected error of the OS call: False, never raised (cleanup paths go on)."""
@@ -183,7 +178,6 @@ class TestResourceCleanupProcess:
                 name="error-process",
                 context_id="test-ctx",
                 term_timeout=3.0,
-                kill_timeout=2.0,
                 kill_first=False,
             )
             is False

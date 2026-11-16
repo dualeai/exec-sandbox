@@ -733,7 +733,7 @@ class TestFolderRecords:
         """Under `sg qemu-vm` every new folder has group qemu-vm, also those of a QEMU that runs
         as this user: rmtree removes them, with no sudo. Only what rmtree leaves (files of a
         qemu-vm QEMU) goes with `sudo -n rm -rf`. A folder only root may enter stands in for
-        those files; a stand-in for sudo removes it."""
+        those files; a stand-in sudo on PATH writes its arguments to a file and removes it."""
         if os.geteuid() == 0:
             pytest.skip("root enters every folder")
         root = tmp_path / "root"
@@ -745,19 +745,22 @@ class TestFolderRecords:
             (workdir / "private" / "f").touch()
             (workdir / "private").chmod(0)
         (dead / "vm-1.folder").symlink_to(workdir)
+        calls = tmp_path / "sudo-calls"
+        calls.touch()
+        stand_in = tmp_path / "bin" / "sudo"
+        stand_in.parent.mkdir()
+        # sudo -n rm -rf -- <folder>: the folder is $5
+        stand_in.write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\nchmod -R u+rwx "$5"\n/bin/rm -rf -- "$5"\n')
+        stand_in.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{stand_in.parent}{os.pathsep}{os.environ['PATH']}")
         monkeypatch.setattr(private_run_dir, "get_qemu_vm_gid", lambda: workdir.stat().st_gid)
-        commands: list[list[str]] = []
-
-        def sudo(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
-            commands.append(command)
-            (workdir / "private").chmod(0o700)
-            shutil.rmtree(command[-1])
-            return subprocess.CompletedProcess(command, 0, b"", b"")
-
-        monkeypatch.setattr(private_run_dir.subprocess, "run", sudo)
-        remove_dead_folders(root)
-        assert not workdir.exists()
-        assert commands == ([["sudo", "-n", "rm", "-rf", "--", str(workdir)]] if kept_by_rmtree else [])
+        try:
+            remove_dead_folders(root)
+            assert not workdir.exists()
+            assert calls.read_text() == (f"-n rm -rf -- {workdir}\n" if kept_by_rmtree else "")
+        finally:
+            if (workdir / "private").exists():
+                (workdir / "private").chmod(0o700)
 
     def test_stuck_sudo_is_bounded_and_the_record_stays(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A sudo that hangs (a hostname, PAM or SSSD lookup) is killed after
@@ -994,7 +997,7 @@ class TestRootChecks:
             patch.object(Cgroup, "end_all", return_value=[]) as end,
         ):
             remove_dead_folders(root)
-        end.assert_not_called()
+        end.assert_called_once_with([])  # the checked root records no cgroup; the planted vm-x is never read
         assert (victim / "src.py").exists()
         assert planted.exists()
         assert not (tmp_path / "moved" / dead.name).exists()

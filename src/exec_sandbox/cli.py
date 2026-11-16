@@ -13,13 +13,18 @@ Multi-input (each source in its own VM, all at the same time):
 Saved instances:
     sbx run --instance my-vm -c 'x = 41'          # Makes instance my-vm, saves it
     sbx run --instance my-vm -c 'print(x + 1)'    # Continues it: prints 42, saves it
-    sbx instance list | describe ID | rm ID...
+    sbx instance list | describe ID | keys | check [ID...] | rm ID...
+
+Worker and images:
+    sbx worker describe                           # This worker's facts for a broker
+    sbx prefetch                                  # Download the VM images before use
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import os
@@ -55,6 +60,7 @@ from exec_sandbox import (
     InvalidInputError,
     Language,
     PortMapping,
+    RouteError,
     SandboxError,
     Scheduler,
     SchedulerConfig,
@@ -246,7 +252,7 @@ def parse_upload_spec(spec: str) -> tuple[str, str]:
         Tuple of (local_path, guest_path)
 
     Raises:
-        click.BadParameter: If format is invalid
+        click.BadParameter: If format is invalid, or no file or folder is at the local path
     """
     local, sep, guest = spec.partition(":")
     if not sep or not guest:
@@ -280,7 +286,7 @@ def parse_download_spec(spec: str) -> tuple[str, str]:
         Tuple of (guest_path, local_path)
 
     Raises:
-        click.BadParameter: If format is invalid
+        click.BadParameter: If format is invalid, or the local path is a folder
     """
     if not spec:
         raise click.BadParameter(
@@ -394,11 +400,6 @@ class MultiSourceResult(BaseModel):
         return _run_exit_code(self.run.result) if self.run else _error_exit_code(action=self.action, code=self.code)
 
 
-def format_multi_result_json(results: list[MultiSourceResult]) -> str:
-    """Format multiple execution results as a JSON array."""
-    return _MULTI_RESULTS.dump_json(results, indent=2).decode()
-
-
 _MULTI_RESULTS = TypeAdapter(list[MultiSourceResult])
 
 
@@ -449,19 +450,21 @@ def _resolve_source(src: str, language_override: str | None) -> SourceInput:
     return SourceInput(code=code, label=label, language=language)
 
 
-def _display_multi_summary(total_passed: int, total_failed: int, total_sources: int, total_time_ms: int) -> None:
-    """Display summary line for multi-source execution."""
+def _display_multi_summary(results: list[MultiSourceResult], total_time_ms: int) -> None:
+    """Display summary line for multi-source execution: a source passed when its code exited 0."""
+    passed = sum(1 for r in results if r.run and r.run.result.exit_code == 0)
+    failed = len(results) - passed
     click.echo()
     click.echo("─" * 60)
-    if total_failed == 0:
+    if failed == 0:
         click.echo(
-            click.style(f"✓ {total_passed}/{total_sources} passed", fg="green")
+            click.style(f"✓ {passed}/{len(results)} passed", fg="green")
             + click.style(f" ({total_time_ms}ms total)", dim=True)
         )
     else:
         click.echo(
-            click.style(f"⚠ {total_passed}/{total_sources} passed, ", fg="yellow")
-            + click.style(f"{total_failed} failed", fg="red")
+            click.style(f"⚠ {passed}/{len(results)} passed, ", fg="yellow")
+            + click.style(f"{failed} failed", fg="red")
             + click.style(f" ({total_time_ms}ms total)", dim=True)
         )
 
@@ -505,10 +508,10 @@ def _make_spec(
     *,
     language: Language,
     memory: int,
-    packages: list[str],
+    packages: tuple[str, ...],
     network: bool,
-    allowed_domains: list[str],
-    expose_ports: list[PortMapping] | None,
+    allowed_domains: tuple[str, ...],
+    expose_ports: list[PortMapping],
 ) -> VmSpec:
     """VmSpec from the CLI flags (empty flag lists mean "none"). A value the VmSpec refuses
     (-m below its minimum, more --expose than its maximum) raises click.UsageError (exit 2)
@@ -517,10 +520,10 @@ def _make_spec(
         return VmSpec(
             language=language,
             memory_mb=memory,
-            packages=tuple(packages),
+            packages=packages,
             allow_network=network,
-            allowed_domains=tuple(allowed_domains) if allowed_domains else None,
-            expose_ports=tuple(expose_ports or ()),
+            allowed_domains=allowed_domains or None,
+            expose_ports=tuple(expose_ports),
         )
     except ValidationError as e:
         options = dict(_SPEC_OPTIONS.values())  # VmSpec field -> option name
@@ -584,7 +587,8 @@ _ACTION_ADVICE: dict[ErrorAction, str] = {
     ErrorAction.FIX_INPUT: "Correct the command, then run again.",
     ErrorAction.FIX_CONFIG: "Correct the settings, then run again.",
     ErrorAction.ROUTE: "Run it on a host with the needed values "
-    "(CPU, accelerator, QEMU machine type and version, guest images, memory and CPU budget). "
+    "(CPU architecture, guest CPU model, host CPU, guest clock rate, accelerator, QEMU machine type "
+    "and version, guest images, memory and CPU budget). "
     "Do not remove a saved instance for this error: its data is good.",
     ErrorAction.RECREATE: "This instance cannot be used again. "
     "Remove it with 'sbx instance rm {id}', then run again to make a new one.",
@@ -592,6 +596,13 @@ _ACTION_ADVICE: dict[ErrorAction, str] = {
     "EXEC_SANDBOX_LOG_LEVEL=DEBUG.",
 }
 """What the user does next, for each action."""
+
+_OTHER_RELEASE_ADVICE = (
+    "Run it with the exec-sandbox release that wrote it: 'sbx instance describe {id}' names it (writer_release); "
+    "when describe gives this error too, the error names it if the data does."
+)
+"""The ROUTE advice when RouteError.required is empty: no host of this release can run it. Such
+an error comes from host_mismatch, whose hint already says to keep the instance."""
 
 _PREFETCH_ADVICE = "Check the network, then download the VM images with 'sbx prefetch' and run again."
 
@@ -613,8 +624,6 @@ _CODE_ADVICE: dict[ErrorCode, list[str]] = {
     ],
 }
 """Extra advice for some codes, printed before the action's advice."""
-
-_STRINGS = TypeAdapter(list[str])
 
 
 def _valid_instance_id(value: str) -> str:
@@ -825,7 +834,8 @@ def _report_error(error: SandboxError, *, saved: InstanceRef | None) -> int:
     One path for every error: its code and action, its message, its hint, the
     extra advice of its code (_CODE_ADVICE: install, prefetch, package allow-list,
     boot timeout), then the advice of its action (for INSTANCE_SAVE_OUTCOME_UNKNOWN, also
-    the commit to look for with 'sbx instance describe'). After a run that saved (`saved`,
+    the commit to look for with 'sbx instance describe'; for a RouteError with an empty
+    `required`, the release to run it with). After a run that saved (`saved`,
     for a failed download) the action's advice gives way to a note: a new run
     starts from the saved state and runs the code again on it.
 
@@ -839,7 +849,9 @@ def _report_error(error: SandboxError, *, saved: InstanceRef | None) -> int:
             "A new run starts from that state: it runs the code again on it."
         )
     else:
-        suggestions.append(_ACTION_ADVICE[error.action].format(id=error.instance_id or "ID"))
+        other_release = isinstance(error, RouteError) and not error.required
+        advice = _OTHER_RELEASE_ADVICE if other_release else _ACTION_ADVICE[error.action]
+        suggestions.append(advice.format(id=error.instance_id or "ID"))
         if error.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN:  # its context names the commit (save_context)
             suggestions.append(
                 f"The save is stored if 'sbx instance describe {error.instance_id}' lists commit "
@@ -943,11 +955,9 @@ async def run_code(
         codes = [_report_error(e, saved=saved) for e in failures]
         if codes:
             return codes[0]
-        if json_output:
-            return _run_exit_code(result)
 
         # TTY mode: show timing footer
-        if is_tty() and not quiet:
+        if not json_output and is_tty() and not quiet:
             click.echo()  # Ensure newline after output
             click.echo(click.style(f"✓ Done in {run.total_ms}ms", fg="green", dim=True), err=True)
 
@@ -991,8 +1001,6 @@ async def run_multiple(
 
     results: list[MultiSourceResult] = []
     errors: dict[int, SandboxError] = {}  # source index -> why the source has no run
-    total_passed = 0
-    total_failed = 0
     start_time = time.perf_counter()
 
     try:
@@ -1024,12 +1032,6 @@ async def run_multiple(
                 for next_done in asyncio.as_completed(tasks):
                     result = await next_done
                     results.append(result)
-
-                    if result.run and result.run.result.exit_code == 0:
-                        total_passed += 1
-                    else:
-                        total_failed += 1
-
                     if not json_output:
                         _display_multi_result(result, len(sources), quiet, error=errors.get(result.index))
             finally:
@@ -1044,12 +1046,12 @@ async def run_multiple(
         results.sort(key=lambda r: r.index)
 
         if json_output:
-            click.echo(format_multi_result_json(results))
+            click.echo(_MULTI_RESULTS.dump_json(results, indent=2).decode())
             for result in results:
                 if result.index in errors:
                     _report_error(errors[result.index], saved=None)
         elif is_tty() and not quiet:
-            _display_multi_summary(total_passed, total_failed, len(sources), total_time_ms)
+            _display_multi_summary(results, total_time_ms)
 
         return _compute_multi_exit_code(results)
 
@@ -1290,13 +1292,11 @@ def run_command(
         raise click.UsageError("--allow-domain requires --network.")
 
     # Parse environment variables, port mappings and file I/O specs
-    try:
-        parsed_env_vars = parse_env_vars(env_vars)
-        parsed_ports = parse_port_mappings(expose_ports) if expose_ports else None
-        parsed_uploads = tuple(parse_upload_spec(spec) for spec in upload_files)
-        parsed_downloads = tuple(parse_download_spec(spec) for spec in download_files)
-    except click.BadParameter as exc:
-        raise click.UsageError(str(exc)) from exc
+    # A bad value raises click.BadParameter with its option's name: click shows it as a usage error
+    parsed_env_vars = parse_env_vars(env_vars)
+    parsed_ports = parse_port_mappings(expose_ports)
+    parsed_uploads = tuple(parse_upload_spec(spec) for spec in upload_files)
+    parsed_downloads = tuple(parse_download_spec(spec) for spec in download_files)
 
     resolved_sources = [_resolve_source(src, language) for src in all_sources]
 
@@ -1312,9 +1312,9 @@ def run_command(
         _make_spec(
             language=src.language,
             memory=memory,
-            packages=list(packages),
+            packages=packages,
             network=network,
-            allowed_domains=list(allowed_domains),
+            allowed_domains=allowed_domains,
             expose_ports=parsed_ports,
         )
         for src in resolved_sources
@@ -1414,8 +1414,7 @@ def instance_list_command(*, json_output: bool, long_output: bool) -> NoReturn:
         ids = [instance_id async for instance_id in admin.list_ids()]
         if long_output:
             lines: list[str] = []
-            for start in range(0, len(ids), _DESCRIBE_AT_ONCE):
-                batch = ids[start : start + _DESCRIBE_AT_ONCE]
+            for batch in itertools.batched(ids, _DESCRIBE_AT_ONCE):
                 described = await asyncio.gather(*(_described(admin, instance_id) for instance_id in batch))
                 if not json_output:
                     for line in described:
@@ -1424,7 +1423,7 @@ def instance_list_command(*, json_output: bool, long_output: bool) -> NoReturn:
             if json_output:
                 click.echo("[" + ",".join(lines) + "]")
         elif json_output:
-            click.echo(_STRINGS.dump_json(ids, indent=2).decode())
+            click.echo(json.dumps(ids, indent=2))
         else:
             for instance_id in ids:
                 click.echo(instance_id)
@@ -1485,7 +1484,7 @@ def instance_keys_command(*, json_output: bool) -> NoReturn:
             return _report_error(e, saved=None)
         key_ids = [key.id for key in keyring.keys]
         if json_output:
-            click.echo(_STRINGS.dump_json(key_ids, indent=2).decode())
+            click.echo(json.dumps(key_ids, indent=2))
         else:
             for key_id in key_ids:
                 click.echo(key_id)
@@ -1589,7 +1588,7 @@ def worker_describe_command() -> NoReturn:
     """Show this worker's facts as JSON (Scheduler.describe_worker).
 
     "values": one value per key of RouteError.required (arch, accelerator,
-    CPU vendor, guest CPU model, QEMU version and machine types, the guest
+    guest CPU model, host CPU, guest clock rate, QEMU version and machine types, the guest
     images on this worker's disk, the admission budget); "key_ids": the
     instance keys of the store of 'sbx run --instance ID'. A call that raised
     RouteError can run on a worker whose facts satisfy the error's "required".
@@ -1639,10 +1638,7 @@ def prefetch_command(arch: str | None, quiet: bool) -> NoReturn:
 
 
 def _display_prefetch_result(result: PrefetchResult, quiet: bool) -> None:
-    """Display prefetch result to the user."""
-    if quiet and result.success:
-        return
-
+    """Display prefetch result to the user: with quiet, only the errors."""
     if not quiet:
         click.echo(f"Prefetching exec-sandbox assets for {result.arch}...")
         for name in result.downloaded:

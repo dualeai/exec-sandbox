@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox._version import __version__
 from exec_sandbox.aio_utils import gather_or_cancel
 from exec_sandbox.asset_downloader import (
@@ -34,7 +34,7 @@ from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import chmod_executable
 from exec_sandbox.platform_utils import UserDir, arch_of, detect_host_arch, get_arch_name, get_user_dir
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # GitHub repository info
 GITHUB_OWNER = "dualeai"
@@ -88,7 +88,6 @@ def get_assets() -> AsyncPooch:
         path=images_download_dir(),
         base_url=f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/v{{version}}",
         version=pooch_version,
-        setting="EXEC_SANDBOX_CACHE_DIR",  # images_download_dir() is under it
     )
 
 
@@ -178,9 +177,9 @@ async def ensure_base_image(language: Language, *, images_dir: Path) -> None:
     await _download(name + RELEASE_SUFFIX)
 
 
-async def get_gvproxy_path(*, override: Path | None) -> Path | None:
+async def get_gvproxy_path(*, override: Path | None, arch: str) -> Path | None:
     """
-    Get path to gvproxy-wrapper binary for current platform (without downloading).
+    Get path to the gvproxy-wrapper binary of this OS for an architecture (without downloading).
 
     Detection order:
     0. override (explicit from SchedulerConfig.images_dir)
@@ -191,15 +190,11 @@ async def get_gvproxy_path(*, override: Path | None) -> Path | None:
 
     Args:
         override: Explicit path to search first (from SchedulerConfig.images_dir), or None.
+        arch: Architecture ("x86_64" or "aarch64").
 
     Returns:
         Path to the gvproxy-wrapper binary if found, None otherwise.
     """
-    return await _find_gvproxy(override, arch=get_arch_name())
-
-
-async def _find_gvproxy(override: Path | None, *, arch: str) -> Path | None:
-    """The gvproxy-wrapper binary of this OS for `arch`, in get_gvproxy_path's order; None if not found."""
     fname = f"gvproxy-wrapper-{get_gvproxy_suffix(arch)}"
 
     # 0. Check override path first if provided
@@ -233,7 +228,7 @@ async def fetch_gvproxy(*, override: Path | None, arch: str) -> Path:
         OSError: the binary cannot be made executable (a read-only folder, a file of another user)
     """
     # Check local paths first
-    if local_path := await _find_gvproxy(override, arch=arch):
+    if local_path := await get_gvproxy_path(override=override, arch=arch):
         logger.debug("Using cached gvproxy-wrapper", extra={"path": str(local_path)})
         # Ensure executable
         await chmod_executable(local_path)
@@ -254,7 +249,7 @@ async def fetch_gvproxy(*, override: Path | None, arch: str) -> Path:
     return path
 
 
-async def ensure_assets_available() -> tuple[Path, Path]:
+async def ensure_assets_available() -> Path:
     """
     Make the download cache hold the boot files (the kernel and the initramfs), and find or
     download gvproxy (base images are fetched per language, on first use: ensure_base_image).
@@ -266,11 +261,11 @@ async def ensure_assets_available() -> tuple[Path, Path]:
     missing assets raise ConfigError ASSET_NOT_FOUND (no download).
 
     Returns:
-        Tuple of (images_dir: the download cache, gvproxy_path)
+        The images folder: the download cache
 
     Raises:
-        ConfigError: ASSET_NOT_FOUND: release not found on GitHub, or offline mode
-            and assets missing. SETTING_INVALID: the download cache (under
+        ConfigError: ASSET_NOT_FOUND: release not found on GitHub, a file the release lacks,
+            or offline mode and assets missing. SETTING_INVALID: the download cache (under
             EXEC_SANDBOX_CACHE_DIR) cannot be made or written.
         TransientError: ASSET_DOWNLOAD: the release metadata could not be read, or a
             download or hash verification failed after retries. LOCAL_DISK: a host error
@@ -290,7 +285,7 @@ async def ensure_assets_available() -> tuple[Path, Path]:
         extra={"images_dir": str(images_dir), "gvproxy": str(gvproxy_path)},
     )
 
-    return images_dir, gvproxy_path
+    return images_dir
 
 
 async def ensure_assets(*, override: Path | None, download: bool) -> Path:
@@ -308,7 +303,8 @@ async def ensure_assets(*, override: Path | None, download: bool) -> Path:
         Path to images directory.
 
     Raises:
-        ConfigError: ASSET_NOT_FOUND: assets not found and download=False, or release not found on GitHub.
+        ConfigError: ASSET_NOT_FOUND: assets not found and download=False; with download, release
+            not found on GitHub, a file the release lacks, or offline mode.
             SETTING_INVALID: the download cache (under EXEC_SANDBOX_CACHE_DIR) cannot be made or written.
         TransientError: ASSET_DOWNLOAD: the release metadata could not be read, or a download or
             hash verification failed after retries. LOCAL_DISK: a host error on the download cache
@@ -344,8 +340,7 @@ async def ensure_assets(*, override: Path | None, download: bool) -> Path:
         )
 
     # Download assets and return images directory
-    images_dir, _ = await ensure_assets_available()
-    return images_dir
+    return await ensure_assets_available()
 
 
 def _get_search_paths(override: Path | None) -> list[Path]:

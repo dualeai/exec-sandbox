@@ -19,14 +19,15 @@ from exec_sandbox.instance import local_store
 from exec_sandbox.instance.local_store import LocalInstanceStore
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import Applied, InstanceStore, ListedObject, NotApplied, probe
+from exec_sandbox.s3_parts import PART_BYTES
 from tests.instance_support import NO_VM_TIMEOUT
 from tests.s3_faults import BUCKET
 
 pytestmark = NO_VM_TIMEOUT
 
 _MAX = 1024 * 1024
-_TWO_PARTS_AND_ONE = 2 * 8 * 1024 * 1024 + 1
-"""Two parts of the S3 store's multipart size (8 MiB) and one byte."""
+_TWO_PARTS_AND_ONE = 2 * PART_BYTES + 1
+"""Two parts of the S3 store's multipart size and one byte."""
 
 
 @pytest.fixture(params=["s3", "local"])

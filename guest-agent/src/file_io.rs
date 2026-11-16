@@ -43,13 +43,17 @@ impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
 /// State for an in-progress streaming file write operation.
 pub(crate) struct WriteFileState {
     pub(crate) decoder: zstd::stream::write::Decoder<'static, CountingWriter<std::fs::File>>,
-    /// The target's folder, opened beneath SANDBOX_ROOT (`make_dirs_beneath`): the
-    /// temporary file is made, renamed and removed through it, never through a path.
+    /// The target's folder, opened beneath the write's root (SANDBOX_ROOT in the
+    /// agent; `make_dirs_beneath`): the temporary file is made, renamed and removed
+    /// through it, never through a path.
     pub(crate) dir: OwnedFd,
     pub(crate) tmp_name: CString,
     pub(crate) final_name: CString,
     pub(crate) make_executable: bool,
     pub(crate) path_display: String,
+    /// The bytes `run_write` reserves before the first chunk: the header's `size`,
+    /// 0 for none (an empty file, or a header with no size).
+    pub(crate) reserve: u64,
     pub(crate) finished: bool,
 }
 
@@ -125,14 +129,12 @@ impl WriteEnd {
 // Path validation
 // ============================================================================
 
-/// Validate a relative file path and resolve it under SANDBOX_ROOT.
+/// Validate a relative file path and resolve it below SANDBOX_ROOT: the path
+/// below it, "" for SANDBOX_ROOT itself (an empty path too).
 ///
-/// An empty path is SANDBOX_ROOT. The check is lexical: it does not resolve
-/// symlinks (`open_beneath` resolves them and checks where they lead).
+/// The check is lexical: it does not resolve symlinks (`open_beneath` resolves
+/// them and checks where they lead).
 pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathBuf, String> {
-    if relative_path.is_empty() {
-        return Ok(std::path::PathBuf::from(SANDBOX_ROOT));
-    }
     if relative_path.len() > MAX_FILE_PATH_LENGTH {
         return Err(format!(
             "Path too long: {} chars (max {})",
@@ -150,11 +152,10 @@ pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathB
         return Err("Absolute paths are not allowed".to_string());
     }
 
-    let sandbox_root = std::path::PathBuf::from(SANDBOX_ROOT);
-    let mut resolved = sandbox_root.clone();
+    let mut resolved = std::path::PathBuf::new();
 
-    // `resolved` stays under SANDBOX_ROOT at each step (a ParentDir that would
-    // leave it is refused): no check at the end.
+    // `resolved` stays below SANDBOX_ROOT at each step (a ParentDir with no
+    // folder left to leave is refused): no check at the end.
     for component in std::path::Path::new(relative_path).components() {
         match component {
             std::path::Component::Normal(c) => {
@@ -168,8 +169,7 @@ pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathB
                 resolved.push(c);
             }
             std::path::Component::ParentDir => {
-                resolved.pop();
-                if !resolved.starts_with(&sandbox_root) {
+                if !resolved.pop() {
                     return Err("Path traversal outside sandbox".to_string());
                 }
             }
@@ -185,13 +185,6 @@ pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathB
 // ============================================================================
 // Resolution beneath the sandbox root
 // ============================================================================
-
-/// The part of a `validate_file_path` result below SANDBOX_ROOT ("" for the root).
-fn below_root(resolved: &Path) -> &Path {
-    resolved
-        .strip_prefix(SANDBOX_ROOT)
-        .unwrap_or_else(|_| Path::new(""))
-}
 
 /// Open `rel` below the folder `root`, with `flags`. Links resolve as the
 /// kernel resolves them, absolute ones too, so a link to another place in
@@ -309,16 +302,43 @@ fn beneath_error(path: &str, e: &std::io::Error, what: &str) -> CmdError {
     }
 }
 
+/// Refuse a write of `size` bytes that does not fit in the free space of the
+/// filesystem of `root` (SANDBOX_ROOT, or a test's folder). statvfs reads the
+/// filesystem's counters: no journal, no wait. A size that passes can still
+/// fail at the reservation of `run_write`, which then refuses the write: the
+/// file can need one more block (an extent-tree block), and guest code can
+/// take free space between the two steps.
+fn check_free_space(root: &Path, path: &str, size: u64) -> Result<(), CmdError> {
+    let root_c = CString::new(root.as_os_str().as_bytes()).expect("a path with no NUL byte");
+    // SAFETY: an all-zero statvfs is valid (integers and private padding).
+    let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path, and a statvfs that the call fills.
+    if unsafe { libc::statvfs(root_c.as_ptr(), &mut fs) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(CmdError::io(format!(
+            "No free space count for '{path}': {e}"
+        )));
+    }
+    let free = fs.f_bavail.saturating_mul(fs.f_frsize);
+    if size > free {
+        return Err(CmdError::io(format!(
+            "No space for '{path}': needs {size} bytes, {free} bytes free: {}",
+            std::io::Error::from_raw_os_error(libc::ENOSPC)
+        )));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // File handlers
 // ============================================================================
 
 /// Handle read_file command: read from disk, stream as zstd-compressed chunks.
 pub(crate) async fn handle_read_file(path: &str, writer: &ResponseWriter) -> Result<(), CmdError> {
-    let resolved_path = validate_file_path(path)
+    let rel = validate_file_path(path)
         .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
-    if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+    if rel.as_os_str().is_empty() {
         return Err(CmdError::path("Cannot read a directory"));
     }
 
@@ -327,7 +347,7 @@ pub(crate) async fn handle_read_file(path: &str, writer: &ResponseWriter) -> Res
     // not hold the open (the read below refuses anything but a regular file).
     let fd = open_beneath(
         Path::new(SANDBOX_ROOT),
-        below_root(&resolved_path),
+        &rel,
         libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK,
     )
     .map_err(|e| beneath_error(path, &e, "File not found or inaccessible"))?;
@@ -383,7 +403,7 @@ pub(crate) async fn handle_read_file(path: &str, writer: &ResponseWriter) -> Res
 
 /// Handle list_files command: read directory entries.
 pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Result<(), CmdError> {
-    let resolved_path = validate_file_path(path)
+    let rel = validate_file_path(path)
         .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
     // The folder opened beneath SANDBOX_ROOT, then listed through its
@@ -391,7 +411,7 @@ pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Re
     // Entries are not followed: a link reports as a link (not a folder).
     let folder = open_beneath(
         Path::new(SANDBOX_ROOT),
-        below_root(&resolved_path),
+        &rel,
         libc::O_RDONLY | libc::O_DIRECTORY,
     )
     .map_err(|e| beneath_error(path, &e, "Cannot list"))?;
@@ -427,36 +447,51 @@ pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Re
 
 /// Set up a pipelined file write operation.
 ///
-/// Creates the parent folders and a temporary file `.wr.<op_id>.tmp` next to
-/// the target, then starts the writer task (`run_write`). Returns the handle
-/// of that task, or an error.
+/// Checks the path, then the header's `size`: it refuses at once a size over
+/// MAX_FILE_SIZE_BYTES or one that does not fit in the free space of `root`
+/// (SANDBOX_ROOT, or a test's folder), before it makes a folder or a temporary
+/// file. Else it creates the parent folders beneath `root` and a temporary file
+/// `.wr.<op_id>.tmp` next to the target, then starts the writer task
+/// (`run_write`), which reserves `size`. Returns the handle of that task, or an
+/// error.
 pub(crate) fn handle_write_file(
+    root: &Path,
     op_id: &str,
     path: &str,
     make_executable: bool,
+    size: Option<u64>,
 ) -> Result<ActiveWriteHandle, CmdError> {
-    let resolved_path = validate_file_path(path)
+    let rel = validate_file_path(path)
         .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
-    if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+    if rel.as_os_str().is_empty() {
         return Err(CmdError::path("Cannot write to sandbox root directory"));
     }
 
-    let rel = below_root(&resolved_path);
     let final_name = CString::new(rel.file_name().unwrap_or_default().as_bytes())
         .expect("validate_file_path refuses a NUL byte");
     let tmp_name = CString::new(format!(".wr.{op_id}.tmp"))
         .map_err(|_| CmdError::path(format!("Invalid operation id '{op_id}'")))?;
 
+    // The size checks come before any side effect: a refusal leaves no folder and
+    // no temporary file, and the host gets it at the header. It is an io_error, as
+    // when the same limits stop a write in its middle
+    let reserve = size.unwrap_or(0);
+    if reserve > MAX_FILE_SIZE_BYTES as u64 {
+        return Err(CmdError::io(format!(
+            "File '{path}' is {reserve} bytes, exceeds {MAX_FILE_SIZE_BYTES}"
+        )));
+    }
+    if reserve > 0 {
+        check_free_space(root, path, reserve)?;
+    }
+
     // The folders and the temporary file are made through handles opened
-    // beneath SANDBOX_ROOT: a link that guest code planted cannot move the
+    // beneath `root`: a link that guest code planted cannot move the
     // write out of it (EXDEV), and O_NOFOLLOW refuses a link at the temporary
     // name. The rename later replaces a link at the final name, never follows it.
-    let dir = make_dirs_beneath(
-        Path::new(SANDBOX_ROOT),
-        rel.parent().unwrap_or(Path::new("")),
-    )
-    .map_err(|e| beneath_error(path, &e, "Failed to create directories"))?;
+    let dir = make_dirs_beneath(root, rel.parent().unwrap_or(Path::new("")))
+        .map_err(|e| beneath_error(path, &e, "Failed to create directories"))?;
     // SAFETY: valid folder descriptor and NUL-terminated name; owned at once.
     let tmp_fd = unsafe {
         libc::openat(
@@ -495,6 +530,7 @@ pub(crate) fn handle_write_file(
         final_name,
         make_executable,
         path_display: path.to_string(),
+        reserve,
         finished: false,
     };
 
@@ -512,17 +548,37 @@ pub(crate) fn handle_write_file(
 
 /// Body of the writer task of a pipelined write (a blocking thread).
 ///
-/// Decompresses each chunk into the temporary file. An empty chunk is the
-/// end marker: flush, set the mode and owner, claim the commit (`WriteEnd`),
-/// then rename into place. A closed channel without the end marker, or an
-/// abandon that the agent claimed first, ends the write; dropping `state` then
-/// removes the temporary file. Returns the bytes written, or the message of
-/// an `io_error` reply.
+/// First reserves `state.reserve` bytes, if any: a failure refuses the write
+/// (the host gets the io_error at its next chunk or at file_end). Then
+/// decompresses each chunk into the temporary file. An empty chunk is the end
+/// marker: flush, cut the file to the bytes written (frees the reserved blocks
+/// the content did not use), set the mode and owner, claim the commit
+/// (`WriteEnd`), then rename into place. A closed channel without the end
+/// marker, or an abandon that the agent claimed first, ends the write; dropping
+/// `state` then removes the temporary file. Returns the bytes written, or the
+/// message of an `io_error` reply.
 fn run_write(
     mut state: WriteFileState,
     mut chunk_rx: mpsc::Receiver<Vec<u8>>,
     end: &WriteEnd,
 ) -> Result<usize, String> {
+    // KEEP_SIZE: the blocks are taken, the file length stays 0. Guest code that
+    // writes meanwhile cannot make this write fail half way, for its first
+    // `reserve` bytes. A failure keeps what it took until the file goes: the error
+    // return drops `state`, which removes the file at once. Here, not in
+    // handle_write_file: a fallocate can wait for a journal commit, and the agent's
+    // runtime has one thread.
+    if state.reserve > 0 {
+        let fd = state.decoder.get_ref().inner.as_raw_fd();
+        let len = state.reserve as libc::off_t;
+        // SAFETY: an open descriptor; reserve <= MAX_FILE_SIZE_BYTES
+        // (handle_write_file), so it fits in off_t.
+        let reserved = unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len) };
+        if reserved != 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(state.io_error(format!("reserve {} bytes: {e}", state.reserve)));
+        }
+    }
     let mut finalize = false;
     while let Some(decoded) = chunk_rx.blocking_recv() {
         if decoded.is_empty() {
@@ -540,9 +596,16 @@ fn run_write(
         return Err(state.io_error(format!("decompression finalize: {e}")));
     }
     let bytes_written = state.decoder.get_ref().count;
+    let file = &state.decoder.get_ref().inner;
+    // KEEP_SIZE blocks past the end of the file stay until a truncate (also a
+    // truncate to the same length): free the ones the content did not use.
+    if state.reserve > 0
+        && let Err(e) = file.set_len(bytes_written as u64)
+    {
+        return Err(state.io_error(format!("truncate: {e}")));
+    }
     // Mode and owner through the open file (fchmod, fchown): no path to swap.
     let mode = if state.make_executable { 0o755 } else { 0o644 };
-    let file = &state.decoder.get_ref().inner;
     if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(mode)) {
         return Err(state.io_error(format!("set_permissions: {e}")));
     }
@@ -583,167 +646,64 @@ mod tests {
     // validate_file_path
     // -------------------------------------------------------------------------
 
-    #[test]
-    fn test_validate_file_path_basic() {
-        let result = validate_file_path("hello.txt");
-        assert!(result.is_ok());
+    // Each valid path and its place below the root ("": the root). Web encodings (fuzzdb)
+    // are literal names on Unix: a path below the sandbox root
+    #[rstest::rstest]
+    #[case("hello.txt", "hello.txt")]
+    #[case("subdir/data.csv", "subdir/data.csv")]
+    #[case("a/b/c/d/e.txt", "a/b/c/d/e.txt")]
+    #[case("subdir/../file.txt", "file.txt")]
+    #[case("a/b/../../c.txt", "c.txt")]
+    #[case("dir//file.txt", "dir/file.txt")]
+    #[case("subdir/", "subdir")]
+    #[case(".hidden", ".hidden")]
+    #[case("日本語.txt", "日本語.txt")]
+    #[case(".", "")]
+    #[case("subdir/..", "")]
+    #[case("", "")]
+    #[case::web_encoding("....//....//etc/passwd", "..../..../etc/passwd")]
+    #[case::web_encoding("..%2f..%2fetc/passwd", "..%2f..%2fetc/passwd")]
+    #[case::web_encoding("..\\..\\etc\\passwd", "..\\..\\etc\\passwd")]
+    fn test_validate_file_path_resolves_under_the_root(#[case] path: &str, #[case] resolved: &str) {
         assert_eq!(
-            result.unwrap(),
-            std::path::PathBuf::from("/home/user/hello.txt")
+            validate_file_path(path),
+            Ok(std::path::PathBuf::from(resolved))
         );
     }
 
+    // The traversal vectors, checked here where the rule lives (a lexical check, no file
+    // is opened); tests/test_file_io_security.py keeps one relative and one absolute
+    // vector for the host's error mapping
+    #[rstest::rstest]
+    #[case("../etc/passwd", "Path traversal outside sandbox")]
+    #[case("../../etc/shadow", "Path traversal outside sandbox")]
+    #[case("../../../root/.ssh/id_rsa", "Path traversal outside sandbox")]
+    #[case("subdir/../../etc/passwd", "Path traversal outside sandbox")]
+    #[case("subdir/../subdir/../../etc/passwd", "Path traversal outside sandbox")]
+    #[case("a/b/../../../etc/passwd", "Path traversal outside sandbox")]
+    #[case("../etc", "Path traversal outside sandbox")]
+    #[case("../../", "Path traversal outside sandbox")]
+    #[case("subdir/../../etc", "Path traversal outside sandbox")]
+    #[case("/etc/passwd", "Absolute paths are not allowed")]
+    #[case("/home/user/../../../etc/passwd", "Absolute paths are not allowed")]
+    #[case("/etc", "Absolute paths are not allowed")]
+    #[case("file\x00.txt", "Path contains null byte")]
+    #[case("file\x01name", "Path contains control character")]
+    fn test_validate_file_path_refuses(#[case] path: &str, #[case] reason: &str) {
+        assert_eq!(validate_file_path(path), Err(reason.to_string()));
+    }
+
     #[test]
-    fn test_validate_file_path_nested() {
-        let result = validate_file_path("subdir/data.csv");
-        assert!(result.is_ok());
+    fn test_validate_file_path_name_of_255_bytes_is_valid_one_byte_more_is_not() {
+        let longest = "a".repeat(255);
         assert_eq!(
-            result.unwrap(),
-            std::path::PathBuf::from("/home/user/subdir/data.csv")
+            validate_file_path(&longest),
+            Ok(std::path::PathBuf::from(&longest))
         );
-    }
-
-    #[test]
-    fn test_validate_file_path_deeply_nested() {
-        assert!(validate_file_path("a/b/c/d/e.txt").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_traversal_rejected() {
-        let result = validate_file_path("../etc/passwd");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("traversal"));
-    }
-
-    #[test]
-    fn test_validate_file_path_mid_path_traversal() {
-        assert!(validate_file_path("subdir/../../etc/shadow").is_err());
-    }
-
-    #[test]
-    fn test_validate_file_path_deep_traversal() {
-        assert!(validate_file_path("a/b/../../../etc/passwd").is_err());
-    }
-
-    #[test]
-    fn test_validate_file_path_absolute_rejected() {
-        let result = validate_file_path("/etc/passwd");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Absolute"));
-    }
-
-    // The host's traversal vectors (tests/test_file_io_security.py), checked here where the
-    // rule lives (a lexical check, no file is opened): each is refused
-    #[test]
-    fn test_validate_file_path_refuses_the_traversal_vectors() {
-        for path in [
-            "../etc/passwd",
-            "../../etc/shadow",
-            "../../../root/.ssh/id_rsa",
-            "subdir/../../etc/passwd",
-            "subdir/../subdir/../../etc/passwd",
-            "/etc/passwd",
-            "/home/user/../../../etc/passwd",
-            "../etc",
-            "../../",
-            "/etc",
-            "subdir/../../etc",
-        ] {
-            assert!(validate_file_path(path).is_err(), "{path}");
-        }
-    }
-
-    // Web encodings (fuzzdb) are literal names on Unix: a path under the sandbox root
-    #[test]
-    fn test_validate_file_path_web_encodings_are_literal_names() {
-        for (path, real) in [
-            ("....//....//etc/passwd", "/home/user/..../..../etc/passwd"),
-            ("..%2f..%2fetc/passwd", "/home/user/..%2f..%2fetc/passwd"),
-            ("..\\..\\etc\\passwd", "/home/user/..\\..\\etc\\passwd"),
-        ] {
-            assert_eq!(
-                validate_file_path(path).unwrap(),
-                std::path::PathBuf::from(real),
-                "{path}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_file_path_empty_returns_sandbox_root() {
-        let result = validate_file_path("");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user"));
-    }
-
-    #[test]
-    fn test_validate_file_path_null_byte_rejected() {
-        let result = validate_file_path("file\x00.txt");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("null byte"));
-    }
-
-    #[test]
-    fn test_validate_file_path_control_chars_rejected() {
-        let result = validate_file_path("file\x01name");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("control character"));
-    }
-
-    #[test]
-    fn test_validate_file_path_component_too_long() {
-        let long_name = "a".repeat(256);
-        let result = validate_file_path(&long_name);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("too long"));
-    }
-
-    #[test]
-    fn test_validate_file_path_component_exactly_max() {
-        let name = "a".repeat(255);
-        assert!(validate_file_path(&name).is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_dot_dot_normalization() {
-        let result = validate_file_path("subdir/../file.txt");
-        assert!(result.is_ok());
         assert_eq!(
-            result.unwrap(),
-            std::path::PathBuf::from("/home/user/file.txt")
+            validate_file_path(&format!("{longest}a")),
+            Err("Filename component too long: 256 bytes (max 255)".to_string())
         );
-    }
-
-    #[test]
-    fn test_validate_file_path_double_slash() {
-        assert!(validate_file_path("dir//file.txt").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_trailing_slash() {
-        assert!(validate_file_path("subdir/").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_hidden_file() {
-        let result = validate_file_path(".hidden");
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            std::path::PathBuf::from("/home/user/.hidden")
-        );
-    }
-
-    #[test]
-    fn test_validate_file_path_unicode() {
-        assert!(validate_file_path("日本語.txt").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_dot_only() {
-        let result = validate_file_path(".");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user"));
     }
 
     /// A relative path of `len` bytes: components of 254 bytes (below NAME_MAX), then the rest.
@@ -760,23 +720,61 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_file_path_exactly_max_length() {
-        let path = path_of_len(MAX_FILE_PATH_LENGTH);
-        assert_eq!(path.len(), 4096);
-        assert!(validate_file_path(&path).is_ok());
+    fn test_validate_file_path_of_4096_bytes_is_valid_one_byte_more_is_not() {
+        let longest = path_of_len(4096);
+        assert_eq!(
+            validate_file_path(&longest),
+            Ok(std::path::PathBuf::from(&longest))
+        );
+        assert_eq!(
+            validate_file_path(&path_of_len(4097)),
+            Err("Path too long: 4097 chars (max 4096)".to_string())
+        );
+        // Many short components: the length counts the separators too
+        assert_eq!(
+            validate_file_path(&"a/".repeat(4096)),
+            Err("Path too long: 8192 chars (max 4096)".to_string())
+        );
     }
 
-    #[test]
-    fn test_validate_file_path_one_byte_over_max_length() {
-        let path = path_of_len(MAX_FILE_PATH_LENGTH + 1);
-        assert_eq!(path.len(), 4097);
-        assert!(validate_file_path(&path).is_err());
+    /// The (message, error type) of a refused command.
+    fn refusal<T>(result: Result<T, CmdError>) -> (String, &'static str) {
+        match result {
+            Err(CmdError::Reply {
+                message,
+                error_type,
+            }) => (message, error_type),
+            Err(CmdError::Fatal(e)) => panic!("expected a reply error, got {e}"),
+            Ok(_) => panic!("expected a refusal"),
+        }
     }
 
-    #[test]
-    fn test_validate_file_path_exceeds_max_length() {
-        let path = "a/".repeat(MAX_FILE_PATH_LENGTH);
-        assert!(validate_file_path(&path).is_err());
+    // A path that resolves to the root itself: no file to read or write, refused before any
+    // open (validate_file_path gives "" for it)
+    #[rstest::rstest]
+    #[case(".")]
+    #[case("subdir/..")]
+    #[tokio::test]
+    async fn test_the_root_itself_is_refused_for_a_read_and_a_write(#[case] path: &str) {
+        let (tx, _rx) = mpsc::channel(1);
+        let writer = ResponseWriter::new(tx, None);
+        assert_eq!(
+            refusal(handle_read_file(path, &writer).await),
+            ("Cannot read a directory".to_string(), "path_error")
+        );
+        assert_eq!(
+            refusal(handle_write_file(
+                Path::new(SANDBOX_ROOT),
+                "op",
+                path,
+                false,
+                None
+            )),
+            (
+                "Cannot write to sandbox root directory".to_string(),
+                "path_error"
+            )
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -807,35 +805,20 @@ mod tests {
         assert_eq!(writer.count, 5);
     }
 
+    // A write that would pass the limit writes nothing: the count and the file stay
     #[test]
-    fn test_counting_writer_exceeds_limit() {
-        let mut buf = Vec::new();
-        let mut writer = CountingWriter {
-            inner: &mut buf,
-            count: 0,
-            limit: 4,
-        };
-        let result = std::io::Write::write(&mut writer, b"hello");
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("file size limit exceeded")
-        );
-    }
-
-    #[test]
-    fn test_counting_writer_multiple_writes_exceeding() {
+    fn test_counting_writer_refuses_a_write_past_the_limit_whole() {
         let mut buf = Vec::new();
         let mut writer = CountingWriter {
             inner: &mut buf,
             count: 0,
             limit: 8,
         };
-        assert!(std::io::Write::write_all(&mut writer, b"hello").is_ok());
-        let result = std::io::Write::write(&mut writer, b"world");
-        assert!(result.is_err());
+        std::io::Write::write_all(&mut writer, b"hello").unwrap();
+        let refused = std::io::Write::write(&mut writer, b"world").unwrap_err();
+        assert_eq!(refused.to_string(), "file size limit exceeded");
+        assert_eq!(writer.count, 5);
+        assert_eq!(buf, b"hello");
     }
 
     // -------------------------------------------------------------------------
@@ -852,21 +835,125 @@ mod tests {
         HostGone,
     }
 
-    /// Run a whole write of `data` into a fresh temp folder.
-    fn write_through_pipeline(
-        name: &str,
-        data: &[u8],
-        ending: Ending,
-    ) -> (Result<usize, String>, std::path::PathBuf) {
+    /// A fresh, empty temp folder: the root of a write, or of `root_with_links`.
+    fn write_root(name: &str) -> std::path::PathBuf {
         let dir = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("guest-agent-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let file = std::fs::File::create(dir.join(".wr.op.tmp")).unwrap();
+        dir
+    }
+
+    /// Run a whole write of `data` to `file.bin` in a fresh root, through
+    /// handle_write_file as the agent does; `size` is the header's.
+    async fn write_through_pipeline(
+        name: &str,
+        data: &[u8],
+        size: Option<u64>,
+        ending: Ending,
+    ) -> (Result<usize, String>, std::path::PathBuf) {
+        let root = write_root(name);
+        let handle = handle_write_file(&root, "op", "file.bin", false, size).unwrap();
+        if matches!(ending, Ending::Abandoned) {
+            // Claimed before the task can reach its commit
+            assert!(handle.end.try_abandon());
+        }
+        let compressed = zstd::stream::encode_all(data, FILE_TRANSFER_ZSTD_LEVEL).unwrap();
+        handle.chunk_tx.send(compressed).await.unwrap();
+        if !matches!(ending, Ending::HostGone) {
+            handle.chunk_tx.send(vec![]).await.unwrap();
+        }
+        drop(handle.chunk_tx);
+        (handle.task.await.unwrap(), root)
+    }
+
+    #[tokio::test]
+    async fn test_run_write_commits_a_finished_write() {
+        let (result, dir) =
+            write_through_pipeline("commit", b"hello", None, Ending::EndMarker).await;
+        assert_eq!(result, Ok(5));
+        assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), b"hello");
+        assert!(!dir.join(".wr.op.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_write_never_commits_an_abandoned_write() {
+        let (result, dir) =
+            write_through_pipeline("abandoned", b"hello", None, Ending::Abandoned).await;
+        assert_eq!(
+            result.unwrap_err(),
+            "I/O error for 'file.bin': abandoned after a stall"
+        );
+        assert!(!dir.join("file.bin").exists());
+        assert!(!dir.join(".wr.op.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_write_drops_a_write_whose_host_is_gone() {
+        let (result, dir) =
+            write_through_pipeline("host-gone", b"hello", None, Ending::HostGone).await;
+        assert_eq!(
+            result.unwrap_err(),
+            "I/O error for 'file.bin': channel closed without finalize"
+        );
+        assert!(!dir.join("file.bin").exists());
+        assert!(!dir.join(".wr.op.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The header's size is reserved before the first chunk (guest code sees it used), and
+    // the commit frees what the content did not use
+    #[tokio::test]
+    async fn test_handle_write_file_reserves_its_size_until_the_commit() {
+        let root = write_root("reserve");
+        let handle = handle_write_file(&root, "op", "file.bin", false, Some(4 << 20)).unwrap();
+        let tmp = root.join(".wr.op.tmp");
+        let mut allocated = 0;
+        for _ in 0..5000 {
+            // A write that failed first (its reserve error) removed the temporary file
+            if handle.task.is_finished() {
+                panic!(
+                    "the write ended before its first chunk: {:?}",
+                    handle.task.await
+                );
+            }
+            allocated = std::fs::metadata(&tmp).unwrap().blocks() * 512;
+            if allocated >= 4 << 20 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(allocated >= 4 << 20, "{allocated} bytes reserved");
+        assert_eq!(std::fs::metadata(&tmp).unwrap().len(), 0); // KEEP_SIZE
+        let compressed = zstd::stream::encode_all(&b"hello"[..], FILE_TRANSFER_ZSTD_LEVEL).unwrap();
+        handle.chunk_tx.send(compressed).await.unwrap();
+        handle.chunk_tx.send(vec![]).await.unwrap();
+        assert_eq!(handle.task.await.unwrap(), Ok(5));
+        let committed = std::fs::metadata(root.join("file.bin")).unwrap();
+        assert_eq!(committed.len(), 5);
+        assert!(
+            committed.blocks() * 512 < 1 << 20,
+            "{} bytes allocated",
+            committed.blocks() * 512
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // A reservation that fails refuses the write with its text, and leaves no file. The
+    // failure is EBADF (a descriptor not open for writing, which handle_write_file never
+    // opens: the state is built here): an ENOSPC would take the free space of the test
+    // machine's disk until the unlink.
+    #[test]
+    fn test_run_write_refuses_a_write_whose_reservation_fails() {
+        let dir = write_root("reserve-fails");
+        std::fs::File::create(dir.join(".wr.op.tmp")).unwrap();
+        let read_only = std::fs::File::open(dir.join(".wr.op.tmp")).unwrap();
         let state = WriteFileState {
             decoder: zstd::stream::write::Decoder::new(CountingWriter {
-                inner: file,
+                inner: read_only,
                 count: 0,
                 limit: MAX_FILE_SIZE_BYTES,
             })
@@ -876,62 +963,87 @@ mod tests {
             final_name: CString::new("file.bin").unwrap(),
             make_executable: false,
             path_display: "file.bin".to_string(),
+            reserve: 4096,
             finished: false,
         };
-        let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(16);
-        let compressed = zstd::stream::encode_all(data, FILE_TRANSFER_ZSTD_LEVEL).unwrap();
-        chunk_tx.try_send(compressed).unwrap();
-        let end = WriteEnd::new();
-        match ending {
-            Ending::EndMarker => chunk_tx.try_send(vec![]).unwrap(),
-            Ending::Abandoned => {
-                chunk_tx.try_send(vec![]).unwrap();
-                assert!(end.try_abandon());
-            }
-            Ending::HostGone => drop(chunk_tx),
-        }
-        (run_write(state, chunk_rx, &end), dir)
-    }
-
-    #[test]
-    fn test_run_write_commits_a_finished_write() {
-        let (result, dir) = write_through_pipeline("commit", b"hello", Ending::EndMarker);
-        assert_eq!(result.ok().unwrap(), 5);
-        assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), b"hello");
+        let (_, chunk_rx) = mpsc::channel::<Vec<u8>>(1);
+        let result = run_write(state, chunk_rx, &WriteEnd::new());
+        assert_eq!(
+            result.unwrap_err(),
+            format!(
+                "I/O error for 'file.bin': reserve 4096 bytes: {}",
+                std::io::Error::from_raw_os_error(libc::EBADF)
+            )
+        );
         assert!(!dir.join(".wr.op.tmp").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn test_run_write_never_commits_an_abandoned_write() {
-        let (result, dir) = write_through_pipeline("abandoned", b"hello", Ending::Abandoned);
-        assert_eq!(
-            result.unwrap_err(),
-            "I/O error for 'file.bin': abandoned after a stall"
-        );
-        assert!(
-            !dir.join("file.bin").exists(),
-            "an abandoned write must not land"
-        );
-        assert!(
-            !dir.join(".wr.op.tmp").exists(),
-            "its temporary file is removed"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn test_run_write_drops_a_write_whose_host_is_gone() {
-        // The host closed its connection before file_end: the agent drops the
-        // write's channel. No file lands, and the temporary file is removed.
-        let (result, dir) = write_through_pipeline("host-gone", b"hello", Ending::HostGone);
-        assert_eq!(
-            result.unwrap_err(),
-            "I/O error for 'file.bin': channel closed without finalize"
-        );
         assert!(!dir.join("file.bin").exists());
-        assert!(!dir.join(".wr.op.tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // An empty file (size 0) has no reservation: fallocate refuses a length of 0 (EINVAL)
+    #[tokio::test]
+    async fn test_run_write_reserves_nothing_for_an_empty_file() {
+        let (result, dir) = write_through_pipeline("empty", b"", Some(0), Ending::EndMarker).await;
+        assert_eq!(result, Ok(0));
+        assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), b"");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Refused at the header, before any folder or temporary file is made
+    #[test]
+    fn test_handle_write_file_refuses_a_size_past_the_limit_at_the_header() {
+        let root = write_root("limit");
+        let size = MAX_FILE_SIZE_BYTES as u64 + 1;
+        assert_eq!(
+            refusal(handle_write_file(
+                &root,
+                "op",
+                "sub/big.bin",
+                false,
+                Some(size)
+            )),
+            (
+                format!("File 'sub/big.bin' is {size} bytes, exceeds {MAX_FILE_SIZE_BYTES}"),
+                "io_error"
+            )
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // A size the filesystem cannot hold is refused; one byte fits.
+    #[test]
+    fn test_check_free_space_refuses_a_size_that_does_not_fit() {
+        let size = 1 << 60;
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(check_free_space(&root, "big.bin", 1).is_ok());
+        let (message, error_type) = refusal(check_free_space(&root, "big.bin", size));
+        assert_eq!(error_type, "io_error");
+        assert!(
+            message.starts_with(&format!("No space for 'big.bin': needs {size} bytes, ")),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(&format!(
+                " bytes free: {}",
+                std::io::Error::from_raw_os_error(libc::ENOSPC)
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_check_free_space_without_its_root_is_an_io_error() {
+        let (message, error_type) = refusal(check_free_space(
+            Path::new("/nonexistent-guest-agent-root"),
+            "a.bin",
+            1,
+        ));
+        assert_eq!(error_type, "io_error");
+        assert!(
+            message.starts_with("No free space count for 'a.bin': "),
+            "{message}"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -944,10 +1056,7 @@ mod tests {
     /// (absolute, to root/inside), `loop` (to itself), `fd` (a /proc magic
     /// link) and `dangling` (absolute, to outside/new, which does not exist).
     fn root_with_links(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let base = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("guest-agent-beneath-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = write_root(&format!("beneath-{name}"));
         let root = base.join("root");
         let outside = base.join("outside");
         std::fs::create_dir_all(root.join("inside")).unwrap();

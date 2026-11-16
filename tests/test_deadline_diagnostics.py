@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
-import json
 import logging
 import os
 import socket
@@ -36,32 +35,12 @@ from exec_sandbox.qmp_client import QMP_BUFFER_LIMIT, QmpClient
 from exec_sandbox.socket_auth import connect_and_verify
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType, VmState
+from tests.conftest import NESTED_QMP_LINE, fake_qmp_server
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from exec_sandbox.vm_manager import VmManager
-
-
-async def _fake_qmp(path: Path, *, status: str | None) -> asyncio.Server:
-    """A QMP server: greeting, then a reply per command. status=None never greets."""
-
-    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if status is None:
-            await reader.read()  # silent until the client hangs up
-            writer.close()
-            return
-        writer.write(b'{"QMP": {"version": {}, "capabilities": []}}\n')
-        while line := await reader.readline():
-            request = json.loads(line)
-            result: dict[str, Any] = {}
-            if request["execute"] == "query-status":
-                result = {"status": status, "running": status == "running"}
-            writer.write(json.dumps({"return": result, "id": request["id"]}).encode() + b"\n")
-            await writer.drain()
-        writer.close()
-
-    return await asyncio.start_unix_server(serve, path=str(path))
 
 
 @pytest.fixture
@@ -145,7 +124,7 @@ class TestDeadlineDiagnostics:
         console = ["boot", "[WARN] Read timeout after 18000ms, reconnecting..."]
         vm = make_vm(qemu=own, console=console)
 
-        async with await _fake_qmp(qmp_path, status="paused"):
+        async with await fake_qmp_server(qmp_path, status="paused", status_line=None, requests=[]):
             with caplog.at_level(logging.ERROR, logger="exec_sandbox.qemu_vm"):
                 values = await vm.deadline_diagnostics(operation="write_file")
 
@@ -171,6 +150,30 @@ class TestDeadlineDiagnostics:
         assert values["qemu_status"].startswith("unavailable (FileNotFoundError")
         assert (values["qemu_cpu_seconds"], values["qemu_threads"], values["console_log"]) == (None, None, "(empty)")
 
+    @pytest.mark.parametrize(
+        ("line", "status"),
+        [
+            (b"not json\n", "unavailable (JSONDecodeError: Expecting value: line 1 column 1 (char 0))"),
+            (
+                NESTED_QMP_LINE,
+                "unavailable (ValueError: QMP line of 60001 bytes nested too deep for the JSON parser)",
+            ),
+        ],
+        ids=["not-json", "nested-too-deep"],
+    )
+    @pytest.mark.usefixtures("qmp_parser_too_deep")
+    async def test_an_answer_qemu_should_not_send_is_unavailable(
+        self, make_vm: _MakeVm, qmp_path: Path, line: bytes, status: str
+    ) -> None:
+        """A query-status answer that is no JSON (also one nested too deep for the parser):
+        the status says so, nothing raises (the diagnostics run inside error paths)."""
+        vm = make_vm(qemu=None, console=[])
+
+        async with await fake_qmp_server(qmp_path, status="running", status_line=line, requests=[]):
+            values = await vm.deadline_diagnostics(operation="execute")
+
+        assert values["qemu_status"] == status
+
     async def test_silent_qemu_is_bounded(
         self, make_vm: _MakeVm, qmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -178,7 +181,7 @@ class TestDeadlineDiagnostics:
         monkeypatch.setattr(constants, "DEADLINE_DIAGNOSTICS_TIMEOUT_SECONDS", 0.05)
         vm = make_vm(qemu=None, console=[])
 
-        async with await _fake_qmp(qmp_path, status=None), asyncio.timeout(1):
+        async with await fake_qmp_server(qmp_path, status=None, status_line=None, requests=[]), asyncio.timeout(1):
             values = await vm.deadline_diagnostics(operation="execute")
 
         assert values["qemu_status"].startswith("unavailable (TimeoutError")
@@ -332,12 +335,12 @@ async def test_deadline_on_a_paused_guest_carries_the_qemu_state(
         mem_path=None,
     )
     try:
-        await vm.write_file("warm.txt", io.BytesIO(b"x"))  # connected and answering
+        await vm.write_file("warm.txt", io.BytesIO(b"x"), make_executable=False)  # connected and answering
         await _qmp(vm, "stop")
         monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 0.3)
 
         with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN) as exc_info:
-            await vm.write_file("stalled.txt", io.BytesIO(b"y"))
+            await vm.write_file("stalled.txt", io.BytesIO(b"y"), make_executable=False)
 
         context = exc_info.value.context
         assert (context["vm_id"], context["path"]) == (vm.vm_id, "stalled.txt")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import os
+import re
 import shutil
 import socket
 import stat
@@ -50,12 +51,17 @@ def _sudo_stand_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail_firs
 class TestVmWorkingDirectoryCreate:
     """Test VmWorkingDirectory.create() method."""
 
-    async def test_create_makes_directory(self):
-        """create() creates a directory that exists."""
+    async def test_create_makes_a_private_directory_in_the_temp_folder(self):
+        """create() makes a directory in the temp folder, of mode 0700: other users get no
+        access to the overlay and the sockets."""
         workdir = await VmWorkingDirectory.create("test-vm-123", home_dir=_HOME_DIR)
         try:
-            assert workdir.path.exists()
-            assert workdir.path.is_dir()
+            st = workdir.path.stat()
+            assert (workdir.path.parent, stat.S_ISDIR(st.st_mode), stat.S_IMODE(st.st_mode)) == (
+                Path(tempfile.gettempdir()),
+                True,
+                0o700,
+            )
         finally:
             await workdir.cleanup()
 
@@ -87,11 +93,11 @@ class TestVmWorkingDirectoryCreate:
             await workdir.cleanup()
 
     async def test_create_uses_prefix(self):
-        """create() uses vm_id prefix in directory name."""
+        """The directory name is "vm-", the first 8 characters of the vm_id and "-", then the
+        random part of mkdtemp."""
         workdir = await VmWorkingDirectory.create("test-vm-789", home_dir=_HOME_DIR)
         try:
-            # Directory name should start with "vm-test-vm-" (prefix + truncated vm_id)
-            assert workdir.path.name.startswith("vm-test-vm-")
+            assert re.fullmatch(r"vm-test-vm--[a-z0-9_]+", workdir.path.name) is not None, workdir.path.name
         finally:
             await workdir.cleanup()
 
@@ -159,6 +165,33 @@ class TestVmWorkingDirectoryCreate:
         assert attempts == 2
         assert not abandoned.exists()
         assert not retries & workdir_module._WORKDIR_CLEANUP_TASKS
+
+    async def test_cancelled_creation_whose_cleanup_is_cancelled_retains_the_folder(self, tmp_path: Path):
+        """A cancelled create() whose removal of the new folder is cancelled too: the folder
+        gets a retry owner (_retain_cleanup), as after a failed removal."""
+        abandoned = tmp_path / "abandoned-cancelled-cleanup"
+        created = threading.Event()
+        release_thread = threading.Event()
+
+        def blocked_mkdtemp(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            abandoned.mkdir()
+            created.set()
+            release_thread.wait()
+            return str(abandoned)
+
+        with (
+            patch("exec_sandbox.vm_working_directory.tempfile.mkdtemp", side_effect=blocked_mkdtemp),
+            patch.object(VmWorkingDirectory, "cleanup", AsyncMock(side_effect=asyncio.CancelledError)),
+            patch.object(VmWorkingDirectory, "_retain_cleanup", autospec=True) as retain,
+        ):
+            creation = asyncio.create_task(VmWorkingDirectory.create("cancelled-cleanup", home_dir=_HOME_DIR))
+            assert await asyncio.to_thread(created.wait, 1)
+            creation.cancel()
+            release_thread.set()
+            with pytest.raises(asyncio.CancelledError):
+                await creation
+
+        assert [call.args[0].path for call in retain.call_args_list] == [abandoned]
 
     async def test_cancelled_failed_cleanup_retries_and_the_drain_waits_for_it(self, tmp_path: Path):
         """A cleanup() cancelled while its rmtree worker runs: the cancel waits for the worker,

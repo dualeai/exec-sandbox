@@ -14,16 +14,16 @@ Security Model:
 from __future__ import annotations
 
 import asyncio
+import logging
 import pwd
 import socket
 import struct
 from dataclasses import dataclass
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import SocketAuthError
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Platform constants for SO_PEERCRED (Linux)
 _SO_PEERCRED = 17  # Linux socket option

@@ -25,16 +25,12 @@ from exec_sandbox.files.disk import (
     create_sparse,
     make_private_dir,
     memory_filesystem,
-    pwrite_all,
+    overlay_upper,
     statfs_type,
 )
-from tests.conftest import skip_unless_linux
+from tests.conftest import skip_unless_linux, skip_unless_macos
 
 _MIB = 1024 * 1024
-
-
-def _allocated(path: Path) -> int:
-    return path.stat().st_blocks * 512
 
 
 @contextlib.contextmanager
@@ -66,10 +62,11 @@ def _copy_on_write(*, reflink: bool) -> Iterator[None]:
 
 class TestCreateSparse:
     def test_full_size_no_allocation(self, tmp_path: Path) -> None:
+        """The whole size, not one block allocated (APFS, ext4, XFS, tmpfs)."""
         disk = tmp_path / "home.img"
         create_sparse(disk, 64 * _MIB)
         assert disk.stat().st_size == 64 * _MIB
-        assert _allocated(disk) < _MIB
+        assert allocated_bytes(disk.stat()) == 0
 
     def test_refuses_existing_file(self, tmp_path: Path) -> None:
         disk = tmp_path / "home.img"
@@ -105,7 +102,6 @@ class TestAllocatedBytes:
         path = tmp_path / "data"
         path.write_bytes(os.urandom(1024 * 1024))
         assert allocated_bytes(path.stat()) >= 1024 * 1024
-        assert allocated_bytes(os.lstat(path)) == allocated_bytes(path.stat())
 
 
 class TestCreateFile:
@@ -165,8 +161,8 @@ class TestCloneSparse:
             with _copy_on_write(reflink=False):
                 assert clone_sparse(src, dst, stop=None) is False  # a copy: its blocks are not shared
         assert dst.read_bytes() == content
-        assert _allocated(dst) <= _allocated(src) + _MIB
-        assert _allocated(dst) < 64 * _MIB  # holes were not written as zeros
+        assert allocated_bytes(dst.stat()) <= allocated_bytes(src.stat()) + _MIB
+        assert allocated_bytes(dst.stat()) < 64 * _MIB  # holes were not written as zeros
         assert stat.S_IMODE(dst.stat().st_mode) == 0o600
 
     @pytest.mark.skipif(sys.platform != "darwin", reason="fclonefileat is macOS only (APFS)")
@@ -206,17 +202,18 @@ class TestCloneSparse:
         self._written_disk(src)
         stop = _SetAfterOneCheck()
         written: list[int] = []
+        pwrite = os.pwrite
 
-        def write(fd: int, data: bytes, offset: int) -> None:
+        def recorded(fd: int, data: bytes, offset: int) -> int:
             written.append(offset)
-            pwrite_all(fd, data, offset)
+            return pwrite(fd, data, offset)
 
         src_fd = os.open(src, os.O_RDONLY)
         folder = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
         try:
             with (
                 _copy_on_write(reflink=False),
-                patch.object(files_disk, "pwrite_all", write),
+                patch.object(os, "pwrite", recorded),
                 pytest.raises(InterruptedError, match=r"The copy was stopped"),
             ):
                 clone_sparse_fd(src_fd, "dst.img", dst_dir_fd=folder, stop=stop)
@@ -413,3 +410,66 @@ class TestMakePrivateDir:
 
         assert stat.S_IMODE(tmp_path.stat().st_mode) & 0o777 == 0o755
         assert stat.S_IMODE((tmp_path / "new").stat().st_mode) & 0o777 == 0o700
+
+
+@skip_unless_macos
+def test_rd_advise_reaches_the_kernel(tmp_path: Path) -> None:
+    """macOS F_RDADVISE takes the prefetch request (0): its variadic struct pointer goes where
+    Apple Silicon reads it (without argtypes the call failed with EFAULT, and advise_willneed
+    ignored that)."""
+    path = tmp_path / "image"
+    path.write_bytes(b"\0" * (1 << 20))
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        assert files_disk._rd_advise(fd, 1 << 20) == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(fd)
+
+
+class TestOverlayUpper:
+    """overlay_upper: the upper folder of the overlay a folder is on, from /proc/self/mountinfo
+    (faked at its path)."""
+
+    def test_the_upper_folder_of_an_overlay_comes_from_mountinfo(self, tmp_path: Path) -> None:
+        """The line of /proc/self/mountinfo with the device of the folder gives the upperdir
+        option (octal escapes undone). In a container it names a folder of the host: no folder,
+        no upper (_OTHER then)."""
+        upper = tmp_path / "up per"
+        upper.mkdir()
+        dev = tmp_path.stat().st_dev
+        mountinfo = tmp_path / "mountinfo"
+        line = (
+            f"36 25 {os.major(dev)}:{os.minor(dev)} / /merged rw,relatime shared:1 - overlay overlay "
+            f"rw,lowerdir=/lower,upperdir={str(upper).replace(' ', chr(92) + '040')},workdir=/work\n"
+        )
+        mountinfo.write_text("25 1 8:1 / / rw - ext4 /dev/root rw\n" + line)
+        with patch("exec_sandbox.files.disk.MOUNTINFO", mountinfo):
+            assert overlay_upper(tmp_path) == upper
+            upper.rmdir()
+            assert overlay_upper(tmp_path) is None
+
+    def test_mountinfo_lines_of_any_bytes_and_empty_sources_parse(self, tmp_path: Path) -> None:
+        """A mount point that is not UTF-8 and an empty mount source (two spaces) parse: the lines are read as
+        bytes (a text read raises UnicodeDecodeError), the fields split on single spaces (a split on runs of
+        spaces shifts the fields)."""
+        upper = tmp_path / "upper"
+        upper.mkdir()
+        dev = tmp_path.stat().st_dev
+        mountinfo = tmp_path / "mountinfo"
+        mountinfo.write_bytes(
+            b"40 25 0:99 / /tmp/bad\xe9 rw - tmpfs tmpfs rw\n"
+            + f"36 25 {os.major(dev)}:{os.minor(dev)} / /merged rw - overlay  rw,upperdir={upper},workdir=/w\n".encode()
+        )
+        with patch("exec_sandbox.files.disk.MOUNTINFO", mountinfo):
+            assert overlay_upper(tmp_path) == upper
+
+    def test_a_relative_upper_folder_is_no_upper(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A relative upperdir ("u5") would be taken from the current folder, on another
+        filesystem. Only an absolute path names the upper folder."""
+        (tmp_path / "u5").mkdir()
+        monkeypatch.chdir(tmp_path)
+        dev = tmp_path.stat().st_dev
+        mountinfo = tmp_path / "mountinfo"
+        mountinfo.write_text(f"36 25 {os.major(dev)}:{os.minor(dev)} / /merged rw - overlay overlay rw,upperdir=u5\n")
+        with patch("exec_sandbox.files.disk.MOUNTINFO", mountinfo):
+            assert overlay_upper(tmp_path) is None

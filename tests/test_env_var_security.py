@@ -28,7 +28,7 @@ class TestEnvVarSecurityIntegration:
     """Integration tests for env var validation across Python->Rust boundary."""
 
     # =========================================================================
-    # Control Character Rejection (Guest Agent Validation)
+    # Allowed characters (tab, UTF-8); the refused ones: TestGuestAgentControlCharValidation
     # =========================================================================
 
     async def test_tab_allowed_by_guest(self, dual_scheduler: Scheduler) -> None:

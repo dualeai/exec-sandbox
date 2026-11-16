@@ -15,8 +15,8 @@ Tested features:
 - Core MVP: compile, instantiate, linear memory, imports/exports, tables, globals
 - WebAssembly API: validate(), Module(), Instance(), Memory, Table, Global
 - Streaming APIs: compileStreaming(), instantiateStreaming() (Bun 1.3+)
-- SIMD: i32x4.add via memory load/store (Wasm 3.0, JSC)
-- Exception handling: try/catch/throw (Wasm 3.0, JSC)
+- SIMD: i32x4.add via memory load/store (Wasm 2.0, JSC)
+- Exceptions: a JS exception from an imported function goes through the WASM call
 - REPL session persistence: instance survives across exec() calls
 
 See:
@@ -364,7 +364,7 @@ console.log("G:" + instance.exports.g());
 
 
 # =============================================================================
-# SIMD (128-bit, Wasm 3.0)
+# SIMD (128-bit, Wasm 2.0)
 # =============================================================================
 class TestWasmSimd:
     """128-bit SIMD operations (i32x4.add) via memory marshalling.
@@ -463,13 +463,14 @@ console.log("SIMD_RESULT:" + r.join(","));
 
 
 # =============================================================================
-# Exception handling (Wasm 3.0)
+# Exceptions through a WASM call (no Wasm exception-handling instructions)
 # =============================================================================
 class TestWasmExceptionHandling:
-    """Wasm exception handling: try/catch/throw."""
+    """A JS exception goes through WASM frames to the JS caller."""
 
     async def test_throw_catch_roundtrip(self, scheduler: Scheduler) -> None:
-        """WASM module catches its own exception and returns a sentinel."""
+        """WASM calls an imported JS function that throws: the JS caller of the WASM export
+        catches the error, with its message."""
         # Exception handling bytecode encoding has changed over time.
         # We test the feature via JS-WASM interop: WASM calls an imported
         # JS function that throws, and the exception propagates to the JS
@@ -689,7 +690,7 @@ try {
         assert result.stdout == "TRAP:RuntimeError\n"
 
     async def test_stack_overflow_traps(self, scheduler: Scheduler) -> None:
-        """Infinite recursion in WASM causes a RuntimeError (stack overflow)."""
+        """Infinite recursion in WASM ends with a RangeError (stack overflow), not a trap's RuntimeError."""
         # Module: func 0 calls itself recursively
         # Body: locals(0) + call 0(0x10 0x00) + end(0x0b) = 4 bytes
         code = """\

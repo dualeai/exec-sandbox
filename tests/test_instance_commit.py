@@ -5,7 +5,6 @@ requests, lost answers and other writers come from the wire, not from patches.
 """
 
 import asyncio
-import base64
 import secrets
 from collections.abc import AsyncGenerator, Callable
 
@@ -18,12 +17,12 @@ from exec_sandbox.instance.commit import Base, Commit, commit_head
 from exec_sandbox.instance.models import RECENT_COMMITS, RecentCommit
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import InstanceStore
-from tests.instance_support import NO_VM_TIMEOUT, head_header, head_object
+from tests.instance_support import NO_VM_TIMEOUT, head_header, head_object, new_keyring
 from tests.s3_faults import After, Before, DropAfter, DropBefore, Edit, Fail, Request, Response, S3Proxy
 
 pytestmark = NO_VM_TIMEOUT
 
-_RING = keyring.Keyring.parse(",".join(base64.b64encode(secrets.token_bytes(32)).decode() for _ in range(2)))
+_RING = keyring.Keyring.parse(f"{new_keyring()},{new_keyring()}")
 """This worker's keyring: the newest key and an older one."""
 _STRANGER = keyring.Key(id="f" * 64, secret=secrets.token_bytes(32))
 """A key-encryption key this worker does not have."""
@@ -83,7 +82,7 @@ class _Chain:
 
     def next_sealed(self, generation: int, *, kek: keyring.Key, data_key: bytes) -> Commit:
         """A commit as a saver writes it: its data key wrapped by `kek`, read back
-        with this worker's keyring (the real check, head.authenticate)."""
+        with this worker's keyring (the real check, head.open_header)."""
         header = head_header(
             instance_id=self.instance_id,
             generation=generation,

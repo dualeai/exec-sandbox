@@ -229,8 +229,8 @@ class TestEntryLease:
         assert not entry.exists()
 
     def test_an_eviction_of_another_process_is_no_lease(self, tmp_path: Path) -> None:
-        """Another process holds the use lock exclusive (its eviction, or its own check): no VM
-        runs on the entry, so it still counts as space evictions give back."""
+        """Another process holds the use lock exclusive (its eviction; a check takes no lock): no
+        VM runs on the entry, so it still counts as space evictions give back."""
         entry = tmp_path / "entry.qcow2"
         entry.write_bytes(b"x")
         with evicted_in_child(entry):

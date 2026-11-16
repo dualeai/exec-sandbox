@@ -236,17 +236,17 @@ pub(crate) fn setup_phase1() {
 /// runs in the background, and main.rs awaits zram setup before it opens the ports.
 pub(crate) fn setup_phase2_core() {
     // CIS Benchmark 6.1.x compliance (libc::chmod, no fork/exec)
-    chmod_paths(0o755, &["/etc", "/usr", "/var", "/sbin", "/bin"]);
+    chmod_paths(0o755, &[c"/etc", c"/usr", c"/var", c"/sbin", c"/bin"]);
     chmod_paths(
         0o644,
         &[
-            "/etc/passwd",
-            "/etc/group",
-            "/etc/resolv.conf",
-            "/etc/hosts",
+            c"/etc/passwd",
+            c"/etc/group",
+            c"/etc/resolv.conf",
+            c"/etc/hosts",
         ],
     );
-    chmod_paths(0o640, &["/etc/shadow"]);
+    chmod_paths(0o640, &[c"/etc/shadow"]);
 
     // /home/user: ext4 home disk, mounted by tiny-init before the agent starts.
     // ALL /proc/sys writes MUST happen before mount_readonly_paths() which
@@ -300,7 +300,7 @@ pub(crate) async fn setup_zram_and_seal_dev() {
             false
         }
     };
-    let dev_read_only = mount_readonly(c"/dev");
+    let dev_read_only = mount_readonly(c"/dev", false); // its nodes are the guest's devices
     if !dev_read_only {
         log_warn!("[zram] failed to seal /dev read-only; marking VM unavailable");
     }
@@ -354,25 +354,18 @@ pub(crate) async fn setup_network_background() {
     }
 }
 
-/// Capped-zram setup ends before the virtio listener starts (main.rs awaits
-/// it), so commands check it synchronously and fail closed on anything but
-/// active swap. In particular, `swapon` cannot overlap untrusted process
-/// execution before monitor startup.
-fn require_memory_safety() -> Result<(), &'static str> {
-    if ZRAM_READY.load(Ordering::Acquire) {
-        Ok(())
-    } else {
-        Err("zram safety setup failed")
-    }
-}
-
 /// Process-spawning commands require both boot workers' outcomes. Zram is
-/// final before the listener starts; only network setup is still concurrent
-/// (setup_network_background sets its outcome within its deadline).
-/// Intentionally offline VMs are ready after loopback setup; a failed or stuck
-/// worker is an infrastructure error so the host can destroy and replace the VM.
+/// final before the listener starts (main.rs awaits it), so it is checked
+/// first and at once: anything but active swap fails closed, and `swapon`
+/// cannot overlap untrusted process execution before monitor startup. Only
+/// network setup is still concurrent (setup_network_background sets its
+/// outcome within its deadline). Intentionally offline VMs are ready after
+/// loopback setup; a failed or stuck worker is an infrastructure error so the
+/// host can destroy and replace the VM.
 pub(crate) async fn wait_for_untrusted_readiness() -> Result<(), &'static str> {
-    require_memory_safety()?;
+    if !ZRAM_READY.load(Ordering::Acquire) {
+        return Err("zram safety setup failed");
+    }
     *NETWORK_STATE.wait().await
 }
 
@@ -387,7 +380,7 @@ fn mount_readonly_paths() {
         log_info!("init.rw=1: skipping /usr, /bin, /sbin read-only remounts");
     } else {
         for path in [c"/usr", c"/bin", c"/sbin"] {
-            let _ = mount_readonly(path);
+            let _ = mount_readonly(path, true);
         }
     }
 
@@ -397,7 +390,7 @@ fn mount_readonly_paths() {
     // read-only remount succeeds.
     // No /proc/sysrq-trigger to seal: the kernel has no MAGIC_SYSRQ.
     for path in [c"/etc/hosts", c"/etc/resolv.conf", c"/proc/sys"] {
-        let _ = mount_readonly(path);
+        let _ = mount_readonly(path, true);
     }
 
     // Mask sensitive /proc files (bind-mount /dev/null → reads return empty).
@@ -682,9 +675,10 @@ fn setup_dev_symlinks() {
 /// Mount /dev/shm for POSIX shared memory / semaphores.
 /// Only needed for Python multiprocessing and similar use cases.
 ///
-/// Sized to 40% of RAM with per-UID quota enforcement (`usrquota` +
-/// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
-/// Quota must be set at initial mount time — cannot be added via remount.
+/// Sized to 40% of RAM, with a per-UID quota (`usrquota` +
+/// `usrquota_block_hardlimit`): each UID may use up to the mount size, the same
+/// bound as `size=`, so it adds no limit for the sandbox user. Quota options take
+/// effect only at the initial mount, not at a remount.
 fn setup_dev_shm() {
     // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
     let page_mask = !(page_size() - 1);
@@ -746,10 +740,6 @@ fn setup_zram_swap() -> bool {
 
     const SWAP_FLAG_PREFER: libc::c_int = 0x8000; // <sys/swap.h>
 
-    fn reset_zram() {
-        let _ = std::fs::write("/sys/block/zram0/reset", "1");
-    }
-
     // Wait for the built-in zram device to appear.
     // Exponential backoff: 0.5+1+2+4+8+16 = 31.5ms max
     let zram_exists = || Path::new("/sys/block/zram0").exists();
@@ -767,12 +757,12 @@ fn setup_zram_swap() -> bool {
     }
 
     let requested_algorithm = "lz4";
-    let dev = std::ffi::CString::new("/dev/zram0").unwrap();
+    let dev = c"/dev/zram0";
 
     // Configure geometry and activate swap. Every step here is a reset-only
     // failure — swapon is the last fallible step, so any Err leaves swap
-    // inactive and a bare reset_zram() is always the correct cleanup. The
-    // closure boundary ends exactly at swapon; guard.spawn() and remove_file
+    // inactive and a bare zram reset is always the correct cleanup. The
+    // closure boundary ends exactly at swapon; oom_guard.spawn() and remove_file
     // below keep their own stage-specific cleanup.
     let setup =
         (|| -> Result<(crate::oom_guard::PreparedOomGuard, crate::oom_guard::VerifiedZramGeometry), String> {
@@ -824,7 +814,7 @@ fn setup_zram_swap() -> bool {
         Ok(v) => v,
         Err(e) => {
             log_warn!("[zram] setup failed: {e}");
-            reset_zram();
+            let _ = std::fs::write("/sys/block/zram0/reset", "1");
             return false;
         }
     };
@@ -1058,11 +1048,9 @@ fn verify_gvproxy() -> Result<(), &'static str> {
 }
 
 /// Set file mode on multiple paths using libc::chmod (no fork/exec overhead).
-fn chmod_paths(mode: libc::mode_t, paths: &[&str]) {
+fn chmod_paths(mode: libc::mode_t, paths: &[&std::ffi::CStr]) {
     for path in paths {
-        if let Ok(cpath) = std::ffi::CString::new(*path) {
-            unsafe { libc::chmod(cpath.as_ptr(), mode) };
-        }
+        unsafe { libc::chmod(path.as_ptr(), mode) };
     }
 }
 
@@ -1086,8 +1074,10 @@ fn mount_mask(path: &std::ffi::CStr) {
     }
 }
 
-/// Bind-mount a path onto itself and remount read-only with nosuid.
-fn mount_readonly(path: &std::ffi::CStr) -> bool {
+/// Bind-mount a path onto itself and remount read-only with nosuid, and nodev when `nodev`.
+/// A bind remount keeps only the flags it names, so it names each one (the overlay root has
+/// neither). /dev takes no nodev: it would refuse every open of its device nodes.
+fn mount_readonly(path: &std::ffi::CStr, nodev: bool) -> bool {
     unsafe {
         let ret = libc::mount(
             path.as_ptr(),
@@ -1108,7 +1098,11 @@ fn mount_readonly(path: &std::ffi::CStr) -> bool {
             std::ptr::null(),
             path.as_ptr(),
             std::ptr::null(),
-            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID,
+            libc::MS_BIND
+                | libc::MS_REMOUNT
+                | libc::MS_RDONLY
+                | libc::MS_NOSUID
+                | if nodev { libc::MS_NODEV } else { 0 },
             std::ptr::null(),
         );
         if ret != 0 {

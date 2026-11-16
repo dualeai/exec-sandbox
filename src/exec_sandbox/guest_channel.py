@@ -21,7 +21,6 @@ from uuid import uuid4
 from pydantic import TypeAdapter, ValidationError
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import gather_or_cancel
 from exec_sandbox.exceptions import CommunicationError, ErrorCode, InternalError, OutcomeUnknownError, TransientError
 from exec_sandbox.guest_agent_protocol import (
@@ -40,7 +39,7 @@ from exec_sandbox.guest_agent_protocol import (
 from exec_sandbox.socket_auth import connect_and_verify
 from exec_sandbox.subprocess_utils import socket_access_error
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # StreamReader buffer limit of each port socket: readuntil() fails on a line
 # longer than it (the asyncio default is 64KB), and asyncio pauses the
@@ -135,13 +134,9 @@ class OperationInbox:
         self._sent_at: float | None = None
 
     @property
-    def command_may_have_been_sent(self) -> bool:
-        """Whether transport failure can no longer prove non-execution."""
-        return self._sent_at is not None
-
-    @property
     def command_sent_at(self) -> float | None:
-        """time.monotonic() of the first send of the command, or None."""
+        """time.monotonic() of the first send of the command, or None: not None, a transport
+        failure can no longer prove non-execution."""
         return self._sent_at
 
     def mark_command_sent(self) -> None:
@@ -223,15 +218,23 @@ class OperationInbox:
             )
         raise CommunicationError(reason, context=None)
 
+    def take_nowait(self) -> StreamingMessage | None:
+        """get() without a wait: a message already routed, else the out-of-band failure
+        (raised as get() raises it), else None."""
+        # Data written before EOF stays ahead of the failure: the queue is read first.
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            if self._failed.done():
+                self._raise_failure()
+        return None
+
     async def get(self) -> StreamingMessage:
         """Receive ordered data, then raise any out-of-band transport failure."""
         while True:
-            # Data written before EOF stays ahead of the failure: the queue is read first.
-            try:
-                return self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                if self._failed.done():
-                    self._raise_failure()
+            message = self.take_nowait()
+            if message is not None:
+                return message
             waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             self._waiters.append(waiter)
             try:
@@ -320,7 +323,7 @@ class FileOpDispatcher:
                 except ValidationError as error:
                     self._unreadable_frame(data, error)
                     continue
-                op_id = getattr(msg, "op_id", None)
+                op_id = msg.op_id
                 if op_id is not None:
                     # Route to registered op queue, or discard if orphaned.
                     inbox = self._op_queues.get(op_id)
@@ -704,7 +707,8 @@ class DualPortChannel:
         Raises:
             What UnixSocketChannel.connect raises; on a reconnection, TimeoutError when no
             pong came after every probe attempt (GUEST_RECONNECT_PROBE_TIMEOUTS), and
-            InternalError GUEST_PROTOCOL when the guest answers a ping with another reply;
+            InternalError GUEST_PROTOCOL when the guest answers a ping with another reply, or
+            with one this release cannot read;
             after a restore, TransientError GUEST_SILENT_AFTER_RESTORE when the guest answers
             the ping with an io_error (it could not reseed its kernel random source)
         """
@@ -1014,17 +1018,36 @@ async def consume_stream(
 
     Returns:
         StreamResult with collected output, exit code, and timing.
+
+    Raises:
+        InternalError: GUEST_PROTOCOL: a stream goes past the guest's cap and one read (more
+            than MAX_STDOUT_BYTES or MAX_STDERR_BYTES + GUEST_OUTPUT_READ_BYTES characters):
+            the host keeps no more of it.
+        What stream_messages raises, and what on_error raises.
     """
     exit_code = -1
     execution_time_ms: int | None = None
     spawn_ms: int | None = None
     process_ms: int | None = None
     chunks: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    sizes = {"stdout": 0, "stderr": 0}
+    caps = {"stdout": constants.MAX_STDOUT_BYTES, "stderr": constants.MAX_STDERR_BYTES}
     callbacks = {"stdout": on_stdout, "stderr": on_stderr}
 
     async with contextlib.aclosing(channel.stream_messages(request, timeout=timeout)) as stream:
         async for msg in stream:
             if isinstance(msg, OutputChunkMessage):
+                sizes[msg.type] += len(msg.chunk)
+                cap = caps[msg.type]
+                if sizes[msg.type] > cap + constants.GUEST_OUTPUT_READ_BYTES:  # a hostile guest
+                    raise InternalError(
+                        f"The guest sent more than {cap + constants.GUEST_OUTPUT_READ_BYTES} characters of "
+                        f"{msg.type} (its cap: {cap} bytes and one {constants.GUEST_OUTPUT_READ_BYTES}-byte read)",
+                        code=ErrorCode.GUEST_PROTOCOL,
+                        context={"vm_id": vm_id},
+                        hint=None,
+                        instance_id=None,
+                    )
                 chunks[msg.type].append(msg.chunk)
                 if (callback := callbacks[msg.type]) is not None:
                     try:

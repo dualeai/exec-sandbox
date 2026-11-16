@@ -6,16 +6,18 @@ owned by a different UID. This is the primary signal boundary.
 
 Test categories:
 - Normal: signals work correctly within the UID 1000 boundary (self + children)
-- Edge: every signal type to PID 1 must raise PermissionError (EPERM)
+- Edge: every signal type to PID 1 but SIGCONT must raise PermissionError (EPERM)
 - Weird: bypass attempts via alternative syscalls (tgkill, pidfd, rt_sigqueueinfo)
-- Out of bounds: /proc-based attacks, ptrace, capability escalation (CVE-informed)
+- Out of bounds: the /proc/1 files and capability escalation (CVE-informed)
+
+Writes to /proc/sysrq-trigger and /proc/sys/kernel/core_pattern: test_device_security.py.
+ptrace of PID 1: test_kernel_attack_surface.py::TestPtraceRestricted.
 
 References:
 - kill(2): https://man7.org/linux/man-pages/man2/kill.2.html
 - pidfd_send_signal(2): https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html
 - tgkill(2): https://man7.org/linux/man-pages/man2/tkill.2.html
 - CVE-2024-21626: runc /proc/self/fd container escape
-- CVE-2025-31133/52565/52881: runc /proc/sys/kernel/core_pattern escapes
 """
 
 from exec_sandbox.models import Language
@@ -144,12 +146,10 @@ except PermissionError:
         This is harmless -- SIGCONT only resumes a stopped process.
         """
         code = """\
-import os, signal
+import os
 blocked = 0
 allowed = []
 other = []
-# SIGCONT (18) is allowed cross-UID within the same session -- kernel design
-EXPECTED_ALLOWED = {signal.SIGCONT}
 for sig in range(1, 32):
     try:
         os.kill(1, sig)
@@ -158,12 +158,9 @@ for sig in range(1, 32):
         blocked += 1
     except OSError as e:
         other.append((sig, e.errno))
-unexpected = [s for s in allowed if s not in EXPECTED_ALLOWED]
 print(f"BLOCKED:{blocked}")
-print(f"ALLOWED:{sorted(allowed)}")
+print(f"ALLOWED:{allowed}")
 print(f"OTHER:{other}")
-if unexpected:
-    print(f"UNEXPECTED:{unexpected}")
 """
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec(code)
@@ -214,7 +211,7 @@ class TestSignalBypassAttempts:
     """Creative attempts to bypass the signal boundary via alternative syscalls."""
 
     async def test_kill_minus1_broadcast(self, scheduler: Scheduler) -> None:
-        """kill(-1, SIGKILL) -- POSIX excludes PID 1; guest-agent survives.
+        """kill(-1, SIGKILL) -- Linux skips PID 1; guest-agent survives.
 
         Linux kernel excludes both PID 1 (pid > 1 check) and the calling process
         (same_thread_group check) from kill(-1). os.killpg(1, sig) is the same kill(-1, sig) call.
@@ -400,152 +397,40 @@ try {
 class TestSignalOutOfBounds:
     """Non-signal vectors to influence or exfiltrate from PID 1, informed by recent CVEs."""
 
-    async def test_proc_pid1_fd_dir_blocked(self, scheduler: Scheduler) -> None:
-        """/proc/1/fd/ not listable (fd leak vector).
-
-        References: CVE-2024-21626, CVE-2025-31133 (runc container escapes).
+    async def test_proc_pid1_files_blocked(self, scheduler: Scheduler) -> None:
+        """No /proc/1 file is reachable: ENOENT (hidepid hides PID 1) for each vector. One VM
+        tries each:
+        - listing /proc/1/fd (fd leak: CVE-2024-21626, CVE-2025-31133, runc container escapes);
+        - reading /proc/1/environ (secret leak) and /proc/1/maps (ASLR leak: CVE-2023-3269,
+          StackRot);
+        - opening /proc/1/mem read-write (code injection: https://lwn.net/Articles/476684/);
+        - writing /proc/1/oom_score_adj (OOM targeting).
         """
         code = """\
-import os
-try:
-    entries = os.listdir('/proc/1/fd')
-    print(f"unexpected_success:{len(entries)} fds")
-except PermissionError:
-    print("blocked:EPERM")
-except FileNotFoundError:
-    print("blocked:ENOENT")
+import errno, os
+attempts = {
+    'listdir /proc/1/fd': lambda: os.listdir('/proc/1/fd'),
+    'read /proc/1/environ': lambda: open('/proc/1/environ', 'rb').read(),
+    'read /proc/1/maps': lambda: open('/proc/1/maps').read(),
+    'open-rdwr /proc/1/mem': lambda: os.close(os.open('/proc/1/mem', os.O_RDWR)),
+    'write /proc/1/oom_score_adj': lambda: open('/proc/1/oom_score_adj', 'w').write('1000'),
+}
+for label, attempt in attempts.items():
+    try:
+        attempt()
+        print(f'{label}:DONE')
+    except OSError as e:
+        print(f'{label}:{errno.errorcode[e.errno]}')
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert (result.exit_code, result.stdout) == (0, "blocked:ENOENT\n"), result.stderr
-
-    async def test_proc_pid1_environ_read_blocked(self, scheduler: Scheduler) -> None:
-        """/proc/1/environ not readable (secret leak vector)."""
-        code = """\
-try:
-    with open('/proc/1/environ', 'rb') as f:
-        data = f.read()
-    print(f"unexpected_success:{len(data)} bytes")
-except PermissionError:
-    print("blocked:EPERM")
-except FileNotFoundError:
-    print("blocked:ENOENT")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert (result.exit_code, result.stdout) == (0, "blocked:ENOENT\n"), result.stderr
-
-    async def test_proc_pid1_mem_write_blocked(self, scheduler: Scheduler) -> None:
-        """/proc/1/mem not writable (code injection vector).
-
-        Reference: https://lwn.net/Articles/476684/
-        """
-        code = """\
-import os
-try:
-    fd = os.open('/proc/1/mem', os.O_RDWR)
-    os.close(fd)
-    print("unexpected_success")
-except PermissionError:
-    print("blocked:EPERM")
-except FileNotFoundError:
-    print("blocked:ENOENT")
-except OSError as e:
-    print(f"blocked:errno={e.errno}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert (result.exit_code, result.stdout) == (0, "blocked:ENOENT\n"), result.stderr
-
-    async def test_proc_pid1_maps_read_blocked(self, scheduler: Scheduler) -> None:
-        """/proc/1/maps not readable (ASLR leak vector).
-
-        Reference: CVE-2023-3269 (StackRot).
-        """
-        code = """\
-try:
-    with open('/proc/1/maps') as f:
-        data = f.read()
-    print(f"unexpected_success:{len(data)} bytes")
-except PermissionError:
-    print("blocked:EPERM")
-except FileNotFoundError:
-    print("blocked:ENOENT")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert (result.exit_code, result.stdout) == (0, "blocked:ENOENT\n"), result.stderr
-
-    async def test_proc_pid1_oom_score_adj_blocked(self, scheduler: Scheduler) -> None:
-        """/proc/1/oom_score_adj not writable (OOM targeting vector)."""
-        code = """\
-try:
-    with open('/proc/1/oom_score_adj', 'w') as f:
-        f.write('1000')
-    print("unexpected_success")
-except PermissionError:
-    print("blocked:EPERM")
-except FileNotFoundError:
-    print("blocked:ENOENT")
-except OSError as e:
-    print(f"blocked:errno={e.errno}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert (result.exit_code, result.stdout) == (0, "blocked:ENOENT\n"), result.stderr
-
-    async def test_proc_sysrq_trigger_blocked(self, scheduler: Scheduler) -> None:
-        """/proc/sysrq-trigger not writable (write 'c' = kernel crash, 'b' = reboot).
-
-        Reference: CVE-2025-52881.
-        """
-        code = """\
-try:
-    with open('/proc/sysrq-trigger', 'w') as f:
-        f.write('h')  # 'h' = help (safest), but should fail before write
-    print("unexpected_success")
-except PermissionError:
-    print("blocked")
-except FileNotFoundError:
-    print("blocked:not_found")
-except OSError as e:
-    print(f"blocked:errno={e.errno}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert (result.exit_code, result.stdout) == (0, "blocked:not_found\n"), result.stderr
-
-    async def test_proc_core_pattern_blocked(self, scheduler: Scheduler) -> None:
-        """/proc/sys/kernel/core_pattern not writable (arbitrary code execution vector).
-
-        Reference: CVE-2025-52881.
-        """
-        code = """\
-try:
-    with open('/proc/sys/kernel/core_pattern', 'w') as f:
-        f.write('|/tmp/evil %p')
-    print("unexpected_success")
-except PermissionError:
-    print("blocked")
-except FileNotFoundError:
-    print("blocked:not_found")
-except OSError as e:
-    print(f"blocked:errno={e.errno}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert (result.exit_code, result.stdout) == (0, "blocked:not_found\n"), result.stderr
-
-    async def test_ptrace_pid1_blocked(self, scheduler: Scheduler) -> None:
-        """ptrace(PTRACE_ATTACH, 1) fails -- cannot debug PID 1."""
-        code = """\
-import ctypes
-
-libc = ctypes.CDLL("libc.so.6", use_errno=True)
-# PTRACE_ATTACH = 16
-ret = libc.ptrace(16, 1, 0, 0)
-err = ctypes.get_errno()
-if ret == -1:
-    print(f"blocked:errno={err}")
-else:
-    print("unexpected_success")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "blocked:errno=1\n"  # EPERM = 1
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            "listdir /proc/1/fd:ENOENT",
+            "read /proc/1/environ:ENOENT",
+            "read /proc/1/maps:ENOENT",
+            "open-rdwr /proc/1/mem:ENOENT",
+            "write /proc/1/oom_score_adj:ENOENT",
+        ]
 
     async def test_prctl_cap_kill_blocked(self, scheduler: Scheduler) -> None:
         """prctl(PR_CAP_AMBIENT, RAISE, CAP_KILL) fails -- can't grant self CAP_KILL."""

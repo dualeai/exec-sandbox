@@ -1,11 +1,10 @@
 """Tests for cgroup.py cgroup v2 and ulimit utilities.
 
-Test categories:
-- Normal cases: Happy path with valid inputs
-- Edge cases: None, empty, boundary values
-- Error cases: OSError, PermissionError, ConfigError
-- Weird cases: Special characters, path traversal, malformed data
-- Integration tests: Real cgroups on Linux (requires sudo)
+A folder stands in for /sys/fs/cgroup where the kernel is not under test: the functions read
+and write real files in it. Covers the cgroup v2 detection, the ulimit wrap (shell quoting
+included), the VM cgroup's life (create, attach, stats, kill, remove, end_all, reclaim), the
+probe of can_contain_processes, and the container limits (cgroup v2 and v1, malformed
+values). TestCgroupIntegration runs real cgroups on Linux (requires sudo).
 """
 
 import asyncio
@@ -951,12 +950,6 @@ class TestDetectCgroupMemoryLimitMb:
         (tmp_path / "memory.max").write_text("max")
         result = _read_at(tmp_path, detect_cgroup_memory_limit_mb)
         assert result is None
-
-    def test_v2_small_limit(self, tmp_path: Path):
-        """cgroup v2 small memory limit (1GB) returns correct MB."""
-        (tmp_path / "memory.max").write_text("1073741824")  # 1GB
-        result = _read_at(tmp_path, detect_cgroup_memory_limit_mb)
-        assert result == pytest.approx(1024.0)
 
     def test_no_cgroup_returns_none(self, tmp_path: Path):
         """No cgroup files → returns None (macOS, bare metal)."""

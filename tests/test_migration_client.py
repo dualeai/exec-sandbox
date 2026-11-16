@@ -12,16 +12,19 @@ import asyncio
 import errno
 import json
 import os
+import signal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from exec_sandbox import constants
 from exec_sandbox.exceptions import ConfigError, ErrorCode, RouteError, RouteKey, SandboxError, TransientError
-from exec_sandbox.migration_client import MigrationClient, migration_timeout, qemu_refusal
-from exec_sandbox.qmp_client import QmpClient
+from exec_sandbox.migration_client import MigrationClient, migration_timeout, refusal_cause
+from exec_sandbox.qmp_client import QMP_BUFFER_LIMIT, QmpClient
+from tests.conftest import NESTED_QMP_LINE
 from tests.instance_support import FakeQmp
 
 if TYPE_CHECKING:
@@ -108,7 +111,7 @@ async def qemu(short_tmp_dir: Path) -> AsyncIterator[_Connect]:
         servers.append(await asyncio.start_unix_server(peer.serve, path=str(path)))
         client = MigrationClient(path, os.getuid())
         clients.append(client)
-        await client.connect(timeout=5.0)
+        await client.connect()
         return client, peer
 
     yield connect
@@ -184,6 +187,20 @@ def _replies(operation: str, *, queries: list[dict[str, Any]], after_failure: bo
 # ============================================================================
 
 
+# Lines from QEMU that QmpClient cannot read: not JSON, not UTF-8, longer than QMP_BUFFER_LIMIT,
+# nested too deep for the JSON parser
+_MALFORMED_LINES = pytest.mark.parametrize(
+    ("line", "cause"),
+    [
+        (b"not valid json\n", json.JSONDecodeError),
+        (b'{"return": "\xff"}\n', UnicodeDecodeError),
+        (b'"' + b"x" * QMP_BUFFER_LIMIT + b'"\n', ValueError),  # StreamReader.readline
+        (NESTED_QMP_LINE, ValueError),  # parse_qmp_line, from a RecursionError (qmp_parser_too_deep)
+    ],
+    ids=["not-json", "not-utf8", "over-the-buffer-limit", "nested-too-deep"],
+)
+
+
 async def _restore(client: MigrationClient) -> None:
     """A restore of /tmp/t.vmstate (QEMU 11.2.0, no template)."""
     await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
@@ -224,7 +241,7 @@ class TestMigrationClientConnectOwnership:
         with pytest.raises(
             TransientError, match="QMP capabilities failed", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
         ):
-            await client.connect(timeout=5.0)
+            await client.connect()
 
         await asyncio.wait_for(fake.hung_up.wait(), 5.0)
         await _assert_not_connected(client)
@@ -256,7 +273,7 @@ class TestMigrationClientConnectOwnership:
             new_callable=AsyncMock,
             return_value=(reader, writer),
         ):
-            connect = asyncio.create_task(client.connect(timeout=5.0))
+            connect = asyncio.create_task(client.connect())
             await asyncio.wait_for(greeting_entered.wait(), timeout=1)
             connect.cancel()
             await asyncio.wait_for(close_entered.wait(), timeout=1)
@@ -301,23 +318,18 @@ class TestMigrationClientExchange:
             {"execute": "cont", "id": "migration-4"},
         ]
 
-    @pytest.mark.parametrize(
-        ("events", "completes"), [(63, True), (64, False)], ids=["under-the-limit", "at-the-limit"]
-    )
-    async def test_skipped_events_limit(self, qemu: _Connect, events: int, completes: bool) -> None:
-        """Up to 63 skipped messages before an answer: 64 or more is MIGRATION_FAILED (a QEMU
-        that floods its monitor), not an endless read."""
+    async def test_an_event_flood_is_migration_failed(self, qemu: _Connect) -> None:
+        """A QEMU that floods its monitor (64 events before an answer: QmpClient's limit) fails
+        the operation with TransientError MIGRATION_FAILED, not an endless read."""
         replies = _replies("restore", queries=[_query("completed")], after_failure=False)
-        client, _peer = await qemu([*[_EVENT] * events, *replies], at_end="close")
+        client, _peer = await qemu([*[_EVENT] * 64, *replies], at_end="close")
 
-        with _fast_poll():
-            if completes:
-                await _restore(client)
-            else:
-                with pytest.raises(
-                    TransientError, match="Too many QMP messages", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
-                ):
-                    await _restore(client)
+        with pytest.raises(
+            TransientError,
+            match=r"^Too many QMP messages without a matching command response$",
+            check=lambda e: e.code is ErrorCode.MIGRATION_FAILED,
+        ):
+            await _restore(client)
 
     async def test_connection_closed_raises(self, qemu: _Connect) -> None:
         """The end of the stream (QEMU exited): TransientError MIGRATION_FAILED."""
@@ -328,16 +340,21 @@ class TestMigrationClientExchange:
         ):
             await _restore(client)
 
-    async def test_malformed_json_response_raises(self, qemu: _Connect) -> None:
-        """Malformed JSON from QEMU raises TransientError MIGRATION_FAILED (no bare JSONDecodeError)."""
-        client, _peer = await qemu([b"not valid json\n"], at_end="silent")
+    @_MALFORMED_LINES
+    @pytest.mark.usefixtures("qmp_parser_too_deep")
+    async def test_malformed_json_response_raises(self, qemu: _Connect, line: bytes, cause: type[Exception]) -> None:
+        """A line from QEMU that is not JSON, not UTF-8, longer than QMP_BUFFER_LIMIT or nested
+        too deep raises TransientError MIGRATION_FAILED from the error of that line (no bare
+        ValueError or RecursionError, and no wait for the command's deadline)."""
+        client, _peer = await qemu([line], at_end="silent")
 
         with pytest.raises(
             TransientError,
             match="QMP migrate-set-capabilities failed",
             check=lambda e: e.code is ErrorCode.MIGRATION_FAILED,
-        ):
+        ) as exc_info:
             await _restore(client)
+        assert type(exc_info.value.__cause__) is cause
 
     async def test_command_timeout_is_transient(self, qemu: _Connect, monkeypatch: pytest.MonkeyPatch) -> None:
         """A QMP command without an answer raises TransientError MIGRATION_FAILED, not a bare
@@ -376,19 +393,26 @@ class TestMigrationCapabilities:
         assert states == {"multifd": True, "mapped-ram": True, "x-ignore-shared": use_template}
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
-    @pytest.mark.parametrize("version", [(10, 99, 99), (8, 2, 0)], ids=["just-below", "old"])
+    @pytest.mark.parametrize(
+        ("version", "message"),
+        [
+            ((10, 99, 99), "QEMU 10.99.99 is below the migration floor 11.0.0"),
+            ((8, 2, 0), "QEMU 8.2.0 is below the migration floor 11.0.0"),
+        ],
+        ids=["just-below", "old"],
+    )
     async def test_below_floor_sends_nothing(
-        self, qemu: _Connect, operation: str, version: tuple[int, int, int]
+        self, qemu: _Connect, operation: str, version: tuple[int, int, int], message: str
     ) -> None:
+        """A QEMU below the floor gets no command: ConfigError MIGRATION_UNSUPPORTED, whose
+        message is the refusal's cause (an L1 entry this QEMU cannot load is evicted)."""
         client, peer = await qemu([], at_end="silent")
 
-        with pytest.raises(
-            ConfigError, match="below the migration floor", check=lambda e: e.code is ErrorCode.MIGRATION_UNSUPPORTED
-        ) as exc:
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.MIGRATION_UNSUPPORTED) as exc:
             await _run(client, operation, qemu_version=version, use_template=False, timeout=5.0)
 
         assert await peer.sent(client) == []
-        assert qemu_refusal(exc.value) is not None  # an L1 entry this QEMU cannot load is evicted
+        assert (str(exc.value), refusal_cause(exc.value)) == (message, message)
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
     async def test_refused_capability_is_rejected(self, qemu: _Connect, operation: str) -> None:
@@ -461,13 +485,13 @@ class TestMigrationProgress:
         if operation == "save":
             assert sent[-2:] == ["migrate_cancel", "cont"]
             assert exc.value.context["vm_resumed"] is True
-            assert qemu_refusal(exc.value) is None
+            assert refusal_cause(exc.value) is None
         else:
             assert sent[-1] == "query-migrate"
             assert isinstance(exc.value, RouteError)
             assert exc.value.required == {}  # the caller names the target: it knows who saved the state
             assert exc.value.found == {"qemu_version": "11.2.0"}
-            assert qemu_refusal(exc.value) is not None
+            assert refusal_cause(exc.value) == f"Migration {status}: disk full"
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
     async def test_failed_query_is_transient(self, qemu: _Connect, operation: str) -> None:
@@ -481,7 +505,25 @@ class TestMigrationProgress:
             ) as exc,
         ):
             await _run(client, operation, qemu_version=_QEMU, use_template=False, timeout=5.0)
-        assert qemu_refusal(exc.value) is None  # a good L1 entry is kept
+        assert refusal_cause(exc.value) is None  # a good L1 entry is kept
+
+    @pytest.mark.parametrize("operation", ["save", "restore"])
+    async def test_a_query_answer_that_is_not_an_object_is_transient(self, qemu: _Connect, operation: str) -> None:
+        """A query-migrate answer whose return is not an object (a broken QEMU) is TransientError
+        MIGRATION_FAILED at once, never a raw AttributeError, nor a wait for the deadline."""
+        replies = _replies(operation, queries=[{"return": []}], after_failure=True)
+        client, _peer = await qemu(replies, at_end="close")
+
+        with (
+            _fast_poll(),
+            pytest.raises(
+                TransientError,
+                match=r"^query-migrate answer is not an object: \[\]",
+                check=lambda e: e.code is ErrorCode.MIGRATION_FAILED,
+            ) as exc,
+        ):
+            await _run(client, operation, qemu_version=_QEMU, use_template=False, timeout=5.0)
+        assert refusal_cause(exc.value) is None  # says nothing about the saved state
 
     @pytest.mark.parametrize("operation", ["save", "restore"])
     async def test_hung_migration_is_transient(self, qemu: _Connect, operation: str) -> None:
@@ -500,10 +542,11 @@ class TestMigrationProgress:
 
 
 class TestRejectedByQemu:
-    """qemu_refusal decides the L1 eviction and the reuse() ROUTE rule. It matches by code
-    (MIGRATION_REJECTED, MIGRATION_UNSUPPORTED), never by class, anywhere in the cause or
-    context chain: a restore whose setup fails (HOST_DEPENDENCY, also a ConfigError) or whose
-    QEMU fails otherwise must not evict a good entry."""
+    """refusal_cause decides the L1 eviction and the reuse() ROUTE rule, from the evidence of
+    one failure. It matches by code (MIGRATION_REJECTED, MIGRATION_UNSUPPORTED; QEMU_CRASHED
+    with SIGABRT; GUEST_SILENT_AFTER_RESTORE with QEMU's exit code 0), never by class, anywhere
+    in the cause or context chain: a restore whose setup fails (HOST_DEPENDENCY, also a
+    ConfigError) or whose QEMU fails otherwise must not evict a good entry."""
 
     @staticmethod
     def _rejected() -> SandboxError:
@@ -544,6 +587,85 @@ class TestRejectedByQemu:
         return TransientError("QEMU exited", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None)
 
     @staticmethod
+    def _died(returncode: int, console: str, *, loading: bool) -> SandboxError:
+        return TransientError(
+            f"QEMU died during the restore of vm (rc={returncode}).",
+            code=ErrorCode.QEMU_CRASHED,
+            context={"vm_id": "vm", "returncode": returncode, "loading": loading, "console_log": console},
+            hint=None,
+            instance_id=None,
+        )
+
+    _MSR_ABORT = (
+        "qemu-system-x86_64: error: failed to set MSR 0x48f to 0x7fffff00036dfb\n"
+        "qemu-system-x86_64: ../target/i386/kvm/kvm.c:4116: kvm_buf_set_msrs: Assertion `ret == cpu->kvm_msr_buf->nmsrs' failed."
+    )
+
+    def _aborted(self) -> SandboxError:
+        """QEMU killed by SIGABRT while it loaded the state (an x86 MSR KVM refuses asserts)."""
+        return self._died(-signal.SIGABRT, self._MSR_ABORT, loading=True)
+
+    def _aborted_before_the_load(self) -> SandboxError:
+        """The same abort before the load started (QEMU waits with -incoming defer): not the state."""
+        return self._died(-signal.SIGABRT, self._MSR_ABORT, loading=False)
+
+    def _aborted_on_a_limit(self) -> SandboxError:
+        """QEMU could not make a thread (a host limit: error_exit aborts): it can pass."""
+        return self._died(-signal.SIGABRT, "qemu: qemu_thread_create: Resource temporarily unavailable", loading=True)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "qemu: qemu_thread_create: Invalid argument",
+            "qemu-system-x86_64: kvm_init_vcpu: Resource temporarily unavailable",
+            "qemu-system-x86_64: cannot set up guest memory 'mem0': Cannot allocate memory",
+            "(process:4242): GLib-ERROR **: ../glib/gmem.c:136: failed to allocate 1073741824 bytes",
+        ],
+        ids=["thread-create", "eagain", "enomem", "glib-allocation"],
+    )
+    def test_an_abort_on_a_host_limit_can_pass(self, line: str) -> None:
+        """Each host-limit line makes a SIGABRT during the load no refusal (_HOST_LIMIT_LINES)."""
+        assert refusal_cause(self._died(-signal.SIGABRT, f"[    1.2] guest line\n{line}", loading=True)) is None
+
+    def _registers_after_init(self) -> SandboxError:
+        """KVM refused the loaded vCPU registers: QEMU ends with 1 (accel/kvm/kvm-all.c)."""
+        return self._died(1, "qemu-system-aarch64: Failed to put registers after init: Invalid argument", loading=True)
+
+    def _exit_1_other(self) -> SandboxError:
+        return self._died(
+            1, "qemu-system-aarch64: cannot set up guest memory 'mem0': Cannot allocate memory", loading=True
+        )
+
+    def _killed(self) -> SandboxError:
+        """QEMU killed by SIGKILL (the OOM killer): it can pass."""
+        return self._died(-signal.SIGKILL, "(empty)", loading=True)
+
+    @staticmethod
+    def _silent(exit_code: int | None) -> SandboxError:
+        console = "[    0.000000] Linux version 6.18.63\n[    2.413000] Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b"
+        return TransientError(
+            "VM vm: the guest did not answer after its saved state loaded.",
+            code=ErrorCode.GUEST_SILENT_AFTER_RESTORE,
+            context={"vm_id": "vm", "vmstate_path": "/x", "exit_code": exit_code, "console_log": console},
+            hint=None,
+            instance_id=None,
+        )
+
+    def _panicked(self) -> SandboxError:
+        """The guest panicked right after the load: the reboot ends QEMU with 0 (-no-reboot)."""
+        return self._silent(0)
+
+    def _terminated(self) -> SandboxError:
+        """QEMU ended with 0 on a SIGTERM from outside: not a guest panic."""
+        error = self._silent(0)
+        error.context["console_log"] = "qemu-system-x86_64: terminating on signal 15 from pid 4242 (<unknown process>)"
+        return error
+
+    def _silent_running(self) -> SandboxError:
+        """The guest did not answer and QEMU still runs (host load, or a hang): it can pass."""
+        return self._silent(None)
+
+    @staticmethod
     def _chained(inner: BaseException, *, link: str) -> BaseException:
         """`inner` as raised, or under the restore's TransientError wrap: `raise ... from` (cause)
         or a raise inside the handler without `from` (context only, as _check_qemu_alive does)."""
@@ -571,23 +693,49 @@ class TestRejectedByQemu:
             ("_host_dependency", False),
             ("_failed", False),
             ("_crashed", False),
+            ("_aborted", True),
+            ("_aborted_before_the_load", False),
+            ("_aborted_on_a_limit", False),
+            ("_registers_after_init", True),
+            ("_exit_1_other", False),
+            ("_killed", False),
+            ("_panicked", True),
+            ("_terminated", False),
+            ("_silent_running", False),
         ],
     )
     def test_matches_only_refusal_codes(self, make: str, refused: bool, link: str) -> None:
         error = self._chained(getattr(self, make)(), link=link)
-        assert (qemu_refusal(error) is not None) is refused
+        assert (refusal_cause(error) is not None) is refused
+
+    @pytest.mark.parametrize(
+        ("make", "cause"),
+        [
+            ("_rejected", "migrate-incoming command failed"),
+            (
+                "_aborted",
+                "qemu-system-x86_64: ../target/i386/kvm/kvm.c:4116: kvm_buf_set_msrs: "
+                "Assertion `ret == cpu->kvm_msr_buf->nmsrs' failed.",
+            ),
+            ("_panicked", "Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b"),
+            ("_registers_after_init", "qemu-system-aarch64: Failed to put registers after init: Invalid argument"),
+        ],
+    )
+    def test_the_cause_is_qemus_or_the_guests_line(self, make: str, cause: str) -> None:
+        """The reason a reuse() error names: QEMU's message, its last line, the panic line."""
+        assert refusal_cause(self._chained(getattr(self, make)(), link="cause")) == cause
 
     def test_refusal_below_a_plain_error_is_found(self) -> None:
         """The restore wrap, then an OSError (context), then QEMU's refusal (its cause)."""
         os_error = OSError("QMP socket closed")
-        assert qemu_refusal(self._chained(os_error, link="context")) is None
+        assert refusal_cause(self._chained(os_error, link="context")) is None
         os_error.__cause__ = self._rejected()
-        assert qemu_refusal(self._chained(os_error, link="context")) is not None
+        assert refusal_cause(self._chained(os_error, link="context")) == "migrate-incoming command failed"
 
     def test_cycle_in_the_chain_ends(self) -> None:
         a, b = self._failed(), self._crashed()
         a.__context__, b.__context__ = b, a
-        assert qemu_refusal(a) is None
+        assert refusal_cause(a) is None
 
 
 class TestMigrationTimeout:
@@ -1070,28 +1218,9 @@ class TestMigrationClientSaveSnapshot:
 
 
 class TestMigrationClientRestoreSnapshot:
-    """restore_snapshot: set-capabilities → migrate-incoming → poll → cont."""
-
-    async def test_restore_command_sequence(self, qemu: _Connect) -> None:
-        client, peer = await qemu(
-            [
-                {"return": {}},  # migrate-set-capabilities
-                {"return": {}},  # migrate-incoming
-                {"return": {"status": "completed"}},  # query-migrate
-                {"return": {}},  # cont
-            ],
-            at_end="close",
-        )
-
-        with _fast_poll():
-            await client.restore_snapshot(
-                Path("/tmp/snapshot.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False
-            )
-
-        cmds = await peer.sent(client)
-        assert [c["execute"] for c in cmds] == ["migrate-set-capabilities", "migrate-incoming", "query-migrate", "cont"]
-        # exit-on-error=false: QEMU stays up on a bad stream so the error can be read
-        assert cmds[1]["arguments"] == {"uri": "file:/tmp/snapshot.vmstate", "exit-on-error": False}
+    """restore_snapshot: set-capabilities → migrate-incoming → poll → cont (the sequence:
+    TestMigrationProgress.test_polls_until_completed; the migrate-incoming arguments:
+    TestMigrationClientExchange.test_events_are_skipped_and_commands_written_as_qmp)."""
 
     async def test_restore_cont_error(self, qemu: _Connect) -> None:
         client, _peer = await qemu(
@@ -1136,7 +1265,61 @@ class TestMigrationClientRestoreSnapshot:
             check=lambda e: e.code is ErrorCode.MIGRATION_FAILED,
         ) as exc_info:
             await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
-        assert qemu_refusal(exc_info.value) is None
+        assert refusal_cause(exc_info.value) is None
+
+
+class TestRestoreEvidence:
+    """What restore_vm reads after a failed load: whether migrate-incoming was sent (a QEMU
+    death counts as the state's only then) and whether QEMU closed the connection (it ends:
+    wait for its exit code; one that answered still runs)."""
+
+    async def test_no_load_before_migrate_incoming(self, qemu: _Connect) -> None:
+        client, _peer = await qemu([{"error": {"class": "GenericError", "desc": "no mapped-ram"}}], at_end="silent")
+        with pytest.raises(ConfigError):
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
+        assert client.load_started is False
+
+    async def test_qemu_gone_before_it_took_the_load(self, qemu: _Connect) -> None:
+        """QEMU ended before it answered migrate-incoming: it never started the load (QEMU
+        reads the stream only after its reply), so a death then is not the state's."""
+        client, _peer = await qemu([{"return": {}}], at_end="close")  # set-capabilities only
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
+        await client.close()
+        assert (client.load_started, client.qemu_closed) == (False, True)
+
+    async def test_a_reset_is_a_closed_connection(self) -> None:
+        """Linux: QEMU that exits with unread bytes on the socket resets it: the reader holds the
+        error and is not at EOF, and QEMU closed the connection all the same."""
+        client = MigrationClient(Path("/tmp/qmp.sock"), expected_uid=0)
+        reader = asyncio.StreamReader()
+        reader.set_exception(ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"))
+        client._qmp = cast("Any", SimpleNamespace(reader=reader, close=AsyncMock()))  # pyright: ignore[reportPrivateUsage]
+        await client.close()
+        assert client.qemu_closed is True
+
+    async def test_qemu_ended_during_the_load(self, qemu: _Connect) -> None:
+        """migrate-incoming sent, then EOF (QEMU exited while it loaded)."""
+        client, _peer = await qemu([{"return": {}}, {"return": {}}], at_end="close")
+        with _fast_poll(), pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
+        await client.close()
+        assert (client.load_started, client.qemu_closed) == (True, True)
+
+    async def test_qemu_that_answered_still_runs(self, qemu: _Connect) -> None:
+        """QEMU refused the stream and answered: the connection stays up (QEMU runs)."""
+        client, _peer = await qemu(
+            [
+                {"return": {}},  # migrate-set-capabilities
+                {"return": {}},  # migrate-incoming
+                {"return": {"status": "failed", "error-desc": "Unknown ramblock"}},  # query-migrate
+            ],
+            at_end="silent",
+        )
+        with _fast_poll(), pytest.raises(RouteError):
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
+        await client.close()
+        assert (client.load_started, client.qemu_closed) == (True, False)
 
 
 # ============================================================================
@@ -1167,6 +1350,32 @@ class TestMigrationClientContextManager:
             async with MigrationClient(short_tmp_dir / "no-qemu.sock", os.getuid()):
                 pass
         assert isinstance(exc_info.value.__cause__, OSError)
+
+    @_MALFORMED_LINES
+    @pytest.mark.usefixtures("qmp_parser_too_deep")
+    async def test_a_malformed_greeting_is_migration_failed(
+        self, short_tmp_dir: Path, line: bytes, cause: type[Exception]
+    ) -> None:
+        """A greeting QmpClient cannot read fails connect() with TransientError
+        MIGRATION_FAILED, never a bare ValueError or RecursionError."""
+
+        async def qemu(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            writer.write(line)
+            await writer.drain()
+            await reader.read()  # until the client hangs up: wait_closed() waits for this handler
+            writer.close()
+
+        path = short_tmp_dir / "greeting.sock"
+        server = await asyncio.start_unix_server(qemu, path=str(path))
+        try:
+            with pytest.raises(
+                TransientError, match=r"^QMP connection failed: ", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+            ) as exc_info:
+                await MigrationClient(path, os.getuid()).connect()
+            assert type(exc_info.value.__cause__) is cause
+        finally:
+            server.close()
+            await server.wait_closed()
 
     async def test_quit_that_qemu_answers_by_closing_is_no_error(self, short_tmp_dir: Path) -> None:
         """QEMU may close the QMP socket before it answers quit: quit() returns."""

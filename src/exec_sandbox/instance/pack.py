@@ -153,9 +153,9 @@ def apply_object(
         try:
             index = _INDEX.validate_json(plain)
         except ValidationError:
-            raise codec.other_release(instance_id, what="object index") from None
+            raise codec.other_release(instance_id, what="object index", writer=None) from None
         if set(index) - set(targets):
-            raise codec.other_release(instance_id, what="object's streams")
+            raise codec.other_release(instance_id, what="object's streams", writer=None)
         tasks: list[_Records] = []
         position = 0
         for stream in sorted(index):

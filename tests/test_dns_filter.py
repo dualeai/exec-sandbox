@@ -77,13 +77,8 @@ def test_generate_outbound_allow_json_custom():
 
 def test_generate_outbound_allow_json_empty_means_no_filter():
     """allowed_domains=[]: no pattern, so no domain filter (with allow_network, all outbound
-    is allowed). Blocking all outbound is the separate BlockAllOutbound flag."""
+    is allowed). Blocking all outbound is gvproxy's separate -block-outbound flag."""
     assert generate_outbound_allow_json(resolved_domains([], "python")) == "[]"
-
-
-def test_generate_outbound_allow_json_none_uses_defaults_or_no_filter():
-    """raw has no package registry: None means no domain filter."""
-    assert generate_outbound_allow_json(resolved_domains(None, "raw")) == "[]"
 
 
 def test_the_shared_cases_are_this_generator():

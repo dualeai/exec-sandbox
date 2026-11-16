@@ -88,9 +88,9 @@ def test_a_failed_prctl_stops_the_repl_before_any_exec(tmp_path: Path) -> None:
         check=False,
     )
 
-    assert run.returncode != 0
-    assert "prctl(PR_SET_DUMPABLE, 0) failed" in run.stderr.decode()
-    assert "ran" not in run.stdout.decode()
+    assert (run.returncode, run.stdout) == (1, b"")
+    # errno 0: the fake call sets none
+    assert run.stderr.decode().splitlines()[-1] == "OSError: [Errno 0] prctl(PR_SET_DUMPABLE, 0) failed"
     assert "__SENTINEL_" not in run.stderr.decode()
     assert "__REPL_READY__" not in run.stderr.decode()  # the agent reports a REPL that did not start
 
@@ -117,7 +117,7 @@ def test_user_names_do_not_break_the_loop() -> None:
         "print('ok')",
     )
 
-    assert "ok" in stdout, stderr
+    assert _printed(stdout) == ["ok"], stderr
     assert _sentinels(stderr) == [f"__SENTINEL_s{i}_0__" for i in range(4)], stderr
 
 
@@ -133,7 +133,7 @@ def test_replaced_original_streams_do_not_hide_the_end_of_an_exec() -> None:
         "print('ok')",
     )
 
-    assert "ok" in stdout, stderr
+    assert _printed(stdout) == ["ok"], stderr
     assert _sentinels(stderr) == [f"__SENTINEL_s{i}_{code}__" for i, code in enumerate((0, 0, 1, 0))], stderr
     assert "ZeroDivisionError" in stderr
 
@@ -213,7 +213,7 @@ def test_an_error_shows_whatever_user_code_did_to_stderr_or_traceback() -> None:
         "print('ok')",
     )
 
-    assert "ok" in stdout, stderr
+    assert _printed(stdout) == ["ok"], stderr
     assert "ZeroDivisionError" in stderr
     assert "IndexError" in stderr
     assert _sentinels(stderr) == [f"__SENTINEL_s{i}_{code}__" for i, code in enumerate((0, 1, 0, 1, 0))], stderr

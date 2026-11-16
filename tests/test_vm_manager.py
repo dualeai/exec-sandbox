@@ -31,7 +31,6 @@ from pydantic import ValidationError
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox.cgroup import Cgroup
-from exec_sandbox.constants import GuestErrorType
 from exec_sandbox.exceptions import (
     CommunicationError,
     ConfigError,
@@ -44,7 +43,8 @@ from exec_sandbox.exceptions import (
     TransientError,
 )
 from exec_sandbox.files.locks import CacheEntry, EntryLease, share_all
-from exec_sandbox.images import GuestImages, guest_digests
+from exec_sandbox.images import GuestImages
+from exec_sandbox.migration_client import refusal_cause
 from exec_sandbox.models import ExposedPort, Language
 from exec_sandbox.platform_utils import (
     HostArch,
@@ -52,6 +52,7 @@ from exec_sandbox.platform_utils import (
     detect_host_arch,
 )
 from exec_sandbox.process_registry import unregister_process
+from exec_sandbox.qemu_cmd import CounterRate, guest_cpu_model
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
 from exec_sandbox.qemu_vm import QemuDiagnostics, QemuVM
 from exec_sandbox.settings import Settings
@@ -73,7 +74,7 @@ from exec_sandbox.vm_manager import (
     _stop_qemu,
 )
 from exec_sandbox.vm_spec import VmSpec
-from exec_sandbox.vm_types import AccelType, VmState
+from exec_sandbox.vm_types import AccelType, GuestBoot, VmState
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 from tests.conftest import asyncio_with, skip_unless_linux, skip_unless_macos
 from tests.instance_support import qemu_file
@@ -104,9 +105,10 @@ def unit_test_vm_manager(unit_test_settings: Any) -> Iterator[VmManager]:
 # another only with the same model): written out here, never derived from qemu_cmd.
 _X86_MODEL = (
     "qemu64-v1,+avx,+avx2,+bmi1,+bmi2,+f16c,+fma,+abm,+movbe,+xsave,+xsaveopt,+cx16,+lahf_lm,"
-    "+popcnt,+sse4.1,+sse4.2,+ssse3,+aes,+pclmulqdq,+rdrand,+rdseed,+hypervisor,-svm,-vmx"
+    "+popcnt,+sse4.1,+sse4.2,+ssse3,+aes,+pclmulqdq,+rdrand,+hypervisor,-svm,-vmx"
 )
 _X86_KVM_PV = "+kvm-pv-ipi,+kvm-pv-tlb-flush,+kvm-pv-sched-yield,+kvm-poll-control,+kvm-asyncpf-int"
+_X86_INTEL = "family=6,model=60,stepping=4"  # GenuineIntel only: QEMU Haswell's signature
 
 
 class TestVmState:
@@ -151,31 +153,42 @@ async def _host_accelerator() -> str | None:
     return "hvf" if (await sysctl.communicate())[0].strip() == b"1" else None
 
 
+_HOME_DISK_DIR_HINT: Final = "Set EXEC_SANDBOX_HOME_DISK_DIR to a folder this user can write, on a writable disk."
+
+
 class TestWorkDirErrors:
-    """VmManager.start makes its folder in home_disk_dir: a file error there is a SandboxError
-    (every error the library raises at run time is one), never a raw OSError."""
+    """VmManager.start makes its folder in home_disk_dir first: a file error there is a
+    SandboxError (every error the library raises at run time is one), never a raw OSError.
+    The hint names the setting that fixes it; a host error that can pass has none."""
 
     @pytest.mark.parametrize(
-        ("errno_value", "error", "code"),
+        ("errno_value", "error", "code", "hint"),
         [
-            pytest.param(errno.EACCES, ConfigError, ErrorCode.SETTING_INVALID, id="no-access"),
-            pytest.param(errno.EROFS, ConfigError, ErrorCode.SETTING_INVALID, id="read-only-disk"),
-            pytest.param(errno.ENOSPC, TransientError, ErrorCode.LOCAL_DISK, id="disk-full"),
+            pytest.param(errno.EACCES, ConfigError, ErrorCode.SETTING_INVALID, _HOME_DISK_DIR_HINT, id="no-access"),
+            pytest.param(errno.EROFS, ConfigError, ErrorCode.SETTING_INVALID, _HOME_DISK_DIR_HINT, id="read-only-disk"),
+            pytest.param(errno.ENOSPC, TransientError, ErrorCode.LOCAL_DISK, None, id="disk-full"),
         ],
     )
-    def test_a_folder_that_cannot_be_made(
-        self, unit_test_vm_manager: VmManager, errno_value: int, error: type[Exception], code: ErrorCode
+    async def test_a_folder_that_cannot_be_made(
+        self,
+        unit_test_settings: Settings,
+        errno_value: int,
+        error: type[SandboxError],
+        code: ErrorCode,
+        hint: str | None,
     ) -> None:
-        unit_test_vm_manager._run_dir = None  # pyright: ignore[reportPrivateUsage]
+        manager = VmManager(unit_test_settings)
         failure = OSError(errno_value, os.strerror(errno_value))
         with (
             patch("exec_sandbox.vm_manager.PrivateRunDir.open", side_effect=failure),
             pytest.raises(error, check=lambda e: e.code is code) as exc_info,
         ):
-            unit_test_vm_manager._open_run_dir()  # pyright: ignore[reportPrivateUsage]
+            await manager.start()
+        assert str(exc_info.value) == (
+            f"Folder {unit_test_settings.home_disk_dir} cannot hold this process's folder: {os.strerror(errno_value)}"
+        )
+        assert exc_info.value.hint == hint
         assert exc_info.value.__cause__ is failure
-        if code is ErrorCode.SETTING_INVALID:  # the hint names the setting that fixes it
-            assert "EXEC_SANDBOX_HOME_DISK_DIR" in (exc_info.value.hint or "")
 
 
 class TestStateTransitions:
@@ -187,11 +200,11 @@ class TestStateTransitions:
     async def test_a_vm_moves_only_along_its_lifecycle(self, start: VmState, end: VmState) -> None:
         vm = TestExecuteExceptionWrapping._make_vm(MagicMock(), state=start)
         if (start, end) in _LIFECYCLE:
-            await vm.transition_state(end)
+            vm.transition_state(end)
             assert vm.state is end
         else:
             with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.INTERNAL):
-                await vm.transition_state(end)
+                vm.transition_state(end)
             assert vm.state is start
 
 
@@ -387,7 +400,7 @@ class TestQemuAcceleratorProbe:
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
-            assert len(result) == 1000
+            assert result == {f"accel{i}" for i in range(1000)}
 
 
 # ============================================================================
@@ -396,11 +409,10 @@ class TestQemuAcceleratorProbe:
 
 
 class TestQemuVersionProbe:
-    """Tests for probe_qemu_version() - QEMU binary version detection.
+    """Tests for probe_qemu_version() - QEMU binary version detection (`--version`).
 
-    This probe detects QEMU version to select appropriate netdev reconnect parameter:
-    - QEMU 9.2+: reconnect-ms (milliseconds)
-    - QEMU 8.0-9.1: reconnect (seconds)
+    The version gates flags of the VM command (netdev reconnect, -run-with, machine
+    properties), and VmManager.start needs it (require_qemu_version).
     """
 
     # ========================================================================
@@ -633,14 +645,14 @@ class TestNetdevReconnect(_QemuCmdTestBase):
     """
 
     @pytest.mark.parametrize(
-        "qemu_version, present, absent",
+        "qemu_version, reconnect",
         [
-            pytest.param((10, 0, 0), "reconnect-ms=250", "reconnect=1", id="10.0-reconnect-ms"),
-            pytest.param((9, 2, 0), "reconnect-ms=250", "reconnect=1", id="9.2-reconnect-ms"),
-            pytest.param((9, 1, 9), "reconnect=1", "reconnect-ms", id="9.1-reconnect-seconds"),
-            pytest.param((8, 2, 0), "reconnect=1", "reconnect-ms", id="8.x-reconnect-seconds"),
-            pytest.param((8, 0, 0), "reconnect=1", "reconnect-ms", id="8.0-reconnect-seconds"),
-            pytest.param((7, 2, 0), None, "reconnect", id="7.x-none"),
+            pytest.param((10, 0, 0), ",reconnect-ms=250", id="10.0-reconnect-ms"),
+            pytest.param((9, 2, 0), ",reconnect-ms=250", id="9.2-reconnect-ms"),
+            pytest.param((9, 1, 9), ",reconnect=1", id="9.1-reconnect-seconds"),
+            pytest.param((8, 2, 0), ",reconnect=1", id="8.x-reconnect-seconds"),
+            pytest.param((8, 0, 0), ",reconnect=1", id="8.0-reconnect-seconds"),
+            pytest.param((7, 2, 0), "", id="7.x-none"),
         ],
     )
     async def test_netdev_reconnect_per_qemu_version(
@@ -648,8 +660,7 @@ class TestNetdevReconnect(_QemuCmdTestBase):
         vm_settings,
         workdir,
         qemu_version: tuple[int, int, int],
-        present: str | None,
-        absent: str,
+        reconnect: str,
     ) -> None:
         """QEMU 9.2+ uses reconnect-ms, 8.0-9.1 reconnect (seconds), older QEMU none."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
@@ -672,11 +683,9 @@ class TestNetdevReconnect(_QemuCmdTestBase):
                 machine_type=None,
             )
 
-        netdev = _option(cmd, "-netdev")
-        assert netdev is not None, "netdev argument not found in command"
-        assert "stream,id=net0" in netdev
-        assert present is None or present in netdev
-        assert absent not in netdev
+        assert _option(cmd, "-netdev") == (
+            f"stream,id=net0,addr.type=unix,addr.path={workdir.gvproxy_socket}{reconnect}"
+        )
 
     async def test_netdev_no_reconnect_when_network_disabled(self, vm_settings, workdir) -> None:
         """No netdev at all when network is disabled."""
@@ -704,17 +713,16 @@ class TestNetdevReconnect(_QemuCmdTestBase):
 
 
 # ============================================================================
-# Unit Tests - NIC None (Cold-Start Optimization)
+# Unit Tests - NIC None
 # ============================================================================
 
 
 class TestQemuNicNone(_QemuCmdTestBase):
     """-nic none suppresses QEMU's default NIC when no network is needed.
 
-    Without -nic none, non-microvm machine types (ARM64 virt, x86 pc/q35)
-    create a default NIC that causes the guest-agent's verify_gvproxy() to
-    burn ~4s in exponential-backoff retries. Adding -nic none eliminates
-    this cold-start overhead.
+    ARM64 virt runs without -nodefaults: QEMU would add a default virtio-net NIC. The guest
+    agent then finds eth0, verify_gvproxy fails (no gvproxy), and the readiness gate refuses
+    every ExecuteCode and InstallPackages on the VM.
     """
 
     @pytest.mark.parametrize("arch", [HostArch.X86_64, HostArch.AARCH64], ids=["x86", "arm64"])
@@ -905,46 +913,17 @@ class TestSmpCpuCores(_QemuCmdTestBase):
 
 
 class TestQemuExecutableSelection(_QemuCmdTestBase):
-    """argv[0] honors a configured QEMU path, else falls back to the PATH basename."""
+    """argv[0] with no QEMU file at all. The configured file and the file on PATH (also for
+    the probes): test_qemu_cmd.py TestOneQemuBinary."""
 
-    async def test_command_uses_configured_qemu_path(self, vm_settings, workdir, tmp_path: Path) -> None:
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
-        configured = tmp_path / "qemu-system-aarch64"
-        configured.write_bytes(b"")
-        settings = vm_settings.model_copy(update={"qemu_bin_arm": configured})
-        with _qemu_cmd_mocks(host_os=HostOS.MACOS, accel_type=AccelType.HVF):
-            cmd = await build_qemu_cmd(
-                settings=settings,
-                arch=HostArch.AARCH64,
-                vm_id="exact-qemu-executable",
-                workdir=workdir,
-                spec=VmSpec(language=Language.PYTHON, memory_mb=192, cpu_cores=1, allow_network=False),
-                direct_write=False,
-                debug_boot=False,
-                snapshot_drive=None,
-                defer_incoming=False,
-                qmp_fd=None,
-                guest_port_fds=None,
-                mem_path=None,
-                mem_path_share=False,
-                machine_type=None,
-            )
-
-        assert cmd[0] == str(configured)
-
-    @pytest.mark.parametrize("on_path", [True, False], ids=["on-path", "nowhere"])
-    async def test_command_falls_back_to_the_file_on_path(
-        self, vm_settings, workdir, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, on_path: bool
+    async def test_no_qemu_file_runs_the_bare_name(
+        self, vm_settings, workdir, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No configured file: the VM runs the file of the name on PATH by its full path (the
-        file the probes stamped, also behind sudo), else the bare name (exec reports it)."""
+        """No configured file and none on PATH: the VM runs the bare name (exec reports it)."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
         folder = tmp_path / "on-path"
         folder.mkdir()
-        if on_path:
-            (folder / "qemu-system-aarch64").write_text("")
         monkeypatch.setenv("PATH", str(folder))
         settings = vm_settings.model_copy(update={"qemu_bin_arm": Path("/missing/qemu-system-aarch64")})
         with _qemu_cmd_mocks(host_os=HostOS.MACOS, accel_type=AccelType.HVF):
@@ -965,7 +944,7 @@ class TestQemuExecutableSelection(_QemuCmdTestBase):
                 machine_type=None,
             )
 
-        assert cmd[0] == (str(folder / "qemu-system-aarch64") if on_path else "qemu-system-aarch64")
+        assert cmd[0] == "qemu-system-aarch64"
 
 
 # ============================================================================
@@ -1191,8 +1170,8 @@ def _extract_accel(cmd: list[str]) -> str:
 class TestMachineTypeSelection(_QemuCmdTestBase):
     """Verify -M flag matches arch/accel/platform combinations.
 
-    The core of the microvm refactoring: all x86_64 paths use microvm,
-    machine_type is built from parts, KVM/HVF TSC logic is unified.
+    x86_64 uses microvm under every accelerator, arm64 uses virt; the -M value is built
+    from parts, and only x86 under KVM reads the TSC_DEADLINE answer.
     """
 
     @pytest.mark.parametrize(
@@ -1268,8 +1247,8 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
         host_os: HostOS,
         expected_machine_type: str,
     ) -> None:
-        """Machine type string matches expected value for arch/accel/platform. Only x86 with
-        KVM or HVF reads the TSC_DEADLINE answer (pit/pic/rtc=off)."""
+        """Machine type string matches expected value for arch/accel/platform. Only x86 under
+        KVM reads the TSC_DEADLINE answer (pit/pic/rtc=off)."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
         with _qemu_cmd_mocks(host_os=host_os, accel_type=accel_type, tsc_deadline=tsc):
@@ -1293,14 +1272,24 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
         assert _extract_machine_type(cmd) == expected_machine_type
 
     @pytest.mark.parametrize(
-        ("arch", "saved", "first"),
+        ("arch", "saved", "expected"),
         [
-            pytest.param(HostArch.AARCH64, "virt-11.0", "virt-11.0,virtualization=off", id="arm64-pinned"),
-            pytest.param(HostArch.X86_64, "microvm-test", "microvm-test,acpi=off", id="x86"),
+            pytest.param(
+                HostArch.AARCH64,
+                "virt-11.0",
+                "virt-11.0,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off,memory-backend=mem0",
+                id="arm64-pinned",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                "microvm-test",
+                "microvm-test,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,memory-backend=mem0",
+                id="x86",
+            ),
         ],
     )
     async def test_saved_machine_type_replaces_the_alias(
-        self, *, vm_settings, workdir, arch: HostArch, saved: str, first: str
+        self, *, vm_settings, workdir, arch: HostArch, saved: str, expected: str
     ) -> None:
         """A saved instance's restore names the machine type QEMU resolved at its first boot,
         not the alias: a newer QEMU then applies that type's compat properties. The board
@@ -1325,7 +1314,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 machine_type=saved,
             )
 
-        assert _extract_machine_type(cmd).startswith(first + ",")
+        assert _extract_machine_type(cmd) == expected
 
     @pytest.mark.parametrize(
         "host_os, accel_type, mem_merge, dump_guest_core",
@@ -1393,21 +1382,14 @@ class TestConsoleSelection(_QemuCmdTestBase):
     """
 
     @pytest.mark.parametrize(
-        "arch, expected_console, absent_console",
+        ("arch", "consoles"),
         [
-            pytest.param(HostArch.X86_64, "console=hvc0", "console=ttyAMA0", id="x86"),
-            pytest.param(HostArch.AARCH64, "console=ttyAMA0", "console=hvc0", id="arm64"),
+            pytest.param(HostArch.X86_64, ["console=hvc0"], id="x86"),
+            pytest.param(HostArch.AARCH64, ["console=ttyAMA0"], id="arm64"),
         ],
     )
-    async def test_console_per_arch(
-        self,
-        vm_settings,
-        workdir,
-        arch: HostArch,
-        expected_console: str,
-        absent_console: str,
-    ) -> None:
-        """Each architecture gets its correct console device."""
+    async def test_console_per_arch(self, vm_settings, workdir, arch: HostArch, consoles: list[str]) -> None:
+        """Each architecture gets its one console device."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
         with _qemu_cmd_mocks():
@@ -1428,9 +1410,7 @@ class TestConsoleSelection(_QemuCmdTestBase):
                 machine_type=None,
             )
 
-        cmdline = _extract_kernel_cmdline(cmd)
-        assert expected_console in cmdline
-        assert absent_console not in cmdline
+        assert [p for p in _extract_kernel_cmdline(cmd).split() if p.startswith("console=")] == consoles
 
     @pytest.mark.parametrize(
         ("arch", "consoles"),
@@ -1475,39 +1455,70 @@ class TestConsoleSelection(_QemuCmdTestBase):
 class TestCpuModelSelection(_QemuCmdTestBase):
     """Verify -cpu flag matches arch/accel combinations.
 
-    ARM64 HVF/KVM → host, ARM64 TCG → neoverse-v1,pauth=off (no PAC, no BTI),
+    ARM64 HVF/KVM → host, ARM64 TCG → neoverse-v1,pauth=off,cntfrq=62500000 (no PAC, no BTI),
     x86 (every accel) → the fixed AVX2-level model; KVM adds PV flags, and
     +tsc-deadline with TSC_DEADLINE (HVF never passes it: check_tsc_deadline).
     """
 
     @pytest.mark.parametrize(
-        "arch, accel_type, expected_cpu",
+        "arch, accel_type, x86_vendor, expected_cpu",
         [
-            pytest.param(HostArch.AARCH64, AccelType.HVF, "host", id="arm64-hvf"),
-            pytest.param(HostArch.AARCH64, AccelType.KVM, "host", id="arm64-kvm"),
-            pytest.param(HostArch.AARCH64, AccelType.TCG, "neoverse-v1,pauth=off", id="arm64-tcg"),
+            pytest.param(HostArch.AARCH64, AccelType.HVF, "AuthenticAMD", "host", id="arm64-hvf"),
+            pytest.param(HostArch.AARCH64, AccelType.KVM, "AuthenticAMD", "host", id="arm64-kvm"),
+            pytest.param(
+                HostArch.AARCH64, AccelType.TCG, "AuthenticAMD", "neoverse-v1,pauth=off,cntfrq=62500000", id="arm64-tcg"
+            ),
             pytest.param(
                 HostArch.X86_64,
                 AccelType.KVM,
-                f"{_X86_MODEL},{_X86_KVM_PV},+tsc-deadline,vendor=GenuineIntel,enforce",
+                "GenuineIntel",
+                f"{_X86_MODEL},{_X86_KVM_PV},+tsc-deadline,{_X86_INTEL},vendor=GenuineIntel,enforce",
                 id="x86-kvm",
             ),
-            pytest.param(HostArch.X86_64, AccelType.HVF, f"{_X86_MODEL},vendor=GenuineIntel,enforce", id="x86-hvf"),
-            pytest.param(HostArch.X86_64, AccelType.TCG, f"{_X86_MODEL},vendor=GenuineIntel,enforce", id="x86-tcg"),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.KVM,
+                "AuthenticAMD",
+                f"{_X86_MODEL},{_X86_KVM_PV},+tsc-deadline,vendor=AuthenticAMD,enforce",
+                id="x86-kvm-amd",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.HVF,
+                "GenuineIntel",
+                f"{_X86_MODEL},{_X86_INTEL},vendor=GenuineIntel,enforce",
+                id="x86-hvf",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.TCG,
+                "GenuineIntel",
+                f"{_X86_MODEL},{_X86_INTEL},vendor=GenuineIntel,enforce",
+                id="x86-tcg",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.TCG,
+                "  Shanghai  ",
+                f"{_X86_MODEL},vendor=  Shanghai  ,enforce",
+                id="x86-tcg-zhaoxin",
+            ),
         ],
     )
     async def test_cpu_model(
         self,
         vm_settings,
         workdir,
+        *,
         arch: HostArch,
         accel_type: AccelType,
+        x86_vendor: str,
         expected_cpu: str,
     ) -> None:
-        """CPU model string matches expected value."""
+        """CPU model string matches expected value (x86_vendor: the host's CPUID vendor)."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with _qemu_cmd_mocks(accel_type=accel_type, x86_vendor="GenuineIntel"):
+        with _qemu_cmd_mocks(accel_type=accel_type, x86_vendor=x86_vendor):
             cmd = await build_qemu_cmd(
                 settings=vm_settings,
                 arch=arch,
@@ -1708,7 +1719,7 @@ class TestArm64TcgVersionGuard(_QemuCmdTestBase):
                     mem_path_share=False,
                     machine_type=None,
                 )
-                assert _extract_cpu_model(cmd) == "neoverse-v1,pauth=off"  # the arm64 TCG command
+                assert _extract_cpu_model(cmd) == "neoverse-v1,pauth=off,cntfrq=62500000"  # the arm64 TCG command
 
 
 # ============================================================================
@@ -1798,18 +1809,12 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
         assert ("iothread=" in base_device) == expect_device_iothread
         assert "aio=threads" in base_drive
 
-    @pytest.mark.parametrize(
-        "qemu_sandbox, expect_sandbox",
-        [
-            pytest.param(True, True, id="sandbox-supported"),
-            pytest.param(False, False, id="sandbox-unsupported"),
-        ],
-    )
-    async def test_sandbox_flag(self, vm_settings, workdir, qemu_sandbox: bool, expect_sandbox: bool) -> None:
-        """-sandbox present when probe reports support, absent otherwise."""
+    async def test_no_sandbox_without_probe_support(self, vm_settings, workdir) -> None:
+        """No -sandbox when the probe finds no support. The filter of a host that has it:
+        test_qemu_cmd.py TestSandbox."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with _qemu_cmd_mocks(qemu_sandbox=qemu_sandbox):
+        with _qemu_cmd_mocks(qemu_sandbox=False):
             cmd = await build_qemu_cmd(
                 settings=vm_settings,
                 arch=HostArch.X86_64,
@@ -1827,7 +1832,7 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
                 machine_type=None,
             )
 
-        assert ("-sandbox" in cmd) == expect_sandbox
+        assert "-sandbox" not in cmd
 
     @pytest.mark.parametrize(
         "arch, expect_uarts",
@@ -2098,7 +2103,8 @@ class TestOptionalFeatures(_QemuCmdTestBase):
         assert drives and all("cache=unsafe" in d.split(",") for d in drives), drives
 
     async def test_home_disk_drive(self, vm_settings, workdir) -> None:
-        """Every VM has its private raw home disk (serial=home, hd2), never a shared one."""
+        """Every VM has its private raw home disk (serial=home, hd2), never a shared one. The
+        home disk and the rootfs overlay (hd0) have the I/O limits."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
         with _qemu_cmd_mocks():
@@ -2124,6 +2130,14 @@ class TestOptionalFeatures(_QemuCmdTestBase):
         assert "format=raw" in hd2
         assert "file.locking=off" not in hd2
         assert any("drive=hd2,serial=home" in arg for arg in cmd)
+        hd0 = next(arg for arg in cmd if "id=hd0," in arg).split(",")
+        for drive in (hd0, hd2):
+            assert {option for option in drive if option.startswith(("bps", "iops", "throttling.", "group"))} == {
+                f"bps={constants.DISK_BPS_LIMIT}",
+                f"bps_max={constants.DISK_BPS_BURST}",
+                f"iops={constants.DISK_IOPS_LIMIT}",
+                f"iops_max={constants.DISK_IOPS_BURST}",
+            }
 
     @pytest.mark.parametrize("arch", [HostArch.X86_64, HostArch.AARCH64])
     async def test_one_vm_shape_mem0_no_balloon(self, vm_settings, workdir, arch: HostArch) -> None:
@@ -2337,20 +2351,56 @@ class TestOptionalFeatures(_QemuCmdTestBase):
 # ============================================================================
 
 
+_UNSHARE_PREFIX: Final = [
+    "unshare",
+    "--pid",
+    "--net",
+    "--mount",
+    "--uts",
+    "--ipc",
+    "--fork",
+    "--kill-child=SIGKILL",
+    "--",
+]
+
+
 class TestUnshareNamespaces(_QemuCmdTestBase):
     """Verify Linux namespace isolation (unshare) prefix in QEMU command."""
 
-    async def test_unshare_no_network(self, vm_settings, workdir) -> None:
-        """Linux + unshare + no network → full namespace isolation including --net."""
+    @pytest.mark.parametrize(
+        ("host_os", "unshare", "allow_network", "prefix"),
+        [
+            pytest.param(HostOS.LINUX, True, False, _UNSHARE_PREFIX, id="linux-no-network"),
+            pytest.param(HostOS.LINUX, True, True, _UNSHARE_PREFIX, id="linux-network"),
+            pytest.param(HostOS.LINUX, False, False, [], id="linux-no-unshare-support"),
+            pytest.param(HostOS.MACOS, True, False, [], id="macos"),
+        ],
+    )
+    async def test_unshare_prefix(
+        self,
+        vm_settings,
+        workdir,
+        tmp_path: Path,
+        *,
+        host_os: HostOS,
+        unshare: bool,
+        allow_network: bool,
+        prefix: list[str],
+    ) -> None:
+        """Linux with unshare support: QEMU runs in its own pid, network, mount, UTS and IPC
+        namespaces, also with a network (gvproxy is a Unix socket). Without the support, and on
+        macOS whatever the probe says, QEMU is the first program."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with _qemu_cmd_mocks(host_os=HostOS.LINUX, unshare=True):
+        binary = tmp_path / "qemu-system-x86_64"
+        binary.touch()
+        with _qemu_cmd_mocks(host_os=host_os, unshare=unshare):
             cmd = await build_qemu_cmd(
-                settings=vm_settings,
+                settings=vm_settings.model_copy(update={"qemu_bin_x86": binary}),
                 arch=HostArch.X86_64,
                 vm_id="test-vm-unshare",
                 workdir=workdir,
-                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=allow_network),
                 direct_write=False,
                 debug_boot=False,
                 snapshot_drive=None,
@@ -2362,89 +2412,7 @@ class TestUnshareNamespaces(_QemuCmdTestBase):
                 machine_type=None,
             )
 
-        assert cmd[0] == "unshare"
-        assert "--net" in cmd
-        assert "--pid" in cmd
-        assert "--fork" in cmd
-        # "--" separates unshare args from qemu binary
-        separator_idx = cmd.index("--")
-        assert "qemu-system-x86_64" in cmd[separator_idx + 1]
-
-    async def test_unshare_with_network(self, vm_settings, workdir) -> None:
-        """Linux + unshare + network → QEMU still gets its own netns (gvproxy is a Unix socket)."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
-        with _qemu_cmd_mocks(host_os=HostOS.LINUX, unshare=True):
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-unshare",
-                workdir=workdir,
-                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=True),
-                direct_write=False,
-                debug_boot=False,
-                snapshot_drive=None,
-                defer_incoming=False,
-                qmp_fd=None,
-                guest_port_fds=None,
-                mem_path=None,
-                mem_path_share=False,
-                machine_type=None,
-            )
-
-        assert cmd[0] == "unshare"
-        assert "--net" in cmd
-        assert "--pid" in cmd
-        assert "--fork" in cmd
-
-    async def test_no_unshare_support(self, vm_settings, workdir) -> None:
-        """Linux without unshare support → no unshare prefix."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
-        with _qemu_cmd_mocks(host_os=HostOS.LINUX, unshare=False):
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-unshare",
-                workdir=workdir,
-                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
-                direct_write=False,
-                debug_boot=False,
-                snapshot_drive=None,
-                defer_incoming=False,
-                qmp_fd=None,
-                guest_port_fds=None,
-                mem_path=None,
-                mem_path_share=False,
-                machine_type=None,
-            )
-
-        assert cmd[0] != "unshare"
-        assert "qemu-system-x86_64" in cmd[0]
-
-    async def test_macos_no_unshare(self, vm_settings, workdir) -> None:
-        """macOS never uses unshare regardless of probe result."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
-        with _qemu_cmd_mocks(host_os=HostOS.MACOS, unshare=True):
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-unshare",
-                workdir=workdir,
-                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
-                direct_write=False,
-                debug_boot=False,
-                snapshot_drive=None,
-                defer_incoming=False,
-                qmp_fd=None,
-                guest_port_fds=None,
-                mem_path=None,
-                mem_path_share=False,
-                machine_type=None,
-            )
-
-        assert cmd[0] != "unshare"
+        assert cmd[: len(prefix) + 1] == [*prefix, str(binary)]
 
 
 # ============================================================================
@@ -2839,7 +2807,7 @@ class TestDestroyVmStatus:
         vm.cgroup = None
         vm.resource_reservation = None
         vm.state = VmState.DESTROYING
-        vm.begin_destroy = AsyncMock()
+        vm.begin_destroy = MagicMock()
 
         async def confirm() -> None:
             # Mirror the real contract: confirm_destroyed publishes DESTROYED.
@@ -3005,7 +2973,7 @@ class TestDestroyVmStatus:
             ),
             patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
         ):
-            assert await unit_test_vm_manager.destroy_vm(vm, _release_admission=False) is True
+            assert await unit_test_vm_manager._destroy_vm(vm, schedule_retry=True, release_admission=False) is True
 
         release.assert_not_awaited()
         assert vm.resource_reservation is None
@@ -3140,39 +3108,12 @@ class TestDestroyVmStatus:
         assert cleanup.await_count == 3
         assert [call.args[0] for call in sleep.await_args_list] == [1.0, 2.0]
 
-    async def test_ephemeral_vm_rejects_unconfirmed_cleanup_on_success(self, unit_test_vm_manager) -> None:
-        vm = MagicMock()
-        vm.vm_id = "ephemeral-unconfirmed"
-        with (
-            patch.object(unit_test_vm_manager, "create_vm", new_callable=AsyncMock, return_value=vm),
-            patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=False) as destroy,
-        ):
-            with pytest.raises(
-                InternalError,
-                check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED,
-                match="cleanup was not confirmed",
-            ):
-                async with unit_test_vm_manager.ephemeral_vm(
-                    VmSpec(language=Language.PYTHON),
-                    tenant_id="tenant",
-                    task_id="task",
-                    retry_profile=constants.RETRY_BACKGROUND,
-                    direct_write_target=None,
-                    snapshot_drive=None,
-                    cache_leases=(),
-                    mem_path=None,
-                ):
-                    pass
-
-        destroy.assert_awaited_once_with(vm)
-
     @staticmethod
     def _ephemeral_build_vm(manager: VmManager, target: Path) -> AbstractAsyncContextManager[QemuVM]:
         return manager.ephemeral_vm(
             VmSpec(language=Language.PYTHON),
             tenant_id="tenant",
             task_id="task",
-            retry_profile=constants.RETRY_BACKGROUND,
             direct_write_target=target,
             snapshot_drive=None,
             cache_leases=(),
@@ -3358,8 +3299,9 @@ class TestDestroyVmStatus:
 
 class TestStartAndStop:
     """start() and stop() of one manager: a stop before, during or after a start. The host
-    probes are faked at their module (system_probes, validation); the overlay daemon is faked
-    to record its start and stop (it would spawn qemu-storage-daemon)."""
+    probes are faked where vm_manager imports them, and in system_probes for the two that
+    require_qemu_version and require_qemu_machine_types call; the overlay daemon is faked to
+    record its start and stop (it would spawn qemu-storage-daemon)."""
 
     @staticmethod
     @contextmanager
@@ -3425,8 +3367,77 @@ class TestStartAndStop:
         """Under TCG a VM also needs QEMU's translation cache: the budget it needs (a route
         fact) counts it, as admission does."""
         monkeypatch.setattr(unit_test_vm_manager, "_detect_accel_type", AsyncMock(return_value=accel))
-        need, _have = await unit_test_vm_manager.check_fits(VmSpec(language=Language.PYTHON), vm_id="vm", target={})
+        need, _have = await unit_test_vm_manager.check_fits(
+            VmSpec(language=Language.PYTHON), vm_id="vm", required={}, found={}
+        )
         assert need["memory_mb"] == needed  # 192 MB, 80 MB of overhead, 128 MB of TCG translation cache
+
+    async def test_no_start_on_a_guest_cpu_the_host_cannot_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """x86: the guest CPU probe refuses (enforce: a flag the host lacks): start raises its
+        HOST_DEPENDENCY error and the overlay daemon does not start."""
+        manager = VmManager(Settings(base_images_dir=tmp_path, kernel_path=tmp_path, home_disk_dir=tmp_path / "home"))
+        manager.arch = HostArch.X86_64
+        steps: list[str] = []
+
+        async def tcg(*, force_emulation: bool) -> AccelType:
+            return AccelType.TCG
+
+        refused = ConfigError(
+            "This host cannot run the guest CPU (qemu -accel tcg -cpu m): avx512f",
+            code=ErrorCode.HOST_DEPENDENCY,
+            context=None,
+            hint=None,
+            instance_id=None,
+        )
+        monkeypatch.setattr("exec_sandbox.vm_manager.require_guest_cpu", AsyncMock(side_effect=refused))
+        with self._probes(steps, accel=tcg):
+            try:
+                with pytest.raises(ConfigError) as exc_info:
+                    await manager.start()
+            finally:
+                await manager.stop()
+                if manager._run_dir is not None:
+                    manager._run_dir.close()
+        assert exc_info.value is refused
+        assert "pool start" not in steps
+
+    @pytest.mark.parametrize("arch", [HostArch.X86_64, HostArch.AARCH64], ids=["x86", "arm64"])
+    async def test_start_reads_the_boot_counter_rate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arch: HostArch
+    ) -> None:
+        """start reads the counter rate once: every cold boot and L1 template then gets it
+        (VmManager.counter_hz); it asks the CPU identity, and on x86 runs the guest CPU (the
+        model VMs get) on QEMU, so a host that cannot run it fails here."""
+        manager = VmManager(Settings(base_images_dir=tmp_path, kernel_path=tmp_path, home_disk_dir=tmp_path / "home"))
+        manager.arch = arch
+        steps: list[str] = []
+
+        async def tcg(*, force_emulation: bool) -> AccelType:
+            return AccelType.TCG
+
+        rate = AsyncMock(return_value=CounterRate(hz=1_000_000_000, any_rate=False))
+        cpu_id = AsyncMock(return_value=None)
+        guest_cpu = AsyncMock(return_value=None)
+        monkeypatch.setattr("exec_sandbox.vm_manager.counter_rate", rate)
+        monkeypatch.setattr("exec_sandbox.vm_manager.guest_cpu_id", cpu_id)
+        monkeypatch.setattr("exec_sandbox.vm_manager.require_guest_cpu", guest_cpu)
+        with self._probes(steps, accel=tcg):
+            try:
+                assert manager.counter_hz is None  # not started
+                await manager.start()
+                assert manager.counter_hz == 1_000_000_000
+            finally:
+                await manager.stop()
+                if manager._run_dir is not None:
+                    manager._run_dir.close()
+        rate.assert_awaited_once_with(arch, AccelType.TCG)
+        cpu_id.assert_awaited_once_with(arch, AccelType.TCG)
+        if arch == HostArch.X86_64:
+            guest_cpu.assert_awaited_once_with(await guest_cpu_model(arch, AccelType.TCG), accel="tcg")
+        else:
+            guest_cpu.assert_not_awaited()
 
     async def test_no_start_without_a_qemu_version(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every VM needs the QEMU version (command line, migration, saved facts): a start that
@@ -3628,7 +3639,10 @@ class TestPendingLaunchOwnership:
             patch.object(unit_test_vm_manager, "_schedule_failed_pending_cleanup_retry") as schedule_retry,
             patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
         ):
-            assert await unit_test_vm_manager._cleanup_pending_launch(pending) is False
+            assert (
+                await unit_test_vm_manager._cleanup_pending_launch(pending, schedule_retry=True, release_admission=True)
+                is False
+            )
 
         assert unit_test_vm_manager._pending_launches[pending.vm_id] is pending
         assert pending.reservation is reservation
@@ -3701,7 +3715,10 @@ class TestPendingLaunchOwnership:
             patch.object(unit_test_vm_manager, "_schedule_failed_pending_cleanup_retry") as schedule_retry,
             patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
         ):
-            assert await unit_test_vm_manager._cleanup_pending_launch(pending) is False
+            assert (
+                await unit_test_vm_manager._cleanup_pending_launch(pending, schedule_retry=True, release_admission=True)
+                is False
+            )
 
         assert unit_test_vm_manager._pending_launches[pending.vm_id] is pending
         release.assert_not_awaited()
@@ -3729,7 +3746,9 @@ class TestPendingLaunchOwnership:
             patch.object(unit_test_vm_manager._admission, "release", side_effect=blocked_release) as release,
             patch.object(unit_test_vm_manager, "_schedule_failed_pending_cleanup_retry") as schedule_retry,
         ):
-            task = asyncio.create_task(unit_test_vm_manager._cleanup_pending_launch(pending))
+            task = asyncio.create_task(
+                unit_test_vm_manager._cleanup_pending_launch(pending, schedule_retry=True, release_admission=True)
+            )
             await release_entered.wait()
             task.cancel()
             await asyncio.sleep(0)
@@ -3748,19 +3767,18 @@ class TestPendingLaunchOwnership:
         schedule_retry.assert_not_called()
 
     async def test_infra_cgroup_failure_cleans_published_expected_path(self, unit_test_vm_manager) -> None:
+        """A cgroup create that fails (it may have made the folder): the cleanup gets the VM's
+        cgroup path, published before the create."""
         workdir = MagicMock()
         workdir.overlay_image = Path("/tmp/pending-overlay.qcow2")
         reservation = MagicMock()
-        observed: Cgroup | None = None
+        observed: list[tuple[str, Cgroup | None]] = []
 
         async def acquire_overlay(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
             assert len(unit_test_vm_manager._pending_launches) == 1
 
         async def cleanup_owner(vm_id: str, **_kwargs: object) -> None:
-            nonlocal observed
-            pending = unit_test_vm_manager._pending_launches[vm_id]
-            observed = pending.cgroup
-            unit_test_vm_manager._pending_launches.pop(vm_id)
+            observed.append((vm_id, unit_test_vm_manager._pending_launches.pop(vm_id).cgroup))
 
         with (
             patch("exec_sandbox.vm_manager.validate_kernel_initramfs", new_callable=AsyncMock),
@@ -3770,7 +3788,7 @@ class TestPendingLaunchOwnership:
             patch.object(QemuStorageDaemon, "create_overlay", side_effect=acquire_overlay),
             patch("exec_sandbox.vm_manager.cgroup.cgroup_v2_available", return_value=True),
             patch.object(Cgroup, "create", new_callable=AsyncMock, side_effect=OSError("cgroup")),
-            patch.object(unit_test_vm_manager, "_cleanup_failed_owner", side_effect=cleanup_owner) as cleanup,
+            patch.object(unit_test_vm_manager, "_cleanup_failed_owner", side_effect=cleanup_owner),
         ):
             with pytest.raises(OSError, match="cgroup"):
                 await unit_test_vm_manager._setup_vm_infra(
@@ -3782,10 +3800,9 @@ class TestPendingLaunchOwnership:
                     home_template=None,
                 )
 
-        cleanup.assert_awaited_once()
-        assert observed is not None
-        assert observed.path.parent == Path("/sys/fs/cgroup/code-exec/tenant")
-        assert observed.path.name.startswith("tenant-task-")
+        [(vm_id, cleaned)] = observed
+        assert vm_id.startswith("tenant-task-")
+        assert cleaned == Cgroup(Path("/sys/fs/cgroup/code-exec/tenant") / vm_id)
         assert not unit_test_vm_manager._pending_launches
 
     async def test_qemu_vm_without_a_cgroup_is_refused_before_any_grant(self, unit_test_vm_manager) -> None:
@@ -4073,7 +4090,9 @@ class TestCacheLeasesOfAVm:
                 ),
                 patch.object(unit_test_vm_manager, "_schedule_failed_pending_cleanup_retry"),
             ):
-                await unit_test_vm_manager._cleanup_pending_launch(pending, _release_admission=False)
+                await unit_test_vm_manager._cleanup_pending_launch(
+                    pending, schedule_retry=True, release_admission=False
+                )
             assert evictable(lease.path) is evictable_after
         finally:
             pending.release_cache_leases()
@@ -4135,12 +4154,18 @@ class TestImageDigestsOfAVm:
     _launch_qemu_vm with a faked spawn: the file must change at the spawn, a moment that
     create_vm does not give on demand."""
 
-    @pytest.mark.parametrize("saved_boot", [None, ("a" * 64, "b" * 64)], ids=["cold-boot", "restore"])
+    @pytest.mark.parametrize(
+        "saved_boot",
+        [None, GuestBoot(kernel="a" * 64, initramfs="b" * 64, counter_hz=1_000_000_000)],
+        ids=["cold-boot", "restore"],
+    )
     async def test_digests_are_taken_before_the_spawn(
-        self, unit_test_vm_manager: VmManager, tmp_path: Path, saved_boot: tuple[str, str] | None
+        self, unit_test_vm_manager: VmManager, tmp_path: Path, saved_boot: GuestBoot | None
     ) -> None:
-        """The VM keeps the digests of its images, of its boot (a restore: the saved ones, else
-        this worker's kernel and initramfs) and its device layout, for its next save."""
+        """The VM keeps the digests of its images, of its boot (a restore: the saved ones and
+        counter rate, else this worker's kernel and initramfs and the rate start read) and its
+        device layout, for its next save."""
+        unit_test_vm_manager._counter_hz = 24_000_000  # pyright: ignore[reportPrivateUsage] - start reads it
         base, layer = tmp_path / "base.qcow2", tmp_path / "l2.qcow2"
         base.write_bytes(b"base image")
         layer.write_bytes(b"l2 layer")
@@ -4187,8 +4212,10 @@ class TestImageDigestsOfAVm:
             assert vm.base_image_digest == hashlib.sha256(b"base image").hexdigest()
             assert vm.packages_image_digest == hashlib.sha256(b"l2 layer").hexdigest()
             assert vm.device_layout == "-device virtio-blk-device drive=base serial=base"
-            assert (vm.kernel_digest, vm.initramfs_digest) == (
-                saved_boot or (hashlib.sha256(b"kernel").hexdigest(), hashlib.sha256(b"initramfs").hexdigest())
+            assert (vm.kernel_digest, vm.initramfs_digest, vm.counter_hz) == (
+                (saved_boot.kernel, saved_boot.initramfs, 1_000_000_000)
+                if saved_boot is not None
+                else (hashlib.sha256(b"kernel").hexdigest(), hashlib.sha256(b"initramfs").hexdigest(), 24_000_000)
             )
         finally:
             unit_test_vm_manager._vms.pop(pending.vm_id, None)
@@ -4196,7 +4223,7 @@ class TestImageDigestsOfAVm:
 
 
 class TestLaunchLeases:
-    """The launch's own shares of the caller's leases, and the digests of its images."""
+    """The launch's own shares of the caller's leases (share_all): all of them, or none."""
 
     async def test_shares_are_all_taken_or_none(self, tmp_path: Path) -> None:
         """A share that fails (a released lease) leaves no share of the earlier leases."""
@@ -4211,27 +4238,6 @@ class TestLaunchLeases:
             share_all((first, second))
         first.release()
         assert evictable(held)  # no share of `first` was left behind
-
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file of mode 000")
-    def test_unreadable_image_is_a_local_disk_error(self, tmp_path: Path) -> None:
-        """A guest image this process cannot read (here: no access) fails the launch with
-        LOCAL_DISK, not a raw OSError out of create_vm."""
-        base = tmp_path / "base.qcow2"
-        base.write_bytes(b"base")
-        base.chmod(0)
-        try:
-            with pytest.raises(
-                TransientError,
-                check=lambda e: e.code is ErrorCode.LOCAL_DISK and e.context["errno"] == errno.EACCES,
-                match=r"^Guest image base\.qcow2 cannot be read: Permission denied$",
-            ):
-                guest_digests(base, None)
-        finally:
-            base.chmod(0o600)
-
-
-_PDEATHSIG_PROBE = "import ctypes; v = ctypes.c_int(); ctypes.CDLL(None).prctl(2, ctypes.byref(v)); print(v.value)"
-"""Prints the parent-death signal of its process (2 = PR_GET_PDEATHSIG)."""
 
 
 async def _launch_for_test(manager: VmManager, infra: Any, reservation: Any, qemu_cmd: list[str]) -> None:
@@ -4254,10 +4260,10 @@ async def _launch_for_test(manager: VmManager, infra: Any, reservation: Any, qem
     )
 
 
-class TestThisUserQemuEndsWithUs:
-    """A QEMU that runs as this user, maybe under unshare (which outlives a killed host process
-    and keeps QEMU, its child): the first program gets a parent-death signal, with no
-    Python preexec_fn where setpriv works."""
+class TestThisUserQemuJoinsItsCgroup:
+    """A QEMU that runs as this user starts through start_managed_process with the cgroup join
+    step. Its parent-death signal: test_subprocess_utils.py TestEndWithThisProcess; the launch
+    command: TestQemuLaunchHasNoPreexec."""
 
     @staticmethod
     async def _run(cmd: list[str], steps: list[tuple[str, str]]) -> tuple[int, bytes, bytes]:
@@ -4271,11 +4277,6 @@ class TestThisUserQemuEndsWithUs:
         finally:
             unregister_process(proc)
         return proc.returncode, out, err
-
-    @skip_unless_linux
-    async def test_first_program_gets_sigkill_when_this_process_ends(self) -> None:
-        _, out, _ = await self._run([sys.executable, "-I", "-c", _PDEATHSIG_PROBE], [])
-        assert int(out) == signal.SIGKILL
 
     @pytest.mark.parametrize("refused", [False, True], ids=["joined", "refused"])
     async def test_joins_its_cgroup_and_runs_also_when_refused(self, tmp_path: Path, refused: bool) -> None:
@@ -4294,8 +4295,8 @@ class TestThisUserQemuEndsWithUs:
 
 class TestStopQemu:
     """_stop_qemu: a QEMU of this user gets SIGKILL first (its drives go with the VM folder: its
-    clean SIGTERM exit keeps nothing); a qemu-vm QEMU gets SIGTERM only (sudo does not pass
-    SIGKILL on). Real processes that ignore SIGTERM stand in for QEMU."""
+    clean SIGTERM exit keeps nothing); a qemu-vm QEMU gets SIGTERM first (sudo does not pass
+    SIGKILL on: its cgroup kill ends it). Real shells with a SIGTERM trap stand in for QEMU."""
 
     _IGNORES_SIGTERM: Final = ["/bin/sh", "-c", "trap '' TERM; echo ready; while :; do sleep 0.01; done"]
     _EXITS_3_ON_SIGTERM: Final = ["/bin/sh", "-c", "trap 'exit 3' TERM; echo ready; while :; do sleep 0.01; done"]
@@ -4474,10 +4475,12 @@ class TestQemuVmNeedsItsCgroup:
 
 
 class TestLaunchErrorCodes:
-    """The code of each launch failure: the spawn errno decides the class, a missing
-    qemu-vm user is the host's, and a boot timeout keeps the console out of the message.
+    """The code of each launch failure: the spawn errno decides the class, an exec that failed
+    in the launch (exit 126 or 127) is the host's, and a boot timeout keeps the console out
+    of the message.
 
-    The spawn cases run _launch_qemu_vm on real binaries. The boot cases run _create_vm_impl
+    The start cases run start() with a QEMU binary for another CPU. The spawn cases run
+    _launch_qemu_vm on real binaries (or a faked spawn errno). The boot cases run _create_vm_impl
     with its steps stubbed (infra, gvproxy, launch, cleanup): the answer of a QEMU or guest
     (exit 126, a gvproxy that fails late, no guest answer) needs a booted VM through create_vm."""
 
@@ -4689,7 +4692,7 @@ class TestLaunchErrorCodes:
         vm = MagicMock()
         vm.process.returncode = None
         vm.wait_for_guest = AsyncMock(side_effect=lambda **_: order.append("guest"))
-        vm.transition_state = AsyncMock()
+        vm.transition_state = MagicMock()
 
         async def gvproxy_ready() -> None:
             order.append("gvproxy")
@@ -4730,7 +4733,7 @@ class TestLaunchErrorCodes:
             )
         assert exc_info.value is failed
         assert order == ["guest", "gvproxy"]  # the gvproxy wait overlaps the boot
-        vm.transition_state.assert_not_awaited()  # never READY
+        vm.transition_state.assert_not_called()  # never READY
         cleanup.assert_awaited_once()
 
     async def test_boot_timeout_is_one_line_with_the_console_in_context(self, unit_test_vm_manager) -> None:
@@ -4800,6 +4803,101 @@ class TestLaunchErrorCodes:
             == f"{qemu_system_binary(unit_test_vm_manager.settings, arch=unit_test_vm_manager.arch)} -m 256"
         )
         cleanup.assert_awaited_once()
+
+
+class TestCreateVmRetries:
+    """create_vm boots again after a transient failure (TransientError, TimeoutError), up to
+    retry_profile.max_attempts, never after another error, and counts the failed attempts in
+    vm.timing.boot_retries. Each attempt (_create_vm_impl) is stubbed; the retry wait is 0."""
+
+    _PROFILE: Final = constants.RetryProfile(
+        max_attempts=3, boot_timeout_seconds=7, retry_min_seconds=0, retry_max_seconds=0
+    )
+
+    @staticmethod
+    async def _create(manager: VmManager, reservation: Any) -> QemuVM:
+        return await manager.create_vm(
+            VmSpec(language=Language.PYTHON),
+            tenant_id="t",
+            task_id="retry",
+            direct_write_target=None,
+            expose_ports=None,
+            on_boot_log=None,
+            snapshot_drive=None,
+            cache_leases=(),
+            reservation=reservation,
+            retry_profile=TestCreateVmRetries._PROFILE,
+            mem_path=None,
+        )
+
+    @staticmethod
+    def _transient(message: str) -> TransientError:
+        return TransientError(message, code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None)
+
+    async def test_transient_failures_boot_again_and_are_counted(self, unit_test_vm_manager: VmManager) -> None:
+        reservation, vm = MagicMock(), MagicMock()
+        attempts = AsyncMock(side_effect=[self._transient("first"), TimeoutError("second"), vm])
+        with patch.object(unit_test_vm_manager, "_create_vm_impl", attempts):
+            assert await self._create(unit_test_vm_manager, reservation) is vm
+        assert vm.timing.boot_retries == 2
+        assert [
+            (call.kwargs["reservation"], call.kwargs["boot_timeout_seconds"]) for call in attempts.await_args_list
+        ] == [(reservation, 7)] * 3
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ConfigError("no QEMU", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None),
+            InternalError("unconfirmed", code=ErrorCode.CLEANUP_UNCONFIRMED, context=None, hint=None, instance_id=None),
+            ValueError("tenant_id contains invalid characters"),
+        ],
+        ids=["config", "internal", "value"],
+    )
+    async def test_other_errors_fail_at_once(self, unit_test_vm_manager: VmManager, error: Exception) -> None:
+        """No second attempt; the owners of the caller's reservation are cleaned up, which the
+        caller keeps (release_admission=False)."""
+        reservation = MagicMock()
+        attempts = AsyncMock(side_effect=error)
+        with (
+            patch.object(unit_test_vm_manager, "_create_vm_impl", attempts),
+            patch.object(unit_test_vm_manager, "_cleanup_reservation_owners", new_callable=AsyncMock) as cleanup,
+            pytest.raises(type(error)) as exc_info,
+        ):
+            await self._create(unit_test_vm_manager, reservation)
+        assert (exc_info.value, attempts.await_count) == (error, 1)
+        cleanup.assert_awaited_once_with(reservation, release_admission=False)
+
+    async def test_the_last_transient_failure_comes_out(self, unit_test_vm_manager: VmManager) -> None:
+        failures = [self._transient(f"attempt {n}") for n in range(3)]
+        attempts = AsyncMock(side_effect=failures)
+        with (
+            patch.object(unit_test_vm_manager, "_create_vm_impl", attempts),
+            pytest.raises(TransientError) as exc_info,
+        ):
+            await self._create(unit_test_vm_manager, MagicMock())
+        assert (exc_info.value, attempts.await_count) == (failures[-1], 3)
+
+    async def test_an_ephemeral_vm_boots_with_the_background_profile(self, unit_test_vm_manager: VmManager) -> None:
+        """ephemeral_vm serves the snapshot saves, which no caller waits on: RETRY_BACKGROUND,
+        2 attempts with a 30 s boot timeout each (the user-facing profile: 4 of 45 s)."""
+        failures = [self._transient(f"attempt {n}") for n in range(4)]
+        attempts = AsyncMock(side_effect=failures)
+        with (
+            patch.object(unit_test_vm_manager, "_create_vm_impl", attempts),
+            pytest.raises(TransientError) as exc_info,
+        ):
+            async with unit_test_vm_manager.ephemeral_vm(
+                VmSpec(language=Language.PYTHON),
+                tenant_id="t",
+                task_id="background",
+                direct_write_target=None,
+                snapshot_drive=None,
+                cache_leases=(),
+                mem_path=None,
+            ):
+                pass
+        assert exc_info.value is failures[1]
+        assert [call.kwargs["boot_timeout_seconds"] for call in attempts.await_args_list] == [30, 30]
 
 
 class TestKernelInitramfsValidation:
@@ -4919,24 +5017,24 @@ class TestQemuKernelPathSelection(_QemuCmdTestBase):
 # ============================================================================
 
 
-# Test data for parametrized tests across all image types
+# Test data for parametrized tests across all image types: the code and its whole stdout
 IMAGE_TEST_CASES = [
     pytest.param(
         Language.PYTHON,
         "print('hello')",
-        "hello",
+        "hello\n",
         id="python",
     ),
     pytest.param(
         Language.JAVASCRIPT,
         "console.log('hello')",
-        "hello",
+        "hello\n",
         id="javascript",
     ),
     pytest.param(
         Language.RAW,
         "echo 'hello'",
-        "hello",
+        "hello\n",
         id="raw",
     ),
 ]
@@ -4979,12 +5077,8 @@ class TestVmManagerIntegration:
 
 
 class TestAllImageTypes:
-    """Parametrized tests to verify all image types boot and execute code.
-
-    Each image type (python, javascript, raw) must:
-    1. Boot successfully (guest agent responds to ping)
-    2. Execute code and return correct output
-    """
+    """Each image (python, javascript, raw) boots (its guest agent answers a ping) and runs
+    code with the right output; a VM with the default settings runs on the host's accelerator."""
 
     async def test_default_uses_hardware_acceleration(self, vm_manager) -> None:
         """Default settings (force_emulation=False) use the hardware accelerator when the host
@@ -5124,7 +5218,7 @@ class TestAllImageTypes:
             )
 
             assert result.exit_code == 0, f"Exit code {result.exit_code}, stderr: {result.stderr}"
-            assert expected_output in result.stdout, f"Expected '{expected_output}' in stdout: {result.stdout}"
+            assert result.stdout == expected_output
         finally:
             await vm_manager.destroy_vm(vm)
             assert vm.state == VmState.DESTROYED
@@ -5141,7 +5235,7 @@ class TestEmulationMode:
     async def test_emulation_uses_tcg_not_hvf(self, emulation_vm_manager) -> None:
         """force_emulation=True uses TCG, not hardware acceleration. The running QEMU process has:
         1. -accel tcg,... (software emulation), not hvf or kvm
-        2. an emulated CPU, never host: neoverse-v1,pauth=off on arm64; on x86_64 the fixed
+        2. an emulated CPU, never host: neoverse-v1,pauth=off,cntfrq=62500000 on arm64; on x86_64 the fixed
            model with no KVM PV flags and no +tsc-deadline
         """
         vm = await emulation_vm_manager.create_vm(
@@ -5214,7 +5308,7 @@ class TestEmulationMode:
                 f"Expected TCG emulation with force_emulation=True, got: -accel {accel_found}"
             )
             if detect_host_arch() == HostArch.AARCH64:
-                assert cpu_found == "neoverse-v1,pauth=off", cpu_found
+                assert cpu_found == "neoverse-v1,pauth=off,cntfrq=62500000", cpu_found
             else:
                 assert cpu_found.startswith(f"{_X86_MODEL},"), cpu_found
                 assert cpu_found.endswith(",enforce"), cpu_found
@@ -5258,7 +5352,7 @@ class TestEmulationMode:
             )
 
             assert result.exit_code == 0, f"Exit code {result.exit_code}, stderr: {result.stderr}"
-            assert expected_output in result.stdout, f"Expected '{expected_output}' in stdout: {result.stdout}"
+            assert result.stdout == expected_output
         finally:
             await emulation_vm_manager.destroy_vm(vm)
             assert vm.state == VmState.DESTROYED
@@ -5672,7 +5766,6 @@ class TestExecuteEnvVarValidation:
             pytest.param({"K": "\n"}, id="value-only-newline"),
             pytest.param({"K": "\x00"}, id="value-only-null"),
             pytest.param({"K": "\nfoo"}, id="control-at-start"),
-            pytest.param({"K": "foo\n"}, id="control-at-end"),
             pytest.param({"K": "fo\no"}, id="control-in-middle"),
             pytest.param({"K": "\n\r\x07"}, id="multiple-control-chars"),
         ],
@@ -5915,11 +6008,14 @@ class TestExecuteExceptionWrapping:
     """Unit tests for execute()'s error handling.
 
     Covers:
-    - Transport errors (OSError, CommunicationError) → TransientError GUEST_UNAVAILABLE
+    - Transport errors (OSError, ValidationError, RuntimeError, CommunicationError) →
+      TransientError GUEST_UNAVAILABLE
     - TimeoutError before dispatch → TransientError GUEST_UNAVAILABLE (VM_BOOT_TIMEOUT is the boot's)
+    - TimeoutError or the host deadline after dispatch, QEMU death during the stream →
+      OutcomeUnknownError GUEST_OUTCOME_UNKNOWN
     - CancelledError propagates bare
-    - Guest error classification: execution_error → TransientError GUEST_UNAVAILABLE (raised),
-      timeout_error → exit_code=-1 (returned), others → raised
+    - Guest errors: timeout_error → exit_code=-1 (returned), the others → raised
+      (guest_error_to_exception: TestGuestErrorToException maps each type)
     """
 
     @staticmethod
@@ -5995,15 +6091,6 @@ class TestExecuteExceptionWrapping:
             await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
         assert isinstance(exc_info.value.__cause__, CommunicationError)
 
-    async def test_socket_auth_error(self) -> None:
-        """SocketAuthError (CommunicationError subclass) wrapped as TransientError GUEST_UNAVAILABLE."""
-        vm = self._make_vm(
-            _ConnectRaisesChannel(SocketAuthError("auth failed", expected_uid=1000, actual_uid=0, context=None))
-        )
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-        assert isinstance(exc_info.value.__cause__, SocketAuthError)
-
     # -- Group B: TimeoutError before dispatch → TransientError GUEST_UNAVAILABLE --
 
     async def test_timeout_from_connect(self) -> None:
@@ -6019,7 +6106,7 @@ class TestExecuteExceptionWrapping:
         with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN) as exc_info:
             await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
         assert isinstance(exc_info.value.__cause__, TimeoutError)
-        assert "transport timed out" in str(exc_info.value)
+        assert str(exc_info.value) == "VM test-exec-wrap execution transport timed out before a terminal event"
         assert exc_info.value.context["soft_timeout_seconds"] == 5
         assert exc_info.value.context["hard_timeout_seconds"] == 15
         assert exc_info.value.context["timeout_phase"] == "execution"
@@ -6030,7 +6117,10 @@ class TestExecuteExceptionWrapping:
         vm = self._make_vm(_HardDeadlineChannel())
         with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN) as exc_info:
             await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-        assert "15s host deadline" in str(exc_info.value)
+        assert str(exc_info.value) == (
+            "VM test-exec-wrap execution exceeded 15s host deadline (5s guest timeout + 10s infrastructure "
+            "margin) after command dispatch"
+        )
         assert exc_info.value.context["soft_timeout_seconds"] == 5
         assert exc_info.value.context["hard_timeout_seconds"] == 15
         assert exc_info.value.context["timeout_margin_seconds"] == 10
@@ -6110,8 +6200,8 @@ class TestExecuteExceptionWrapping:
             await release_exit.wait()
             return 0
 
-        async def observe_destroying() -> None:
-            await begin_destroy()
+        def observe_destroying() -> None:
+            begin_destroy()
             destroying.set()
 
         vm.process.wait = AsyncMock(side_effect=controlled_exit)
@@ -6140,8 +6230,8 @@ class TestExecuteExceptionWrapping:
             await release_exit.wait()
             return 0
 
-        async def observe_destroying() -> None:
-            await begin_destroy()
+        def observe_destroying() -> None:
+            begin_destroy()
             destroying.set()
 
         vm.process.wait = AsyncMock(side_effect=controlled_exit)
@@ -6200,34 +6290,6 @@ class TestExecuteExceptionWrapping:
             await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
         assert [r.reseed for r in channel.requests] == reseeds
 
-    async def test_code_validation_error_propagates(self) -> None:
-        """InvalidInputError CODE_INVALID from guest error propagates bare."""
-        vm = self._make_vm(_GuestErrorChannel("code_error", "syntax error"))
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID):
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-
-    async def test_output_limit_error_propagates(self) -> None:
-        """InvalidInputError OUTPUT_LIMIT from guest error propagates bare."""
-        vm = self._make_vm(_GuestErrorChannel("output_limit_error", "output too large"))
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-
-    # -- Group D: OSError subclasses -------------------------------------------
-
-    async def test_connection_reset_wrapped(self) -> None:
-        """ConnectionResetError (OSError subclass) wrapped as TransientError GUEST_UNAVAILABLE."""
-        vm = self._make_vm(_ConnectOKStreamRaisesChannel(ConnectionResetError("peer reset")))
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-        assert isinstance(exc_info.value.__cause__, ConnectionResetError)
-
-    async def test_broken_pipe_wrapped(self) -> None:
-        """BrokenPipeError (OSError subclass) wrapped as TransientError GUEST_UNAVAILABLE."""
-        vm = self._make_vm(_ConnectOKStreamRaisesChannel(BrokenPipeError()))
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-        assert isinstance(exc_info.value.__cause__, BrokenPipeError)
-
     # -- Group E: Context and cause verification -------------------------------
 
     async def test_context_has_vm_id_language_error_type(self) -> None:
@@ -6249,28 +6311,45 @@ class TestExecuteExceptionWrapping:
             await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
         assert exc_info.value.__cause__ is original
 
-    # -- Group F: Guest error classification in _handle_exec_error -------------
+    # -- Group F: Guest errors -------------------------------------------------
 
-    async def test_execution_error_raises_transient(self) -> None:
-        """execution_error (REPL spawn failed) raises TransientError GUEST_UNAVAILABLE."""
-        vm = self._make_vm(_GuestErrorChannel("execution_error", "spawn failed"))
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
+    @pytest.mark.parametrize(
+        ("error_type", "error_class", "code", "state"),
+        [
+            pytest.param("env_var_error", InvalidInputError, ErrorCode.ENV_VAR_INVALID, VmState.READY, id="env_var"),
+            pytest.param("code_error", InvalidInputError, ErrorCode.CODE_INVALID, VmState.READY, id="code"),
+            pytest.param("package_error", InvalidInputError, ErrorCode.ARGUMENT_INVALID, VmState.READY, id="package"),
+            pytest.param(
+                "output_limit_error", InvalidInputError, ErrorCode.OUTPUT_LIMIT, VmState.READY, id="output_limit"
+            ),
+            pytest.param("path_error", InvalidInputError, ErrorCode.PATH_INVALID, VmState.READY, id="path"),
+            pytest.param("io_error", InvalidInputError, ErrorCode.GUEST_IO, VmState.READY, id="io"),
+            pytest.param(
+                "execution_error", TransientError, ErrorCode.GUEST_UNAVAILABLE, VmState.EXECUTING, id="execution"
+            ),
+            pytest.param("request_error", InternalError, ErrorCode.GUEST_PROTOCOL, VmState.EXECUTING, id="request"),
+            pytest.param("protocol_error", InternalError, ErrorCode.GUEST_PROTOCOL, VmState.EXECUTING, id="protocol"),
+            pytest.param("future_new_error", InternalError, ErrorCode.GUEST_PROTOCOL, VmState.EXECUTING, id="unknown"),
+        ],
+    )
+    async def test_a_guest_error_frees_the_vm_only_for_bad_input(
+        self, error_type: str, error_class: type[SandboxError], code: ErrorCode, state: VmState
+    ) -> None:
+        """Each guest error but timeout_error raises its error, with no cause. Bad input
+        (InvalidInputError) leaves the VM READY for the next request; any other error leaves
+        it EXECUTING."""
+        vm = self._make_vm(_GuestErrorChannel(error_type, "refused"))
+        with pytest.raises(SandboxError, match=rf"^execute: \[{error_type}\] refused$") as exc_info:
             await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-        assert "spawn failed" in str(exc_info.value)
+        assert (type(exc_info.value), exc_info.value.code) == (error_class, code)
         assert exc_info.value.__cause__ is None
+        assert vm.state is state
 
     async def test_timeout_error_returns_result(self) -> None:
         """timeout_error returns exit_code=-1 result, no exception."""
         vm = self._make_vm(_GuestErrorChannel("timeout_error", "exceeded 30s"))
         result = await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-        assert result.exit_code == -1
-        assert "[timeout_error]" in result.stderr
-
-    async def test_request_error_raises_internal(self) -> None:
-        """request_error raises InternalError GUEST_PROTOCOL."""
-        vm = self._make_vm(_GuestErrorChannel("request_error", "invalid JSON"))
-        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL):
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
+        assert (result.exit_code, result.stdout, result.stderr) == (-1, "", "[timeout_error] exceeded 30s")
 
     # -- Group G: Partial output before errors ---------------------------------
 
@@ -6286,27 +6365,7 @@ class TestExecuteExceptionWrapping:
         result = await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
         assert result.exit_code == -1
         assert result.stdout == "out1out2"
-        assert "timed out" in result.stderr
-
-    # -- Group H: Errors unlikely during execute() but must be handled ---------
-
-    async def test_protocol_error_during_execute_raises(self) -> None:
-        """protocol_error raises InternalError GUEST_PROTOCOL."""
-        vm = self._make_vm(_GuestErrorChannel("protocol_error", "frame corruption"))
-        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL):
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-
-    async def test_io_error_during_execute_raises(self) -> None:
-        """io_error raises InvalidInputError GUEST_IO."""
-        vm = self._make_vm(_GuestErrorChannel("io_error", "disk full"))
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO):
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-
-    async def test_path_error_during_execute_raises(self) -> None:
-        """path_error raises InvalidInputError PATH_INVALID."""
-        vm = self._make_vm(_GuestErrorChannel("path_error", "no such file"))
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
+        assert result.stderr == "[timeout_error] timed out"
 
     # -- Group I: Out-of-bounds / adversarial ----------------------------------
 
@@ -6324,25 +6383,12 @@ class TestExecuteExceptionWrapping:
             await vm.execute(code="x", timeout_seconds=301, env_vars=None, on_stdout=None, on_stderr=None)
         assert channel.requests == []
 
-    async def test_unknown_error_type_raises_internal(self) -> None:
-        """Unknown error type from newer guest raises InternalError GUEST_PROTOCOL."""
-        vm = self._make_vm(_GuestErrorChannel("future_new_error", "from newer guest"))
-        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL):
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-
-    async def test_execution_error_empty_message(self) -> None:
-        """execution_error with empty message still raises TransientError GUEST_UNAVAILABLE."""
-        vm = self._make_vm(_GuestErrorChannel("execution_error", ""))
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE):
-            await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-
     async def test_timeout_error_long_message(self) -> None:
-        """timeout_error with very long message returns result without exception."""
+        """timeout_error with a 10000-character message: the result's stderr holds all of it."""
         long_msg = "x" * 10000
         vm = self._make_vm(_GuestErrorChannel("timeout_error", long_msg))
         result = await vm.execute(code="x", timeout_seconds=5, env_vars=None, on_stdout=None, on_stderr=None)
-        assert result.exit_code == -1
-        assert long_msg in result.stderr
+        assert (result.exit_code, result.stderr) == (-1, f"[timeout_error] {long_msg}")
 
     # -- Group J: VM state verification ----------------------------------------
 
@@ -6393,7 +6439,8 @@ class TestGuestErrorToException:
         ],
     )
     def test_error_type_mapping(self, error_type: str, expected_cls: type, expected_code: ErrorCode) -> None:
-        """Each error_type maps to the correct exception class and code."""
+        """Each error_type maps to its exception class and code; the message is the operation,
+        the error type and the guest's message."""
         from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
         from exec_sandbox.qemu_vm import guest_error_to_exception
 
@@ -6402,8 +6449,7 @@ class TestGuestErrorToException:
 
         assert type(exc) is expected_cls
         assert exc.code is expected_code
-        assert error_type in str(exc)
-        assert "test error" in str(exc)
+        assert str(exc) == f"read_file '/foo': [{error_type}] test error"
 
     def test_a_command_the_guest_agent_does_not_know(self) -> None:
         """An agent of another release (a VM it saved) does not know the command: the call
@@ -6417,54 +6463,25 @@ class TestGuestErrorToException:
         exc = guest_error_to_exception(msg, "vm-1", operation="list_files '/home'")
 
         assert (type(exc), exc.code) == (InvalidInputError, ErrorCode.ARGUMENT_INVALID)
-        assert str(exc).startswith(
+        assert str(exc) == (
             "list_files '/home': the guest agent of this VM does not know this command (another "
             f"exec-sandbox release started the VM): {guest}"
         )
 
-    def test_operation_in_message(self) -> None:
-        """Operation name appears in the exception message."""
-        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
-        from exec_sandbox.qemu_vm import guest_error_to_exception
-
-        msg = StreamingErrorMessage(type="error", message="not found", error_type="io_error")
-        exc = guest_error_to_exception(msg, "vm-456", operation="read_file '/data.txt'")
-
-        assert "read_file '/data.txt'" in str(exc)
-
     def test_context_fields(self) -> None:
-        """Context dict contains expected fields."""
+        """The context: the VM, the error type, the guest's message and the operation."""
         from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
         from exec_sandbox.qemu_vm import guest_error_to_exception
 
         msg = StreamingErrorMessage(type="error", message="bad path", error_type="path_error")
         exc = guest_error_to_exception(msg, "vm-789", operation="write_file '/evil'")
 
-        assert exc.context["vm_id"] == "vm-789"
-        assert exc.context["error_type"] == "path_error"
-        assert exc.context["guest_message"] == "bad path"
-        assert exc.context["operation"] == "write_file '/evil'"
-
-    @pytest.mark.parametrize(
-        "error_type_enum, expected_code",
-        [
-            pytest.param(GuestErrorType.ENV_VAR, ErrorCode.ENV_VAR_INVALID, id="env_var"),
-            pytest.param(GuestErrorType.CODE, ErrorCode.CODE_INVALID, id="code"),
-            pytest.param(GuestErrorType.REQUEST, ErrorCode.GUEST_PROTOCOL, id="request"),
-        ],
-    )
-    def test_enum_value_round_trip(self, error_type_enum: GuestErrorType, expected_code: ErrorCode) -> None:
-        """GuestErrorType enum .value round-trips through StreamingErrorMessage.
-
-        str(GuestErrorType.ENV_VAR) gives 'GuestErrorType.ENV_VAR', which matches no case
-        branch: a message carries .value ('env_var_error').
-        """
-        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
-        from exec_sandbox.qemu_vm import guest_error_to_exception
-
-        msg = StreamingErrorMessage(type="error", message="test", error_type=error_type_enum.value)
-        exc = guest_error_to_exception(msg, "vm-roundtrip", operation="execute")
-        assert exc.code is expected_code
+        assert exc.context == {
+            "vm_id": "vm-789",
+            "error_type": "path_error",
+            "guest_message": "bad path",
+            "operation": "write_file '/evil'",
+        }
 
 
 # ============================================================================
@@ -6643,10 +6660,15 @@ class TestWaitForGuest:
 
     @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.LINUX)
     async def test_tcg_clean_exit_during_boot_raises_qemu_crashed(self, _mock_os) -> None:
-        """TCG exits with code 0 during boot (ARM64 timing race)."""
+        """TCG exits with code 0 during boot (ARM64 timing race): the message says why (a guest
+        reboot or panic), not the exit code of a crash."""
         vm = self._make_vm(returncode=0, connect_side_effect=OSError("connection refused"), accel_type=AccelType.TCG)
 
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED):
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.QEMU_CRASHED,
+            match=r"^QEMU TCG exited with code 0 during boot \(guest reboot/panic\)$",
+        ):
             await vm.wait_for_guest(timeout=5)
 
     # ------------------------------------------------------------------
@@ -6654,14 +6676,15 @@ class TestWaitForGuest:
     # ------------------------------------------------------------------
 
     async def test_timeout_when_guest_never_ready(self) -> None:
-        """Guest never responds, timeout fires."""
+        """Guest never responds, timeout fires: a TimeoutError that names the wait (create_vm
+        puts its message in VM_BOOT_TIMEOUT)."""
         alive = asyncio.Event()
         vm = self._make_vm(
             process_wait_event=alive,
             connect_side_effect=OSError("connection refused"),
         )
 
-        with pytest.raises(TimeoutError):
+        with pytest.raises(TimeoutError, match=r"^Guest agent not ready after 0\.5s$"):
             await self._wait_with_alive_process(vm, alive, timeout=0.5)
 
     # ------------------------------------------------------------------
@@ -6685,30 +6708,34 @@ class TestWaitForGuest:
 
     @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.LINUX)
     async def test_collect_diagnostics_signal(self, _mock_os) -> None:
-        """collect_diagnostics reports SIGKILL for exit code -9."""
+        """collect_diagnostics reports SIGKILL for exit code -9; an empty console reads "(empty)"."""
         vm = self._make_vm(returncode=-9)
-        diag = vm.collect_diagnostics()
-        assert diag.signal_name == "SIGKILL"
-        assert diag.exit_code == -9
-        assert diag.accel_type == "kvm"
-        assert diag.host_os == "linux"
+        assert vm.collect_diagnostics() == QemuDiagnostics(
+            vm_id="test-wait-for-guest",
+            exit_code=-9,
+            signal_name="SIGKILL",
+            console_log="(empty)",
+            accel_type="kvm",
+            host_os="linux",
+        )
 
     @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.MACOS)
     async def test_collect_diagnostics_fields(self, _mock_os) -> None:
-        """collect_diagnostics produces expected fields and never reads the QEMU pipes:
-        the drain task is their only reader (its lines are in the console buffer)."""
+        """collect_diagnostics joins the console lines, and never reads the QEMU pipes: the
+        drain task is their only reader (its lines are in the console buffer)."""
         vm = self._make_vm(returncode=0, accel_type=AccelType.HVF)
-        vm.console_lines.append("boot line 1")
+        vm.console_lines.extend(["boot line 1", "boot line 2"])
         diag = vm.collect_diagnostics()
 
         vm.process.communicate.assert_not_awaited()
-        # Verify fields
-        assert diag.vm_id == "test-wait-for-guest"
-        assert diag.exit_code == 0
-        assert diag.signal_name == ""
-        assert "boot line 1" in diag.console_log
-        assert diag.accel_type == "hvf"
-        assert diag.host_os == "macos"
+        assert diag == QemuDiagnostics(
+            vm_id="test-wait-for-guest",
+            exit_code=0,
+            signal_name="",
+            console_log="boot line 1\nboot line 2",
+            accel_type="hvf",
+            host_os="macos",
+        )
 
     @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.MACOS)
     async def test_collect_diagnostics_names_forced_emulation(self, _mock_os) -> None:
@@ -6761,7 +6788,7 @@ class TestWaitForGuest:
             send_request_side_effect=asyncio.CancelledError(),
         )
 
-        with pytest.raises(TimeoutError):
+        with pytest.raises(TimeoutError, match=r"^Guest agent not ready after 0\.5s$"):
             await self._wait_with_alive_process(vm, alive, timeout=0.5)
 
     async def test_guest_cancelled_error_connect_phase(self) -> None:
@@ -6907,7 +6934,7 @@ class TestGuestPortSocketActivation(_QemuCmdTestBase):
             assert _guest_port_listeners(workdir) == []
             assert not Path(workdir.cmd_socket).exists()
         finally:
-            workdir.use_qemu_vm_user = False  # as test_qmp_fd_not_used_with_sudo_path
+            workdir.use_qemu_vm_user = False  # as test_a_qemu_vm_command_runs_qemu_behind_sudo
 
 
 # ============================================================================
@@ -6962,13 +6989,12 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
         assert "-qmp" not in cmd
 
     async def test_qmp_fd_none_generates_legacy_syntax(self, vm_settings, workdir) -> None:
-        """qmp_fd=None (default) produces -qmp, never -chardev with qmp0."""
+        """qmp_fd=None produces -qmp with the socket path (QEMU listens there), never -chardev
+        with qmp0."""
         with _qemu_cmd_mocks():
             cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-legacy")
 
-        assert "-qmp" in cmd
-        qmp_idx = cmd.index("-qmp")
-        assert cmd[qmp_idx + 1].startswith("unix:")
+        assert _option(cmd, "-qmp") == f"unix:{workdir.qmp_socket},server=on,wait=off"
         # Must not contain socket-activation syntax
         cmd_str = " ".join(cmd)
         assert "qmp0" not in cmd_str
@@ -6984,18 +7010,29 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
         assert "socket,id=qmp0,fd=0,server=on,wait=off" in cmd_str
         assert "-qmp" not in cmd
 
-    async def test_qmp_fd_not_used_with_sudo_path(self, vm_settings, workdir) -> None:
-        """use_qemu_vm_user=True (always from another user): sudo wraps cmd, legacy -qmp syntax."""
+    async def test_a_qemu_vm_command_runs_qemu_behind_sudo(self, vm_settings, workdir) -> None:
+        """use_qemu_vm_user=True (always from another user): sudo, then stdbuf (sudo drops
+        LD_PRELOAD), then QEMU, which makes the QMP socket at its path (sudo closes inherited
+        fds: restore_vm gives it no QMP fd, TestRestoreFailuresAfterLaunch)."""
         workdir.use_qemu_vm_user = True
         try:
             with _qemu_cmd_mocks():
                 cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-sudo")
 
-            assert "-qmp" in cmd
-            qmp_idx = cmd.index("-qmp")
-            assert cmd[qmp_idx + 1].startswith("unix:")
-            assert "server=on,wait=off" in cmd[qmp_idx + 1]
-            assert "sudo" in cmd
+            assert cmd[:11] == [
+                "sudo",
+                "-n",
+                "-u",
+                "qemu-vm",
+                "/bin/sh",
+                "-c",
+                'umask 007 && exec "$@"',
+                "qemu-vm",
+                "stdbuf",
+                "-oL",
+                qemu_system_binary(vm_settings, arch=HostArch.X86_64),
+            ]
+            assert _option(cmd, "-qmp") == f"unix:{workdir.qmp_socket},server=on,wait=off"
         finally:
             # This flag is part of the command fixture, not ownership of the
             # host-created temporary directory. Do not make fixture teardown
@@ -7052,23 +7089,33 @@ class TestRestoreFailuresAfterLaunch:
         launches: list[tuple[str | None, str | None]] | None = None,
         egress_domains: tuple[str, ...] | None = None,
         egresses: list[tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
-        boot: tuple[str, str] | None = None,
-        boots: list[tuple[str, str] | None] | None = None,
+        boot: GuestBoot | None = None,
+        boots: list[GuestBoot | None] | None = None,
+        restore: Callable[..., Awaitable[None]] | None = None,
+        load_started: bool = True,
+        qemu_closed: bool = False,
+        qmp_connect: Callable[..., Awaitable[object]] | None = None,
+        qemu_vm_user: bool = False,
+        qmp: list[tuple[bool, int]] | None = None,
     ) -> QemuVM:
         """Run restore_vm with QEMU's exit code `returncode` (None: it runs) and a guest
         channel whose connect raises `connect_error` (None: it answers). `host_disk_full`
         is what the VM's raise_if_host_disk_full raises (None: the disk has room).
         `machine_type`: the saved one (None: a new VM's); `launches` gets (the -M value given
         to build_qemu_cmd, the type kept on the VM). This QEMU's machine types are faked: virt
-        is virt-11.1. Returns what restore_vm returns (the stubbed VM)."""
+        is virt-11.1. `qemu_vm_user`: sudo starts QEMU as qemu-vm (its ACL grant works); `qmp`
+        gets (whether build_qemu_cmd got no QMP fd, the waits for QEMU's QMP socket). Returns
+        what restore_vm returns (the stubbed VM)."""
         vmstate = tmp_path / "entry.vmstate"
         vmstate.write_bytes(b"vmstate")
         vmstate.with_suffix(".home").write_bytes(b"home")
         infra = MagicMock()
         infra.vm_id = "restore-vm"
-        infra.workdir.use_qemu_vm_user = False
+        infra.workdir.use_qemu_vm_user = qemu_vm_user
         infra.channel.connect = AsyncMock(side_effect=connect_error)
-        vm = MagicMock() if vm is None else vm
+        if vm is None:
+            vm = MagicMock()
+            vm.process.wait = AsyncMock()  # its end is not seen: returncode stays as given
         vm.process.returncode = returncode
         vm.collect_diagnostics = MagicMock(
             return_value=QemuDiagnostics(
@@ -7080,14 +7127,23 @@ class TestRestoreFailuresAfterLaunch:
                 host_os="linux",
             )
         )
-        vm.transition_state = AsyncMock()
+        vm.transition_state = MagicMock()
         vm.raise_if_host_disk_full = AsyncMock(side_effect=host_disk_full)
         client = AsyncMock()
-        client.__aenter__ = AsyncMock(return_value=client)
+        client.load_started, client.qemu_closed = False, False
+        if restore is not None:  # the state load (MigrationClient.restore_snapshot), then what it saw
+
+            async def load(*args: object, **kwargs: object) -> None:
+                client.load_started, client.qemu_closed = load_started, qemu_closed
+                await restore(*args, **kwargs)
+
+            client.restore_snapshot = load
+        client.__aenter__ = AsyncMock(return_value=client) if qmp_connect is None else qmp_connect
         client.__aexit__ = AsyncMock(return_value=False)
         launch = AsyncMock(return_value=vm)
         build = AsyncMock(return_value=[qemu_system_binary(manager.settings, arch=manager.arch)])
         gvproxy = AsyncMock(return_value=(None, None, 0, gvproxy_ready))
+        socket_wait = AsyncMock()
         leases = (MagicMock(),)  # the L1 entry's lease: the launch takes the VM's share of it
         machine_types = {"virt": "virt-11.1", "virt-11.1": "virt-11.1", "virt-11.0": "virt-11.0", "microvm": "microvm"}
         try:
@@ -7095,6 +7151,8 @@ class TestRestoreFailuresAfterLaunch:
                 patch.object(manager, "_setup_vm_infra", new_callable=AsyncMock, return_value=infra),
                 _fake_guest_port_listeners(),
                 patch("exec_sandbox.vm_manager.create_unix_socket", return_value=MagicMock()),
+                patch("exec_sandbox.vm_manager.grant_qemu_vm_acl", AsyncMock(return_value=True)),
+                patch("exec_sandbox.vm_manager.wait_for_socket", socket_wait),
                 patch("exec_sandbox.vm_manager.build_qemu_cmd", build),
                 patch("exec_sandbox.qemu_cmd.require_qemu_machine_types", AsyncMock(return_value=machine_types)),
                 patch.object(manager, "_start_gvproxy_for_vm", gvproxy),
@@ -7127,6 +7185,8 @@ class TestRestoreFailuresAfterLaunch:
                 egresses.append((gvproxy.await_args.kwargs["egress"], launch.await_args.kwargs["egress"]))
             if boots is not None:
                 boots.append(launch.await_args.kwargs["boot"])
+            if qmp is not None:
+                qmp.append((build.await_args.kwargs["qmp_fd"] is None, socket_wait.await_count))
 
     @pytest.mark.parametrize("boot", [("1" * 64, "2" * 64), None], ids=["saved-instance", "l1-template"])
     async def test_restore_keeps_the_boot_of_the_save(
@@ -7190,6 +7250,21 @@ class TestRestoreFailuresAfterLaunch:
         )
         assert launches == [(built, kept)]
 
+    @pytest.mark.parametrize(
+        ("qemu_vm_user", "no_fd_and_waits"), [(False, (False, 0)), (True, (True, 1))], ids=["this-user", "qemu-vm"]
+    )
+    async def test_only_a_qemu_of_this_user_inherits_the_qmp_socket(
+        self, unit_test_vm_manager, tmp_path: Path, qemu_vm_user: bool, no_fd_and_waits: tuple[bool, int]
+    ) -> None:
+        """A QEMU of this user inherits the QMP socket the restore made (no wait for it). sudo
+        closes inherited fds: a qemu-vm QEMU gets no QMP fd, makes the socket at its path, and
+        the restore waits for it."""
+        qmp: list[tuple[bool, int]] = []
+        await self._restore(
+            unit_test_vm_manager, tmp_path, returncode=None, connect_error=None, qemu_vm_user=qemu_vm_user, qmp=qmp
+        )
+        assert qmp == [no_fd_and_waits]
+
     @pytest.mark.parametrize("returncode", [-6, -9, 0])
     async def test_qemu_dead_after_launch_is_qemu_crashed(
         self, unit_test_vm_manager, tmp_path: Path, returncode: int
@@ -7206,8 +7281,153 @@ class TestRestoreFailuresAfterLaunch:
         assert exc_info.value.context == {
             "vm_id": "restore-vm",
             "returncode": returncode,
+            "loading": False,  # before the load: no evidence against the saved state
             "console_log": "qemu-system: Unknown ramblock",
         }
+        assert refusal_cause(exc_info.value) is None
+
+    async def test_qemu_abort_while_loading_is_a_refusal(self, unit_test_vm_manager, tmp_path: Path) -> None:
+        """QEMU aborts while it loads the state (the load raises, then QEMU is gone with
+        SIGABRT): QEMU_CRASHED marked loading, which refusal_cause takes as the state's."""
+        vm = MagicMock()
+        vm.process.wait = AsyncMock()
+
+        async def load_aborts(*_args: object, **_kwargs: object) -> None:
+            vm.process.returncode = -6
+            raise ConnectionResetError
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
+            await self._restore(
+                unit_test_vm_manager,
+                tmp_path,
+                returncode=None,
+                connect_error=None,
+                vm=vm,
+                restore=load_aborts,
+                qemu_closed=True,
+            )
+        assert exc_info.value.context["loading"] is True
+        assert refusal_cause(exc_info.value) == "qemu-system: Unknown ramblock"
+
+    async def test_qemu_reaped_after_the_failed_load_is_still_its_death(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        """QEMU aborts while it loads: the load fails on the closed QMP socket before the event
+        loop has reaped QEMU (its returncode comes with its wait). The restore waits for the
+        end, so the error is QEMU's death while loading (QEMU_CRASHED), not MIGRATION_FAILED."""
+        vm = MagicMock()
+
+        async def ends() -> int:
+            vm.process.returncode = -6
+            return -6
+
+        vm.process.wait = ends
+
+        async def load_fails(*_args: object, **_kwargs: object) -> None:
+            raise ConnectionResetError
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
+            await self._restore(
+                unit_test_vm_manager,
+                tmp_path,
+                returncode=None,
+                connect_error=None,
+                vm=vm,
+                restore=load_fails,
+                qemu_closed=True,
+            )
+        assert (exc_info.value.context["returncode"], exc_info.value.context["loading"]) == (-6, True)
+
+    async def test_a_death_during_the_qmp_handshake_is_not_the_states(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        """QEMU aborts at its start (an HVF assert, KVM registers at machine init): the QMP
+        connect fails before the greeting, nothing was loaded: QEMU_CRASHED not marked loading."""
+        vm = MagicMock()
+        vm.process.wait = AsyncMock()
+
+        async def startup_abort(*_args: object) -> object:
+            vm.process.returncode = -6
+            raise TransientError(
+                "QMP connection closed before the greeting",
+                code=ErrorCode.MIGRATION_FAILED,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
+            await self._restore(
+                unit_test_vm_manager, tmp_path, returncode=None, connect_error=None, vm=vm, qmp_connect=startup_abort
+            )
+        assert exc_info.value.context["loading"] is False
+        assert refusal_cause(exc_info.value) is None
+
+    async def test_the_exit_wait_is_bounded(
+        self, unit_test_vm_manager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """QEMU closed the QMP connection but never ends (stuck in its exit): the restore waits
+        at most RESTORE_EXIT_WAIT_SECONDS, then fails (MIGRATION_FAILED: no exit code seen)."""
+        monkeypatch.setattr("exec_sandbox.vm_manager.RESTORE_EXIT_WAIT_SECONDS", 0.05)
+        vm = MagicMock()
+        vm.process.wait = asyncio.Event().wait  # never set: QEMU never ends
+
+        async def load_fails(*_args: object, **_kwargs: object) -> None:
+            raise ConnectionResetError
+
+        async with asyncio.timeout(5):  # an unbounded wait would hang here
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+                await self._restore(
+                    unit_test_vm_manager,
+                    tmp_path,
+                    returncode=None,
+                    connect_error=None,
+                    vm=vm,
+                    restore=load_fails,
+                    qemu_closed=True,
+                )
+
+    async def test_a_failed_load_qemu_answered_has_no_wait(self, unit_test_vm_manager, tmp_path: Path) -> None:
+        """QEMU answered the failure (a refused stream, a deadline) and runs: the restore does
+        not wait for its end (the wait would fail this test): MIGRATION_FAILED at once."""
+        vm = MagicMock()
+        vm.process.wait = AsyncMock(side_effect=AssertionError("waited for a QEMU that runs"))
+
+        async def refused(*_args: object, **_kwargs: object) -> None:
+            raise TransientError(
+                "migrate failed", code=ErrorCode.MIGRATION_FAILED, context=None, hint=None, instance_id=None
+            )
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+            await self._restore(
+                unit_test_vm_manager, tmp_path, returncode=None, connect_error=None, vm=vm, restore=refused
+            )
+        vm.process.wait.assert_not_awaited()
+
+    async def test_a_death_before_migrate_incoming_is_not_the_states(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        """QEMU aborts before migrate-incoming (a startup abort: HVF's assert, KVM's registers
+        at machine init): QEMU_CRASHED not marked loading, so no refusal of the state."""
+        vm = MagicMock()
+
+        async def startup_abort(*_args: object, **_kwargs: object) -> None:
+            vm.process.returncode = -6
+            raise ConnectionResetError
+
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
+            await self._restore(
+                unit_test_vm_manager,
+                tmp_path,
+                returncode=None,
+                connect_error=None,
+                vm=vm,
+                restore=startup_abort,
+                load_started=False,
+                qemu_closed=True,
+            )
+        assert exc_info.value.context["loading"] is False
+        assert refusal_cause(exc_info.value) is None
 
     @pytest.mark.parametrize("returncode", [126, 127])
     async def test_qemu_launch_ended_with_126_or_127_is_host_dependency(
@@ -7230,6 +7450,7 @@ class TestRestoreFailuresAfterLaunch:
         assert exc_info.value.context == {
             "vm_id": "restore-vm",
             "returncode": returncode,
+            "loading": False,
             "console_log": "qemu-system: Unknown ramblock",
             "qemu_cmd": qemu,
             "binary": qemu,
@@ -7252,8 +7473,33 @@ class TestRestoreFailuresAfterLaunch:
         assert exc_info.value.context == {
             "vm_id": "restore-vm",
             "vmstate_path": str(tmp_path / "entry.vmstate"),
+            "exit_code": None,  # QEMU runs: the guest may answer another time
             "console_log": "qemu-system: Unknown ramblock",  # QEMU's own reason: the VM and its log go next
         }
+        assert refusal_cause(exc_info.value) is None
+
+    async def test_a_guest_that_panics_after_the_load_ends_qemu_with_0(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        """The guest closed its port and QEMU ended with 0 (its panic reboots, -no-reboot ends
+        QEMU): the error holds the exit code, which makes the state refused here
+        (refusal_cause): the same state fails the same way on this worker."""
+        vm = MagicMock()
+
+        async def ends() -> int:
+            vm.process.returncode = 0
+            return 0
+
+        vm.process.wait = ends
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_SILENT_AFTER_RESTORE) as exc_info:
+            await self._restore(
+                unit_test_vm_manager, tmp_path, returncode=None, connect_error=ConnectionResetError(), vm=vm
+            )
+        assert exc_info.value.context["exit_code"] == 0
+        assert str(exc_info.value) == (
+            "VM restore-vm: the guest did not answer after its saved state loaded (QEMU exit code 0)."
+        )
+        assert refusal_cause(exc_info.value) == str(exc_info.value)  # no panic line in this console
 
     async def test_a_guest_that_cannot_reseed_passes_the_channel_error_on(
         self, unit_test_vm_manager, tmp_path: Path
@@ -7310,10 +7556,10 @@ class TestRestoreFailuresAfterLaunch:
         )
 
         vm = MagicMock()
-        vm.transition_state = AsyncMock()
+        vm.transition_state = MagicMock()
 
         async def gvproxy_ready() -> None:
-            vm.transition_state.assert_not_awaited()  # the wait comes before READY
+            vm.transition_state.assert_not_called()  # the wait comes before READY
             raise failed
 
         with pytest.raises(TransientError) as exc_info:
@@ -7321,14 +7567,14 @@ class TestRestoreFailuresAfterLaunch:
                 unit_test_vm_manager, tmp_path, returncode=None, connect_error=None, gvproxy_ready=gvproxy_ready, vm=vm
             )
         assert exc_info.value is failed
-        vm.transition_state.assert_not_awaited()
+        vm.transition_state.assert_not_called()
 
     async def test_guest_that_answers_is_restored(self, unit_test_vm_manager, tmp_path: Path) -> None:
         """Control: the same harness with a guest that answers gives a READY restored VM."""
         vm = await self._restore(unit_test_vm_manager, tmp_path, returncode=None, connect_error=None)
         assert vm.l1_restored is True
         assert vm.reseed_next_exec is True  # every copy of one saved state reseeds at its first exec
-        vm.transition_state.assert_awaited_once_with(VmState.READY)  # type: ignore[attr-defined]
+        vm.transition_state.assert_called_once_with(VmState.READY)  # type: ignore[attr-defined]
 
 
 class TestRestoreWithoutHomeTemplate:
@@ -8040,11 +8286,18 @@ class TestDeviceLayout(_QemuCmdTestBase):
         ],
     )
     async def test_a_build_logs_nothing(
-        self, vm_settings, workdir, *, arch: HostArch, host_os: HostOS, accel: AccelType
+        self,
+        vm_settings,
+        workdir,
+        caplog: pytest.LogCaptureFixture,
+        *,
+        arch: HostArch,
+        host_os: HostOS,
+        accel: AccelType,
     ) -> None:
-        """A build writes no INFO or WARNING log: the dry build of each load check and L1 key
-        (VmManager.restore_layout) starts no VM, and the launch logs a real one."""
-        with patch("exec_sandbox.qemu_cmd.logger") as logger:
+        """A build writes no library log at INFO or above: the dry build of each load check and
+        L1 key (VmManager.restore_layout) starts no VM, and the launch logs a real one."""
+        with caplog.at_level("INFO", logger="exec_sandbox"):
             await self._layout(
                 vm_settings,
                 workdir,
@@ -8057,7 +8310,7 @@ class TestDeviceLayout(_QemuCmdTestBase):
                 snapshot_drive=None,
                 allow_network=True,
             )
-        assert (logger.info.call_args_list, logger.warning.call_args_list) == ([], [])
+        assert [(record.name, record.getMessage()) for record in caplog.records] == []
 
     async def test_a_device_change_changes_the_layout(self, vm_settings, workdir) -> None:
         """An L2 drive or a network device: another layout."""

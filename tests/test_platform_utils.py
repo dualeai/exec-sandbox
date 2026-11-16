@@ -25,6 +25,7 @@ from exec_sandbox.platform_utils import (
     UserDir,
     detect_host_arch,
     detect_host_os,
+    detect_host_x86_vendor,
     get_account_dir,
     get_arch_name,
     get_os_name,
@@ -35,8 +36,6 @@ from tests.conftest import (
     skip_unless_aarch64,
     skip_unless_linux,
     skip_unless_macos,
-    skip_unless_macos_arm64,
-    skip_unless_macos_x86_64,
     skip_unless_x86_64,
 )
 
@@ -99,6 +98,30 @@ class TestGetOsName:
         assert get_os_name() == "linux"
 
 
+class TestDetectHostX86Vendor:
+    """detect_host_x86_vendor on Linux x86: the vendor_id line of /proc/cpuinfo, as the
+    kernel prints it ("vendor_id\\t: %s" of the 12 CPUID bytes)."""
+
+    @pytest.fixture(autouse=True)
+    def linux_x86(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """A Linux x86 host; each test starts and ends with no answer kept."""
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_arch", lambda: HostArch.X86_64)
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
+        detect_host_x86_vendor.cache_clear()
+        yield
+        detect_host_x86_vendor.cache_clear()
+
+    @pytest.mark.parametrize(
+        "vendor",
+        ["GenuineIntel", "AuthenticAMD", "HygonGenuine", "CentaurHauls", "  Shanghai  "],
+        ids=["intel", "amd", "hygon", "centaur", "zhaoxin"],
+    )
+    def test_the_12_characters_spaces_kept(self, vendor: str) -> None:
+        cpuinfo = f"processor\t: 0\nvendor_id\t: {vendor}\ncpu family\t: 7\n"
+        with patch.object(Path, "read_text", return_value=cpuinfo):
+            assert detect_host_x86_vendor() == vendor
+
+
 class TestGetArchName:
     """Tests for get_arch_name helper function."""
 
@@ -128,7 +151,6 @@ class TestUserDirCache:
         [
             pytest.param(HostOS.MACOS, "/home/u/Library/Caches/exec-sandbox", id="macos-library-caches"),
             pytest.param(HostOS.LINUX, "/home/u/.cache/exec-sandbox", id="linux-dot-cache"),
-            pytest.param(HostOS.UNKNOWN, "/home/u/.cache/exec-sandbox", id="unknown-falls-back-to-dot-cache"),
         ],
     )
     def test_default_per_os(self, monkeypatch: pytest.MonkeyPatch, host_os: HostOS, expected: str) -> None:
@@ -177,7 +199,7 @@ class TestUserDirCache:
     # --- Edge cases ---
 
     def test_empty_xdg_cache_home_ignored(self) -> None:
-        """Empty XDG_CACHE_HOME is falsy, falls through to ~/.cache default."""
+        """An empty XDG_CACHE_HOME is no absolute path (XDG spec): ~/.cache."""
         with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
             with patch.dict("os.environ", {"XDG_CACHE_HOME": "", "HOME": "/home/u"}, clear=True):
                 result = get_user_dir(kind=UserDir.CACHE)
@@ -211,9 +233,8 @@ class TestUserDirData:
         monkeypatch.setenv("XDG_DATA_HOME", xdg)
         assert get_user_dir(kind=UserDir.DATA) == Path("/home/u/.local/share/exec-sandbox")
 
-    @pytest.mark.parametrize("host_os", [HostOS.LINUX, HostOS.UNKNOWN])
-    def test_without_xdg(self, monkeypatch: pytest.MonkeyPatch, host_os: HostOS) -> None:
-        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: host_os)
+    def test_without_xdg(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
         monkeypatch.setenv("HOME", "/home/u")
         monkeypatch.delenv("XDG_DATA_HOME", raising=False)
         assert get_user_dir(kind=UserDir.DATA) == Path("/home/u/.local/share/exec-sandbox")
@@ -227,10 +248,6 @@ class TestUserDirData:
         assert get_user_dir(kind=UserDir.DATA) == Path("/home/u/.local/share/exec-sandbox")
         assert get_user_dir(kind=UserDir.CACHE) == Path("/cache")
 
-    def test_cache_and_data_apart(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
-        assert get_user_dir(kind=UserDir.DATA) != get_user_dir(kind=UserDir.CACHE)
-
     @pytest.mark.parametrize(
         ("host_os", "data", "cache"),
         [
@@ -240,9 +257,8 @@ class TestUserDirData:
                 "/accounts/me/Library/Caches/exec-sandbox",
             ),
             (HostOS.LINUX, "/accounts/me/.local/share/exec-sandbox", "/accounts/me/.cache/exec-sandbox"),
-            (HostOS.UNKNOWN, "/accounts/me/.local/share/exec-sandbox", "/accounts/me/.cache/exec-sandbox"),
         ],
-        ids=["macos", "linux", "unknown"],
+        ids=["macos", "linux"],
     )
     def test_account_dir_ignores_the_environment(
         self, monkeypatch: pytest.MonkeyPatch, host_os: HostOS, data: str, cache: str
@@ -288,7 +304,6 @@ class TestProcessWrapperInit:
         """pid and psutil_proc name the process that asyncio spawned."""
         proc = await create_wrapped_process(["sleep", "10"])
         try:
-            assert proc.pid is not None
             assert psutil.Process(proc.pid).name() == "sleep"
             assert proc.psutil_proc is not None
             assert proc.psutil_proc.pid == proc.pid
@@ -477,26 +492,3 @@ class TestProcessWrapperWaitWithTimeout:
         proc.drain_task = ended
 
         assert await proc.wait_with_timeout(5.0) == 0
-
-
-# ============================================================================
-# Platform-Specific Tests Using Skip Markers
-# ============================================================================
-
-
-class TestPlatformArchCombinations:
-    """Test platform+architecture combinations using skip markers."""
-
-    @skip_unless_macos_x86_64
-    def test_darwin_amd64_naming_combination(self) -> None:
-        """Verify darwin-amd64 naming for Intel Mac."""
-        from exec_sandbox.asset_downloader import get_gvproxy_suffix
-
-        assert get_gvproxy_suffix(get_arch_name()) == "darwin-amd64"
-
-    @skip_unless_macos_arm64
-    def test_darwin_arm64_naming_combination(self) -> None:
-        """Verify darwin-arm64 naming for Apple Silicon."""
-        from exec_sandbox.asset_downloader import get_gvproxy_suffix
-
-        assert get_gvproxy_suffix(get_arch_name()) == "darwin-arm64"

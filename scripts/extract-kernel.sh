@@ -194,7 +194,7 @@ extract_for_arch() {
     if [ "$need_initramfs" = true ]; then
         # Build minimal initramfs: tiny-init + device nodes only.
         # With CONFIG_MODULES=n, all drivers are built-in — no modules needed.
-        "$SCRIPT_DIR/build-initramfs.sh" "$target_arch" "$OUTPUT_DIR"
+        "$SCRIPT_DIR/build-initramfs.sh" "$target_arch"
         save_hash "$initramfs_file" "$initramfs_hash"
     fi
 

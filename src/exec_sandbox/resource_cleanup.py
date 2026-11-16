@@ -1,14 +1,19 @@
 """Resource cleanup utilities for VM lifecycle management.
 
 Defensive cleanup operations that log errors but don't fail.
-Used by VmManager, DiskSnapshotManager (L2 builds), qemu-storage-daemon, gvproxy and
-subprocess_utils to end their child processes.
+Used by VmManager (QEMU, gvproxy), DiskSnapshotManager (L2 builds), QemuStorageDaemon and
+subprocess_utils (communicate_managed_process) to end their child processes.
 """
 
-from exec_sandbox._logging import get_logger
+import logging
+from typing import Final
+
 from exec_sandbox.platform_utils import ProcessWrapper
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
+
+_KILL_TIMEOUT_SECONDS: Final = 2.0
+"""How long a SIGKILLed process may take to end: a process still alive then is stuck (D state)."""
 
 
 async def cleanup_process(
@@ -17,13 +22,12 @@ async def cleanup_process(
     context_id: str,
     *,
     term_timeout: float,
-    kill_timeout: float,
     kill_first: bool,
 ) -> bool:
     """Force cleanup of subprocess (SIGTERM → SIGKILL).
 
     - A process with a returncode is already reaped (asyncio sets it after waitpid)
-    - SIGTERM, wait up to term_timeout, then SIGKILL, wait up to kill_timeout; with
+    - SIGTERM, wait up to term_timeout, then SIGKILL, wait up to _KILL_TIMEOUT_SECONDS; with
       kill_first, SIGKILL at once (no clean exit needed)
     - A process still alive after SIGKILL: False; the event loop's child watcher reaps it
       when it ends (every child of create_subprocess_exec), no task here waits for it
@@ -37,7 +41,6 @@ async def cleanup_process(
         name: Process name for logging (e.g., "gvproxy", "QEMU", "qemu-storage-daemon")
         context_id: Context for logging (e.g., vm_id, tenant_id)
         term_timeout: Seconds to wait after SIGTERM before SIGKILL
-        kill_timeout: Seconds to wait after SIGKILL before giving up
         kill_first: SIGKILL with no SIGTERM before (a process whose clean exit keeps nothing)
 
     Returns:
@@ -78,7 +81,7 @@ async def cleanup_process(
         await proc.kill()
 
         try:
-            await proc.wait_with_timeout(timeout=kill_timeout)
+            await proc.wait_with_timeout(timeout=_KILL_TIMEOUT_SECONDS)
             (logger.debug if kill_first else logger.warning)(
                 f"{name} stopped (SIGKILL)" if kill_first else f"{name} force killed (SIGKILL)",
                 extra={"context_id": context_id, "returncode": proc.returncode},
@@ -87,7 +90,7 @@ async def cleanup_process(
         except TimeoutError:
             logger.error(  # the loop's child watcher reaps it when it ends
                 f"{name} didn't respond to SIGKILL within timeout",
-                extra={"context_id": context_id, "kill_timeout": kill_timeout, "pid": proc.pid},
+                extra={"context_id": context_id, "kill_timeout": _KILL_TIMEOUT_SECONDS, "pid": proc.pid},
             )
             return False
 

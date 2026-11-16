@@ -58,38 +58,24 @@ IS_X86 = detect_host_arch() == HostArch.X86_64
 
 
 def _read_vuln_file_code(name: str) -> str:
-    """Guest code reading one /sys/devices/system/cpu/vulnerabilities file."""
-    return f"""\
-try:
-    with open('/sys/devices/system/cpu/vulnerabilities/{name}') as f:
-        val = f.read().strip()
-        print(f'STATUS:{{val}}')
-except FileNotFoundError:
-    print('NOT_FOUND')
-except PermissionError:
-    print('PERM_DENIED')
-"""
-
-
-def _extract_status(result_stdout: str, name: str) -> str:
-    """Extract the STATUS: payload; the file must exist and be readable.
+    """Guest code printing one /sys/devices/system/cpu/vulnerabilities file.
 
     CONFIG_GENERIC_CPU_VULNERABILITIES=y on both arches (vendored Alpine base
-    configs), so NOT_FOUND/PERM_DENIED are failures, not skips — a future
-    guest-side mask of /sys must fail these tests, not void them.
+    configs), so a missing or unreadable file fails the exec (exit code 1), not a
+    skip — a future guest-side mask of /sys must fail these tests, not void them.
     """
-    stdout = result_stdout.strip()
-    assert "STATUS:" in stdout, f"{name} sysfs file must be readable in guest, got: {stdout!r}"
-    return stdout.split("STATUS:", 1)[1]
+    return f"print(open('/sys/devices/system/cpu/vulnerabilities/{name}').read().strip())"
 
 
 def _assert_mitigations_off_reached_guest(name: str, status: str) -> None:
     """x86: status must be a hardware 'Not affected' claim or 'Vulnerable*'.
 
-    'Not affected' survives mitigations=off — bugs.c short-circuits on CPU
-    self-declaration (ARCH_CAPABILITIES: MDS_NO etc.) before mitigation state,
-    so AMD / Ice Lake+ hosts under -cpu host legitimately report it. Under TCG
-    the arch-capabilities MSR is stripped, so affected bugs report 'Vulnerable*'.
+    'Not affected' survives mitigations=off — the kernel decides whether the CPU is
+    affected (vendor and model lists, ARCH_CAPABILITIES bits) before the mitigation
+    state. Every x86 guest (KVM and TCG) gets the fixed CPU model of qemu_cmd.py
+    (_X86_CPU_FLAGS, with the host's vendor) and no arch-capabilities flag, so the
+    vendor lists decide: an AMD host can report 'Not affected', and affected bugs
+    report 'Vulnerable*'.
 
     An active 'Mitigation:' string means mitigations=off does not reach the
     guest — check the qemu_cmd.py mitigations block and
@@ -123,15 +109,15 @@ class TestMitigationStatus:
         """Spectre v2 (CVE-2017-5715) status matches documented arch behavior.
 
         x86: nospectre_v2 (via mitigations=off) yields 'Vulnerable*' on all
-        affected CPUs. arm64: reporting is dominated by hardware CSV2 claims
+        affected CPUs. arm64: reporting is dominated by hardware CSV2 and BHB claims
         (proton-pack.c checks ID_AA64PFR0_EL1.CSV2 / safe-MIDR list before
-        mitigation state), so any of 'Not affected' (Apple Silicon, Graviton,
-        QEMU TCG max), 'Mitigation:*' (BHB-listed cores), or 'Vulnerable*'
-        (non-CSV2 cores) is hardware-truthful — transparency only.
+        mitigation state), so any of 'Not affected', 'Mitigation:*' (Apple Silicon
+        under HVF and the neoverse-v1 TCG model: 'Mitigation: CSV2, but not BHB'),
+        or 'Vulnerable*' (non-CSV2 cores) is hardware-truthful — transparency only.
         """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _read_vuln_file_code("spectre_v2"))
-        assert result.exit_code == 0
-        status = _extract_status(result.stdout, "spectre_v2")
+        assert result.exit_code == 0, result.stderr
+        status = result.stdout.strip()
         if IS_X86:
             _assert_mitigations_off_reached_guest("spectre_v2", status)
         else:
@@ -150,8 +136,8 @@ class TestMitigationStatus:
         mitigations=off.
         """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _read_vuln_file_code("spectre_v1"))
-        assert result.exit_code == 0
-        status = _extract_status(result.stdout, "spectre_v1")
+        assert result.exit_code == 0, result.stderr
+        status = result.stdout.strip()
         if IS_X86:
             _assert_mitigations_off_reached_guest("spectre_v1", status)
         else:
@@ -163,16 +149,15 @@ class TestMitigationStatus:
     async def test_mds_status_matches_posture(self, dual_scheduler: Scheduler) -> None:
         """MDS (CVE-2018-12130) status matches documented arch behavior.
 
-        x86 hwaccel: 'Not affected' on AMD / MDS_NO CPUs (hardware claim wins
-        over mitigation state in bugs.c). x86 TCG: 'Vulnerable; SMT Host state
-        unknown' — TCG strips the arch-capabilities MSR from SapphireRapids-v2
-        so the MDS_NO self-declaration never reaches the guest.
-        arm64: MDS is an x86-only bug; the weak default handler in
+        x86 (KVM and TCG): 'Not affected' on an AMD host (the kernel's vendor list
+        wins over mitigation state), else 'Vulnerable; SMT Host state unknown': the
+        fixed guest CPU model has no arch-capabilities flag, so no MDS_NO reaches
+        the guest. arm64: MDS is an x86-only bug; the weak default handler in
         drivers/base/cpu.c always reports 'Not affected'.
         """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _read_vuln_file_code("mds"))
-        assert result.exit_code == 0
-        status = _extract_status(result.stdout, "mds")
+        assert result.exit_code == 0, result.stderr
+        status = result.stdout.strip()
         if IS_X86:
             _assert_mitigations_off_reached_guest("mds", status)
         else:
@@ -200,30 +185,15 @@ class TestTimerPrecision:
         coarsening is not a mitigation in VM environments, so no bound on them.
         """
         code = """\
-import ctypes, ctypes.util, struct, platform
+import time
 
-# Load libc for clock_gettime
-libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-
-class timespec(ctypes.Structure):
-    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
-
-CLOCK_MONOTONIC = 1
-ts = timespec()
-
-# Warm up
-for _ in range(100):
-    libc.clock_gettime(CLOCK_MONOTONIC, ctypes.byref(ts))
+# time.monotonic_ns() is clock_gettime(CLOCK_MONOTONIC)
+for _ in range(100):  # warm up
+    time.monotonic_ns()
 
 # Steps between 1000 consecutive reads
-deltas = []
-prev_ns = None
-for _ in range(1000):
-    libc.clock_gettime(CLOCK_MONOTONIC, ctypes.byref(ts))
-    cur_ns = ts.tv_sec * 1_000_000_000 + ts.tv_nsec
-    if prev_ns is not None:
-        deltas.append(cur_ns - prev_ns)
-    prev_ns = cur_ns
+reads = [time.monotonic_ns() for _ in range(1000)]
+deltas = [b - a for a, b in zip(reads, reads[1:])]
 
 forward = sorted(d for d in deltas if d > 0)
 print(f"BACKWARD:{sum(d < 0 for d in deltas)}")
@@ -233,9 +203,9 @@ if forward:
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0, result.stderr
-        steps = re.fullmatch(r"BACKWARD:0\nFORWARD:(\d+)\nMIN_DELTA_NS:\d+ MEDIAN_DELTA_NS:\d+\n", result.stdout)
-        assert steps, result.stdout
-        assert int(steps[1]) > 0, result.stdout
+        # A MIN_DELTA_NS line only when at least one step went forward: the clock advances
+        steps = r"BACKWARD:0\nFORWARD:\d+\nMIN_DELTA_NS:\d+ MEDIAN_DELTA_NS:\d+\n"
+        assert re.fullmatch(steps, result.stdout), result.stdout
 
 
 # =============================================================================
@@ -252,27 +222,16 @@ class TestTimerSideChannelDefenses:
         """KSM (Kernel Same-page Merging) must be disabled inside the guest.
 
         KSM enables cross-VM side channels by measuring page deduplication
-        timing. Host-side KSM (QEMU mem-merge=on) is enabled for density, but
-        the guest kernel has CONFIG_KSM=n. The sysfs control must therefore be
+        timing. Host-side KSM (QEMU mem-merge=on, Linux hosts) is enabled for
+        density, but the guest kernel has CONFIG_KSM=n. The sysfs control must therefore be
         absent; accepting run=0 would miss an accidental KSM re-enable.
         Host-side KSM (mem-merge=on) operates at the QEMU process level and is
         invisible to the guest. perf_event_paranoid, the other guest control:
-        test_kernel_attack_surface.py::TestKernelInfoLeakSysctls::test_perf_event_paranoid.
+        test_kernel_attack_surface.py::TestKernelInfoLeakSysctls::test_info_leak_sysctls.
         """
-        code = """\
-try:
-    with open('/sys/kernel/mm/ksm/run') as f:
-        val = f.read().strip()
-        print(f'KSM_RUN:{val}')
-except FileNotFoundError:
-    print('NOT_FOUND')
-except PermissionError:
-    print('PERM_DENIED')
-"""
+        code = "import os; print(os.path.exists('/sys/kernel/mm/ksm/run'))"
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        assert stdout == "NOT_FOUND", f"CONFIG_KSM=n requires /sys/kernel/mm/ksm/run to be absent, got: {stdout!r}"
+        assert (result.exit_code, result.stdout) == (0, "False\n"), result.stderr
 
 
 # =============================================================================
@@ -296,31 +255,19 @@ class TestCpuVulnerabilityTransparency:
         posture semantics are tested individually in TestMitigationStatus.
         """
         code = """\
-import os
+import errno, os
 vuln_dir = '/sys/devices/system/cpu/vulnerabilities'
-if not os.path.isdir(vuln_dir):
-    print('DIR_NOT_FOUND')
-else:
-    entries = sorted(os.listdir(vuln_dir))
-    if not entries:
-        print('EMPTY')
-    else:
-        for name in entries:
-            path = os.path.join(vuln_dir, name)
-            try:
-                with open(path) as f:
-                    val = f.read().strip()
-                print(f'{name}:{val}')
-            except (PermissionError, OSError) as e:
-                print(f'{name}:ERROR:{e}')
+for name in sorted(os.listdir(vuln_dir)):
+    try:
+        print(f"{name}:{open(os.path.join(vuln_dir, name)).read().strip()}")
+    except OSError as e:  # the other files are still read
+        print(f"{name}:ERROR:{errno.errorcode[e.errno]}")
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        assert "DIR_NOT_FOUND" not in stdout, "CPU vulnerability directory should exist"
-        error_lines = [line for line in stdout.splitlines() if ":ERROR:" in line]
-        assert not error_lines, f"All CPU vulnerability files must be readable, got: {error_lines}"
-        # The files that TestMitigationStatus reads are listed, each with a status
-        statuses = dict(line.split(":", 1) for line in stdout.splitlines())
-        assert {"mds", "spectre_v1", "spectre_v2"} <= statuses.keys(), stdout
-        assert all(statuses.values()), stdout
+        # A missing folder fails the exec
+        assert result.exit_code == 0, result.stderr
+        # The files that TestMitigationStatus reads are listed, each with a status; none unreadable
+        statuses = dict(line.split(":", 1) for line in result.stdout.splitlines())
+        assert {"mds", "spectre_v1", "spectre_v2"} <= statuses.keys(), result.stdout
+        assert all(statuses.values()), result.stdout
+        assert [name for name, status in statuses.items() if status.startswith("ERROR:")] == [], result.stdout
