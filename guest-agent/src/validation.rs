@@ -87,7 +87,8 @@ fn is_forbidden_control_char(c: char) -> bool {
     code < 0x09 || (0x0A..0x20).contains(&code) || code == 0x7F
 }
 
-/// Build code prefix that sets environment variables for the given language.
+/// The code the REPL runs: `code` (a leading UTF-8 BOM removed) after a prefix that
+/// sets `env_vars` for `language`.
 ///
 /// In RAW mode, a key that is not a valid shell name is skipped with a warning.
 /// For RAW mode with shebang lines (`#!`), the user code is written to a temp
@@ -175,137 +176,118 @@ mod tests {
     // validate_code_params
     // -------------------------------------------------------------------------
 
-    #[test]
-    fn test_valid_code() {
-        assert!(validate_code_params("print('hello')", 30).is_ok());
-    }
-
-    #[test]
-    fn test_valid_code_timeout_zero() {
-        assert!(validate_code_params("x=1", 0).is_ok());
-    }
-
-    #[test]
-    fn test_code_exactly_max() {
-        let code = "x".repeat(MAX_CODE_SIZE_BYTES);
-        assert!(validate_code_params(&code, 30).is_ok());
-    }
-
-    #[test]
-    fn test_code_exceeds_max() {
-        let code = "x".repeat(MAX_CODE_SIZE_BYTES + 1);
-        assert!(validate_code_params(&code, 30).is_err());
-    }
-
-    #[test]
-    fn test_timeout_exactly_max() {
-        assert!(validate_code_params("x=1", MAX_TIMEOUT_SECONDS).is_ok());
-    }
-
-    #[test]
-    fn test_timeout_exceeds_max() {
-        assert!(validate_code_params("x=1", MAX_TIMEOUT_SECONDS + 1).is_err());
-    }
-
-    #[test]
-    fn test_null_byte_in_code() {
-        assert!(validate_code_params("print('hi')\0print('bye')", 30).is_err());
-    }
-
-    #[test]
-    fn test_whitespace_only_code() {
-        assert!(validate_code_params("   \n\t  ", 30).is_err());
-    }
-
-    #[test]
-    fn test_newlines_only_code() {
-        assert!(validate_code_params("\n\n\n", 30).is_err());
-    }
-
-    #[test]
-    fn test_code_error_type() {
-        let err = validate_code_params("", 30).unwrap_err();
-        match err {
-            CmdError::Reply { error_type, .. } => assert_eq!(error_type, "code_error"),
-            CmdError::Fatal(_) => panic!("expected Reply"),
+    /// The reply of refused code parameters: (message, error type); None when accepted.
+    fn code_refusal(code: &str, timeout: u64) -> Option<(String, &'static str)> {
+        match validate_code_params(code, timeout) {
+            Ok(()) => None,
+            Err(CmdError::Reply {
+                message,
+                error_type,
+            }) => Some((message, error_type)),
+            Err(CmdError::Fatal(e)) => panic!("expected a reply error, got {e}"),
         }
+    }
+
+    #[rstest]
+    #[case::code("print('hello')", 30)]
+    #[case::timeout_zero("x=1", 0)] // the default deadline
+    #[case::timeout_of_300_seconds("x=1", 300)]
+    fn test_code_params_are_accepted(#[case] code: &str, #[case] timeout: u64) {
+        assert_eq!(code_refusal(code, timeout), None);
+    }
+
+    #[rstest]
+    #[case::empty("", 30, "Code cannot be empty")]
+    #[case::whitespace_only("   \n\t  ", 30, "Code cannot be empty")]
+    #[case::newlines_only("\n\n\n", 30, "Code cannot be empty")]
+    #[case::null_byte("print('hi')\0print('bye')", 30, "Code cannot contain null bytes")]
+    #[case::timeout_over_300_seconds("x=1", 301, "Timeout too large: 301s (max 300s)")]
+    fn test_code_params_are_refused(
+        #[case] code: &str,
+        #[case] timeout: u64,
+        #[case] message: &str,
+    ) {
+        assert_eq!(
+            code_refusal(code, timeout),
+            Some((message.to_string(), "code_error"))
+        );
+    }
+
+    #[test]
+    fn test_code_of_1_mib_is_accepted_one_byte_more_is_refused() {
+        assert_eq!(code_refusal(&"x".repeat(1_048_576), 30), None);
+        assert_eq!(
+            code_refusal(&"x".repeat(1_048_577), 30),
+            Some((
+                "Code too large: 1048577 bytes (max 1048576 bytes)".to_string(),
+                "code_error"
+            ))
+        );
     }
 
     // -------------------------------------------------------------------------
     // validate_env_vars
     // -------------------------------------------------------------------------
 
-    #[test]
-    fn test_valid_env_vars() {
-        let env = HashMap::from([("FOO".into(), "bar".into()), ("BAZ".into(), "qux".into())]);
+    #[rstest]
+    #[case::none(HashMap::new())]
+    #[case::two(HashMap::from([("FOO".into(), "bar".into()), ("BAZ".into(), "qux".into())]))]
+    #[case::one_hundred((0..100).map(|i| (format!("VAR_{i}"), "val".into())).collect())]
+    #[case::name_of_256_bytes(HashMap::from([("A".repeat(256), "val".into())]))]
+    #[case::value_of_4096_bytes(HashMap::from([("FOO".into(), "x".repeat(4096))]))]
+    #[case::tab_in_value(HashMap::from([("FOO".into(), "a\tb".into())]))]
+    fn test_env_vars_are_accepted(#[case] env: HashMap<String, String>) {
         assert!(validate_env_vars(&env).is_ok());
     }
 
-    #[test]
-    fn test_empty_env_vars() {
-        assert!(validate_env_vars(&HashMap::new()).is_ok());
-    }
-
-    #[test]
-    fn test_exactly_max_env_vars() {
-        let env: HashMap<String, String> = (0..MAX_ENV_VARS)
-            .map(|i| (format!("VAR_{i}"), "val".into()))
-            .collect();
-        assert!(validate_env_vars(&env).is_ok());
-    }
-
-    #[test]
-    fn test_too_many_env_vars() {
-        let env: HashMap<String, String> = (0..MAX_ENV_VARS + 1)
-            .map(|i| (format!("VAR_{i}"), "val".into()))
-            .collect();
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_env_var_name_exactly_max() {
-        let key = "A".repeat(MAX_ENV_VAR_NAME_LENGTH);
-        let env = HashMap::from([(key, "val".into())]);
-        assert!(validate_env_vars(&env).is_ok());
-    }
-
-    #[test]
-    fn test_env_var_name_exceeds_max() {
-        let key = "A".repeat(MAX_ENV_VAR_NAME_LENGTH + 1);
-        let env = HashMap::from([(key, "val".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_env_var_value_exactly_max() {
-        let val = "x".repeat(MAX_ENV_VAR_VALUE_LENGTH);
-        let env = HashMap::from([("FOO".into(), val)]);
-        assert!(validate_env_vars(&env).is_ok());
-    }
-
-    #[test]
-    fn test_env_var_value_exceeds_max() {
-        let val = "x".repeat(MAX_ENV_VAR_VALUE_LENGTH + 1);
-        let env = HashMap::from([("FOO".into(), val)]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_tab_in_env_var_value_allowed() {
-        let env = HashMap::from([("FOO".into(), "a\tb".into())]);
-        assert!(validate_env_vars(&env).is_ok());
-    }
-
-    /// The reply of a refused `name=value`: (message, error type).
-    fn refusal(name: &str, value: &str) -> (String, &'static str) {
-        let env = HashMap::from([(name.to_string(), value.to_string())]);
-        match validate_env_vars(&env) {
+    /// The reply of refused env vars: (message, error type).
+    fn refusal_of(env: &HashMap<String, String>) -> (String, &'static str) {
+        match validate_env_vars(env) {
             Err(CmdError::Reply {
                 message,
                 error_type,
             }) => (message, error_type),
             other => panic!("expected a reply error, got {other:?}"),
         }
+    }
+
+    /// The reply of a refused `name=value`: (message, error type).
+    fn refusal(name: &str, value: &str) -> (String, &'static str) {
+        refusal_of(&HashMap::from([(name.to_string(), value.to_string())]))
+    }
+
+    #[test]
+    fn test_more_than_100_env_vars_are_refused() {
+        let env = (0..101)
+            .map(|i| (format!("VAR_{i}"), "val".into()))
+            .collect();
+        assert_eq!(
+            refusal_of(&env),
+            (
+                "Too many environment variables: 101 (max 100)".to_string(),
+                "env_var_error"
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::empty("", "val", "Invalid environment variable name length: 0 (max 256)")]
+    #[case::name_of_257_bytes(
+        &"A".repeat(257),
+        "val",
+        "Invalid environment variable name length: 257 (max 256)"
+    )]
+    #[case::value_of_4097_bytes(
+        "FOO",
+        &"x".repeat(4097),
+        "Environment variable value too large: 4097 bytes (max 4096)"
+    )]
+    fn test_env_var_of_a_refused_size(
+        #[case] name: &str,
+        #[case] value: &str,
+        #[case] message: &str,
+    ) {
+        assert_eq!(refusal(name, value), (message.to_string(), "env_var_error"));
     }
 
     #[rstest]
@@ -387,38 +369,54 @@ mod tests {
     }
 
     #[test]
-    fn test_prepend_strips_bom_shebang() {
-        let result = prepend_env_vars(
-            Language::Raw,
-            "\u{FEFF}#!/bin/sh\necho hello",
-            &HashMap::new(),
-        );
-        assert!(result.contains("mktemp"));
-    }
-
-    #[test]
     fn test_prepend_no_bom_unchanged() {
         let result = prepend_env_vars(Language::Python, "print('hello')", &HashMap::new());
         assert_eq!(result, "print('hello')");
     }
 
+    // The whole text of a shebang exec: the code goes to a temporary file through a quoted
+    // heredoc (no expansion of $VAR or `cmd`), the file runs, and its status is the exec's
+    // (`( exit $_sec )`: a bare `exit` would end the REPL). No line starts with a space
     #[test]
-    fn test_prepend_shebang_wraps_tempfile() {
-        let code = "#!/usr/bin/awk -f\nBEGIN{print}";
-        let result = prepend_env_vars(Language::Raw, code, &HashMap::new());
-        assert!(result.contains("mktemp"));
-        assert!(result.contains("cat >"));
-        assert!(result.contains("chmod +x"));
-        assert!(result.contains("#!/usr/bin/awk -f\nBEGIN{print}"));
+    fn test_prepend_shebang_runs_the_code_from_a_temporary_file() {
+        let result = prepend_env_vars(Language::Raw, "#!/bin/sh\necho $VAR `cmd`", &HashMap::new());
+        assert_eq!(
+            result,
+            concat!(
+                "_sf=$(mktemp /tmp/exec_XXXXXX) || { printf 'exec-sandbox: mktemp failed\\n' >&2; exit 126; }\n",
+                "cat > \"$_sf\" <<'_EXEC_SANDBOX_EOF_'\n",
+                "#!/bin/sh\n",
+                "echo $VAR `cmd`\n",
+                "_EXEC_SANDBOX_EOF_\n",
+                "chmod +x \"$_sf\"\n",
+                "\"$_sf\"\n",
+                "_sec=$?\n",
+                "rm -f \"$_sf\"\n",
+                "( exit $_sec )\n",
+            )
+        );
     }
 
     #[test]
-    fn test_prepend_shebang_with_env_vars() {
+    fn test_prepend_strips_bom_shebang() {
+        let code = "#!/bin/sh\necho hello";
+        assert_eq!(
+            prepend_env_vars(Language::Raw, &format!("\u{FEFF}{code}"), &HashMap::new()),
+            prepend_env_vars(Language::Raw, code, &HashMap::new())
+        );
+    }
+
+    #[test]
+    fn test_prepend_shebang_with_env_vars_exports_them_first() {
         let env = HashMap::from([("FOO".to_string(), "bar".to_string())]);
-        let result = prepend_env_vars(Language::Raw, "#!/bin/sh\necho $FOO", &env);
-        let export_pos = result.find("export FOO='bar'").unwrap();
-        let mktemp_pos = result.find("mktemp").unwrap();
-        assert!(export_pos < mktemp_pos);
+        let code = "#!/bin/sh\necho $FOO";
+        assert_eq!(
+            prepend_env_vars(Language::Raw, code, &env),
+            format!(
+                "export FOO='bar'\n{}",
+                prepend_env_vars(Language::Raw, code, &HashMap::new())
+            )
+        );
     }
 
     #[test]
@@ -431,33 +429,33 @@ mod tests {
     fn test_prepend_no_shebang_with_env() {
         let env = HashMap::from([("X".to_string(), "1".to_string())]);
         let result = prepend_env_vars(Language::Raw, "echo $X", &env);
-        assert!(result.contains("export X='1'"));
-        assert!(result.contains("echo $X"));
-        assert!(!result.contains("mktemp"));
+        assert_eq!(result, "export X='1'\necho $X");
     }
 
-    #[test]
-    fn test_prepend_shebang_sentinel_no_collision_substring() {
-        // Sentinel as a substring of a line should NOT trigger collision avoidance
-        let code = "#!/bin/sh\necho _EXEC_SANDBOX_EOF_";
+    // The heredoc's end word: one X more while a line of the code is that word (a word
+    // inside a line is no end)
+    #[rstest]
+    #[case::inside_a_line("#!/bin/sh\necho _EXEC_SANDBOX_EOF_", "_EXEC_SANDBOX_EOF_")]
+    #[case::a_line("#!/bin/sh\n_EXEC_SANDBOX_EOF_", "_EXEC_SANDBOX_EOF_X")]
+    #[case::a_line_and_inside_a_line(
+        "#!/bin/sh\n_EXEC_SANDBOX_EOF_\necho _EXEC_SANDBOX_EOF_X",
+        "_EXEC_SANDBOX_EOF_X"
+    )]
+    #[case::two_lines(
+        "#!/bin/sh\n_EXEC_SANDBOX_EOF_\n_EXEC_SANDBOX_EOF_X",
+        "_EXEC_SANDBOX_EOF_XX"
+    )]
+    fn test_prepend_shebang_heredoc_word_is_no_line_of_the_code(
+        #[case] code: &str,
+        #[case] word: &str,
+    ) {
         let result = prepend_env_vars(Language::Raw, code, &HashMap::new());
-        assert!(result.contains("<<'_EXEC_SANDBOX_EOF_'"));
-    }
-
-    #[test]
-    fn test_prepend_shebang_sentinel_collision_own_line() {
-        // Sentinel on its own line MUST trigger collision avoidance
-        let code = "#!/bin/sh\n_EXEC_SANDBOX_EOF_";
-        let result = prepend_env_vars(Language::Raw, code, &HashMap::new());
-        assert!(result.contains("_EXEC_SANDBOX_EOF_X"));
-    }
-
-    #[test]
-    fn test_prepend_shebang_sentinel_double_collision() {
-        let code = "#!/bin/sh\n_EXEC_SANDBOX_EOF_\necho _EXEC_SANDBOX_EOF_X";
-        let result = prepend_env_vars(Language::Raw, code, &HashMap::new());
-        // First sentinel collides, appends X. Second sentinel is a substring, not own line.
-        assert!(result.contains("<<'_EXEC_SANDBOX_EOF_X'"));
+        let lines: Vec<&str> = result.lines().collect();
+        let end = 2 + code.lines().count(); // the line after the code
+        assert_eq!(
+            (lines[1], lines[end]),
+            (format!("cat > \"$_sf\" <<'{word}'").as_str(), word)
+        );
     }
 
     #[test]
@@ -467,76 +465,25 @@ mod tests {
         assert_eq!(result, code);
     }
 
-    #[test]
-    fn test_prepend_shebang_quoted_heredoc() {
-        let code = "#!/bin/sh\necho $VAR `cmd`";
-        let result = prepend_env_vars(Language::Raw, code, &HashMap::new());
-        assert!(result.contains("<<'_EXEC_SANDBOX_EOF_'"));
-    }
-
-    #[test]
-    fn test_prepend_shebang_no_leading_whitespace() {
-        let code = "#!/bin/sh\necho hi";
-        let result = prepend_env_vars(Language::Raw, code, &HashMap::new());
-        for (i, line) in result.lines().enumerate() {
-            assert!(
-                !line.starts_with(' ') && !line.starts_with('\t'),
-                "line {} has leading whitespace: {:?}",
-                i,
-                line,
-            );
-        }
-    }
-
-    #[test]
-    fn test_prepend_shebang_mktemp_guard() {
-        let code = "#!/bin/sh\necho hi";
-        let result = prepend_env_vars(Language::Raw, code, &HashMap::new());
-        assert!(result.contains("|| {") && result.contains("exit 126"));
-    }
-
-    #[test]
-    fn test_prepend_python_single_quote_escape() {
-        let env = HashMap::from([("KEY".into(), "it's".into())]);
-        let result = prepend_env_vars(Language::Python, "x=1", &env);
-        assert!(result.contains("it\\'s"));
-    }
-
-    #[test]
-    fn test_prepend_python_backslash_escape() {
-        let env = HashMap::from([("KEY".into(), "C:\\path".into())]);
-        let result = prepend_env_vars(Language::Python, "x=1", &env);
-        assert!(result.contains("C:\\\\path"));
-    }
-
-    #[test]
-    fn test_prepend_js_single_quote_escape() {
-        let env = HashMap::from([("KEY".into(), "it's".into())]);
-        let result = prepend_env_vars(Language::Javascript, "x=1", &env);
-        assert!(result.contains("it\\'s"));
-    }
-
     // A key and a value that both hold ' and \ (both pass the env checks): the whole
-    // preamble, so a key that is not quoted (or a value quoted twice) fails here
+    // code, so a key that is not quoted, a value quoted twice or quoted user code fails here
     #[test]
     fn test_prepend_python_quotes_key_and_value() {
         let env = HashMap::from([("a'b\\c".into(), "it's\\x".into())]);
-        let result = prepend_env_vars(Language::Python, "x=1", &env);
-        assert!(
-            result.starts_with(
-                "import os as __os__\n__os__.environ['a\\'b\\\\c']='it\\'s\\\\x'\ndel __os__\n"
-            ),
-            "{result}"
+        let result = prepend_env_vars(Language::Python, "print('x')", &env);
+        assert_eq!(
+            result,
+            "import os as __os__\n__os__.environ['a\\'b\\\\c']='it\\'s\\\\x'\ndel __os__\nprint('x')"
         );
     }
 
     #[test]
     fn test_prepend_js_quotes_key_and_value() {
         let env = HashMap::from([("a'b\\c".into(), "it's\\x".into())]);
-        let result = prepend_env_vars(Language::Javascript, "x=1", &env);
-        assert!(
-            result.starts_with("process.env['a\\'b\\\\c']='it\\'s\\\\x';\n"),
-            "{result}"
+        let result = prepend_env_vars(Language::Javascript, "console.log('x')", &env);
+        assert_eq!(
+            result,
+            "process.env['a\\'b\\\\c']='it\\'s\\\\x';\nconsole.log('x')"
         );
     }
 
@@ -544,20 +491,15 @@ mod tests {
     fn test_prepend_raw_single_quote_escape() {
         let env = HashMap::from([("KEY".into(), "it's".into())]);
         let result = prepend_env_vars(Language::Raw, "echo hi", &env);
-        assert!(result.contains("'\"'\"'"));
+        assert_eq!(result, "export KEY='it'\"'\"'s'\necho hi");
     }
 
-    #[test]
-    fn test_prepend_raw_skip_space_in_key() {
-        let env = HashMap::from([("BAD KEY".into(), "val".into())]);
-        let result = prepend_env_vars(Language::Raw, "echo hi", &env);
-        assert!(!result.contains("export BAD KEY"));
-    }
-
-    #[test]
-    fn test_prepend_raw_skip_digit_start_key() {
-        let env = HashMap::from([("1KEY".into(), "val".into())]);
-        let result = prepend_env_vars(Language::Raw, "echo hi", &env);
-        assert!(!result.contains("export 1KEY"));
+    #[rstest]
+    #[case::space("BAD KEY")]
+    #[case::digit_first("1KEY")]
+    #[case::dash("A-B")]
+    fn test_prepend_raw_skips_a_key_that_is_no_shell_name(#[case] key: &str) {
+        let env = HashMap::from([(key.to_string(), "val".to_string())]);
+        assert_eq!(prepend_env_vars(Language::Raw, "echo hi", &env), "echo hi");
     }
 }

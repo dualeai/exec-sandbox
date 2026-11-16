@@ -228,12 +228,4 @@ mod tests {
         unsafe { libc::open(bad.as_ptr(), libc::O_RDONLY) };
         assert_eq!(last_errno(), 2); // ENOENT
     }
-
-    #[test]
-    #[serial]
-    fn last_errno_after_failed_chmod() {
-        let bad = CString::new("/nonexistent_path_xxxxx").unwrap();
-        unsafe { libc::chmod(bad.as_ptr(), 0) };
-        assert_eq!(last_errno(), 2); // ENOENT
-    }
 }

@@ -57,11 +57,16 @@ pub(crate) const MAX_PACKAGE_NAME_LENGTH: usize = 214;
 pub(crate) const FLUSH_INTERVAL_MS: u64 = 50;
 pub(crate) const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB
 
-// Output size limits (guest-enforced). Exceeding either raises CmdError::output_limit
-// to the host (InvalidInputError OUTPUT_LIMIT in Python). The REPL is preserved for
-// session reuse.
+// Output size limits (guest-enforced). Exceeding either ends the exec with
+// CmdError::output_limit (InvalidInputError OUTPUT_LIMIT in Python), but a timeout and
+// exit code 137 keep their own result. The REPL serves the next exec, unless it exited
+// (the message then ends with its exit code).
 pub(crate) const MAX_STDOUT_BYTES: usize = 1_000_000; // 1 MB
 pub(crate) const MAX_STDERR_BYTES: usize = 100_000; // 100 KB
+// Bytes of one read of the exec's stdout and stderr pipes. stdout goes out up to its cap,
+// stderr up to its cap and the lines of the read that crosses it: the host stops a stream
+// past its cap and one read (GUEST_OUTPUT_READ_BYTES in Python, the same value).
+pub(crate) const OUTPUT_READ_BYTES: usize = 8192;
 
 // File I/O limits
 pub(crate) const MAX_FILE_SIZE_BYTES: usize = 500 * 1024 * 1024; // 500 MiB

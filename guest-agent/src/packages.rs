@@ -376,55 +376,82 @@ mod tests {
     }
 
     #[rstest]
-    #[case("pandas==2.0.0", true)]
-    #[case("lodash@4.17.21", true)]
-    #[case("numpy>=1.0,<2.0", true)]
-    #[case("a==1", true)]
-    #[case("pkg~=2.0", true)]
-    #[case("lodash@~4.17", true)]
-    #[case("lodash@^4.0.0", true)]
-    fn test_validate_package_name_valid(#[case] name: &str, #[case] valid: bool) {
-        assert_eq!(validate_package_name(name).is_ok(), valid);
+    #[case("pandas==2.0.0")]
+    #[case("lodash@4.17.21")]
+    #[case("numpy>=1.0,<2.0")]
+    #[case("a==1")]
+    #[case("pkg~=2.0")]
+    #[case("lodash@~4.17")]
+    #[case("lodash@^4.0.0")]
+    fn test_validate_package_name_valid(#[case] spec: &str) {
+        assert_eq!(validate_package_name(spec), Ok(()));
     }
 
+    // Each refused spec with the reason of the check that refuses it first
     #[rstest]
-    #[case("", false)]
-    #[case("pandas", false)] // no version specifier
-    #[case("../evil==1.0", false)] // path traversal
-    #[case("pkg/../../etc==1.0", false)] // slash in name
-    #[case("pkg\x00==1.0", false)] // null byte
-    #[case("pkg\x01==1.0", false)] // control char
-    #[case("pkg\\path==1.0", false)] // backslash
-    #[case("numpy=", false)] // empty version after operator
-    #[case("numpy==", false)] // only operators, no version
-    #[case("a@/etc/passwd", false)] // local-path injection via slash in version
-    fn test_validate_package_name_invalid(#[case] name: &str, #[case] valid: bool) {
-        assert_eq!(validate_package_name(name).is_ok(), valid);
-    }
-
+    #[case("", "Package name cannot be empty")]
+    #[case(
+        "../evil==1.0",
+        "Invalid package name: '../evil==1.0' (path characters not allowed)"
+    )]
+    #[case(
+        "pkg/../../etc==1.0",
+        "Invalid package name: 'pkg/../../etc==1.0' (path characters not allowed)"
+    )]
+    #[case::no_version_operator(
+        "pandas",
+        "Invalid package name: 'pandas' (contains invalid characters)"
+    )]
+    #[case::operator_first("==1.0", "Invalid package name: '==1.0' (contains invalid characters)")]
+    #[case::empty_version(
+        "numpy=",
+        "Invalid package specifier: 'numpy=' (empty version after operator)"
+    )]
+    #[case::only_operators(
+        "numpy==",
+        "Invalid package specifier: 'numpy==' (empty version after operator)"
+    )]
     // Specs that pass every earlier check: only the name's or the version's character set
     // refuses them
-    #[rstest]
-    #[case("pa$ndas==1")] // a name character outside [a-zA-Z0-9_.-]
-    #[case("pandas==1.0;id")] // a version character outside its set (a shell separator)
-    #[case("pandas==1.0|x")]
-    fn test_validate_package_name_character_sets(#[case] spec: &str) {
+    #[case::null_byte(
+        "pkg\x00==1.0",
+        "Invalid package name: 'pkg\x00==1.0' (contains invalid characters)"
+    )]
+    #[case::control_character(
+        "pkg\x01==1.0",
+        "Invalid package name: 'pkg\x01==1.0' (contains invalid characters)"
+    )]
+    #[case::backslash(
+        "pkg\\path==1.0",
+        "Invalid package name: 'pkg\\path==1.0' (contains invalid characters)"
+    )]
+    #[case::dollar_in_name(
+        "pa$ndas==1",
+        "Invalid package name: 'pa$ndas==1' (contains invalid characters)"
+    )]
+    #[case::shell_separator_in_version(
+        "pandas==1.0;id",
+        "Invalid package name: 'pandas==1.0;id' (contains invalid characters)"
+    )]
+    #[case::pipe_in_version(
+        "pandas==1.0|x",
+        "Invalid package name: 'pandas==1.0|x' (contains invalid characters)"
+    )]
+    #[case::slash_in_version(
+        "a@/etc/passwd",
+        "Invalid package name: 'a@/etc/passwd' (contains invalid characters)"
+    )] // a local path
+    fn test_validate_package_name_invalid(#[case] spec: &str, #[case] reason: &str) {
+        assert_eq!(validate_package_name(spec), Err(reason.to_string()));
+    }
+
+    #[test]
+    fn test_validate_package_name_of_214_bytes_is_valid_one_byte_more_is_not() {
+        let longest = format!("{}==1.0", "a".repeat(209));
+        assert_eq!(validate_package_name(&longest), Ok(()));
         assert_eq!(
-            validate_package_name(spec).unwrap_err(),
-            format!("Invalid package name: '{spec}' (contains invalid characters)")
+            validate_package_name(&format!("{longest}0")),
+            Err("Package name too long: 215 bytes (max 214)".to_string())
         );
-    }
-
-    #[test]
-    fn test_validate_package_name_exactly_max_length() {
-        let name = format!("{}==1.0", "a".repeat(MAX_PACKAGE_NAME_LENGTH - 5));
-        // "==1.0" is 5 chars, so total = MAX_PACKAGE_NAME_LENGTH
-        assert!(validate_package_name(&name).is_ok());
-    }
-
-    #[test]
-    fn test_validate_package_name_exceeds_max_length() {
-        let name = format!("{}==1.0", "a".repeat(MAX_PACKAGE_NAME_LENGTH));
-        assert!(validate_package_name(&name).is_err());
     }
 }

@@ -364,43 +364,9 @@ mod tests {
     // Response serialization
     // -------------------------------------------------------------------------
 
-    // Each response as a whole JSON value (field names and values): the host's models read
-    // these names (src/exec_sandbox/guest_agent_protocol.py)
-    #[test]
-    fn test_serialize_file_write_ack() {
-        let ack = GuestResponse::FileWriteAck {
-            path: "test.txt".to_string(),
-            bytes_written: 42,
-        };
-        assert_eq!(
-            serde_json::to_value(&ack).unwrap(),
-            serde_json::json!({"type": "file_write_ack", "path": "test.txt", "bytes_written": 42})
-        );
-    }
-
-    #[test]
-    fn test_serialize_file_chunk_response() {
-        let chunk = GuestResponse::FileChunk {
-            data: "SGVsbG8=".to_string(),
-        };
-        assert_eq!(
-            serde_json::to_value(&chunk).unwrap(),
-            serde_json::json!({"type": "file_chunk", "data": "SGVsbG8="})
-        );
-    }
-
-    #[test]
-    fn test_serialize_file_read_complete() {
-        let msg = GuestResponse::FileReadComplete {
-            path: "data.csv".to_string(),
-            size: 1024,
-        };
-        assert_eq!(
-            serde_json::to_value(&msg).unwrap(),
-            serde_json::json!({"type": "file_read_complete", "path": "data.csv", "size": 1024})
-        );
-    }
-
+    // A response as a whole JSON value (field names and values): the host's models read
+    // these names (src/exec_sandbox/guest_agent_protocol.py). The other responses, as the
+    // agent sends them: error.rs (response_writer_adds_the_op_id_to_each_message)
     #[test]
     fn test_serialize_file_list() {
         let list = GuestResponse::FileList {

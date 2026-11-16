@@ -55,7 +55,8 @@ impl ErrorType {
 ///
 /// Two variants mirror the h2 crate's stream-error vs connection-error pattern:
 /// - `Reply`: non-fatal — send error response to host, continue with next command.
-/// - `Fatal`: connection-level — write queue closed or port I/O failure, drop connection.
+/// - `Fatal`: connection-level — the write queue closed (its task stops at a port write
+///   error) or a message did not serialize: drop the connection.
 #[derive(Debug)]
 pub(crate) enum CmdError {
     Reply {
@@ -123,8 +124,8 @@ impl CmdError {
     }
 }
 
-impl From<mpsc::error::SendError<Vec<u8>>> for CmdError {
-    fn from(_: mpsc::error::SendError<Vec<u8>>) -> Self {
+impl<T> From<mpsc::error::SendError<T>> for CmdError {
+    fn from(_: mpsc::error::SendError<T>) -> Self {
         Self::Fatal("Write queue closed".into())
     }
 }
@@ -143,6 +144,28 @@ struct Frame<'a> {
     op_id: Option<&'a str>,
 }
 
+/// The line of `msg` with `op_id`: its JSON and a newline.
+fn line_of(msg: &GuestResponse, op_id: Option<&str>) -> Result<Vec<u8>, CmdError> {
+    let mut bytes =
+        serde_json::to_vec(&Frame { msg, op_id }).map_err(|e| CmdError::Fatal(e.into()))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// A reserved slot of a ResponseWriter's queue (ResponseWriter::reserve).
+pub(crate) struct ResponsePermit<'a> {
+    permit: mpsc::Permit<'a, Vec<u8>>,
+    op_id: Option<&'a str>,
+}
+
+impl ResponsePermit<'_> {
+    /// Queue `msg` (with the writer's op_id) in the reserved slot: no wait.
+    pub(crate) fn send(self, msg: &GuestResponse) -> Result<(), CmdError> {
+        self.permit.send(line_of(msg, self.op_id)?);
+        Ok(())
+    }
+}
+
 /// Wraps a write channel and the optional `op_id` of a request. Every message
 /// sent through this writer gets that `op_id` in its JSON.
 pub(crate) struct ResponseWriter {
@@ -157,14 +180,20 @@ impl ResponseWriter {
 
     /// Serialize `msg` to JSON with the `op_id` field, append newline, and queue for sending.
     pub(crate) async fn send(&self, msg: &GuestResponse) -> Result<(), CmdError> {
-        let frame = Frame {
-            msg,
-            op_id: self.op_id.as_deref(),
-        };
-        let mut bytes = serde_json::to_vec(&frame).map_err(|e| CmdError::Fatal(e.into()))?;
-        bytes.push(b'\n');
-        self.write_tx.send(bytes).await?;
+        self.write_tx
+            .send(line_of(msg, self.op_id.as_deref())?)
+            .await?;
         Ok(())
+    }
+
+    /// A slot in the write queue, for a send that a cancel cannot cut: a cancel while it
+    /// waits (an exec's deadline) loses no message, and the slot's send does not wait.
+    pub(crate) async fn reserve(&self) -> Result<ResponsePermit<'_>, CmdError> {
+        let permit = self.write_tx.reserve().await?;
+        Ok(ResponsePermit {
+            permit,
+            op_id: self.op_id.as_deref(),
+        })
     }
 
     /// Build and send an Error response using the writer's `op_id`.
@@ -466,112 +495,44 @@ mod tests {
         assert_eq!(exit_code_from_status(ExitStatus::from_raw(137 << 8)), 137);
     }
 
-    #[test]
-    fn test_cmd_error_env_var() {
-        let err = CmdError::env_var("blocked env var");
-        match err {
-            CmdError::Reply {
-                message,
-                error_type,
-            } => {
-                assert_eq!(message, "blocked env var");
-                assert_eq!(error_type, "env_var_error");
-            }
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
-    #[test]
-    fn test_cmd_error_code() {
-        let err = CmdError::code("code too large");
-        match err {
-            CmdError::Reply {
-                message,
-                error_type,
-            } => {
-                assert_eq!(message, "code too large");
-                assert_eq!(error_type, "code_error");
-            }
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
-    #[test]
-    fn test_cmd_error_path() {
-        let err = CmdError::path("path traversal");
-        match err {
-            CmdError::Reply {
-                message,
-                error_type,
-            } => {
-                assert_eq!(message, "path traversal");
-                assert_eq!(error_type, "path_error");
-            }
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
-    #[test]
-    fn test_cmd_error_package() {
-        let err = CmdError::package("invalid package name");
-        match err {
-            CmdError::Reply {
-                message,
-                error_type,
-            } => {
-                assert_eq!(message, "invalid package name");
-                assert_eq!(error_type, "package_error");
-            }
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
-    #[test]
-    fn test_cmd_error_io() {
-        let err = CmdError::io("disk full");
-        match err {
-            CmdError::Reply {
-                message,
-                error_type,
-            } => {
-                assert_eq!(message, "disk full");
-                assert_eq!(error_type, "io_error");
-            }
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
-    #[test]
-    fn test_cmd_error_timeout() {
-        let err = CmdError::timeout("took too long");
-        match err {
-            CmdError::Reply { error_type, .. } => assert_eq!(error_type, "timeout_error"),
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
-    #[test]
-    fn test_cmd_error_execution() {
-        let err = CmdError::execution("spawn failed");
-        match err {
-            CmdError::Reply { error_type, .. } => assert_eq!(error_type, "execution_error"),
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
-    #[test]
-    fn test_cmd_error_output_limit() {
-        let err = CmdError::output_limit("stdout 1200000 bytes exceeds 1000000 limit");
-        match err {
-            CmdError::Reply {
-                message,
-                error_type,
-            } => {
-                assert!(message.contains("1200000"));
-                assert_eq!(error_type, "output_limit_error");
-            }
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
+    // Each constructor: a reply with the message as given and its wire error type
+    #[rstest::rstest]
+    #[case(
+        CmdError::env_var("blocked env var"),
+        "blocked env var",
+        "env_var_error"
+    )]
+    #[case(CmdError::code("code too large"), "code too large", "code_error")]
+    #[case(CmdError::path("path traversal"), "path traversal", "path_error")]
+    #[case(
+        CmdError::package("invalid package name"),
+        "invalid package name",
+        "package_error"
+    )]
+    #[case(CmdError::io("disk full"), "disk full", "io_error")]
+    #[case(CmdError::timeout("took too long"), "took too long", "timeout_error")]
+    #[case(CmdError::execution("spawn failed"), "spawn failed", "execution_error")]
+    #[case(
+        CmdError::output_limit("stdout 1200000 bytes exceeds 1000000 limit"),
+        "stdout 1200000 bytes exceeds 1000000 limit",
+        "output_limit_error"
+    )]
+    fn test_cmd_error_constructor_is_a_reply(
+        #[case] error: CmdError,
+        #[case] expected_message: &str,
+        #[case] expected_type: &str,
+    ) {
+        let CmdError::Reply {
+            message,
+            error_type,
+        } = error
+        else {
+            panic!("expected Reply");
+        };
+        assert_eq!(
+            (message.as_str(), error_type),
+            (expected_message, expected_type)
+        );
     }
 
     #[test]
@@ -591,7 +552,7 @@ mod tests {
     #[test]
     fn test_cmd_error_from_send_error() {
         // A closed write queue ends the connection: Fatal, never a reply
-        let err: CmdError = mpsc::error::SendError(vec![]).into();
+        let err: CmdError = mpsc::error::SendError(Vec::<u8>::new()).into();
         assert!(matches!(&err, CmdError::Fatal(e) if e.to_string() == "Write queue closed"));
     }
 
@@ -599,163 +560,130 @@ mod tests {
     // ResponseWriter
     // -------------------------------------------------------------------------
 
-    /// Helper: send a message through ResponseWriter and return the JSON value.
-    async fn writer_send_json(op_id: Option<&str>, msg: &GuestResponse) -> serde_json::Value {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
-        let writer = ResponseWriter::new(tx, op_id.map(String::from));
-        writer.send(msg).await.unwrap();
+    /// A ResponseWriter of `op_id`, and the receiver of the lines it queues.
+    fn writer_of(op_id: Option<&str>) -> (ResponseWriter, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        (ResponseWriter::new(tx, op_id.map(String::from)), rx)
+    }
+
+    /// The JSON value of the only line in `rx` (its writer dropped). The host reads the
+    /// event port line by line: one newline, at the end.
+    async fn only_line(mut rx: mpsc::Receiver<Vec<u8>>) -> serde_json::Value {
         let bytes = rx.recv().await.unwrap();
-        // strip trailing newline
-        let json_bytes = &bytes[..bytes.len() - 1];
+        assert_eq!(rx.recv().await, None, "one line per message");
+        let (last, json_bytes) = bytes.split_last().unwrap();
+        assert_eq!(*last, b'\n');
+        assert!(!json_bytes.contains(&b'\n'), "{bytes:?}");
         serde_json::from_slice(json_bytes).unwrap()
+    }
+
+    /// Send `msg` through a ResponseWriter of `op_id`: the JSON value of its line.
+    async fn writer_send_json(op_id: Option<&str>, msg: &GuestResponse) -> serde_json::Value {
+        let (writer, rx) = writer_of(op_id);
+        writer.send(msg).await.unwrap();
+        drop(writer);
+        only_line(rx).await
     }
 
     const PONG: GuestResponse = GuestResponse::Pong { version: "1.0" };
 
+    // Each message gets the op_id of its request next to its own fields: the host matches
+    // each reply, chunk and end of a transfer by it
+    #[rstest::rstest]
+    #[case(PONG, serde_json::json!({"type": "pong", "version": "1.0"}))]
+    #[case(
+        GuestResponse::Stdout { chunk: "hello\n".into() },
+        serde_json::json!({"type": "stdout", "chunk": "hello\n"})
+    )]
+    #[case(
+        GuestResponse::Stderr { chunk: "oops".into() },
+        serde_json::json!({"type": "stderr", "chunk": "oops"})
+    )]
+    #[case(
+        GuestResponse::Complete { exit_code: 0, execution_time_ms: 100, spawn_ms: None, process_ms: None },
+        serde_json::json!({"type": "complete", "exit_code": 0, "execution_time_ms": 100})
+    )]
+    #[case(
+        GuestResponse::Complete { exit_code: 1, execution_time_ms: 100, spawn_ms: Some(3), process_ms: Some(90) },
+        serde_json::json!({"type": "complete", "exit_code": 1, "execution_time_ms": 100, "spawn_ms": 3, "process_ms": 90})
+    )]
+    #[case(
+        GuestResponse::FileList { entries: vec![] },
+        serde_json::json!({"type": "file_list", "entries": []})
+    )]
+    #[case(
+        GuestResponse::WarmReplAck { status: "ok".into(), message: None },
+        serde_json::json!({"type": "warm_repl_ack", "status": "ok"})
+    )]
+    #[case(
+        GuestResponse::WarmReplAck { status: "error".into(), message: Some("no".into()) },
+        serde_json::json!({"type": "warm_repl_ack", "status": "error", "message": "no"})
+    )]
+    #[case(
+        GuestResponse::FileWriteAck { path: "f.txt".into(), bytes_written: 42 },
+        serde_json::json!({"type": "file_write_ack", "path": "f.txt", "bytes_written": 42})
+    )]
+    #[case(
+        GuestResponse::FileChunk { data: "SGVsbG8=".into() },
+        serde_json::json!({"type": "file_chunk", "data": "SGVsbG8="})
+    )]
+    #[case(
+        GuestResponse::FileReadComplete { path: "f.txt".into(), size: 100 },
+        serde_json::json!({"type": "file_read_complete", "path": "f.txt", "size": 100})
+    )]
     #[tokio::test]
-    async fn response_writer_inject_op_id_into_pong() {
-        let val = writer_send_json(Some("abc"), &PONG).await;
-        assert_eq!(val["op_id"], "abc");
-        assert_eq!(val["type"], "pong");
+    async fn response_writer_adds_the_op_id_to_each_message(
+        #[case] msg: GuestResponse,
+        #[case] fields: serde_json::Value,
+    ) {
+        let mut expected = fields.clone();
+        expected["op_id"] = "abc".into();
+        assert_eq!(writer_send_json(Some("abc"), &msg).await, expected);
+        // A request with no op_id: no op_id field, the message's own fields only
+        assert_eq!(writer_send_json(None, &msg).await, fields);
     }
 
+    #[rstest::rstest]
+    #[case::with_op_id(Some("abc"), serde_json::json!({"type": "stdout", "chunk": "x", "op_id": "abc"}))]
+    #[case::without(None, serde_json::json!({"type": "stdout", "chunk": "x"}))]
     #[tokio::test]
-    async fn response_writer_inject_op_id_into_stdout() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::Stdout {
-                chunk: "hello".into(),
-            },
-        )
-        .await;
-        assert_eq!(val["op_id"], "abc");
-    }
-
-    #[tokio::test]
-    async fn response_writer_inject_op_id_into_stderr() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::Stderr {
-                chunk: "oops".into(),
-            },
-        )
-        .await;
-        assert_eq!(val["op_id"], "abc");
-    }
-
-    #[tokio::test]
-    async fn response_writer_inject_op_id_into_complete() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::Complete {
-                exit_code: 0,
-                execution_time_ms: 100,
-                spawn_ms: None,
-                process_ms: None,
-            },
-        )
-        .await;
-        assert_eq!(val["op_id"], "abc");
-    }
-
-    #[tokio::test]
-    async fn response_writer_inject_op_id_into_file_list() {
-        let val = writer_send_json(Some("abc"), &GuestResponse::FileList { entries: vec![] }).await;
-        assert_eq!(val["op_id"], "abc");
-    }
-
-    #[tokio::test]
-    async fn response_writer_inject_op_id_into_warm_repl_ack() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::WarmReplAck {
-                status: "ok".into(),
-                message: None,
-            },
-        )
-        .await;
-        assert_eq!(val["op_id"], "abc");
-    }
-
-    #[tokio::test]
-    async fn response_writer_inject_op_id_into_file_transfer_messages() {
-        // The host matches each chunk and the end of a transfer by this op_id
-        for msg in [
-            GuestResponse::FileWriteAck {
-                path: "f.txt".into(),
-                bytes_written: 42,
-            },
-            GuestResponse::FileChunk {
-                data: "SGVsbG8=".into(),
-            },
-            GuestResponse::FileReadComplete {
-                path: "f.txt".into(),
-                size: 100,
-            },
-        ] {
-            let val = writer_send_json(Some("abc"), &msg).await;
-            assert_eq!(val["op_id"], "abc", "{msg:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn response_writer_no_op_id_writer_produces_no_op_id() {
-        let val = writer_send_json(None, &PONG).await;
-        assert!(val.get("op_id").is_none());
-    }
-
-    #[tokio::test]
-    async fn response_writer_send_error() {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
-        let writer = ResponseWriter::new(tx, Some("abc".into()));
-        writer.send_error("boom".into(), "io_error").await.unwrap();
-        let bytes = rx.recv().await.unwrap();
-        let val: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
-        assert_eq!(val["type"], "error");
-        assert_eq!(val["message"], "boom");
-        assert_eq!(val["error_type"], "io_error");
-        assert_eq!(val["op_id"], "abc");
-    }
-
-    #[tokio::test]
-    async fn response_writer_error_of_a_request_with_no_op_id_has_none() {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
-        let writer = ResponseWriter::new(tx, None);
-        writer
-            .send_error("bad".into(), "request_error")
-            .await
+    async fn a_reserved_slot_sends_with_the_op_id(
+        #[case] op_id: Option<&str>,
+        #[case] expected: serde_json::Value,
+    ) {
+        let (writer, rx) = writer_of(op_id);
+        let permit = writer.reserve().await.unwrap();
+        permit
+            .send(&GuestResponse::Stdout { chunk: "x".into() })
             .unwrap();
-        let bytes = rx.recv().await.unwrap();
-        let val: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
-        assert_eq!(
-            val,
-            serde_json::json!({"type": "error", "message": "bad", "error_type": "request_error"})
-        );
+        drop(writer);
+        assert_eq!(only_line(rx).await, expected);
     }
 
+    #[rstest::rstest]
+    #[case(Some("abc"), serde_json::json!({"type": "error", "message": "boom", "error_type": "io_error", "op_id": "abc"}))]
+    #[case(None, serde_json::json!({"type": "error", "message": "boom", "error_type": "io_error"}))]
     #[tokio::test]
-    async fn response_writer_special_chars_in_op_id() {
-        let val = writer_send_json(Some("a\"b\\c"), &PONG).await;
-        assert_eq!(val["op_id"], "a\"b\\c");
+    async fn response_writer_send_error(
+        #[case] op_id: Option<&str>,
+        #[case] expected: serde_json::Value,
+    ) {
+        let (writer, rx) = writer_of(op_id);
+        writer.send_error("boom".into(), "io_error").await.unwrap();
+        drop(writer);
+        assert_eq!(only_line(rx).await, expected);
     }
 
+    // The op_id comes back as the host sent it, whatever its text
+    #[rstest::rstest]
+    #[case::quote_and_backslash("a\"b\\c")]
+    #[case::unicode("日本語")]
+    #[case::long(&"x".repeat(1000))]
+    #[case::empty("")]
     #[tokio::test]
-    async fn response_writer_unicode_op_id() {
-        let val = writer_send_json(Some("日本語"), &PONG).await;
-        assert_eq!(val["op_id"], "日本語");
-    }
-
-    #[tokio::test]
-    async fn response_writer_long_op_id() {
-        let long_id = "x".repeat(1000);
-        let val = writer_send_json(Some(&long_id), &PONG).await;
-        assert_eq!(val["op_id"].as_str().unwrap().len(), 1000);
-    }
-
-    #[tokio::test]
-    async fn response_writer_empty_op_id() {
-        let val = writer_send_json(Some(""), &PONG).await;
-        assert_eq!(val["op_id"], "");
+    async fn response_writer_keeps_the_op_id_as_sent(#[case] op_id: &str) {
+        let val = writer_send_json(Some(op_id), &PONG).await;
+        assert_eq!(val["op_id"], op_id);
     }
 
     // -------------------------------------------------------------------------

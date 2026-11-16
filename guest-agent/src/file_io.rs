@@ -125,14 +125,12 @@ impl WriteEnd {
 // Path validation
 // ============================================================================
 
-/// Validate a relative file path and resolve it under SANDBOX_ROOT.
+/// Validate a relative file path and resolve it below SANDBOX_ROOT: the path
+/// below it, "" for SANDBOX_ROOT itself (an empty path too).
 ///
-/// An empty path is SANDBOX_ROOT. The check is lexical: it does not resolve
-/// symlinks (`open_beneath` resolves them and checks where they lead).
+/// The check is lexical: it does not resolve symlinks (`open_beneath` resolves
+/// them and checks where they lead).
 pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathBuf, String> {
-    if relative_path.is_empty() {
-        return Ok(std::path::PathBuf::from(SANDBOX_ROOT));
-    }
     if relative_path.len() > MAX_FILE_PATH_LENGTH {
         return Err(format!(
             "Path too long: {} chars (max {})",
@@ -150,11 +148,10 @@ pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathB
         return Err("Absolute paths are not allowed".to_string());
     }
 
-    let sandbox_root = std::path::PathBuf::from(SANDBOX_ROOT);
-    let mut resolved = sandbox_root.clone();
+    let mut resolved = std::path::PathBuf::new();
 
-    // `resolved` stays under SANDBOX_ROOT at each step (a ParentDir that would
-    // leave it is refused): no check at the end.
+    // `resolved` stays below SANDBOX_ROOT at each step (a ParentDir with no
+    // folder left to leave is refused): no check at the end.
     for component in std::path::Path::new(relative_path).components() {
         match component {
             std::path::Component::Normal(c) => {
@@ -168,8 +165,7 @@ pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathB
                 resolved.push(c);
             }
             std::path::Component::ParentDir => {
-                resolved.pop();
-                if !resolved.starts_with(&sandbox_root) {
+                if !resolved.pop() {
                     return Err("Path traversal outside sandbox".to_string());
                 }
             }
@@ -185,13 +181,6 @@ pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathB
 // ============================================================================
 // Resolution beneath the sandbox root
 // ============================================================================
-
-/// The part of a `validate_file_path` result below SANDBOX_ROOT ("" for the root).
-fn below_root(resolved: &Path) -> &Path {
-    resolved
-        .strip_prefix(SANDBOX_ROOT)
-        .unwrap_or_else(|_| Path::new(""))
-}
 
 /// Open `rel` below the folder `root`, with `flags`. Links resolve as the
 /// kernel resolves them, absolute ones too, so a link to another place in
@@ -315,10 +304,10 @@ fn beneath_error(path: &str, e: &std::io::Error, what: &str) -> CmdError {
 
 /// Handle read_file command: read from disk, stream as zstd-compressed chunks.
 pub(crate) async fn handle_read_file(path: &str, writer: &ResponseWriter) -> Result<(), CmdError> {
-    let resolved_path = validate_file_path(path)
+    let rel = validate_file_path(path)
         .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
-    if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+    if rel.as_os_str().is_empty() {
         return Err(CmdError::path("Cannot read a directory"));
     }
 
@@ -327,7 +316,7 @@ pub(crate) async fn handle_read_file(path: &str, writer: &ResponseWriter) -> Res
     // not hold the open (the read below refuses anything but a regular file).
     let fd = open_beneath(
         Path::new(SANDBOX_ROOT),
-        below_root(&resolved_path),
+        &rel,
         libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK,
     )
     .map_err(|e| beneath_error(path, &e, "File not found or inaccessible"))?;
@@ -383,7 +372,7 @@ pub(crate) async fn handle_read_file(path: &str, writer: &ResponseWriter) -> Res
 
 /// Handle list_files command: read directory entries.
 pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Result<(), CmdError> {
-    let resolved_path = validate_file_path(path)
+    let rel = validate_file_path(path)
         .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
     // The folder opened beneath SANDBOX_ROOT, then listed through its
@@ -391,7 +380,7 @@ pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Re
     // Entries are not followed: a link reports as a link (not a folder).
     let folder = open_beneath(
         Path::new(SANDBOX_ROOT),
-        below_root(&resolved_path),
+        &rel,
         libc::O_RDONLY | libc::O_DIRECTORY,
     )
     .map_err(|e| beneath_error(path, &e, "Cannot list"))?;
@@ -435,14 +424,13 @@ pub(crate) fn handle_write_file(
     path: &str,
     make_executable: bool,
 ) -> Result<ActiveWriteHandle, CmdError> {
-    let resolved_path = validate_file_path(path)
+    let rel = validate_file_path(path)
         .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
-    if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+    if rel.as_os_str().is_empty() {
         return Err(CmdError::path("Cannot write to sandbox root directory"));
     }
 
-    let rel = below_root(&resolved_path);
     let final_name = CString::new(rel.file_name().unwrap_or_default().as_bytes())
         .expect("validate_file_path refuses a NUL byte");
     let tmp_name = CString::new(format!(".wr.{op_id}.tmp"))
@@ -583,167 +571,64 @@ mod tests {
     // validate_file_path
     // -------------------------------------------------------------------------
 
-    #[test]
-    fn test_validate_file_path_basic() {
-        let result = validate_file_path("hello.txt");
-        assert!(result.is_ok());
+    // Each valid path and its place below the root ("": the root). Web encodings (fuzzdb)
+    // are literal names on Unix: a path below the sandbox root
+    #[rstest::rstest]
+    #[case("hello.txt", "hello.txt")]
+    #[case("subdir/data.csv", "subdir/data.csv")]
+    #[case("a/b/c/d/e.txt", "a/b/c/d/e.txt")]
+    #[case("subdir/../file.txt", "file.txt")]
+    #[case("a/b/../../c.txt", "c.txt")]
+    #[case("dir//file.txt", "dir/file.txt")]
+    #[case("subdir/", "subdir")]
+    #[case(".hidden", ".hidden")]
+    #[case("日本語.txt", "日本語.txt")]
+    #[case(".", "")]
+    #[case("subdir/..", "")]
+    #[case("", "")]
+    #[case::web_encoding("....//....//etc/passwd", "..../..../etc/passwd")]
+    #[case::web_encoding("..%2f..%2fetc/passwd", "..%2f..%2fetc/passwd")]
+    #[case::web_encoding("..\\..\\etc\\passwd", "..\\..\\etc\\passwd")]
+    fn test_validate_file_path_resolves_under_the_root(#[case] path: &str, #[case] resolved: &str) {
         assert_eq!(
-            result.unwrap(),
-            std::path::PathBuf::from("/home/user/hello.txt")
+            validate_file_path(path),
+            Ok(std::path::PathBuf::from(resolved))
         );
     }
 
+    // The traversal vectors, checked here where the rule lives (a lexical check, no file
+    // is opened); tests/test_file_io_security.py keeps one relative and one absolute
+    // vector for the host's error mapping
+    #[rstest::rstest]
+    #[case("../etc/passwd", "Path traversal outside sandbox")]
+    #[case("../../etc/shadow", "Path traversal outside sandbox")]
+    #[case("../../../root/.ssh/id_rsa", "Path traversal outside sandbox")]
+    #[case("subdir/../../etc/passwd", "Path traversal outside sandbox")]
+    #[case("subdir/../subdir/../../etc/passwd", "Path traversal outside sandbox")]
+    #[case("a/b/../../../etc/passwd", "Path traversal outside sandbox")]
+    #[case("../etc", "Path traversal outside sandbox")]
+    #[case("../../", "Path traversal outside sandbox")]
+    #[case("subdir/../../etc", "Path traversal outside sandbox")]
+    #[case("/etc/passwd", "Absolute paths are not allowed")]
+    #[case("/home/user/../../../etc/passwd", "Absolute paths are not allowed")]
+    #[case("/etc", "Absolute paths are not allowed")]
+    #[case("file\x00.txt", "Path contains null byte")]
+    #[case("file\x01name", "Path contains control character")]
+    fn test_validate_file_path_refuses(#[case] path: &str, #[case] reason: &str) {
+        assert_eq!(validate_file_path(path), Err(reason.to_string()));
+    }
+
     #[test]
-    fn test_validate_file_path_nested() {
-        let result = validate_file_path("subdir/data.csv");
-        assert!(result.is_ok());
+    fn test_validate_file_path_name_of_255_bytes_is_valid_one_byte_more_is_not() {
+        let longest = "a".repeat(255);
         assert_eq!(
-            result.unwrap(),
-            std::path::PathBuf::from("/home/user/subdir/data.csv")
+            validate_file_path(&longest),
+            Ok(std::path::PathBuf::from(&longest))
         );
-    }
-
-    #[test]
-    fn test_validate_file_path_deeply_nested() {
-        assert!(validate_file_path("a/b/c/d/e.txt").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_traversal_rejected() {
-        let result = validate_file_path("../etc/passwd");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("traversal"));
-    }
-
-    #[test]
-    fn test_validate_file_path_mid_path_traversal() {
-        assert!(validate_file_path("subdir/../../etc/shadow").is_err());
-    }
-
-    #[test]
-    fn test_validate_file_path_deep_traversal() {
-        assert!(validate_file_path("a/b/../../../etc/passwd").is_err());
-    }
-
-    #[test]
-    fn test_validate_file_path_absolute_rejected() {
-        let result = validate_file_path("/etc/passwd");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Absolute"));
-    }
-
-    // The host's traversal vectors (tests/test_file_io_security.py), checked here where the
-    // rule lives (a lexical check, no file is opened): each is refused
-    #[test]
-    fn test_validate_file_path_refuses_the_traversal_vectors() {
-        for path in [
-            "../etc/passwd",
-            "../../etc/shadow",
-            "../../../root/.ssh/id_rsa",
-            "subdir/../../etc/passwd",
-            "subdir/../subdir/../../etc/passwd",
-            "/etc/passwd",
-            "/home/user/../../../etc/passwd",
-            "../etc",
-            "../../",
-            "/etc",
-            "subdir/../../etc",
-        ] {
-            assert!(validate_file_path(path).is_err(), "{path}");
-        }
-    }
-
-    // Web encodings (fuzzdb) are literal names on Unix: a path under the sandbox root
-    #[test]
-    fn test_validate_file_path_web_encodings_are_literal_names() {
-        for (path, real) in [
-            ("....//....//etc/passwd", "/home/user/..../..../etc/passwd"),
-            ("..%2f..%2fetc/passwd", "/home/user/..%2f..%2fetc/passwd"),
-            ("..\\..\\etc\\passwd", "/home/user/..\\..\\etc\\passwd"),
-        ] {
-            assert_eq!(
-                validate_file_path(path).unwrap(),
-                std::path::PathBuf::from(real),
-                "{path}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_file_path_empty_returns_sandbox_root() {
-        let result = validate_file_path("");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user"));
-    }
-
-    #[test]
-    fn test_validate_file_path_null_byte_rejected() {
-        let result = validate_file_path("file\x00.txt");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("null byte"));
-    }
-
-    #[test]
-    fn test_validate_file_path_control_chars_rejected() {
-        let result = validate_file_path("file\x01name");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("control character"));
-    }
-
-    #[test]
-    fn test_validate_file_path_component_too_long() {
-        let long_name = "a".repeat(256);
-        let result = validate_file_path(&long_name);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("too long"));
-    }
-
-    #[test]
-    fn test_validate_file_path_component_exactly_max() {
-        let name = "a".repeat(255);
-        assert!(validate_file_path(&name).is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_dot_dot_normalization() {
-        let result = validate_file_path("subdir/../file.txt");
-        assert!(result.is_ok());
         assert_eq!(
-            result.unwrap(),
-            std::path::PathBuf::from("/home/user/file.txt")
+            validate_file_path(&format!("{longest}a")),
+            Err("Filename component too long: 256 bytes (max 255)".to_string())
         );
-    }
-
-    #[test]
-    fn test_validate_file_path_double_slash() {
-        assert!(validate_file_path("dir//file.txt").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_trailing_slash() {
-        assert!(validate_file_path("subdir/").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_hidden_file() {
-        let result = validate_file_path(".hidden");
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            std::path::PathBuf::from("/home/user/.hidden")
-        );
-    }
-
-    #[test]
-    fn test_validate_file_path_unicode() {
-        assert!(validate_file_path("日本語.txt").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_path_dot_only() {
-        let result = validate_file_path(".");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user"));
     }
 
     /// A relative path of `len` bytes: components of 254 bytes (below NAME_MAX), then the rest.
@@ -760,23 +645,55 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_file_path_exactly_max_length() {
-        let path = path_of_len(MAX_FILE_PATH_LENGTH);
-        assert_eq!(path.len(), 4096);
-        assert!(validate_file_path(&path).is_ok());
+    fn test_validate_file_path_of_4096_bytes_is_valid_one_byte_more_is_not() {
+        let longest = path_of_len(4096);
+        assert_eq!(
+            validate_file_path(&longest),
+            Ok(std::path::PathBuf::from(&longest))
+        );
+        assert_eq!(
+            validate_file_path(&path_of_len(4097)),
+            Err("Path too long: 4097 chars (max 4096)".to_string())
+        );
+        // Many short components: the length counts the separators too
+        assert_eq!(
+            validate_file_path(&"a/".repeat(4096)),
+            Err("Path too long: 8192 chars (max 4096)".to_string())
+        );
     }
 
-    #[test]
-    fn test_validate_file_path_one_byte_over_max_length() {
-        let path = path_of_len(MAX_FILE_PATH_LENGTH + 1);
-        assert_eq!(path.len(), 4097);
-        assert!(validate_file_path(&path).is_err());
+    /// The (message, error type) of a refused command.
+    fn refusal<T>(result: Result<T, CmdError>) -> (String, &'static str) {
+        match result {
+            Err(CmdError::Reply {
+                message,
+                error_type,
+            }) => (message, error_type),
+            Err(CmdError::Fatal(e)) => panic!("expected a reply error, got {e}"),
+            Ok(_) => panic!("expected a refusal"),
+        }
     }
 
-    #[test]
-    fn test_validate_file_path_exceeds_max_length() {
-        let path = "a/".repeat(MAX_FILE_PATH_LENGTH);
-        assert!(validate_file_path(&path).is_err());
+    // A path that resolves to the root itself: no file to read or write, refused before any
+    // open (validate_file_path gives "" for it)
+    #[rstest::rstest]
+    #[case(".")]
+    #[case("subdir/..")]
+    #[tokio::test]
+    async fn test_the_root_itself_is_refused_for_a_read_and_a_write(#[case] path: &str) {
+        let (tx, _rx) = mpsc::channel(1);
+        let writer = ResponseWriter::new(tx, None);
+        assert_eq!(
+            refusal(handle_read_file(path, &writer).await),
+            ("Cannot read a directory".to_string(), "path_error")
+        );
+        assert_eq!(
+            refusal(handle_write_file("op", path, false)),
+            (
+                "Cannot write to sandbox root directory".to_string(),
+                "path_error"
+            )
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -807,35 +724,20 @@ mod tests {
         assert_eq!(writer.count, 5);
     }
 
+    // A write that would pass the limit writes nothing: the count and the file stay
     #[test]
-    fn test_counting_writer_exceeds_limit() {
-        let mut buf = Vec::new();
-        let mut writer = CountingWriter {
-            inner: &mut buf,
-            count: 0,
-            limit: 4,
-        };
-        let result = std::io::Write::write(&mut writer, b"hello");
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("file size limit exceeded")
-        );
-    }
-
-    #[test]
-    fn test_counting_writer_multiple_writes_exceeding() {
+    fn test_counting_writer_refuses_a_write_past_the_limit_whole() {
         let mut buf = Vec::new();
         let mut writer = CountingWriter {
             inner: &mut buf,
             count: 0,
             limit: 8,
         };
-        assert!(std::io::Write::write_all(&mut writer, b"hello").is_ok());
-        let result = std::io::Write::write(&mut writer, b"world");
-        assert!(result.is_err());
+        std::io::Write::write_all(&mut writer, b"hello").unwrap();
+        let refused = std::io::Write::write(&mut writer, b"world").unwrap_err();
+        assert_eq!(refused.to_string(), "file size limit exceeded");
+        assert_eq!(writer.count, 5);
+        assert_eq!(buf, b"hello");
     }
 
     // -------------------------------------------------------------------------

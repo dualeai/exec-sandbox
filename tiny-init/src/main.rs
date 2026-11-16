@@ -9,7 +9,6 @@
 mod sys;
 mod device;
 
-use std::ffi::CString;
 use std::fs;
 use std::os::unix::process::CommandExt;
 
@@ -23,8 +22,9 @@ fn mount_virtual_filesystems() {
     // devtmpfs creates these as 0666, allowing any user to inject entropy via
     // write(). The RO bind-mount of /dev (guest-agent) does NOT block char
     // device writes (Linux VFS exempts S_ISCHR from sb_permission RO check).
-    // Guest-agent (root) needs write for RNDRESEEDCRNG ioctl; user code
-    // (UID 1000) only needs read or getrandom() syscall.
+    // Guest-agent (root) opens /dev/urandom for writing, for its RNDADDENTROPY
+    // and RNDRESEEDCRNG ioctls (entropy.rs); user code (UID 1000) only needs
+    // read or getrandom() syscall.
     device::chmod_paths(0o644, &["/dev/urandom", "/dev/random"]);
 
     // The guest agent mounts /dev/shm in its phase-2 setup (setup_dev_shm).
@@ -54,8 +54,10 @@ fn mount_virtual_filesystems() {
     // noexec intentionally omitted: breaks uv wheel unpacking (pypa/pip#6364),
     // pnpm (pnpm#9776), PyInstaller, and user temp executables.
     // Size = 50% of RAM: scales with VM memory instead of fixed cap.
-    // Per-UID quota (usrquota + usrquota_block_hardlimit) prevents sparse file
-    // inflation attacks — must be set at initial mount time, not remount.
+    // Per-UID quota (usrquota + usrquota_block_hardlimit): each UID may use up to
+    // the mount size, the same bound as size=, so it adds no limit for the
+    // sandbox user. Quota options take effect only at the initial mount, not at
+    // a remount.
     // nr_inodes=16384: fixed cap independent of VM memory (default is
     // totalram_pages/2, which varies 13K–55K+ depending on memory_mb). 16K
     // covers typical `pip install` (measured ~2K-5K files for large packages
@@ -138,16 +140,14 @@ fn mkfs_in_lower(dev: &str) -> bool {
         );
         return false;
     }
-    let root_c = CString::new("/lower").unwrap();
     let status = unsafe {
         std::process::Command::new("/sbin/mkfs.ext4")
             .args(["-q", "-O", "^has_journal", "-m", "0", dev])
-            .pre_exec(move || {
-                let slash = CString::new("/").unwrap();
-                if libc::chroot(root_c.as_ptr()) != 0 {
+            .pre_exec(|| {
+                if libc::chroot(c"/lower".as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::chdir(slash.as_ptr()) != 0 {
+                if libc::chdir(c"/".as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -330,14 +330,11 @@ fn enter_rootfs() {
     // 4. exec new init (exec_agent, after mount_home)
     // See: https://docs.kernel.org/filesystems/ramfs-rootfs-initramfs.html
 
-    let dot = CString::new(".").unwrap();
-    let root = CString::new("/").unwrap();
-
     // Step 1: mount --move . / (overmount rootfs)
     unsafe {
         libc::mount(
-            dot.as_ptr(),
-            root.as_ptr(),
+            c".".as_ptr(),
+            c"/".as_ptr(),
             std::ptr::null(),
             libc::MS_MOVE,
             std::ptr::null(),
@@ -345,7 +342,7 @@ fn enter_rootfs() {
     }
 
     // Step 2: chroot .
-    let chroot_ret = unsafe { libc::chroot(dot.as_ptr()) };
+    let chroot_ret = unsafe { libc::chroot(c".".as_ptr()) };
     if chroot_ret != 0 {
         log_error!("chroot failed");
         sys::fallback_shell();
@@ -353,7 +350,7 @@ fn enter_rootfs() {
 
     // Step 3: chdir /
     unsafe {
-        libc::chdir(root.as_ptr());
+        libc::chdir(c"/".as_ptr());
     }
 }
 
@@ -367,8 +364,7 @@ fn exec_agent() -> ! {
     }
 
     // Stage 1: point stdin at /dev/null (stage 3 replaces it when a console opens)
-    let devnull = CString::new("/dev/null").unwrap();
-    let stdin_fd = unsafe { libc::open(devnull.as_ptr(), libc::O_RDONLY) };
+    let stdin_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
     if stdin_fd > 0 {
         unsafe {
             libc::dup2(stdin_fd, 0);
@@ -395,7 +391,7 @@ fn exec_agent() -> ! {
     device::open_console(device::CONSOLE_DEVICES, libc::O_RDWR, &[0, 1, 2]);
 
     // exec /usr/local/bin/guest-agent
-    let prog = CString::new("/usr/local/bin/guest-agent").unwrap();
+    let prog = c"/usr/local/bin/guest-agent";
     let args: [*const libc::c_char; 2] = [prog.as_ptr(), std::ptr::null()];
     unsafe { libc::execv(prog.as_ptr(), args.as_ptr()) };
 

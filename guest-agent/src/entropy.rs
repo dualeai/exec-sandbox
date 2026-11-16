@@ -258,7 +258,7 @@ mod tests {
             reseed_fails: true,
             ..FakeKernel::default()
         };
-        let (encoded, _) = entropy_of_32_bytes();
+        let (encoded, bytes) = entropy_of_32_bytes();
 
         let error = mix_and_reseed(&kernel, &encoded).unwrap_err();
 
@@ -269,7 +269,10 @@ mod tests {
                 io::Error::from_raw_os_error(libc::ENODATA)
             )
         );
-        assert_eq!(kernel.calls.borrow().len(), 2);
+        assert_eq!(
+            *kernel.calls.borrow(),
+            vec![format!("mix {bytes:?}"), "reseed".to_string()]
+        );
     }
 
     #[test]

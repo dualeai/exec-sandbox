@@ -95,7 +95,8 @@ pub(crate) struct PreparedOomGuard {
 }
 
 impl PreparedOomGuard {
-    /// Verify PID1, register a PSI trigger, and confirm the effective zram cap.
+    /// Verify PID1, register a PSI trigger, and confirm the effective zram cap and disk
+    /// size (each the request rounded up to a page).
     pub(crate) fn prepare(
         expected_mem_limit: u64,
         expected_disksize: u64,
@@ -115,7 +116,7 @@ impl PreparedOomGuard {
 
         let mm_stat = File::open(MM_STAT_PATH)?;
         let disksize_file = File::open(DISKSIZE_PATH)?;
-        let memory = read_memory_stats(&mm_stat)?;
+        let memory = read_memory_stats_into(&mm_stat, &mut [0u8; 256])?;
         let disksize = read_single_u64(&disksize_file)?;
 
         let geometry =
@@ -299,11 +300,6 @@ pub(crate) fn page_size() -> io::Result<u64> {
     }
 }
 
-fn read_memory_stats(file: &File) -> io::Result<ZramMemoryStats> {
-    let mut buf = [0u8; 256];
-    read_memory_stats_into(file, &mut buf)
-}
-
 fn read_single_u64(file: &File) -> io::Result<u64> {
     let mut buf = [0u8; 64];
     let n = read_fd_at_start(file, &mut buf)?;
@@ -463,10 +459,45 @@ mod tests {
             mem_used_total: 0,
             mem_limit,
         };
+        let refusal = |memory, disksize, mem_limit, requested_disksize| {
+            let error =
+                verify_zram_geometry_values(memory, disksize, mem_limit, requested_disksize)
+                    .unwrap_err();
+            (error.kind(), error.to_string())
+        };
+        let mismatch = |name: &str, requested: u64, expected: u64, effective: u64| {
+            (
+                io::ErrorKind::InvalidData,
+                format!(
+                    "zram {name} mismatch: requested {requested}, expected kernel-rounded {expected}, effective {effective}"
+                ),
+            )
+        };
 
-        assert!(verify_zram_geometry_values(stats(0), page, page, page).is_err());
-        assert!(verify_zram_geometry_values(stats(page * 2), page, page, page).is_err());
-        assert!(verify_zram_geometry_values(stats(page), 0, page, page).is_err());
-        assert!(verify_zram_geometry_values(stats(page), page * 2, page, page).is_err());
+        assert_eq!(
+            refusal(stats(0), page, page, page),
+            mismatch("mem_limit", page, page, 0)
+        );
+        assert_eq!(
+            refusal(stats(page * 2), page, page, page),
+            mismatch("mem_limit", page, page, page * 2)
+        );
+        assert_eq!(
+            refusal(stats(page), 0, page, page),
+            mismatch("disksize", page, page, 0)
+        );
+        assert_eq!(
+            refusal(stats(page), page * 2, page, page),
+            mismatch("disksize", page, page, page * 2)
+        );
+        // A request of 0 rounds to 0: an effective 0 equals it, and is still refused
+        assert_eq!(
+            refusal(stats(0), page, 0, page),
+            mismatch("mem_limit", 0, 0, 0)
+        );
+        assert_eq!(
+            refusal(stats(page), 0, page, 0),
+            mismatch("disksize", 0, 0, 0)
+        );
     }
 }

@@ -930,7 +930,10 @@ mod tests {
             })
             .await;
 
-            assert!(sent.is_err(), "host_entropy={host_entropy:?}");
+            assert!(
+                matches!(&sent, Err(CmdError::Fatal(e)) if e.to_string() == "Write queue closed"),
+                "host_entropy={host_entropy:?}: {sent:?}"
+            );
         }
     }
 

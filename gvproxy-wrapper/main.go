@@ -147,7 +147,8 @@ func main() {
 // acceptLoop hands each connection of listener to handle for the life of the
 // process (the shutdown handler ends it with os.Exit). A failing Accept (EMFILE, ENFILE) is
 // retried after a pause (sleep) that doubles from acceptRetryFirst to
-// acceptRetryMax, never in a busy loop; an accepted connection resets the pause.
+// acceptRetryMax, never in a busy loop; an accepted connection resets the pause. It
+// returns when the listener is closed (net.ErrClosed).
 func acceptLoop(listener net.Listener, sleep func(time.Duration), handle func(net.Conn)) {
 	delay := acceptRetryFirst
 	for {
