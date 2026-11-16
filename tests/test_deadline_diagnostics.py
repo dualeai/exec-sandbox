@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
-import json
 import logging
 import os
 import socket
@@ -36,38 +35,12 @@ from exec_sandbox.qmp_client import QMP_BUFFER_LIMIT, QmpClient
 from exec_sandbox.socket_auth import connect_and_verify
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType, VmState
-from tests.conftest import NESTED_QMP_LINE
+from tests.conftest import NESTED_QMP_LINE, fake_qmp_server
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from exec_sandbox.vm_manager import VmManager
-
-
-async def _fake_qmp(path: Path, *, status: str | None, status_line: bytes | None) -> asyncio.Server:
-    """A QMP server: greeting, then a reply per command (`status_line`, when set, is the
-    whole answer to query-status). status=None never greets."""
-
-    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if status is None:
-            await reader.read()  # silent until the client hangs up
-            writer.close()
-            return
-        writer.write(b'{"QMP": {"version": {}, "capabilities": []}}\n')
-        while line := await reader.readline():
-            request = json.loads(line)
-            result: dict[str, Any] = {}
-            if request["execute"] == "query-status":
-                if status_line is not None:
-                    writer.write(status_line)
-                    await writer.drain()
-                    continue
-                result = {"status": status, "running": status == "running"}
-            writer.write(json.dumps({"return": result, "id": request["id"]}).encode() + b"\n")
-            await writer.drain()
-        writer.close()
-
-    return await asyncio.start_unix_server(serve, path=str(path))
 
 
 @pytest.fixture
@@ -151,7 +124,7 @@ class TestDeadlineDiagnostics:
         console = ["boot", "[WARN] Read timeout after 18000ms, reconnecting..."]
         vm = make_vm(qemu=own, console=console)
 
-        async with await _fake_qmp(qmp_path, status="paused", status_line=None):
+        async with await fake_qmp_server(qmp_path, status="paused", status_line=None, requests=[]):
             with caplog.at_level(logging.ERROR, logger="exec_sandbox.qemu_vm"):
                 values = await vm.deadline_diagnostics(operation="write_file")
 
@@ -196,7 +169,7 @@ class TestDeadlineDiagnostics:
         the status says so, nothing raises (the diagnostics run inside error paths)."""
         vm = make_vm(qemu=None, console=[])
 
-        async with await _fake_qmp(qmp_path, status="running", status_line=line):
+        async with await fake_qmp_server(qmp_path, status="running", status_line=line, requests=[]):
             values = await vm.deadline_diagnostics(operation="execute")
 
         assert values["qemu_status"] == status
@@ -208,7 +181,7 @@ class TestDeadlineDiagnostics:
         monkeypatch.setattr(constants, "DEADLINE_DIAGNOSTICS_TIMEOUT_SECONDS", 0.05)
         vm = make_vm(qemu=None, console=[])
 
-        async with await _fake_qmp(qmp_path, status=None, status_line=None), asyncio.timeout(1):
+        async with await fake_qmp_server(qmp_path, status=None, status_line=None, requests=[]), asyncio.timeout(1):
             values = await vm.deadline_diagnostics(operation="execute")
 
         assert values["qemu_status"].startswith("unavailable (TimeoutError")

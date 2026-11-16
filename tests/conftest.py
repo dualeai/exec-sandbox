@@ -324,6 +324,37 @@ NESTED_QMP_LINE = b"[" * 60_000 + b"\n"
 """A QMP line nested too deep for the JSON parser (with the qmp_parser_too_deep fixture)."""
 
 
+async def fake_qmp_server(
+    path: Path, *, status: str | None, status_line: bytes | None, requests: list[dict[str, Any]]
+) -> asyncio.Server:
+    """A QMP server on `path` in place of QEMU's command monitor: the greeting, then a reply
+    per command, each command recorded in `requests` (query-status: `status`, or
+    `status_line` as the whole answer when set; any other command: an empty return).
+    status=None never greets."""
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if status is None:
+            await reader.read()  # silent until the client hangs up
+            writer.close()
+            return
+        writer.write(b'{"QMP": {"version": {}, "capabilities": []}}\n')
+        while line := await reader.readline():
+            request = json.loads(line)
+            requests.append(request)
+            result: dict[str, Any] = {}
+            if request["execute"] == "query-status":
+                if status_line is not None:
+                    writer.write(status_line)
+                    await writer.drain()
+                    continue
+                result = {"status": status, "running": status == "running"}
+            writer.write(json.dumps({"return": result, "id": request["id"]}).encode() + b"\n")
+            await writer.drain()
+        writer.close()
+
+    return await asyncio.start_unix_server(serve, path=str(path))
+
+
 @pytest.fixture
 def qmp_parser_too_deep(monkeypatch: pytest.MonkeyPatch) -> None:
     """The JSON parser of qmp_client raises RecursionError on NESTED_QMP_LINE, on every Python.
