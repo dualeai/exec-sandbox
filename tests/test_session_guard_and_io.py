@@ -5,15 +5,15 @@ guest channel (frames on the wire, error mapping), of FileOpDispatcher routing, 
 DualPortChannel reconnection probe.
 
 No VM: the Session tests use a mocked QemuVM (TestWriteFileSessionOverQemuVM: a real
-QemuVM on a mocked channel); the QemuVM tests use a real QemuVM on a mocked channel; the
-DualPortChannel tests use a real channel on a fake guest agent that serves the two port
-sockets (_FakeGuest). Covers:
+QemuVM on a mocked channel); the QemuVM tests use a real QemuVM on a mocked channel (the
+home disk limits also on a fake QMP server); the DualPortChannel tests use a real channel
+on a fake guest agent that serves the two port sockets (_FakeGuest). Covers:
 - Session calls: closed checks, lock serialization, idle deadline suspended during a
   call, fail-fast retirement of dead VMs, close paths, the save() close rule
 - write_file sources (bytes, Path, stream): checks, size limits of bytes and a Path, local errors
 - QemuVM write_file and read_file: frames sent, content round trip, error mapping; the
   write_file header size, its stop at a guest reply before file_end, the source set back
-  after a failure; local_path_error, the errno split of a local path
+  after a failure, the home disk limits; local_path_error, the errno split of a local path
 - FileOpDispatcher message routing by op_id, transport failure
 - DualPortChannel reconnection probe, stream deadline and close
 """
@@ -81,7 +81,7 @@ from exec_sandbox.qemu_vm import QemuVM, local_path_error, zstd
 from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType, VmState
-from tests.conftest import LoopClock, NonSeekableIO, make_destroy_mock
+from tests.conftest import LoopClock, NonSeekableIO, fake_qmp_server, make_destroy_mock
 
 _CODE_LIMIT = 1024 * 1024
 """Largest code of one exec(): 1 MiB, written out (not the library's constant)."""
@@ -1211,7 +1211,8 @@ async def _file_io_vm(vm_id: str, *answers: StreamingMessage) -> tuple[QemuVM, A
     go into it when a write's file_end, or any other request, is queued (route() of a non-full
     inbox does not yield: they are in the inbox when the enqueue returns); a test that needs a
     reply sooner routes it into the returned inbox. enqueue_registered is the real channel code;
-    enqueue_raw records each frame. deadline_diagnostics gives _DEADLINE_DIAGNOSTICS."""
+    enqueue_raw records each frame. deadline_diagnostics gives _DEADLINE_DIAGNOSTICS;
+    _qmp_command (write_file's home disk limits) answers {"return": {}}."""
     inbox = OperationInbox(changes_state=True)
     channel = AsyncMock(spec=DualPortChannel)
     channel.register_op.return_value = inbox
@@ -1250,6 +1251,7 @@ async def _file_io_vm(vm_id: str, *answers: StreamingMessage) -> tuple[QemuVM, A
         device_layout="",
     )
     vm.deadline_diagnostics = AsyncMock(return_value=_DEADLINE_DIAGNOSTICS)  # type: ignore[method-assign]
+    vm._qmp_command = AsyncMock(return_value={"return": {}})  # type: ignore[method-assign]
     return vm, channel, inbox
 
 
@@ -1268,6 +1270,30 @@ def _on_frame(channel: AsyncMock, *, action: str, then: Callable[[], Awaitable[o
             await then()
 
     channel.enqueue_raw.side_effect = enqueue_raw
+
+
+def _disk_limit_calls(vm: QemuVM) -> list[dict[str, Any]]:
+    """The arguments of each block_set_io_throttle that write_file sent, in order."""
+    calls = vm._qmp_command.await_args_list  # type: ignore[attr-defined]
+    assert all(call.args == ("block_set_io_throttle",) for call in calls)
+    return [call.kwargs["arguments"] for call in calls]
+
+
+_RESTORE = {
+    "device": "hd2",
+    "bps": constants.DISK_BPS_LIMIT,
+    "bps_max": constants.DISK_BPS_BURST,
+    "iops": constants.DISK_IOPS_LIMIT,
+    "iops_max": constants.DISK_IOPS_BURST,
+    "bps_rd": 0,
+    "bps_wr": 0,
+    "iops_rd": 0,
+    "iops_wr": 0,
+}
+"""The home disk's command-line limits, set back at the end of write_file."""
+
+_LIFT = {**_RESTORE, "bps": 0, "bps_max": 0}
+"""write_file's lift: no bandwidth limit, the request limits kept."""
 
 
 def _frames(channel: AsyncMock) -> list[dict[str, Any]]:
@@ -1553,6 +1579,7 @@ class TestWriteFileCommitProtocol:
             await vm.write_file("target.bin", io.BytesIO(b"payload"), make_executable=False)
 
         channel.enqueue_raw.assert_not_awaited()
+        vm._qmp_command.assert_not_awaited()  # type: ignore[attr-defined]  # no lift, so no restore
 
     async def test_ack_timeout_after_commit_is_outcome_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 0.01)
@@ -1567,6 +1594,7 @@ class TestWriteFileCommitProtocol:
         # A host deadline carries the guest console and the QEMU state.
         assert exc_info.value.context.items() >= _DEADLINE_DIAGNOSTICS.items()
         vm.deadline_diagnostics.assert_awaited_once_with(operation="write_file")  # type: ignore[attr-defined]
+        assert _disk_limit_calls(vm) == [_LIFT, _RESTORE]  # set back after an unknown outcome
 
     @pytest.mark.parametrize(
         ("ack_path", "ack_size"),
@@ -1661,6 +1689,7 @@ class TestWriteFileSize:
         ):
             await vm.write_file("out.bin", source, make_executable=False)
         channel.connect.assert_not_awaited()
+        vm._qmp_command.assert_not_awaited()  # type: ignore[attr-defined]
         assert source.tell() == 0
 
     async def test_limit_counts_from_the_stream_position(self) -> None:
@@ -1805,6 +1834,7 @@ class TestWriteFileEarlyStop:
         assert [f["action"] for f in _frames(channel)] == ["write_file", "file_chunk"]
         assert source.reads == 1
         assert source.tell() == 0
+        assert _disk_limit_calls(vm) == [_LIFT, _RESTORE]  # set back after a refusal
 
     async def test_reply_to_the_last_chunk_sends_no_file_end(self) -> None:
         """30 bytes: the compressor buffers them, so the flush frame is the only chunk."""
@@ -1869,6 +1899,7 @@ class TestWriteFileEarlyStop:
             await vm.write_file("out.bin", source, make_executable=False)
         task.uncancel()
         assert source.tell() == 4
+        assert _disk_limit_calls(vm) == [_LIFT, _RESTORE]  # set back after a cancel
 
     async def test_failed_seek_back_never_replaces_the_error(self) -> None:
         """The source cannot seek back after the guest's refusal: the refusal is raised."""
@@ -1909,6 +1940,135 @@ class TestWriteFileEarlyStop:
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
             await vm.write_file("out.bin", BrokenSource(b"abc"), make_executable=False)
         channel.close.assert_awaited_once()
+
+
+class TestWriteFileDiskLimits:
+    """write_file lifts the home disk's bandwidth limit right after the header, and sets the
+    command-line limits back at its end on every path, unless the VM ends (QEMU exited, a
+    destroy started, or QEMU sent SHUTDOWN). Neither QMP call fails the write: a failed lift
+    logs a WARNING, a failed restore an ERROR."""
+
+    async def test_lift_after_the_header_restore_at_the_end(self) -> None:
+        """The lift goes after the header frame, the restore after file_end and the ack, with
+        the arguments of _LIFT and _RESTORE."""
+        vm, channel, _ = await _file_io_vm("limits-vm", FileWriteAckMessage(op_id="w", path="out.bin", bytes_written=4))
+        frames_at_call: list[list[str]] = []
+
+        async def record(*_args: object, **_kwargs: object) -> dict[str, Any]:
+            frames_at_call.append([f["action"] for f in _frames(channel)])
+            return {"return": {}}
+
+        vm._qmp_command.side_effect = record  # type: ignore[attr-defined]
+        await vm.write_file("out.bin", io.BytesIO(b"data"), make_executable=False)
+        assert _disk_limit_calls(vm) == [_LIFT, _RESTORE]
+        assert frames_at_call == [["write_file"], ["write_file", "file_chunk", "file_end"]]
+
+    async def test_limits_go_on_the_command_monitor(self, short_tmp_dir: Path) -> None:
+        """The lift and the restore reach the command monitor as block_set_io_throttle
+        commands with their arguments (a fake QMP server in place of QEMU)."""
+        vm, _channel, _ = await _file_io_vm(
+            "limits-vm", FileWriteAckMessage(op_id="w", path="out.bin", bytes_written=4)
+        )
+        del vm._qmp_command  # the QemuVM method again, not _file_io_vm's stub
+        vm.workdir.qmp_socket = short_tmp_dir / "qmp.sock"
+        requests: list[dict[str, Any]] = []
+        async with await fake_qmp_server(vm.workdir.qmp_socket, status="running", status_line=None, requests=requests):
+            await vm.write_file("out.bin", io.BytesIO(b"data"), make_executable=False)
+        assert [(r["execute"], r.get("arguments")) for r in requests if r["execute"] != "qmp_capabilities"] == [
+            ("block_set_io_throttle", _LIFT),
+            ("block_set_io_throttle", _RESTORE),
+        ]
+
+    @pytest.mark.timeout(15)  # past DISK_LIMITS_QMP_TIMEOUT_SECONDS, a restore waits again in `finally`
+    async def test_a_silent_command_monitor_costs_the_bound(
+        self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A command monitor that never answers (busy, or held by another client): the lift and
+        the restore each give up at DISK_LIMITS_QMP_TIMEOUT_SECONDS and log; the write ends."""
+        monkeypatch.setattr(constants, "DISK_LIMITS_QMP_TIMEOUT_SECONDS", 0.05)
+        vm, _channel, _ = await _file_io_vm(
+            "limits-vm", FileWriteAckMessage(op_id="w", path="out.bin", bytes_written=4)
+        )
+        del vm._qmp_command  # the QemuVM method again, not _file_io_vm's stub
+        vm.workdir.qmp_socket = short_tmp_dir / "qmp.sock"
+        loop = asyncio.get_running_loop()
+        async with await fake_qmp_server(vm.workdir.qmp_socket, status=None, status_line=None, requests=[]):
+            with caplog.at_level(logging.WARNING, logger="exec_sandbox.qemu_vm"):
+                start = loop.time()
+                async with asyncio.timeout(5):  # far below FILE_IO_TIMEOUT_SECONDS
+                    await vm.write_file("out.bin", io.BytesIO(b"data"), make_executable=False)
+                elapsed = loop.time() - start
+        # 2 x 0.05 s; a call bounded by another QMP timeout (1 s and more) costs 2 s at least
+        assert elapsed < 1.5, elapsed
+        records = [r for r in caplog.records if r.name == "exec_sandbox.qemu_vm"]
+        assert [(r.levelno, r.getMessage()) for r in records] == [
+            (logging.WARNING, "Home disk bandwidth limit not lifted"),
+            (logging.ERROR, "Home disk I/O limits not set back"),
+        ]
+        assert all(r.__dict__["vm_id"] == "limits-vm" for r in records)
+        assert all(r.__dict__["error"].startswith("TimeoutError") for r in records)
+
+    async def test_no_restore_on_a_vm_that_ends(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A destroy starts during the write (its QEMU stops next): no restore, no ERROR."""
+        vm, channel, inbox = await _file_io_vm("limits-vm")
+
+        async def destroy() -> None:
+            vm.begin_destroy()
+            inbox.fail("event channel reached EOF with 0 trailing bytes")
+
+        _on_frame(channel, action="file_chunk", then=destroy)
+        with caplog.at_level(logging.WARNING, logger="exec_sandbox.qemu_vm"):
+            with pytest.raises(OutcomeUnknownError):
+                await vm.write_file("out.bin", io.BytesIO(os.urandom(3 * _CHUNK)), make_executable=False)
+        assert _disk_limit_calls(vm) == [_LIFT]
+        assert not [r for r in caplog.records if r.name == "exec_sandbox.qemu_vm"]
+
+    async def test_no_restore_once_qemu_exited(self) -> None:
+        """QEMU exits during the write: no restore (no QMP call to a process that ended)."""
+        vm, channel, inbox = await _file_io_vm("limits-vm")
+
+        async def qemu_exits() -> None:
+            vm.process.returncode = -9
+            assert await inbox.route(_guest_refusal())
+
+        _on_frame(channel, action="file_chunk", then=qemu_exits)
+        with pytest.raises(InvalidInputError):
+            await vm.write_file("out.bin", io.BytesIO(os.urandom(3 * _CHUNK)), make_executable=False)
+        assert _disk_limit_calls(vm) == [_LIFT]
+
+    @pytest.mark.parametrize(
+        ("lift", "error"),
+        [
+            (OSError(errno.ECONNREFUSED, "refused"), f"ConnectionRefusedError: [Errno {errno.ECONNREFUSED}] refused"),
+            (ValueError("not a JSON line"), "ValueError: not a JSON line"),
+            (
+                CommunicationError("the socket's peer is not QEMU", context=None),
+                "CommunicationError: the socket's peer is not QEMU",
+            ),
+            (
+                {"error": {"class": "GenericError", "desc": "no device"}},
+                "{'class': 'GenericError', 'desc': 'no device'}",
+            ),
+        ],
+        ids=["no-connection", "bad-line", "bad-peer", "error-answer"],
+    )
+    async def test_failed_lift_lets_the_write_go_on(
+        self, caplog: pytest.LogCaptureFixture, lift: object, error: str
+    ) -> None:
+        """A failed lift logs one WARNING with the vm_id and the cause; the write succeeds, and
+        the restore still runs."""
+        vm, _channel, _ = await _file_io_vm(
+            "limits-vm", FileWriteAckMessage(op_id="w", path="out.bin", bytes_written=4)
+        )
+        vm._qmp_command.side_effect = [lift, {"return": {}}]  # type: ignore[attr-defined]
+        with caplog.at_level(logging.WARNING, logger="exec_sandbox.qemu_vm"):
+            await vm.write_file("out.bin", io.BytesIO(b"data"), make_executable=False)
+        records = [r for r in caplog.records if r.name == "exec_sandbox.qemu_vm"]
+        assert [(r.levelno, r.getMessage()) for r in records] == [
+            (logging.WARNING, "Home disk bandwidth limit not lifted")
+        ]
+        assert (records[0].__dict__["vm_id"], records[0].__dict__["error"]) == ("limits-vm", error)
+        assert _disk_limit_calls(vm) == [_LIFT, _RESTORE]  # a lift may have landed: set back
 
 
 class TestReadFileTerminalIntegrity:

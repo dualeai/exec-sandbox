@@ -2103,7 +2103,8 @@ class TestOptionalFeatures(_QemuCmdTestBase):
         assert drives and all("cache=unsafe" in d.split(",") for d in drives), drives
 
     async def test_home_disk_drive(self, vm_settings, workdir) -> None:
-        """Every VM has its private raw home disk (serial=home, hd2), never a shared one."""
+        """Every VM has its private raw home disk (serial=home, hd2), never a shared one. The
+        home disk and the rootfs overlay (hd0) have the I/O limits."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
         with _qemu_cmd_mocks():
@@ -2129,6 +2130,14 @@ class TestOptionalFeatures(_QemuCmdTestBase):
         assert "format=raw" in hd2
         assert "file.locking=off" not in hd2
         assert any("drive=hd2,serial=home" in arg for arg in cmd)
+        hd0 = next(arg for arg in cmd if "id=hd0," in arg).split(",")
+        for drive in (hd0, hd2):
+            assert {option for option in drive if option.startswith(("bps", "iops", "throttling.", "group"))} == {
+                f"bps={constants.DISK_BPS_LIMIT}",
+                f"bps_max={constants.DISK_BPS_BURST}",
+                f"iops={constants.DISK_IOPS_LIMIT}",
+                f"iops_max={constants.DISK_IOPS_BURST}",
+            }
 
     @pytest.mark.parametrize("arch", [HostArch.X86_64, HostArch.AARCH64])
     async def test_one_vm_shape_mem0_no_balloon(self, vm_settings, workdir, arch: HostArch) -> None:

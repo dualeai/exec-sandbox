@@ -324,16 +324,39 @@ lines before init starts.
 # ============================================================================
 
 DISK_BPS_LIMIT: Final[int] = 50 * 1024 * 1024  # 50 MB/s
-"""Sustained disk bandwidth limit in bytes/second (prevent noisy neighbor)."""
+"""Sustained bandwidth, in bytes per second, of a VM's rootfs overlay and of its home disk
+(each; reads and writes together), so that one VM cannot use all the bandwidth of the host
+disk. While a write_file runs, the home disk's bandwidth has no limit (QemuVM.write_file);
+setting the limits again at its end starts a new burst."""
 
-DISK_BPS_BURST: Final[int] = 100 * 1024 * 1024  # 100 MB/s
-"""Burst disk bandwidth limit in bytes/second (package downloads)."""
+DISK_BPS_BURST: Final[int] = 100 * 1024 * 1024  # 100 MB
+"""Burst of the same drives (QEMU bps_max, with its default burst length of 1 s): a drive
+takes about this many bytes at full speed before DISK_BPS_LIMIT applies (package installs)."""
 
 DISK_IOPS_LIMIT: Final[int] = 1000
-"""Sustained IOPS limit (typical code execution workload)."""
+"""Sustained I/O requests per second of the same drives (typical code execution workload)."""
 
 DISK_IOPS_BURST: Final[int] = 2000
-"""Burst IOPS limit (npm install, pip install)."""
+"""Burst of the same drives (QEMU iops_max, with its default burst length of 1 s): a drive
+takes about this many requests at full speed before DISK_IOPS_LIMIT applies (npm install,
+pip install)."""
+
+DISK_IO_LIMITS: Final[dict[str, int]] = {
+    "bps": DISK_BPS_LIMIT,
+    "bps_max": DISK_BPS_BURST,
+    "iops": DISK_IOPS_LIMIT,
+    "iops_max": DISK_IOPS_BURST,
+}
+"""The I/O limits of the rootfs overlay and of the home disk, by the names that a -drive
+option and QMP block_set_io_throttle both take: qemu_cmd builds the command line from it,
+and QemuVM.write_file lifts the home disk's bandwidth limit and sets it back from it."""
+
+HOME_DRIVE_ID: Final[str] = "hd2"
+"""The -drive id of the home disk (qemu_cmd), which QMP block_set_io_throttle names."""
+
+DISK_LIMITS_QMP_TIMEOUT_SECONDS: Final[float] = 1.0
+"""Bound on each QMP block_set_io_throttle of write_file (one short connection: about
+1 ms for a healthy QEMU)."""
 
 VIRTIO_QUEUE_SIZE: Final[int] = 64
 """Queue depth (entries per virtqueue) of each virtio-blk device (qemu_cmd: queue-size).

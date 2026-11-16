@@ -142,6 +142,28 @@ def _source_extent(stream: IO[bytes]) -> tuple[int | None, int | None]:
     return start, None if end is None else max(0, end - start)
 
 
+_HOME_DISK_LIMITS: Final[dict[str, str | int]] = {
+    "device": constants.HOME_DRIVE_ID,
+    "bps_rd": 0,
+    "bps_wr": 0,
+    "iops_rd": 0,
+    "iops_wr": 0,
+    **constants.DISK_IO_LIMITS,
+}
+"""block_set_io_throttle arguments of the home disk's command-line limits. The command sets
+every limit: one left out is 0, and each *_max_length takes QEMU's default (1 s), as on the
+command line. With some limit on (write_file never turns them all off), the drive keeps the
+throttle group the command line gave it (the drive id): no `group` is passed."""
+
+_HOME_DISK_UPLOAD_LIMITS: Final[dict[str, str | int]] = {
+    **_HOME_DISK_LIMITS,
+    "bps": 0,
+    "bps_max": 0,
+}
+"""The same with no bandwidth limit (write_file). The IOPS limits stay: with a limit on, the
+drive keeps its throttle group, and QEMU does not drain it as it does when every limit is 0."""
+
+
 _CALLER_PATH_ERRNOS = frozenset(
     {
         errno.ENOENT,
@@ -913,6 +935,11 @@ class QemuVM:
         read and before file_end; at a reply it queues no more frames and no file_end (the
         frames already queued still go out).
 
+        From the header to the end of the call, the home disk has no bandwidth limit
+        (constants.DISK_BPS_LIMIT; its IOPS limits stay), for every writer in the VM. Each change
+        is one QMP block_set_io_throttle, which starts a new burst; a failed one is logged, never
+        raised (a failed lift leaves the limit on, a failed restore leaves it off).
+
         Content is read from the stream in 128 KB chunks, compressed
         incrementally with a shared ZstdCompressor, and sent immediately.
         The content is never read whole. Up to HOST_WRITE_QUEUE_DEPTH +
@@ -972,14 +999,22 @@ class QemuVM:
             raise
 
     async def _send_file(self, path: str, content: IO[bytes], *, make_executable: bool, size: int | None) -> None:
-        """The protocol of write_file (its docstring), with `size` in the header."""
+        """The protocol of write_file (its docstring), with `size` in the header. It lifts the
+        home disk's bandwidth limit after the header and sets it back at its end."""
         op_id = uuid4().hex
         op_queue: OperationInbox | None = None
+        lifted = False  # set before the lift: a lift whose answer is lost may have taken effect
         try:
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
             op_queue = self.channel.register_op(op_id, changes_state=True)  # write_file
             header = WriteFileRequest(op_id=op_id, path=path, make_executable=make_executable, size=size)
             await self.channel.enqueue_registered(op_queue, request_line(header))
+            # The guest reads the header meanwhile: its refusal is often in the inbox before the
+            # first chunk (the loop looks before each one). A failed lift does not fail the write:
+            # it goes on at DISK_BPS_LIMIT.
+            lifted = True
+            if (failure := await self._set_home_disk_limits(_HOME_DISK_UPLOAD_LIMITS)) is not None:
+                logger.warning("Home disk bandwidth limit not lifted", extra={"vm_id": self.vm_id, "error": failure})
 
             source_size = await self._send_content(op_queue, op_id=op_id, content=content, path=path)
 
@@ -1039,6 +1074,16 @@ class QemuVM:
             raise
         finally:
             self.channel.unregister_op(op_id)
+            # On every path while the VM runs, a cancel and an unknown outcome too (their
+            # session closes after this call returns); not on a VM whose end is known (a destroy
+            # started, QEMU sent SHUTDOWN or exited)
+            if (
+                lifted
+                and self.process.returncode is None
+                and not self._ending()
+                and (failure := await self._set_home_disk_limits(_HOME_DISK_LIMITS)) is not None
+            ):
+                logger.error("Home disk I/O limits not set back", extra={"vm_id": self.vm_id, "error": failure})
 
     async def _send_content(self, op_queue: OperationInbox, *, op_id: str, content: IO[bytes], path: str) -> int:
         """Stream `content` as the file_chunk frames of write_file `op_id`; returns the bytes read.
@@ -1317,6 +1362,10 @@ class QemuVM:
 
         return [FileInfo(name=e.name, is_dir=e.is_dir, size=e.size) for e in response.entries]
 
+    def _ending(self) -> bool:
+        """The VM ends: a destroy started, or QEMU sent SHUTDOWN."""
+        return self._qemu_shut_down or self._state in (VmState.DESTROYING, VmState.DESTROYED)
+
     def begin_destroy(self) -> None:
         """Make the VM non-reusable while allowing cleanup retries (every state before
         DESTROYING may go to it: VALID_STATE_TRANSITIONS)."""
@@ -1355,7 +1404,8 @@ class QemuVM:
         the spawn.
 
         QEMU sends them on its event-only QMP monitor (workdir.qmp_events_socket; the
-        command monitor serves one client at a time: saves and diagnostics use it). The
+        command monitor serves one client at a time: a save holds one connection for its
+        length, the diagnostics and write_file's home disk limits one short connection each). The
         watch ends when QEMU exits (socket EOF) or at confirm_destroyed. Only the home drive
         stops the VM on ENOSPC (werror=enospc); QEMU sends `nospace` only for such a drive,
         so an event with nospace true is the home disk.
@@ -1420,7 +1470,7 @@ class QemuVM:
         if is_open and not was_open:
             return
         reason = f"VM {self.vm_id} guest agent closed its port {port_id}" + (" and opened it again" if is_open else "")
-        if self._qemu_shut_down or self._state in (VmState.DESTROYING, VmState.DESTROYED):
+        if self._ending():
             logger.debug(
                 f"{reason} while the VM ends",
                 extra={"vm_id": self.vm_id, "port_id": port_id, "state": self._state.value},
@@ -1546,24 +1596,48 @@ class QemuVM:
             "qemu_threads": threads,
         }
 
+    async def _qmp_command(self, command: str, *, arguments: dict[str, Any] | None, timeout: float) -> dict[str, Any]:
+        """QMP response to `command`, on one short connection (the command monitor serves one
+        client at a time: none is kept open), bounded by `timeout`.
+
+        Raises:
+            OSError (TimeoutError too), ValueError, CommunicationError: no response
+        """
+        async with (
+            asyncio.timeout(timeout),
+            QmpClient.connect(
+                self.qmp_socket,
+                expected_uid=get_expected_socket_uid(self.use_qemu_vm_user),
+                timeout=timeout,
+                error_factory=OSError,
+                id_prefix=command,
+            ) as qmp,
+        ):
+            return await qmp.execute(command, arguments=arguments, timeout=timeout, on_event=None)
+
+    async def _set_home_disk_limits(self, limits: dict[str, str | int]) -> str | None:
+        """Set the home disk's I/O limits (block_set_io_throttle); returns why they were not
+        set, or None. QEMU empties the limits' buckets at each call: a new burst starts."""
+        try:
+            response = await self._qmp_command(
+                "block_set_io_throttle",
+                arguments=limits,
+                timeout=constants.DISK_LIMITS_QMP_TIMEOUT_SECONDS,
+            )
+        except (OSError, ValueError, CommunicationError) as error:  # TimeoutError too
+            return f"{type(error).__name__}: {error}"
+        return None if "error" not in response else str(response["error"])
+
     async def _qmp_run_status(self) -> str:
         """QEMU run state from QMP query-status ("running", "paused", "internal-error",
         "guest-panicked", ...), or "unavailable (<reason>)". One short QMP connection,
         bounded by DEADLINE_DIAGNOSTICS_TIMEOUT_SECONDS."""
-        timeout = constants.DEADLINE_DIAGNOSTICS_TIMEOUT_SECONDS
-        response: dict[str, Any] = {}
         try:
-            async with (
-                asyncio.timeout(timeout),
-                QmpClient.connect(
-                    self.qmp_socket,
-                    expected_uid=get_expected_socket_uid(self.use_qemu_vm_user),
-                    timeout=timeout,
-                    error_factory=OSError,
-                    id_prefix="diagnostics",
-                ) as qmp,
-            ):
-                response = await qmp.execute("query-status", arguments=None, timeout=timeout, on_event=None)
+            response = await self._qmp_command(
+                "query-status",
+                arguments=None,
+                timeout=constants.DEADLINE_DIAGNOSTICS_TIMEOUT_SECONDS,
+            )
         except (OSError, ValueError, CommunicationError) as error:  # TimeoutError too
             return f"unavailable ({type(error).__name__}: {error})"
         result = response.get("return")

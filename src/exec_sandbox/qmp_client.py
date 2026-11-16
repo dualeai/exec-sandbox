@@ -2,8 +2,8 @@
 
 QmpClient wraps a connected stream (start: the greeting, then qmp_capabilities; execute:
 id-tagged commands; close). QmpClient.connect opens one (peer check, start) for the length of
-a `with` block: the run-state diagnostics and the tests. The migration client and the event
-watch (qmp_events) hold one each.
+a `with` block: the run-state diagnostics, write_file's home disk limits and the tests. The
+migration client and the event watch (qmp_events) hold one each.
 
 QMP echoes the request's ``id`` on every command response (per spec), and interleaves
 asynchronous events (MIGRATION_PASS, STOP, RESUME, ...) on the same stream at any time. A

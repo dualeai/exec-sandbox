@@ -1,8 +1,8 @@
 """Edge case tests for file I/O operations.
 
 Tests path edge cases, content edge cases, input type dispatch, write abort/error
-recovery (no partial file at the final path), and the free space of the home disk
-(refusal, reservation).
+recovery (no partial file at the final path), the free space of the home disk
+(refusal, reservation), and the home disk I/O limits during a write.
 Requires VM (integration tests).
 """
 
@@ -12,9 +12,11 @@ import errno
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import threading
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import IO, Any, cast
 from uuid import uuid4
@@ -23,12 +25,19 @@ import pytest
 
 from exec_sandbox import constants
 from exec_sandbox.constants import (
+    DISK_BPS_BURST,
+    DISK_BPS_LIMIT,
+    DISK_IOPS_BURST,
+    DISK_IOPS_LIMIT,
     FILE_TRANSFER_CHUNK_SIZE,
+    HOME_DRIVE_ID,
 )
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError, SessionClosedError, TransientError
 from exec_sandbox.guest_agent_protocol import StreamingErrorMessage, WriteFileRequest
 from exec_sandbox.models import Language
+from exec_sandbox.permission_utils import get_expected_socket_uid
 from exec_sandbox.qemu_vm import QemuVM
+from exec_sandbox.qmp_client import QmpClient
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
@@ -619,6 +628,56 @@ async def _guest_names(session: Session) -> list[str]:
     return ast.literal_eval(result.stdout)
 
 
+_THROTTLE_KEYS = ("bps", "bps_rd", "bps_wr", "bps_max", "iops", "iops_rd", "iops_wr", "iops_max", "group")
+
+
+def _monitor(vm: QemuVM, *, id_prefix: str) -> AbstractAsyncContextManager[QmpClient]:
+    """A test client of the VM's command monitor, for the length of an `async with` block."""
+    return QmpClient.connect(
+        vm.qmp_socket,
+        expected_uid=get_expected_socket_uid(vm.use_qemu_vm_user),
+        timeout=5.0,
+        error_factory=OSError,
+        id_prefix=id_prefix,
+    )
+
+
+async def _throttle(vm: QemuVM) -> dict[str, dict[str, Any]]:
+    """The I/O limits of each drive of the VM (query-block; QEMU shows them only while set).
+    The connection closes before the call returns: the command monitor serves one client,
+    and QEMU takes a new one only once it saw the last one leave. Until then a connect waits
+    in the listen queue; past one queued connect macOS refuses the next, which this loop
+    retries; past two, Linux fails it at its first read, which it does not (each test leaves
+    one abandoned connect at most)."""
+    async with asyncio.timeout(5.0):
+        while True:
+            try:
+                async with _monitor(vm, id_prefix="test") as qmp:
+                    response = await qmp.execute("query-block", arguments=None, timeout=5.0, on_event=None)
+                break
+            except ConnectionRefusedError:
+                await asyncio.sleep(0.01)
+    return {
+        device["device"]: {key: device["inserted"][key] for key in _THROTTLE_KEYS if key in device["inserted"]}
+        for device in response["return"]
+        if "inserted" in device
+    }
+
+
+_HOME_BOOT_LIMITS = {
+    "bps": DISK_BPS_LIMIT,
+    "bps_rd": 0,
+    "bps_wr": 0,
+    "bps_max": DISK_BPS_BURST,
+    "iops": DISK_IOPS_LIMIT,
+    "iops_rd": 0,
+    "iops_wr": 0,
+    "iops_max": DISK_IOPS_BURST,
+    "group": HOME_DRIVE_ID,
+}
+"""The home disk's limits from the command line, as query-block shows them."""
+
+
 class TestWriteFileSpace:
     """A write_file whose size is known (bytes, a Path, a seekable stream that can seek to its
     end) is refused before the guest writes any of it when it does not fit in the free space
@@ -785,3 +844,116 @@ class TestWriteFileSpace:
             on_stderr=None,
         )
         assert names.stdout == "[]\n", names
+
+
+# ============================================================================
+# Home disk I/O limits during a write
+# ============================================================================
+
+
+class TestWriteFileDiskLimits:
+    """From the header to the end of a write_file, the home disk has no bandwidth limit; at the
+    end the command-line limits come back on every path, unless the VM ends (query-block)."""
+
+    async def test_write_lifts_the_bandwidth_limit_and_sets_it_back(self, scheduler: Scheduler) -> None:
+        """While a write runs, the home disk has no bandwidth limit and keeps its IOPS limits,
+        and the other drives keep theirs; at its end every drive has its boot limits again."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            boot = await _throttle(session._vm)
+            assert boot["hd2"] == _HOME_BOOT_LIMITS
+            # The rootfs overlay has the same limits (one string builds both -drive options)
+            assert {key: value for key, value in boot["hd0"].items() if key != "group"} == {
+                key: value for key, value in _HOME_BOOT_LIMITS.items() if key != "group"
+            }
+            source = VirtualSource(4 * 1024 * 1024, end=4 * 1024 * 1024, hold=True)
+            task = asyncio.create_task(session.write_file("u.bin", cast("IO[bytes]", source)))
+            try:
+                await _until_held(source, task)
+                during = await _throttle(session._vm)  # closed before the read goes on
+            finally:
+                source.release()
+                await task
+            after = await _throttle(session._vm)
+        # No bandwidth limit while the write runs; the request limits stay (no drain)
+        assert (during["hd2"]["bps"], during["hd2"].get("bps_max", 0)) == (0, 0), during
+        assert (during["hd2"]["iops"], during["hd2"]["iops_max"]) == (DISK_IOPS_LIMIT, DISK_IOPS_BURST), during
+        assert {name: limits for name, limits in during.items() if name != "hd2"} == {
+            name: limits for name, limits in boot.items() if name != "hd2"
+        }
+        assert after == boot
+
+    async def test_cancelled_write_sets_the_limit_back(self, running_vm: QemuVM) -> None:
+        """A write_file cancelled while the limit is lifted (outside a session, so the VM stays)
+        sets the limits back."""
+        boot = await _throttle(running_vm)
+        source = VirtualSource(4 * 1024 * 1024, end=4 * 1024 * 1024, hold=True)
+        task = asyncio.create_task(running_vm.write_file("c.bin", cast("IO[bytes]", source), make_executable=False))
+        try:
+            await _until_held(source, task)
+            lifted = await _throttle(running_vm)
+        finally:
+            task.cancel()
+            source.release()
+            await asyncio.wait({task})  # the write ends: cancelled, or failed before its read
+        assert task.cancelled(), task
+        assert lifted["hd2"]["bps"] == 0  # cancelled while lifted
+        assert await _throttle(running_vm) == boot
+
+    async def test_failed_lift_keeps_the_limit(
+        self, scheduler: Scheduler, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A test client holds the command monitor (it serves one client) through the lift: the
+        lift gets no answer, and the write goes on at the command-line limits. The call logs
+        one WARNING; its restore, once the client left, sets the same limits again."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            vm = session._vm
+            boot = await _throttle(vm)
+            caplog.clear()  # the boot's own records
+            source = VirtualSource(1024 * 1024, end=1024 * 1024, hold=True)
+            task: asyncio.Task[None] | None = None
+            with caplog.at_level(logging.WARNING, logger="exec_sandbox.qemu_vm"):
+                try:
+                    with monkeypatch.context() as short:
+                        short.setattr(constants, "DISK_LIMITS_QMP_TIMEOUT_SECONDS", 0.2)  # the lift's bound only
+                        async with _monitor(vm, id_prefix="holder"):
+                            task = asyncio.create_task(session.write_file("l.bin", cast("IO[bytes]", source)))
+                            await _until_held(source, task)  # the lift gave up before the first read
+                    during = await _throttle(vm)
+                finally:
+                    source.release()
+                    if task is not None:
+                        await task
+            records = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == "exec_sandbox.qemu_vm"]
+            assert records == [(logging.WARNING, "Home disk bandwidth limit not lifted")]
+            assert during == boot
+            assert await _throttle(vm) == boot
+
+    async def test_failed_restore_logs_an_error_and_the_next_write_restores(
+        self, scheduler: Scheduler, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A restore that gets no answer (a test client holds the command monitor) logs an ERROR
+        and keeps the session; the home disk stays lifted until the next write_file sets the
+        limits back."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            vm = session._vm
+            boot = await _throttle(vm)
+            caplog.clear()  # the boot's own records
+            source = VirtualSource(1024 * 1024, end=1024 * 1024, hold=True)
+            with caplog.at_level(logging.WARNING, logger="exec_sandbox.qemu_vm"):
+                task = asyncio.create_task(session.write_file("h.bin", cast("IO[bytes]", source)))
+                try:
+                    await _until_held(source, task)  # lifted
+                    with monkeypatch.context() as short:
+                        short.setattr(constants, "DISK_LIMITS_QMP_TIMEOUT_SECONDS", 0.2)  # the restore's bound only
+                        async with _monitor(vm, id_prefix="holder"):
+                            source.release()
+                            await task  # its restore gets no answer
+                finally:
+                    source.release()
+                    await task
+            errors = [r for r in caplog.records if r.levelno == logging.ERROR and r.name == "exec_sandbox.qemu_vm"]
+            assert [r.getMessage() for r in errors] == ["Home disk I/O limits not set back"]
+            assert not session.closed
+            assert (await _throttle(vm))["hd2"]["bps"] == 0  # still lifted
+            await session.write_file("next.bin", b"y")
+            assert await _throttle(vm) == boot

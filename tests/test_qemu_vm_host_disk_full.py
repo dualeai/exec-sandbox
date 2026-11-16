@@ -249,7 +249,9 @@ async def test_full_host_disk_fails_the_exec_in_flight_then_every_exec(
 async def test_full_host_disk_fails_the_write_in_flight_then_every_write(
     short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The event comes after the guest got file_end: the write waits for its ack."""
+    """The event comes after the guest got file_end: the write waits for its ack. That write
+    sets the home disk limits back (QEMU, paused, still answers); the next one fails before
+    its header and sets nothing."""
     monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 2)  # a missed event fails in 2 s, not 120 s
     nospace = _block_io_error(nospace=True, action="stop", reason="No space left on device")
     fake = _fake_vm(
@@ -262,14 +264,19 @@ async def test_full_host_disk_fails_the_write_in_flight_then_every_write(
         hold_query_answer=False,
         drop_first=False,
     )
+    requests: list[dict[str, Any]] = []
     async with fake as (vm, _):
-        # A missed event ends the write at the 2 s timeout, without this text.
-        with pytest.raises(OutcomeUnknownError, match="host disk is full"):
-            await vm.write_file("a.txt", io.BytesIO(b"data"), make_executable=False)  # the paused guest never acks
+        vm.workdir.qmp_socket = short_tmp_dir / "limits.sock"
+        async with await fake_qmp_server(vm.workdir.qmp_socket, status="running", status_line=None, requests=requests):
+            # A missed event ends the write at the 2 s timeout, without this text.
+            with pytest.raises(OutcomeUnknownError, match="host disk is full"):
+                await vm.write_file("a.txt", io.BytesIO(b"data"), make_executable=False)  # the paused guest never acks
 
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
-            await vm.write_file("a.txt", io.BytesIO(b"data"), make_executable=False)
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+                await vm.write_file("a.txt", io.BytesIO(b"data"), make_executable=False)
         assert vm.state is VmState.DESTROYING
+    limits = [r["arguments"]["bps"] for r in requests if r["execute"] == "block_set_io_throttle"]
+    assert limits == [0, constants.DISK_BPS_LIMIT]  # the lift, then the restore
 
 
 async def test_full_host_disk_during_boot_ends_the_boot_wait(short_tmp_dir: Path) -> None:

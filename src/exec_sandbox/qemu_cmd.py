@@ -67,6 +67,9 @@ _X86_INTEL_SIGNATURE = "family=6,model=60,stepping=4"
 _ARM_TCG_CPU = f"neoverse-v1,pauth=off,cntfrq={constants.ARM_TCG_COUNTER_HZ}"
 # Hypercall paravirt features that named models leave off (KVM only).
 _X86_KVM_PV_FLAGS = "+kvm-pv-ipi,+kvm-pv-tlb-flush,+kvm-pv-sched-yield,+kvm-poll-control,+kvm-asyncpf-int"
+# I/O limits of the rootfs overlay and home disk -drives (constants.DISK_IO_LIMITS; QemuVM
+# sets the home disk back to them after write_file lifts its bandwidth limit)
+_DISK_IO_LIMITS = ",".join(f"{name}={value}" for name, value in constants.DISK_IO_LIMITS.items())
 
 
 def _qmp_monitor(chardev: str, *, qemu_version: tuple[int, int, int]) -> list[str]:
@@ -904,10 +907,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             f"werror=report,"
             f"rerror=report,"
             f"copy-on-read=off,"
-            f"bps={constants.DISK_BPS_LIMIT},"
-            f"bps_max={constants.DISK_BPS_BURST},"
-            f"iops={constants.DISK_IOPS_LIMIT},"
-            f"iops_max={constants.DISK_IOPS_BURST},"
+            f"{_DISK_IO_LIMITS},"
             # Disable QEMU file locking to allow concurrent VMs sharing same backing file.
             # On Linux, QEMU uses OFD (Open File Descriptor) locks which cause "Failed to
             # get shared write lock" errors when multiple VMs access the same base image.
@@ -971,8 +971,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Home disk (serial=home): raw sparse file of spec.disk_mb, private to this
     # VM, formatted by tiny-init and mounted on /home/user. Every VM has one (one
-    # VM shape). Same I/O limits as the base drive; default file locking (unlike
-    # the shared base and L2 files, nothing else opens it).
+    # VM shape). Same I/O limits as the base drive (QemuVM.write_file lifts its bandwidth
+    # limit while it runs); default file locking (unlike the shared base and L2 files,
+    # nothing else opens it).
     # werror=enospc: a write that finds the host disk full pauses the VM (other
     # write errors still go to the guest). The guest never gets the error (no
     # EIO, no ext4 error), and BLOCK_IO_ERROR carries nospace=true only for a
@@ -985,19 +986,17 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             f"file={workdir.home_disk},"
             f"format=raw,"
             f"if=none,"
-            f"id=hd2,"
+            f"id={constants.HOME_DRIVE_ID},"
             f"{await written_drive_cache(workdir.home_disk.parent)}"
             f"aio={aio_mode},"
             f"discard=unmap,"
             f"detect-zeroes=unmap,"
             f"werror=enospc,"
             f"rerror=report,"
-            f"bps={constants.DISK_BPS_LIMIT},"
-            f"bps_max={constants.DISK_BPS_BURST},"
-            f"iops={constants.DISK_IOPS_LIMIT},"
-            f"iops_max={constants.DISK_IOPS_BURST}",
+            f"{_DISK_IO_LIMITS}",
             "-device",
-            f"virtio-blk-device,drive=hd2,serial=home{device_iothread},num-queues=1,queue-size={qs},event_idx=off",
+            f"virtio-blk-device,drive={constants.HOME_DRIVE_ID},serial=home{device_iothread},num-queues=1,"
+            f"queue-size={qs},event_idx=off",
         ]
     )
 
@@ -1202,8 +1201,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Event-only QMP monitor: QemuVM.start_event_watch keeps one connection for the
     # VM's life (BLOCK_IO_ERROR, VSERPORT_CHANGE, SHUTDOWN). The monitor above serves
-    # one client at a time, and saves and diagnostics need it. QEMU makes the socket
-    # (as qemu-vm when sudo starts it).
+    # one client at a time, and saves, diagnostics and write_file's home disk limits need
+    # it. QEMU makes the socket (as qemu-vm when sudo starts it).
     qemu_args.extend(
         [
             "-chardev",
