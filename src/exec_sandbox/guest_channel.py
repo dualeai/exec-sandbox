@@ -218,15 +218,23 @@ class OperationInbox:
             )
         raise CommunicationError(reason, context=None)
 
+    def take_nowait(self) -> StreamingMessage | None:
+        """get() without a wait: a message already routed, else the out-of-band failure
+        (raised as get() raises it), else None."""
+        # Data written before EOF stays ahead of the failure: the queue is read first.
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            if self._failed.done():
+                self._raise_failure()
+        return None
+
     async def get(self) -> StreamingMessage:
         """Receive ordered data, then raise any out-of-band transport failure."""
         while True:
-            # Data written before EOF stays ahead of the failure: the queue is read first.
-            try:
-                return self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                if self._failed.done():
-                    self._raise_failure()
+            message = self.take_nowait()
+            if message is not None:
+                return message
             waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             self._waiters.append(waiter)
             try:

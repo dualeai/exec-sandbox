@@ -537,7 +537,9 @@ DEFAULT_VM_CPU_CORES: Final[int] = 1
 
 DEFAULT_DISK_MB: Final[int] = 1024
 """Default size of a VM's home disk (/home/user, ext4 on a raw sparse file).
-Only blocks the guest writes take host space; usable space is ~95% of it."""
+Only blocks the guest writes take host space. The guest sees less free space than
+disk_mb on a new disk: ext4 keeps 6.3% of it at 1024 MB (6.7% at 512 MB, 3.5% at
+4096 MB)."""
 
 MIN_DISK_MB: Final[int] = 128
 """Smallest home disk: the ext4 journal, the REPL files and the files of a few

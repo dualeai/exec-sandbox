@@ -498,7 +498,8 @@ async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
 @pytest.fixture
 async def running_vm(vm_manager: VmManager) -> AsyncGenerator[QemuVM]:
     """A cold-booted Python VM, outside any session: for tests that send raw requests to the
-    guest agent (model_construct requests, pings) and read its replies."""
+    guest agent (model_construct requests, pings) and read its replies, or that call QemuVM
+    with no session (calls at the same time)."""
     vm = await vm_manager.create_vm(
         VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
         tenant_id="test",

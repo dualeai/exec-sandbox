@@ -10,6 +10,7 @@ import contextlib
 import errno
 import json
 import logging
+import os
 import signal
 import sys
 from collections import deque
@@ -50,6 +51,7 @@ from exec_sandbox.guest_agent_protocol import (
     PongMessage,
     ReadFileRequest,
     StreamingErrorMessage,
+    StreamingMessage,
     WriteFileRequest,
     request_line,
 )
@@ -115,12 +117,29 @@ def _write_all_bytes(sink: IO[bytes], data: bytes) -> None:
         offset += written
 
 
-def _stream_position(stream: IO[bytes]) -> int | None:
-    """Where a seekable stream stands, or None: not seekable, or no position (a duck-typed reader)."""
+def _source_extent(stream: IO[bytes]) -> tuple[int | None, int | None]:
+    """Where write_file's source stands and the bytes left after it (0 for a stream past its end).
+    (None, None): not seekable, or no position (a duck-typed reader); (start, None): no end to
+    seek to (a procfs file refuses SEEK_END). Blocking: a seek to the end can wait for a network
+    file's server, or read a compressed stream to its end.
+
+    Raises:
+        OSError, ValueError: the seek back to its start failed (the stream moved); ValueError
+            also from a closed stream
+    """
     try:
-        return stream.tell() if stream.seekable() else None
+        if not stream.seekable():
+            return None, None
+        start = stream.tell()
     except (AttributeError, OSError):
-        return None
+        return None, None
+    try:
+        stream.seek(0, os.SEEK_END)
+        end: int | None = stream.tell()
+    except OSError:  # a failed seek leaves the position as it was
+        end = None
+    stream.seek(start)
+    return start, None if end is None else max(0, end - start)
 
 
 _CALLER_PATH_ERRNOS = frozenset(
@@ -159,24 +178,26 @@ def local_path_error(
     return TransientError(message, code=ErrorCode.LOCAL_DISK, context=context, hint=None, instance_id=None)
 
 
-def _destination_error(error: OSError | ValueError, *, vm_id: str, path: str) -> InvalidInputError | TransientError:
-    """local_path_error of read_file's local destination (*path* is the guest file)."""
-    return local_path_error(
-        error,
-        failure=f"VM {vm_id} read_file could not write the local destination",
-        path=None,
-        context={"vm_id": vm_id, "path": path},
-    )
+_DESTINATION_FAILURE: Final = "read_file could not write the local destination"
+_SOURCE_FAILURE: Final = "write_file could not read the local source"
 
 
-async def _destination_job[T](call: Callable[[], T], *, vm_id: str, path: str) -> T:
-    """Run one job on read_file's local destination to its end (a worker thread). Its
-    OSError or ValueError is this host's or the caller's (local_path_error), never the
-    guest's (GUEST_UNAVAILABLE)."""
+def _local_file_error(
+    error: OSError | ValueError, *, failure: str, vm_id: str, path: str
+) -> InvalidInputError | TransientError:
+    """local_path_error of the local side of a file call: read_file's destination
+    (_DESTINATION_FAILURE) or write_file's source (_SOURCE_FAILURE); *path* is the guest file."""
+    return local_path_error(error, failure=f"VM {vm_id} {failure}", path=None, context={"vm_id": vm_id, "path": path})
+
+
+async def _local_file_job[T](call: Callable[[], T], *, failure: str, vm_id: str, path: str) -> T:
+    """Run one job on the local side of a file call to its end (a worker thread). Its OSError
+    or ValueError is this host's or the caller's (_local_file_error), never the guest's
+    (GUEST_UNAVAILABLE)."""
     try:
         return await run_to_end(call)
     except (OSError, ValueError) as e:
-        raise _destination_error(e, vm_id=vm_id, path=path) from e
+        raise _local_file_error(e, failure=failure, vm_id=vm_id, path=path) from e
 
 
 def guest_error_to_exception(
@@ -877,16 +898,20 @@ class QemuVM:
                 instance_id=None,
             )
 
-    async def write_file(  # noqa: PLR0912, PLR0915
-        self, path: str, content: IO[bytes], *, make_executable: bool
-    ) -> None:
+    async def write_file(self, path: str, content: IO[bytes], *, make_executable: bool) -> None:
         """Write a file to the sandbox via streaming zstd-compressed chunks.
 
         Protocol:
-        1. Send WriteFileRequest header (with op_id)
+        1. Send the WriteFileRequest header (op_id; size: the bytes left in a seekable source,
+           None for another source or one with no end to seek to)
         2. Stream-compress content chunk by chunk as file_chunk frames
         3. Send a file_end frame to finalize
         4. Await FileWriteAckMessage from guest
+
+        Before file_end the guest sends nothing for a write but a terminal error (a path, I/O,
+        space or protocol refusal, or a stall). The call looks for a reply before each 128 KB
+        read and before file_end; at a reply it queues no more frames and no file_end (the
+        frames already queued still go out).
 
         Content is read from the stream in 128 KB chunks, compressed
         incrementally with a shared ZstdCompressor, and sent immediately.
@@ -897,99 +922,66 @@ class QemuVM:
 
         Args:
             path: Relative path in sandbox (PATH_MAX 4096, NAME_MAX 255 per component)
-            content: Readable binary stream (BytesIO for bytes, open file for Path)
+            content: Readable binary stream (BytesIO for bytes, open file for Path); when the
+                call raises (a cancel too), a seekable one is back at the position where the
+                call found it (unless the seek back itself fails)
             make_executable: Set executable permission (0o755 vs 0o644)
 
         Raises:
-            InvalidInputError: PATH_INVALID or GUEST_IO on validation or write failure;
-                ARGUMENT_INVALID when a source read fails with an error the caller can fix
-                (local_path_error: a folder, no access), as for LOCAL_DISK below
-            InternalError: GUEST_PROTOCOL on a protocol error or a wrong answer
+            InvalidInputError: PATH_INVALID or GUEST_IO on validation or write failure
+                (GUEST_IO also when the content does not fit in the free space of the home
+                disk); ARGUMENT_INVALID when a seekable source has more than MAX_FILE_SIZE_BYTES
+                after its position, or the source cannot be measured or read for a reason the
+                caller can fix (local_path_error: a folder, no access), as for LOCAL_DISK below
+            InternalError: GUEST_PROTOCOL on a protocol error or a wrong answer (also a reply
+                other than an error before file_end)
             TransientError: GUEST_UNAVAILABLE on pre-dispatch timeout or communication failure;
-                LOCAL_DISK when the source cannot be read after the header was sent: the
-                channel closes, so the guest drops the write (it commits only on file_end);
-                nothing was written and a seekable source is back at its start position;
-                LOCAL_DISK when QEMU stopped the VM because the host disk is full (the VM
-                is then non-reusable; a call in flight then raised OutcomeUnknownError)
+                LOCAL_DISK when the source cannot be measured (its seek back fails: nothing is
+                sent), or cannot be read after the header was sent (the channel closes, so the
+                guest drops the write: it commits only on file_end): nothing was written;
+                LOCAL_DISK when QEMU stopped the VM because the host disk is full (the VM is
+                then non-reusable; a call in flight then raised OutcomeUnknownError)
             OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the transport is lost
                 after the header was dispatched, or the guest's acknowledgement names
                 another path or byte count — the write may have landed
         """
         self._check_path("write_file", path, may_be_empty=False)
         self._check_host_disk()
+        start, size = await _local_file_job(
+            partial(_source_extent, content), failure=_SOURCE_FAILURE, vm_id=self.vm_id, path=path
+        )
+        # The host's only size check of a caller's stream; a Path gets here only when it grew
+        # after Session's fstat check
+        if size is not None and size > constants.MAX_FILE_SIZE_BYTES:
+            raise InvalidInputError(
+                f"Stream content is {size} bytes, exceeds {constants.MAX_FILE_SIZE_BYTES}",
+                code=ErrorCode.ARGUMENT_INVALID,
+                context={"vm_id": self.vm_id, "path": path},
+                hint=None,
+                instance_id=None,
+            )
+        try:
+            await self._send_file(path, content, make_executable=make_executable, size=size)
+        except BaseException:
+            # Every failure, a cancel too: the same call can run again. A seek error never
+            # replaces the call's error. A worker job: a backward seek of a compressed
+            # stream reads it again; run_to_end ends the job also under a cancel.
+            if start is not None:
+                with contextlib.suppress(Exception):
+                    await run_to_end(partial(content.seek, start))
+            raise
 
+    async def _send_file(self, path: str, content: IO[bytes], *, make_executable: bool, size: int | None) -> None:
+        """The protocol of write_file (its docstring), with `size` in the header."""
         op_id = uuid4().hex
         op_queue: OperationInbox | None = None
-        start = _stream_position(content)  # a failed source read sets the stream back here
-
         try:
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
             op_queue = self.channel.register_op(op_id, changes_state=True)  # write_file
-            header = WriteFileRequest(op_id=op_id, path=path, make_executable=make_executable)
+            header = WriteFileRequest(op_id=op_id, path=path, make_executable=make_executable, size=size)
             await self.channel.enqueue_registered(op_queue, request_line(header))
 
-            # Stream-compress content chunk by chunk.  Each 128 KB slice is
-            # read from the stream, compressed, and sent immediately.
-            # file_end is a commit record and is sent only after a proven EOF,
-            # successful compressor flush, and successful chunk enqueue.
-            chunk_size = constants.FILE_TRANSFER_CHUNK_SIZE
-            compressor = zstd.ZstdCompressor(level=constants.FILE_TRANSFER_ZSTD_LEVEL)
-            source_size = 0
-
-            # base64 and a hex op_id need no JSON escape: the frame is built as bytes, with no
-            # json.dumps scan of the 175 KB text (342 -> 105 us per 128 KB chunk)
-            frame_head = f'{{"action": "file_chunk", "op_id": "{op_id}", "data": "'.encode()
-
-            def _encode_frame(compressed: bytes) -> bytes:
-                # TODO: Binary framing would eliminate this base64 encode overhead (~33% wire bloat)
-                return frame_head + binascii.b2a_base64(compressed, newline=False) + b'"}\n'
-
-            # Keep each caller-owned read joined to this coroutine. A failed
-            # enqueue or cancellation must not return while a thread still
-            # touches the caller's stream.
-            def _read_and_compress(reader: IO[bytes]) -> tuple[bytes, int] | None:
-                raw = reader.read(chunk_size)
-                if not raw:
-                    return None  # EOF
-                compressed = compressor.compress(raw)
-                if not compressed:
-                    return b"", len(raw)  # compressor buffered, no output yet
-                return _encode_frame(compressed), len(raw)
-
-            while True:
-                try:
-                    result = await run_to_end(lambda: _read_and_compress(content))
-                except OSError as e:
-                    # The local source failed after the header, before file_end. The guest
-                    # commits a write only on the file_end of its op_id, which this one never
-                    # gets, and drops the partial file when the channel closes: nothing was
-                    # written (RETRY), not an unknown outcome. A seekable source goes back to
-                    # where the call found it, so the same call can run again.
-                    with contextlib.suppress(OSError, RuntimeError):
-                        await self.channel.close()
-                    if start is not None:
-                        content.seek(start)
-                    raise local_path_error(
-                        e,
-                        failure=f"VM {self.vm_id} write_file could not read the local source",
-                        path=None,
-                        context={"vm_id": self.vm_id, "path": path},
-                    ) from e
-                if result is None:
-                    break  # Proven source EOF.
-                frame, raw_size = result
-                source_size += raw_size
-                if frame:  # non-empty (not just compressor buffering)
-                    await self.channel.enqueue_raw(frame)
-
-            # Flush remaining compressed data from the compressor.
-            def _flush_and_encode() -> bytes | None:
-                remaining = compressor.flush()
-                return _encode_frame(remaining) if remaining else None
-
-            flush_frame = await run_to_end(_flush_and_encode)
-            if flush_frame:
-                await self.channel.enqueue_raw(flush_frame)
+            source_size = await self._send_content(op_queue, op_id=op_id, content=content, path=path)
 
             # This is the only guest-side commit signal.  Never place it in a
             # failure/cancellation cleanup path: disconnect makes the guest
@@ -998,18 +990,8 @@ class QemuVM:
             await self.channel.enqueue_raw(end_frame)
 
             response = await asyncio.wait_for(op_queue.get(), timeout=constants.FILE_IO_TIMEOUT_SECONDS)
-
-            if isinstance(response, StreamingErrorMessage):
-                raise guest_error_to_exception(response, self.vm_id, operation=f"write_file '{path}'")
-
             if not isinstance(response, FileWriteAckMessage):
-                raise InternalError(
-                    f"write_file unexpected response type: {type(response).__name__}",
-                    code=ErrorCode.GUEST_PROTOCOL,
-                    context={"vm_id": self.vm_id, "path": path},
-                    hint=None,
-                    instance_id=None,
-                )
+                raise self._write_reply_error(response, path=path)
 
             if response.path != path or response.bytes_written != source_size:
                 raise _outcome_unknown(
@@ -1057,6 +1039,70 @@ class QemuVM:
             raise
         finally:
             self.channel.unregister_op(op_id)
+
+    async def _send_content(self, op_queue: OperationInbox, *, op_id: str, content: IO[bytes], path: str) -> int:
+        """Stream `content` as the file_chunk frames of write_file `op_id`; returns the bytes read.
+
+        Each 128 KB slice is read from the stream, compressed, and queued at once. Before each
+        slice and before it returns, it takes a guest reply that is already routed (before
+        file_end only an error comes) and raises its error (_write_reply_error), or raises the
+        transport failure; it then reads and queues nothing more.
+        """
+        chunk_size = constants.FILE_TRANSFER_CHUNK_SIZE
+        compressor = zstd.ZstdCompressor(level=constants.FILE_TRANSFER_ZSTD_LEVEL)
+        source_size = 0
+
+        # base64 and a hex op_id need no JSON escape: the frame is built as bytes, with no
+        # json.dumps scan of the 175 KB text (342 -> 105 us per 128 KB chunk)
+        frame_head = f'{{"action": "file_chunk", "op_id": "{op_id}", "data": "'.encode()
+
+        # Keep each caller-owned read joined to this coroutine. A failed
+        # enqueue or cancellation must not return while a thread still
+        # touches the caller's stream.
+        def _read_and_compress() -> tuple[bytes, int]:
+            raw = content.read(chunk_size) or b""
+            # At the proven source EOF (an empty read), the compressor's flush: its last data
+            compressed = compressor.compress(raw) if raw else compressor.flush()
+            if not compressed:
+                return b"", len(raw)  # compressor buffered, no output yet
+            # TODO: Binary framing would eliminate this base64 encode overhead (~33% wire bloat)
+            return frame_head + binascii.b2a_base64(compressed, newline=False) + b'"}\n', len(raw)
+
+        while True:
+            # Before the read: a refusal the guest already sent wins over a later source error
+            if (reply := op_queue.take_nowait()) is not None:
+                raise self._write_reply_error(reply, path=path)
+            try:
+                frame, raw_size = await run_to_end(_read_and_compress)
+            except OSError as e:
+                # The local source failed after the header, before file_end. The guest
+                # commits a write only on the file_end of its op_id, which this one never
+                # gets, and drops the partial file when the channel closes: nothing was
+                # written (RETRY), not an unknown outcome.
+                with contextlib.suppress(OSError, RuntimeError):
+                    await self.channel.close()
+                raise _local_file_error(e, failure=_SOURCE_FAILURE, vm_id=self.vm_id, path=path) from e
+            if frame:
+                await self.channel.enqueue_raw(frame)
+            if not raw_size:
+                break  # the flush frame is queued
+            source_size += raw_size
+        if (reply := op_queue.take_nowait()) is not None:
+            raise self._write_reply_error(reply, path=path)
+        return source_size
+
+    def _write_reply_error(self, reply: StreamingMessage, *, path: str) -> SandboxError:
+        """The error of a write_file reply other than the FileWriteAck after file_end: the
+        guest's error, else GUEST_PROTOCOL (an ack or any other reply before file_end too)."""
+        if isinstance(reply, StreamingErrorMessage):
+            return guest_error_to_exception(reply, self.vm_id, operation=f"write_file '{path}'")
+        return InternalError(
+            f"write_file unexpected response type: {type(reply).__name__}",
+            code=ErrorCode.GUEST_PROTOCOL,
+            context={"vm_id": self.vm_id, "path": path},
+            hint=None,
+            instance_id=None,
+        )
 
     async def read_file(self, path: str, *, destination: Path | IO[bytes]) -> None:
         """Read a file from the sandbox via streaming zstd-compressed chunks.
@@ -1156,7 +1202,12 @@ class QemuVM:
                             f"read_file '{path}': the guest sent more than {constants.MAX_FILE_SIZE_BYTES} bytes",
                             context=None,
                         )
-                    await _destination_job(partial(_write_all_bytes, sink, decompressed), vm_id=self.vm_id, path=path)
+                    await _local_file_job(
+                        partial(_write_all_bytes, sink, decompressed),
+                        failure=_DESTINATION_FAILURE,
+                        vm_id=self.vm_id,
+                        path=path,
+                    )
                     if decompressor.eof or decompressor.needs_input:
                         break
                     data = b""
@@ -1190,7 +1241,7 @@ class QemuVM:
         try:
             tmp_dest = destination.with_suffix(f"{destination.suffix}.{op_id}.tmp")
         except ValueError as e:  # no file name: "", ".", "/"
-            raise _destination_error(e, vm_id=self.vm_id, path=path) from e
+            raise _local_file_error(e, failure=_DESTINATION_FAILURE, vm_id=self.vm_id, path=path) from e
         opened: list[IO[bytes]] = []  # the worker job publishes the file: a cancel still closes it
 
         def open_tmp() -> None:
@@ -1209,9 +1260,9 @@ class QemuVM:
                 tmp_dest.unlink(missing_ok=True)
 
         try:
-            await _destination_job(open_tmp, vm_id=self.vm_id, path=path)
+            await _local_file_job(open_tmp, failure=_DESTINATION_FAILURE, vm_id=self.vm_id, path=path)
             await self._recv_file_chunks(path, op_id, opened[0])
-            await _destination_job(close_and_rename, vm_id=self.vm_id, path=path)
+            await _local_file_job(close_and_rename, failure=_DESTINATION_FAILURE, vm_id=self.vm_id, path=path)
         except BaseException:
             await run_to_end(discard)
             raise

@@ -19,7 +19,7 @@ from hypothesis.strategies import characters, sampled_from, text
 from pydantic import TypeAdapter, ValidationError
 
 from exec_sandbox import constants
-from exec_sandbox.constants import ENV_VAR_FORBIDDEN_CONTROL_CHARS
+from exec_sandbox.constants import ENV_VAR_FORBIDDEN_CONTROL_CHARS, MAX_FILE_SIZE_BYTES
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     ExecutionCompleteMessage,
@@ -137,14 +137,24 @@ REQUEST_WIRE_CASES = [
         id="install-all-fields",
     ),
     pytest.param(
-        WriteFileRequest(op_id="abc123", path="hello.txt", make_executable=False),
+        WriteFileRequest(op_id="abc123", path="hello.txt", make_executable=False, size=None),
         {"action": "write_file", "op_id": "abc123", "path": "hello.txt", "make_executable": False},
         id="write-file",
     ),
     pytest.param(
-        WriteFileRequest(op_id="abc123", path="run.sh", make_executable=True),
+        WriteFileRequest(op_id="abc123", path="run.sh", make_executable=True, size=None),
         {"action": "write_file", "op_id": "abc123", "path": "run.sh", "make_executable": True},
         id="write-file-executable",
+    ),
+    pytest.param(
+        WriteFileRequest(op_id="abc123", path="big.bin", make_executable=False, size=524_288_000),
+        {"action": "write_file", "op_id": "abc123", "path": "big.bin", "make_executable": False, "size": 524_288_000},
+        id="write-file-size",
+    ),
+    pytest.param(
+        WriteFileRequest(op_id="abc123", path="empty.txt", make_executable=False, size=0),
+        {"action": "write_file", "op_id": "abc123", "path": "empty.txt", "make_executable": False, "size": 0},
+        id="write-file-size-zero",
     ),
     pytest.param(
         ReadFileRequest(op_id="abc", path="results/data.json"),
@@ -252,7 +262,15 @@ class TestRequiredFields:
             pytest.param(
                 InstallPackagesRequest, {"language": Language.PYTHON, "packages": ["x==1.0"]}, "timeout", id="install"
             ),
-            pytest.param(WriteFileRequest, {"op_id": "w", "path": "a.txt"}, "make_executable", id="write-file"),
+            pytest.param(
+                WriteFileRequest, {"op_id": "w", "path": "a.txt", "size": 0}, "make_executable", id="write-file"
+            ),
+            pytest.param(
+                WriteFileRequest,
+                {"op_id": "w", "path": "a.txt", "make_executable": False},
+                "size",
+                id="write-file-size",
+            ),
             pytest.param(ListFilesRequest, {}, "path", id="list-files"),
         ],
     )
@@ -260,10 +278,24 @@ class TestRequiredFields:
         self, model: type[GuestAgentRequest], fields: dict[str, Any], missing: str
     ) -> None:
         """No defaults: a send site that leaves a field out fails, rather than sending a value it
-        did not choose (the reseed, the timeout, the environment, the file mode, the folder)."""
+        did not choose (the reseed, the timeout, the environment, the file mode, the file size,
+        the folder)."""
         with pytest.raises(ValidationError) as exc_info:
             model(**{key: value for key, value in fields.items() if value is not None})
         assert [(error["type"], error["loc"]) for error in exc_info.value.errors()] == [("missing", (missing,))]
+
+
+class TestWriteFileSize:
+    """The size of a write_file header: the decoded bytes, from 0 to MAX_FILE_SIZE_BYTES
+    (REQUEST_WIRE_CASES sends both ends, and None as no size key)."""
+
+    @pytest.mark.parametrize("size", [-1, MAX_FILE_SIZE_BYTES + 1])
+    def test_size_out_of_range_is_refused(self, size: int) -> None:
+        """A size below 0 or above MAX_FILE_SIZE_BYTES fails on the size field: the host never
+        sends it."""
+        with pytest.raises(ValidationError) as exc_info:
+            WriteFileRequest(op_id="w", path="a.bin", make_executable=False, size=size)
+        assert [error["loc"] for error in exc_info.value.errors()] == [("size",)]
 
 
 class TestEnvVarValidation:
@@ -378,19 +410,21 @@ class TestFileRequestPaths:
     def test_write_file_path_max_length(self) -> None:
         """WriteFileRequest accepts path at max length."""
         long_path = "a" * _PATH_LIMIT
-        req = WriteFileRequest(op_id="test", path=long_path, make_executable=False)
+        req = WriteFileRequest(op_id="test", path=long_path, make_executable=False, size=None)
         assert len(req.path) == _PATH_LIMIT
 
     def test_write_file_path_exceeds_max_length(self) -> None:
         """WriteFileRequest rejects path exceeding max length."""
         too_long = "a" * (_PATH_LIMIT + 1)
-        with pytest.raises(ValidationError):
-            WriteFileRequest(op_id="test", path=too_long, make_executable=False)
+        with pytest.raises(ValidationError) as exc_info:
+            WriteFileRequest(op_id="test", path=too_long, make_executable=False, size=None)
+        assert [error["loc"] for error in exc_info.value.errors()] == [("path",)]
 
     def test_write_file_empty_path_rejected(self) -> None:
         """WriteFileRequest rejects empty path."""
-        with pytest.raises(ValidationError):
-            WriteFileRequest(op_id="test", path="", make_executable=False)
+        with pytest.raises(ValidationError) as exc_info:
+            WriteFileRequest(op_id="test", path="", make_executable=False, size=None)
+        assert [error["loc"] for error in exc_info.value.errors()] == [("path",)]
 
     def test_read_file_path_max_length(self) -> None:
         """ReadFileRequest accepts path at max length."""
@@ -687,7 +721,7 @@ class TestFilePathValidationPropertyBased:
         """Property: Safe relative paths should be accepted by all file request models."""
         path = f"subdir/{segment}.txt"
         # WriteFileRequest
-        req_w = WriteFileRequest(op_id="test", path=path, make_executable=False)
+        req_w = WriteFileRequest(op_id="test", path=path, make_executable=False, size=None)
         assert req_w.path == path
         # ReadFileRequest
         req_r = ReadFileRequest(op_id="test", path=path)
@@ -709,7 +743,7 @@ class TestFilePathValidationPropertyBased:
         # Build a path that is guaranteed to exceed PATH_MAX
         path = "a" * (_PATH_LIMIT + 1) + extra
         with pytest.raises(ValidationError):
-            WriteFileRequest(op_id="test", path=path, make_executable=False)
+            WriteFileRequest(op_id="test", path=path, make_executable=False, size=None)
         with pytest.raises(ValidationError):
             ReadFileRequest(op_id="test", path=path)
         with pytest.raises(ValidationError):
@@ -734,7 +768,7 @@ class TestFilePathValidationPropertyBased:
         request sends the path as it is, and the guest agent refuses it (guest-agent/src/file_io.rs)."""
         path = prefix + control + suffix
         for request in (
-            WriteFileRequest(op_id="test", path=path, make_executable=False),
+            WriteFileRequest(op_id="test", path=path, make_executable=False, size=None),
             ReadFileRequest(op_id="test", path=path),
             ListFilesRequest(path=path),
         ):

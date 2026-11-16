@@ -5,6 +5,14 @@ Protocol: JSON newline-delimited over dual-port channel (command + event).
 
 Security: the guest agent validates every field again (guest-agent/src/validation.rs,
 file_io.rs, packages.rs).
+
+Releases: a saved VM keeps the guest agent of its release and can load on an older or a newer
+host release, with no version check. So each change is additive in both directions:
+- a new request field is optional for the guest, and an older guest ignores it: the call must
+  stay correct without its effect (request_line drops a None field);
+- the reply models ignore unknown fields (a new reply field is optional here); no new reply
+  type and no new error_type (an older host fails them);
+- before file_end, a write gets no reply but a terminal error.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ from exec_sandbox.constants import (
     MAX_ENV_VAR_VALUE_LENGTH,
     MAX_ENV_VARS,
     MAX_FILE_PATH_LENGTH,
+    MAX_FILE_SIZE_BYTES,
 )
 from exec_sandbox.models import Language  # noqa: TC001 - Required at runtime for Pydantic
 
@@ -205,10 +214,15 @@ class WriteFileRequest(GuestAgentRequest):
     """Header for streaming file write to the sandbox.
 
     Initiates a multi-message write sequence:
-    1. Host sends WriteFileRequest (this header with op_id)
+    1. Host sends WriteFileRequest (this header with op_id, and size when the host knows it)
     2. Host sends file_chunk frames (op_id, data: base64 of zstd-compressed chunks)
     3. Host sends a file_end frame (op_id; signals end of stream)
     4. Guest responds with FileWriteAckMessage
+
+    Before file_end, the guest sends nothing for this op_id but a terminal error
+    (StreamingErrorMessage: a path, I/O, space or protocol refusal, or a stall); QemuVM.write_file
+    stops at it. Every guest release keeps to this: QemuVM.write_file raises GUEST_PROTOCOL for any
+    other reply there.
 
     QemuVM writes the file_chunk and file_end frames itself (no model): at most one
     file_chunk per 128 KB read of the source (none while the compressor buffers), one more
@@ -219,6 +233,10 @@ class WriteFileRequest(GuestAgentRequest):
     - Path length: PATH_MAX 4096 bytes, NAME_MAX 255 bytes per component
     - Path traversal: no escape from /home/user
     - File size: max 500 MiB (streamed in zstd chunks: memory does not grow with the file)
+    - Free space: with a size above 0, the home disk has room for it, else an io_error: at the
+      header when its free-space count is too small, else when its reservation of that room
+      fails (at the next file_chunk or at file_end). The reservation holds until the commit
+      (which frees the part the file does not use) or until the write fails
     - Permissions: 0o644, or 0o755 with make_executable=True
 
     Response: FileWriteAckMessage (after file_end).
@@ -232,6 +250,16 @@ class WriteFileRequest(GuestAgentRequest):
         description="Relative path in sandbox (NAME_MAX 255 bytes per component)",
     )
     make_executable: bool = Field(description="Set executable permission (0o755 vs 0o644)")
+    size: int | None = Field(
+        ge=0,
+        le=MAX_FILE_SIZE_BYTES,
+        description=(
+            "Bytes of the file after decompression, when the host knows them before the first "
+            "file_chunk: what is left in a seekable source. None: not known (a non-seekable "
+            "source, or one with no end to seek to, as a procfs file). The guest checks and "
+            "reserves this room; the file still gets the bytes that come before file_end"
+        ),
+    )
 
 
 class ReadFileRequest(GuestAgentRequest):
