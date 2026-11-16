@@ -23,7 +23,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from exec_sandbox import constants
 from exec_sandbox.cgroup import Cgroup
 from exec_sandbox.exceptions import ConfigError, ErrorCode, InternalError
 from exec_sandbox.models import Language
@@ -47,7 +46,7 @@ def _vm(manager: VmManager, reservation: object) -> MagicMock:
     vm.gvproxy_log_task = None
     vm.resource_reservation = reservation
     vm.state = VmState.BOOTING
-    vm.begin_destroy = AsyncMock()
+    vm.begin_destroy = MagicMock()
 
     async def confirm() -> None:
         vm.state = VmState.DESTROYED
@@ -109,7 +108,7 @@ class TestFailedAttemptOwnership:
         await manager._cleanup_failed_owner(vm.vm_id, operation="boot_failure_cleanup", error=RuntimeError("boot"))  # pyright: ignore[reportPrivateUsage]
 
         cleanup_results.update(_ALL_DONE)
-        assert await manager.destroy_vm(vm, _schedule_retry=False) is True
+        assert await manager._destroy_vm(vm, schedule_retry=False, release_admission=True) is True
         manager.release.assert_not_awaited()  # type: ignore[attr-defined]
         assert vm.vm_id not in manager._vms  # pyright: ignore[reportPrivateUsage]
 
@@ -126,7 +125,7 @@ class TestFailedAttemptOwnership:
         manager.reapers[1].assert_called_once_with(pending)  # type: ignore[attr-defined]
 
         cleanup_results.update(_ALL_DONE)
-        assert await manager._cleanup_pending_launch(pending, _schedule_retry=False) is True  # pyright: ignore[reportPrivateUsage]
+        assert await manager._cleanup_pending_launch(pending, schedule_retry=False, release_admission=True) is True  # pyright: ignore[reportPrivateUsage]
         manager.release.assert_not_awaited()  # type: ignore[attr-defined]
 
     async def test_unconfirmed_process_death_keeps_the_slot_and_raises(
@@ -170,7 +169,6 @@ class TestEphemeralVm:
                     VmSpec(language=Language.PYTHON),
                     tenant_id="tenant",
                     task_id="task",
-                    retry_profile=constants.RETRY_BACKGROUND,
                     direct_write_target=None,
                     snapshot_drive=None,
                     cache_leases=(),
@@ -179,7 +177,11 @@ class TestEphemeralVm:
                     pass
 
             if raises:
-                with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED):
+                with pytest.raises(
+                    InternalError,
+                    check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED,
+                    match=r"^Ephemeral VM resource cleanup was not confirmed for ephemeral$",
+                ):
                     await run()
             else:
                 await run()

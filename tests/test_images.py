@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
-from exec_sandbox.files.disk import create_file
+from exec_sandbox.files.disk import create_file, file_stamp
 from exec_sandbox.images import (
     BASE_IMAGES,
     GuestImages,
@@ -84,6 +84,40 @@ class TestKernelDirOf:
 
 
 class TestGuestImages:
+    def test_base_image_is_the_catalog_version(self, tmp_path: Path) -> None:
+        """An older build in the folder (python-3.13) is not used: the base image is the one the
+        images catalog names (one place for a new runtime version)."""
+        images = tmp_path / "images"
+        images.mkdir()
+        host = GuestImages(images_dir=images, kernel_dir=images, download_dir=None, arch=HostArch.X86_64)
+        (images / "python-3.13-base-x86_64.qcow2").touch()
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND):
+            host.base_image(Language.PYTHON)
+        (images / "python-3.14-base-x86_64.qcow2").touch()
+        assert host.base_image(Language.PYTHON) == images / "python-3.14-base-x86_64.qcow2"
+
+    @pytest.mark.parametrize(
+        ("host_arch", "suffix"), [(HostArch.AARCH64, "aarch64"), (HostArch.X86_64, "x86_64")], ids=["aarch64", "x86_64"]
+    )
+    @pytest.mark.parametrize("language", list(Language), ids=[language.value for language in Language])
+    def test_base_image_skips_the_other_architecture(
+        self, tmp_path: Path, language: Language, host_arch: HostArch, suffix: str
+    ) -> None:
+        """A folder with both architectures (make build IMAGE_ARCH=all) gives the host's image,
+        and VmManager.start makes the overlay template of the same one; a download in progress (.zst) is no image."""
+        images = tmp_path / "images"
+        images.mkdir()
+        stem = {Language.PYTHON: "python-3.14-base", Language.JAVASCRIPT: "node-1.4-base", Language.RAW: "raw-base"}[
+            language
+        ]
+        for arch in ("aarch64", "x86_64"):
+            (images / f"{stem}-{arch}.qcow2").touch()
+        host = GuestImages(images_dir=images, kernel_dir=images, download_dir=None, arch=host_arch)
+        mine = images / f"{stem}-{suffix}.qcow2"
+        (images / f"{mine.name}.zst").touch()
+        assert host.base_image(language) == mine
+        assert host.present_base_images() == [mine]
+
     def test_missing_base_image_is_asset_not_found(self, tmp_path: Path) -> None:
         images = GuestImages(images_dir=tmp_path, kernel_dir=tmp_path, download_dir=None, arch=HostArch.X86_64)
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND, match=r"python-3\.14"):
@@ -208,13 +242,20 @@ class TestImageDigestEdgeCases:
         assert h1 == "61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4"  # b"aaaa"
         assert image_digest(f) == "81cc5b17018674b401b42f35ba07bb79e211239c23bffe658da1577e3e646877"  # b"bbbb"
 
-    def test_sidecar_written(self, tmp_path: Path) -> None:
-        """The digest is cached in a <file>.sha256 sidecar keyed by inode, mtime and size."""
+    def test_a_sidecar_counts_for_its_version_of_the_file_only(self, tmp_path: Path) -> None:
+        """The digest is kept in a <file>.sha256 sidecar keyed by the file's stamp (inode, mtime
+        and size): one that another process wrote gives the digest with no read of the image.
+        Once the file changes, that sidecar does not count: the new bytes are hashed and the
+        sidecar holds the new stamp and digest."""
         f = tmp_path / "image.qcow2"
         f.write_bytes(b"image-bytes")
-        digest = image_digest(f)
         sidecar = tmp_path / "image.qcow2.sha256"
-        assert sidecar.read_text().split()[1] == digest == _SHA256_IMAGE_BYTES
+        sidecar.write_text(f"{file_stamp(f.stat())} {'f' * 64}")  # another process's digest
+
+        assert image_digest(f) == "f" * 64
+        f.write_bytes(b"one")  # a new size and mtime: a new stamp
+        assert image_digest(f) == _SHA256_ONE
+        assert sidecar.read_text() == f"{file_stamp(f.stat())} {_SHA256_ONE}"
 
     def test_sidecar_has_no_group_or_other_access(self, tmp_path: Path) -> None:
         """Under `sg qemu-vm` and umask 002, open() made the sidecar 0664 of group qemu-vm: a

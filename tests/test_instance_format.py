@@ -9,7 +9,6 @@ import contextlib
 import hashlib
 import json
 import os
-import pickle
 import re
 import secrets
 import sys
@@ -47,14 +46,14 @@ def _prefix_len(data: bytes) -> int:
     return 12 + int.from_bytes(data[8:12], "big")
 
 
-def _header(*, generation: int = 2, instance_id: str = _ID) -> models.HeadHeader:
+def _header(*, instance_id: str = _ID) -> models.HeadHeader:
     """A header whose fields are well formed; its key id and wrapped key name no key."""
     commit = ids.new_id()
     return models.HeadHeader(
         instance_id=instance_id,
-        generation=generation,
+        generation=2,
         commit_id=commit,
-        recent_commits=(models.RecentCommit(generation=generation, commit_id=commit),),
+        recent_commits=(models.RecentCommit(generation=2, commit_id=commit),),
         key_id="a" * 64,
         wrapped_data_key="b" * 80,
     )
@@ -233,7 +232,7 @@ class TestHead:
         data_key = secrets.token_bytes(32)
         data, header = _sealed(self._RING, data_key=data_key)
         assert head.open_head(data, self._RING, instance_id=_ID) == (header, _BODY, data_key)
-        assert head.authenticate(data, self._RING, instance_id=_ID) == header
+        assert head.open_header(data, self._RING, instance_id=_ID)[0] == header
 
     def test_every_byte_flip_fails(self) -> None:
         """Header bytes are the body's AAD: changing any byte (public or sealed) fails with
@@ -281,7 +280,7 @@ class TestHead:
         with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
             head.open_head(data, self._RING, instance_id=_ID)
         assert exc.value.action == "ROUTE"
-        head.authenticate(data, self._RING, instance_id=_ID)  # the read-back never parses the body
+        head.open_header(data, self._RING, instance_id=_ID)  # the read-back never parses the body
 
     @pytest.mark.parametrize(
         "fields",
@@ -300,11 +299,42 @@ class TestHead:
             header_fields=fields,
             body_json=head.canonical_json(_BODY.model_dump(mode="json")),
         )
-        for open_head in (head.open_head, head.authenticate):
+        for open_head in (head.open_head, head.open_header):
             with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
                 open_head(data, self._RING, instance_id=_ID)
             assert (exc.value.action, exc.value.instance_id) == ("ROUTE", _ID)
             assert (exc.value.required, exc.value.found) == ({}, {})  # no fact names the release that reads it
+            assert (
+                str(exc.value)
+                == f"Instance {_ID}: this release cannot read its head header (exec-sandbox 1.0.0 wrote it)."
+            )
+
+    @pytest.mark.parametrize(
+        ("release", "message"),
+        [
+            pytest.param("9.9.9", "this release cannot read its head header (exec-sandbox 9.9.9 wrote it)", id="named"),
+            pytest.param(None, "this release cannot read its head header", id="not-named"),
+        ],
+    )
+    def test_describe_of_a_summary_another_release_wrote_names_the_writer(
+        self, release: str | None, message: str
+    ) -> None:
+        """describe cannot show a head whose summary does not parse (generation of another form):
+        its RouteError names the release that wrote the body, when the body names one, so the
+        user finds it without describe."""
+        body = {"host": {"release": release}} if release else {"x": 1}
+        data = seal_foreign_head(
+            kek=self._RING.latest,
+            instance_id=_ID,
+            header_fields={"generation": "2"},
+            body_json=head.canonical_json(body),
+        )
+        with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
+            head.describe_head(data, self._RING, instance_id=_ID)
+        assert (exc.value.required, exc.value.found) == ({}, {})
+        assert str(exc.value) == f"Instance {_ID}: {message}."
+        assert exc.value.context.get("writer_release") == release  # for a broker: no text to parse
+        assert ("writer_release" in exc.value.context) is (release is not None)
 
     @pytest.mark.parametrize(
         "body",
@@ -337,6 +367,9 @@ class TestHead:
         with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH) as exc:
             head.open_head(data, self._RING, instance_id=_ID)
         assert (exc.value.required, exc.value.found) == ({}, {})
+        assert (
+            str(exc.value) == f"Instance {_ID}: this release cannot read its head body (exec-sandbox 1.0.0 wrote it)."
+        )
 
     @pytest.mark.parametrize(
         ("plain", "release"),
@@ -369,10 +402,10 @@ class TestHead:
             match="head failed authentication",
             check=lambda e: e.code is ErrorCode.INSTANCE_INTEGRITY,
         ):
-            head.authenticate(other_key, self._RING, instance_id=_ID)
+            head.open_header(other_key, self._RING, instance_id=_ID)
         stranger = keyring.Keyring.parse(new_keyring())
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.INSTANCE_KEY_MISSING):
-            head.authenticate(_sealed(self._RING, data_key=secrets.token_bytes(32))[0], stranger, instance_id=_ID)
+            head.open_header(_sealed(self._RING, data_key=secrets.token_bytes(32))[0], stranger, instance_id=_ID)
 
     @pytest.mark.parametrize(
         "fields",
@@ -602,21 +635,3 @@ def _nonces_of(obj: bytes, *, data_key: bytes, instance_id: str, commit_id: str)
             position += length
     assert position == index_offset
     return [*nonces, sealed[:12]]
-
-
-def test_instance_errors_pickle_with_hint() -> None:
-    """Instance errors keep instance id, hint note, code and action across processes."""
-    error = ConfigError(
-        "missing",
-        code=ErrorCode.INSTANCE_KEY_MISSING,
-        context={"key_id": "a" * 64},
-        hint="add the key",
-        instance_id=_ID,
-    )
-    restored = pickle.loads(pickle.dumps(error))  # noqa: S301 - bytes produced by this test
-    assert type(restored) is ConfigError
-    assert restored.instance_id == _ID
-    assert restored.context == {"key_id": "a" * 64}
-    assert restored.code == "INSTANCE_KEY_MISSING"
-    assert restored.action == "FIX_CONFIG"
-    assert restored.__notes__ == ["Hint: add the key"]

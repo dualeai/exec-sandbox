@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Awaitable, Callable  # noqa: TC003 - Used at runtime for on_stdout/on_stderr parameters
 from pathlib import Path  # noqa: TC003 - Used at runtime
 from typing import TYPE_CHECKING, Self
@@ -45,9 +46,8 @@ from pydantic import ValidationError
 
 from exec_sandbox import constants
 from exec_sandbox._imports import require_instance_admin, require_instance_manager
-from exec_sandbox._logging import get_logger
 from exec_sandbox._version import __version__
-from exec_sandbox.aio_utils import gather_or_cancel, settle_and_report
+from exec_sandbox.aio_utils import await_settled, gather_or_cancel
 from exec_sandbox.assets import ensure_assets, ensure_base_image, images_download_dir
 from exec_sandbox.config import MAX_SESSION_IDLE_TIMEOUT_SECONDS, MIN_SESSION_IDLE_TIMEOUT_SECONDS, SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
@@ -97,7 +97,7 @@ if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.vm_spec import VmSpec
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def _scheduler_state(message: str) -> InvalidInputError:
@@ -174,6 +174,13 @@ class Scheduler:
         if self._snapshot_manager is None:
             raise _internal(_NOT_INITIALIZED)
         return self._snapshot_manager
+
+    @property
+    def _memory(self) -> MemorySnapshotManager:
+        """The L1 snapshot manager of a started scheduler (InternalError before: a bug)."""
+        if self._memory_snapshot_manager is None:
+            raise _internal(_NOT_INITIALIZED)
+        return self._memory_snapshot_manager
 
     async def __aenter__(self) -> Self:
         """Start the Scheduler.
@@ -313,7 +320,9 @@ class Scheduler:
             # Caller cancellation (Ctrl-C too) waits for the rollback: leaked VM processes
             # would be worse than a slow interrupt
             self._shutdown_task = asyncio.create_task(self._shutdown())
-            if (rollback_error := await settle_and_report(self._shutdown_task)) is not None:
+            await await_settled(self._shutdown_task)
+            # A rollback cancelled from outside is no failure to log
+            if not self._shutdown_task.cancelled() and (rollback_error := self._shutdown_task.exception()):
                 logger.error(
                     "Scheduler startup rollback failed",
                     extra={"error": str(rollback_error)},
@@ -472,9 +481,7 @@ class Scheduler:
         idle_timeout = self._idle_timeout(idle_timeout_seconds)
         loop = asyncio.get_running_loop()
         start = loop.time()
-        vm, is_cold_boot, admission_ms = await self._prepare_vm(
-            spec, task_id=f"session-{id(self)}", on_boot_log=on_boot_log
-        )
+        vm, is_cold_boot, admission_ms = await self._prepare_vm(spec, on_boot_log=on_boot_log)
         total_ms = round((loop.time() - start) * 1000)
 
         session = Session(
@@ -621,8 +628,10 @@ class Scheduler:
         loop = asyncio.get_running_loop()
         load_ms = round((loop.time() - start) * 1000)
         spec = state.body.spec
-        own_layer = packages_lease is not None and state.packages_image == packages_lease.path
-        leases = (*state.asset_leases, *((packages_lease,) if packages_lease is not None and own_layer else ()))
+        own_layer = (
+            (packages_lease,) if packages_lease is not None and state.packages_image == packages_lease.path else ()
+        )
+        leases = (*state.asset_leases, *own_layer)
         try:
             loader_qemu = await qemu_version_fact()  # for the outcome record; before a VM exists
             resolved_ports = resolve_port_mappings(list(spec.expose_ports)) if spec.expose_ports else []
@@ -737,9 +746,9 @@ class Scheduler:
                 require_qemu_version, require_qemu_machine_types, and on x86 KVM
                 require_guest_cpu through counter_rate)
         """
-        if not self._started or self._vm_manager is None:
+        if not self._started:
             raise _scheduler_state(_NOT_STARTED)
-        vm_manager, instances = self._vm_manager, self._instances
+        vm_manager, layers, instances = self._vms, self._snapshots, self._instances
         force_emulation = vm_manager.settings.force_emulation
         facts = {
             **await machine_facts(force_emulation=force_emulation),
@@ -747,12 +756,7 @@ class Scheduler:
         }
         own = await asyncio.to_thread(_image_digests, vm_manager.images.present_base_images())
         # The L2 images of this worker's cache: a load uses one whose digest matches
-        layers = self._snapshot_manager
-        own_layers = (
-            frozenset[str]()
-            if layers is None
-            else await asyncio.to_thread(lambda: _image_digests(layers.entry_paths()))
-        )
+        own_layers = await asyncio.to_thread(lambda: _image_digests(layers.entry_paths()))
         downloaded = frozenset[str]() if instances is None else await asyncio.to_thread(instances.asset_digests)
         memory_mb, cpu = vm_manager.budget_facts()
         return WorkerFacts(
@@ -824,14 +828,12 @@ class Scheduler:
         self,
         spec: VmSpec,
         *,
-        task_id: str,
         on_boot_log: Callable[[str], None] | None,
     ) -> tuple[QemuVM, bool, int]:
         """Create and boot a VM made from `spec`: warm pool, L1 restore or cold boot.
 
         Args:
             spec: What the VM is made of.
-            task_id: Identifier for this VM (e.g. "session-...").
             on_boot_log: Optional callback for streaming boot console output.
 
         Returns:
@@ -885,7 +887,7 @@ class Scheduler:
             )
         try:
             return await self._launch_for(
-                spec, task_id=task_id, on_boot_log=on_boot_log, snapshot=snapshot, resolved_ports=resolved_ports
+                spec, on_boot_log=on_boot_log, snapshot=snapshot, resolved_ports=resolved_ports
             )
         finally:
             if snapshot is not None:
@@ -895,7 +897,6 @@ class Scheduler:
         self,
         spec: VmSpec,
         *,
-        task_id: str,
         on_boot_log: Callable[[str], None] | None,
         snapshot: EntryLease | None,
         resolved_ports: list[ExposedPort],
@@ -929,16 +930,15 @@ class Scheduler:
             # L1 key, once per request (it hashes the base image, kernel and L2 layer).
             # It includes the network device (spec.has_network_device):
             # expose_ports also adds a virtio-net device.
-            memory = self._memory_snapshot_manager
-            l1_key = await memory.compute_cache_key(spec, l2_path=snapshot_path) if memory else None
+            memory = self._memory
+            l1_key = await memory.compute_cache_key(spec, l2_path=snapshot_path)
             # The L1 entry is leased before admission, like the L2 layer: admission may evict
             # cache entries for disk space, never these. Skipped when on_boot_log is requested
             # (L1 skips boot, the callback would never fire).
-            l1_entry = await memory.lease(l1_key) if memory and l1_key and on_boot_log is None else None
+            l1_entry = await memory.lease(l1_key) if on_boot_log is None else None
             try:
                 vm, admission_ms = await self._admit_and_launch(
                     spec,
-                    task_id=task_id,
                     on_boot_log=on_boot_log,
                     snapshot=snapshot,
                     l1_key=l1_key,
@@ -955,17 +955,17 @@ class Scheduler:
         self,
         spec: VmSpec,
         *,
-        task_id: str,
         on_boot_log: Callable[[str], None] | None,
         snapshot: EntryLease | None,
-        l1_key: str | None,
+        l1_key: str,
         l1_entry: EntryLease | None,
         resolved_ports: list[ExposedPort],
     ) -> tuple[QemuVM, int]:
         """_launch_for after a warm pool miss: admission, then an L1 restore of `l1_entry`
         (taken over by restore) or a cold boot on `snapshot`. Returns the VM and the
         admission time in ms."""
-        memory = self._memory_snapshot_manager
+        memory = self._memory
+        task_id = f"session-{id(self)}"
         snapshot_path = snapshot.path if snapshot is not None else None
         held = frozenset(lease.path for lease in (snapshot, l1_entry) if lease is not None)
         admission_start = asyncio.get_running_loop().time()
@@ -975,7 +975,7 @@ class Scheduler:
             admission_ms = round((asyncio.get_running_loop().time() - admission_start) * 1000)
             vm: QemuVM | None = None
             # L1 memory snapshot restore (~50-60 ms)
-            if memory and l1_entry is not None:
+            if l1_entry is not None:
                 vm = await memory.restore(
                     spec,
                     entry=l1_entry,
@@ -1008,15 +1008,14 @@ class Scheduler:
                 )
 
                 # Schedule background L1 save for next time
-                if memory and l1_key:
-                    try:
-                        await memory.schedule_background_save(spec, key=l1_key, snapshot_drive=snapshot)
-                    except BaseException:
-                        # The caller never receives the newly-created VM when
-                        # post-acquisition scheduling is interrupted. Return
-                        # ownership to VmManager before propagating the error.
-                        await self._vms.destroy_vm(vm)
-                        raise
+                try:
+                    await memory.schedule_background_save(spec, key=l1_key, snapshot_drive=snapshot)
+                except BaseException:
+                    # The caller never receives the newly-created VM when
+                    # post-acquisition scheduling is interrupted. Return
+                    # ownership to VmManager before propagating the error.
+                    await self._vms.destroy_vm(vm)
+                    raise
         return vm, admission_ms
 
 

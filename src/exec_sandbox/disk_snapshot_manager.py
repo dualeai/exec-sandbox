@@ -24,6 +24,7 @@ import contextlib
 import errno
 import hashlib
 import json
+import logging
 import os
 import sys
 import time
@@ -39,8 +40,6 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
-import logging
-
 from tenacity import (
     before_sleep_log,
     retry_if_exception,
@@ -50,7 +49,6 @@ from tenacity import (
 
 from exec_sandbox import constants
 from exec_sandbox._imports import aioboto3_session
-from exec_sandbox._logging import get_logger
 from exec_sandbox._version import __version__
 from exec_sandbox.aio_utils import AsyncRetrying, run_stoppable, run_to_end
 from exec_sandbox.base_cache_manager import BaseCacheManager
@@ -90,7 +88,7 @@ if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.vm_manager import VmManager
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _L2_VIRTUAL_SIZE_MB: Final = 512
 """Virtual size of an L2 snapshot image (qemu-img create)."""
@@ -673,7 +671,6 @@ class DiskSnapshotManager(BaseCacheManager):
                     direct_write_target=build_path,
                     snapshot_drive=None,
                     cache_leases=(),
-                    retry_profile=constants.RETRY_BACKGROUND,
                     mem_path=None,
                 ) as vm:
                     # Install packages with death monitoring (asyncio.wait)
@@ -708,9 +705,7 @@ class DiskSnapshotManager(BaseCacheManager):
                                 MigrationClient(vm.qmp_socket, get_expected_socket_uid(vm.use_qemu_vm_user)) as client,
                             ):
                                 await client.quit()
-                    await cleanup_process(
-                        vm.process, "QEMU", cache_key, term_timeout=5.0, kill_timeout=2.0, kill_first=False
-                    )
+                    await cleanup_process(vm.process, "QEMU", cache_key, term_timeout=5.0, kill_first=False)
 
                     # Verify QEMU exited cleanly. Only a clean exit closes the layer: SIGKILL (-9),
                     # from the escalation after term_timeout or from a destroy that a Scheduler
@@ -769,7 +764,7 @@ class DiskSnapshotManager(BaseCacheManager):
                     ) from evict_error
                 retry = True  # after the semaphore is released: the retry takes it again
 
-            except (asyncio.CancelledError, SandboxError):
+            except SandboxError:
                 raise
 
             except Exception as e:

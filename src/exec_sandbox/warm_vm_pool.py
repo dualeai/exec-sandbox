@@ -47,7 +47,6 @@ from tenacity import (
 )
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import AsyncRetrying, await_settled
 from exec_sandbox.exceptions import CommunicationError, ErrorCode, OutcomeUnknownError
 from exec_sandbox.files.disk import advise_willneed
@@ -62,7 +61,7 @@ if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.vm_manager import VmManager
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Transport failures of a health ping: the guest cannot answer (QEMU died, froze or
 # closed its sockets). The ping is tried again; when every try fails, the VM is unhealthy.
@@ -369,13 +368,6 @@ class WarmVMPool:
             raise asyncio.CancelledError
         await stop_task
 
-    async def _stop_initial_boots(self) -> None:
-        """Cancel and await the start task: no initial boot can enqueue a VM after it
-        (its gather ends once each boot ended)."""
-        if (start_task := self._start_task) is not None:
-            start_task.cancel()
-            await asyncio.gather(start_task, return_exceptions=True)
-
     async def _stop_health_check(self) -> None:
         """Stop the health owner without letting its failure abort pool drain."""
         if self._health_task is None:
@@ -389,11 +381,8 @@ class WarmVMPool:
             if not self._health_task.cancelled():
                 raise
             logger.debug("Health check task was already cancelled during shutdown")
-        except TimeoutError:
-            logger.warning("Health check task timed out during shutdown, cancelling")
-            self._health_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._health_task
+        except TimeoutError:  # wait_for cancelled the task and waited for its end
+            logger.warning("Health check task timed out during shutdown and was cancelled")
         except Exception as error:
             logger.exception(
                 "Health check task failed during shutdown; continuing teardown",
@@ -413,8 +402,10 @@ class WarmVMPool:
 
         # Initial-fill children are owned by the shared start task. Cancel and
         # await that task before taking the final queue snapshot so no boot can
-        # enqueue after a successful stop.
-        await self._stop_initial_boots()
+        # enqueue after a successful stop (its gather ends once each boot ended).
+        if (start_task := self._start_task) is not None:
+            start_task.cancel()
+            await asyncio.gather(start_task, return_exceptions=True)
 
         # The shutdown event ends the wait between passes at once; a pass in progress ends
         # first, at most WARM_POOL_HEALTH_CHECK_INTERVAL + 2 s, then it is cancelled
@@ -424,28 +415,22 @@ class WarmVMPool:
         # behind the drain snapshot and survive a successful stop().
         tasks_to_cancel = list(self._replenish_tasks)
         for task in tasks_to_cancel:
-            if not task.done():
-                task.cancel()
-        if tasks_to_cancel:
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+            task.cancel()
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
         # No explicit clear: each task's done-callback (add_done_callback at
         # spawn) already discards itself, and those callbacks run before gather
         # resolves, so the set is empty here.
 
         # Drain and destroy all VMs in parallel
         destroy_tasks: list[asyncio.Task[bool]] = []
-        destroyed_count = 0
         for language, pool in self.pools.items():
             while not pool.empty():
                 vm = pool.get_nowait()  # never QueueEmpty: no await after empty()
                 destroy_tasks.append(asyncio.create_task(self._destroy_vm_with_logging(vm, language)))
 
         # Wait for all destructions to complete
-        if destroy_tasks:
-            results: list[bool | BaseException] = await asyncio.gather(*destroy_tasks, return_exceptions=True)
-            destroyed_count = sum(1 for r in results if r is True)
-
-        logger.info("Warm VM pool shutdown complete", extra={"destroyed_vms": destroyed_count})
+        results: list[bool | BaseException] = await asyncio.gather(*destroy_tasks, return_exceptions=True)
+        logger.info("Warm VM pool shutdown complete", extra={"destroyed_vms": sum(1 for r in results if r is True)})
 
     async def _destroy_vm_with_logging(
         self,
@@ -798,19 +783,11 @@ class WarmVMPool:
                 "Health check exception",
                 extra={"language": language.value, "vm_id": vm.vm_id, "error": str(e)},
             )
-        await self._handle_unhealthy_vm(vm, language)
-        return False
-
-    async def _handle_unhealthy_vm(self, vm: QemuVM, language: Language) -> None:
-        """Handle an unhealthy VM by destroying and triggering replenishment."""
-        logger.warning(
-            "Unhealthy warm VM detected",
-            extra={"language": language.value, "vm_id": vm.vm_id},
-        )
+        logger.warning("Unhealthy warm VM detected", extra={"language": language.value, "vm_id": vm.vm_id})
         with contextlib.suppress(Exception):
             await self.vm_manager.destroy_vm(vm)
-
         self._schedule_replenishment(language)
+        return False
 
     async def _check_vm_health(self, vm: QemuVM) -> bool:
         """Check if VM is healthy (guest agent responsive).

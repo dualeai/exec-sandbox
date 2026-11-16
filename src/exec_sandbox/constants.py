@@ -97,8 +97,8 @@ backoff, fewer attempts and a shorter boot timeout: no user request waits on the
 
 GUEST_NETWORK_SUBNET: Final = "192.168.127.0/24"
 """The guest network of gvproxy-wrapper (passed as -subnet). The guest agent sets the guest
-side at its boot (guest-agent/src/init.rs: GUEST_IP/24, its default route to the gateway):
-change both together. A saved VM keeps the network of its boot."""
+side at its boot (guest-agent/src/init.rs setup_network: GUEST_IP/24, its default route to
+the gateway): change both together. A saved VM keeps the network of its boot."""
 GUEST_GATEWAY_IP: Final = "192.168.127.1"
 """Gateway and DNS server of the guest network (gvproxy-wrapper -gateway-ip)."""
 GUEST_GATEWAY_MAC: Final = "5a:94:ef:e4:0c:dd"
@@ -176,7 +176,7 @@ PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 300
 """Timeout for package installation in guest VM.
 
 Sent to the guest agent via InstallPackagesRequest.timeout field.
-The guest enforces this as the tokio::time::timeout for the package manager process.
+The guest stops the package manager process at this deadline (a timeout_error).
 Also used host-side to compute hard_timeout (+ EXECUTION_TIMEOUT_MARGIN_SECONDS + 8s
 first-op network gate allowance, see disk_snapshot_manager)."""
 
@@ -229,6 +229,26 @@ ENV_VAR_FORBIDDEN_CONTROL_CHARS: Final[frozenset[int]] = frozenset(
 
 
 # ============================================================================
+# Exec output
+# ============================================================================
+
+MAX_STDOUT_BYTES: Final[int] = 1_000_000
+"""The guest's stdout cap for one exec (guest-agent constants.rs), then OUTPUT_LIMIT (a
+timeout or exit code 137 keeps its own result). A package install sends less
+(MAX_PACKAGE_OUTPUT_BYTES, 50 KB per stream)."""
+
+MAX_STDERR_BYTES: Final[int] = 100_000
+"""The guest's stderr cap for one exec, as MAX_STDOUT_BYTES."""
+
+GUEST_OUTPUT_READ_BYTES: Final[int] = 8192
+"""The guest reads the exec's pipes this much at a time (guest-agent constants.rs
+OUTPUT_READ_BYTES; test_guest_agent_protocol ties the copies) and counts the bytes it reads: it
+sends at most its stdout cap, and its stderr cap and the lines of the read that crosses it. A
+character takes at least one byte, so the host stops a stream past its cap and one read of
+characters (consume_stream): only a guest that breaks its caps goes past it."""
+
+
+# ============================================================================
 # File I/O
 # ============================================================================
 
@@ -253,7 +273,8 @@ until sent, with the partly sent frame of the batch before."""
 
 MAX_FILE_PATH_LENGTH: Final[int] = 4096
 """Maximum relative file path length (POSIX PATH_MAX): the guest counts bytes; the
-host check (guest_agent_protocol, QemuVM.write_file) counts characters.
+host check (guest_agent_protocol, QemuVM._check_path for write, read and list)
+counts characters.
 
 Individual filename components are limited to 255 bytes (NAME_MAX) by the
 guest agent's validate_file_path(). This constant covers the full relative path.
@@ -428,7 +449,9 @@ PORT_FORWARD_BIND_HOST: Final[str] = "127.0.0.1"
 # ============================================================================
 
 FILE_TRANSFER_CHUNK_SIZE: Final[int] = 128 * 1024  # 128KB
-"""Raw chunk size for streaming file transfers (before zstd compression).
+"""Chunk size of file transfers: the raw chunk that write_file compresses, the read of
+the guest's compressed stream for read_file (guest-agent file_io.rs), and the largest
+output of one read_file decompress step on the host.
 
 128KB halves the frames of 64KB chunks (syscalls, JSON parses, base64
 encodes and decodes). On-wire size after base64+JSON is ~175KB per frame.
@@ -507,7 +530,7 @@ Fixed value, not a ratio — host infrastructure has roughly constant CPU consum
 regardless of host size. 0.5 cores covers typical observed usage with headroom."""
 
 DEFAULT_VM_CPU_CORES: Final[int] = 1
-"""CPU cores allocated per VM. Flows to three places:
+"""Default guest vCPUs of a VM (VmSpec.cpu_cores). The VmSpec value flows to three places:
 - QEMU -smp (guest-visible vCPU count)
 - cgroup cpu.max quota (host-side CPU time enforcement)
 - Admission controller budget (capacity planning)"""
@@ -552,8 +575,9 @@ Measured breakdown:
   - Combined total                          : ~13-33% of a core
 
 0.25 lies inside the measured range: like DEFAULT_VM_MEMORY_OVERHEAD_MB, it is a
-tight value, not the worst case. The gvproxy share applies only when gvproxy runs in the cgroup (network on); without
-it the overhead is ~5-10% of a core, but every VM gets 0.25 (one value is simpler)."""
+tight value, not the worst case. The gvproxy share applies only when gvproxy runs in
+the cgroup (network on); without it the overhead is ~5-10% of a core, but every VM
+gets 0.25 (one value is simpler)."""
 
 DEFAULT_TCG_TB_CACHE_SIZE_MB: Final[int] = 128
 """TCG translation block cache size in MB (tb-size in qemu_cmd.py). The cap, the most

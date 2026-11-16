@@ -58,6 +58,7 @@ from tests.instance_support import (
     descriptors_of,
     digest,
     disk_full_at_download,
+    exact_key,
     fake_session,
     file_digest,
     head_header,
@@ -110,10 +111,6 @@ async def store(s3_proxy: S3Proxy) -> AsyncGenerator[InstanceStore]:
         bucket=s3_proxy.bucket.name, prefix=s3_proxy.prefix, endpoint_url=s3_proxy.endpoint_url, region=_REGION
     ) as s:
         yield s
-
-
-def _exact(key: str) -> str:
-    return f"^{re.escape(key)}$"
 
 
 def _layout(seed: int) -> tuple[SparseImage, SparseImage]:
@@ -471,7 +468,7 @@ class TestRollover:
         and loads the new generation."""
         saver = await _chain(env, packs=1, seed=6, manager=env.manager)
         old_pack = chain_keys(saver.state)[1]  # type: ignore[arg-type]
-        gate = env.proxy.add("GET", _exact(old_pack), Hold())
+        gate = env.proxy.add("GET", exact_key(old_pack), Hold())
         mark = len(env.proxy.log)
         loading = asyncio.create_task(env.load(saver.instance_id, manager=env.manager))
         await gate.reached.wait()
@@ -487,15 +484,15 @@ class TestRollover:
             assert (file_digest(loaded.vmstate), file_digest(loaded.home)) == (digest(want[0]), digest(want[1]))
         finally:
             await env.manager.release(loaded, wait=True)
-        assert env.proxy.entries("GET", _exact(old_pack), since=mark)[-1].status == 404
-        assert env.proxy.count("GET", _exact(head_object(state.instance_id)), since=mark) == 2
+        assert env.proxy.entries("GET", exact_key(old_pack), since=mark)[-1].status == 404
+        assert env.proxy.count("GET", exact_key(head_object(state.instance_id)), since=mark) == 2
 
     async def test_rollover_unknown_outcome_keeps_old_chain(self, env: InstanceEnv) -> None:
         """No answer to the head write and no read-back: unknown outcome (VERIFY), and nothing is
         deleted, since the new head (which landed) needs the new full copy and the old head the old chain."""
         saver = await _chain(env, packs=1, seed=7, manager=env.manager)
         old = chain_keys(saver.state)  # type: ignore[arg-type]
-        head = _exact(head_object(saver.instance_id))
+        head = exact_key(head_object(saver.instance_id))
         env.proxy.add("PUT_IF", head, DropAfter(), times=None)
         env.proxy.add("GET", head, Fail(503, "ServiceUnavailable"), times=None)
         _rewrite(saver.vm, 7)
@@ -544,7 +541,7 @@ class TestCommitOutcome:
         this save's alone, so it is deleted."""
         saver = await _chain(env, packs=0, seed=71, manager=env.manager)
         a = await _reuse(env, saver.instance_id, manager=env.manager)
-        head = _exact(head_object(saver.instance_id))
+        head = exact_key(head_object(saver.instance_id))
         if outcome == "conflict":
             b = await _reuse(env, saver.instance_id, manager=env.manager)
             _small_change(b.vm, 71)
@@ -642,7 +639,7 @@ class TestDamageAtLoad:
         files = env.work_files()
         mark = len(env.proxy.log)
         no_body = (
-            env.proxy.add("GET", _exact(key), Truncate(0))  # the headers, no body bytes: a body read fails short
+            env.proxy.add("GET", exact_key(key), Truncate(0))  # the headers, no body bytes: a body read fails short
             if damage in _SIZE_DAMAGE
             else None
         )
@@ -650,17 +647,15 @@ class TestDamageAtLoad:
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is expected) as exc:
             await env.load(saver.instance_id, manager=env.manager)
         assert (exc.value.action, exc.value.instance_id) == ("RECREATE", saver.instance_id)
-        if expected is ErrorCode.INSTANCE_INTEGRITY:  # the object and the commit that wrote it
-            assert key.endswith(exc.value.context["key"])
-            name = exc.value.context["key"].split("/")[-1]
-            assert name in {f"{exc.value.context['commit_id']}.f", f"{exc.value.context['commit_id']}.p"}
-            assert len(exc.value.context["commit_id"]) == 32
+        if expected is ErrorCode.INSTANCE_INTEGRITY:  # the store key of the object and the commit that wrote it
+            commit_id = saver.state.body.chain[_POSITION[target]].commit_id  # type: ignore[union-attr]
+            assert exc.value.context == {"key": key, "commit_id": commit_id}
         await env.manager.drain()  # the failed load's folder goes in a worker thread
         assert env.work_files() == files
         if damage == "delete":
-            assert env.proxy.count("GET", _exact(head_object(saver.instance_id)), since=mark) == 2
+            assert env.proxy.count("GET", exact_key(head_object(saver.instance_id)), since=mark) == 2
         if damage == "delete" or damage in _SIZE_DAMAGE:
-            asked = {op: env.proxy.count(op, _exact(key), since=mark) for op in ("GET", "HEAD", "GET_RANGE")}
+            asked = {op: env.proxy.count(op, exact_key(key), since=mark) for op in ("GET", "HEAD", "GET_RANGE")}
             assert asked == {"GET": 1, "HEAD": 1, "GET_RANGE": 0}
         if no_body is not None:
             assert no_body.hits == 1
@@ -858,7 +853,7 @@ class TestDamageAtLoad:
         async def delete(req: Request) -> None:
             await asyncio.to_thread(env.bucket.delete, req.key)
 
-        env.proxy.add("GET", _exact(full), Before(delete))
+        env.proxy.add("GET", exact_key(full), Before(delete))
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_EXPIRED) as exc:
             await env.load(saver.instance_id, manager=env.manager)
         assert (exc.value.action, exc.value.instance_id) == ("RECREATE", saver.instance_id)
@@ -870,13 +865,13 @@ class TestDamageAtLoad:
         saver = await _chain(env, packs=1, seed=144, manager=env.manager)
         iid = saver.instance_id
         full = chain_keys(saver.state)[0]  # type: ignore[arg-type]
-        rule = env.proxy.add("GET", _exact(full), Fail(404, "NoSuchKey"))
+        rule = env.proxy.add("GET", exact_key(full), Fail(404, "NoSuchKey"))
         mark = len(env.proxy.log)
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
             await env.load(iid, manager=env.manager)
         assert exc.value.message == f"Instance {iid}: the store answered 'no such key' for {full}, which it has."
         assert (exc.value.action, exc.value.instance_id) == ("RETRY", iid)
-        assert (rule.hits, env.proxy.count("HEAD", _exact(full), since=mark)) == (1, 1)
+        assert (rule.hits, env.proxy.count("HEAD", exact_key(full), since=mark)) == (1, 1)
         await env.check_load(iid, generation=2, manager=env.manager, want=None)
 
     async def test_head_that_keeps_changing_during_load_is_retry(self, env: InstanceEnv) -> None:
@@ -896,13 +891,16 @@ class TestDamageAtLoad:
         async def before_body_read(req: Request) -> None:
             await asyncio.to_thread(gone_and_new_head)
 
-        env.proxy.add("GET", _exact(full), Before(before_body_read), times=None)
+        env.proxy.add("GET", exact_key(full), Before(before_body_read), times=None)
         mark = len(env.proxy.log)
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
             await env.load(iid, manager=env.manager)
         assert str(exc.value).startswith(f"Instance {iid}: the head kept changing while it was loaded.")
         assert (exc.value.action, exc.value.instance_id) == ("RETRY", iid)
-        assert (env.proxy.count("GET", _exact(head), since=mark), env.proxy.count("GET", _exact(full), since=mark)) == (
+        assert (
+            env.proxy.count("GET", exact_key(head), since=mark),
+            env.proxy.count("GET", exact_key(full), since=mark),
+        ) == (
             3,
             3,
         )
@@ -922,11 +920,11 @@ class TestDamageAtLoad:
         async def replace(req: Request) -> None:
             await asyncio.to_thread(env.bucket.flip, full, 100)  # same size, another ETag
 
-        env.proxy.add("GET_RANGE", _exact(full), Before(replace))
+        env.proxy.add("GET_RANGE", exact_key(full), Before(replace))
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
             await env.load(saver.instance_id, manager=env.manager)
         assert (exc.value.action, exc.value.instance_id) == ("RETRY", saver.instance_id)
-        assert 412 in {e.status for e in env.proxy.entries("GET_RANGE", _exact(full))}
+        assert 412 in {e.status for e in env.proxy.entries("GET_RANGE", exact_key(full))}
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_INTEGRITY):
             await env.load(saver.instance_id, manager=env.manager)
 
@@ -937,12 +935,15 @@ class TestDamageAtLoad:
         def one_more(resp: Response) -> None:
             resp.body += b"\0"  # its Content-Length says one byte more
 
-        rule = env.proxy.add("GET", _exact(pack), Edit(response=one_more))
+        rule = env.proxy.add("GET", exact_key(pack), Edit(response=one_more))
         mark = len(env.proxy.log)
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
             await env.load(saver.instance_id, manager=env.manager)
         assert (exc.value.action, exc.value.instance_id) == ("RETRY", saver.instance_id)
-        asked = (env.proxy.count("GET", _exact(pack), since=mark), env.proxy.count("HEAD", _exact(pack), since=mark))
+        asked = (
+            env.proxy.count("GET", exact_key(pack), since=mark),
+            env.proxy.count("HEAD", exact_key(pack), since=mark),
+        )
         assert (rule.hits, *asked) == (1, 1, 1)
         await env.check_load(saver.instance_id, generation=2, manager=env.manager, want=None)
 
@@ -959,7 +960,7 @@ class TestDownloadAhead:
         keys = chain_keys(saver.state)  # type: ignore[arg-type]
         await env.manager.drain()  # the last save's old files go in a worker thread
         files = env.work_files()
-        held = env.proxy.add("GET", _exact(keys[0]), Hold())
+        held = env.proxy.add("GET", exact_key(keys[0]), Hold())
         mark = len(env.proxy.log)
         loading = asyncio.create_task(env.check_load(saver.instance_id, generation=11, manager=env.manager, want=None))
         try:
@@ -983,19 +984,19 @@ class TestDownloadAhead:
         keys = chain_keys(saver.state)  # type: ignore[arg-type]
         env.bucket.delete(keys[1])
         env.bucket.delete(keys[3])
-        held = env.proxy.add("GET", _exact(keys[1]), Hold())
+        held = env.proxy.add("GET", exact_key(keys[1]), Hold())
         mark = len(env.proxy.log)
         loading = asyncio.create_task(env.load(saver.instance_id, manager=env.manager))
         try:
             await held.reached.wait()
-            await await_until(lambda: env.proxy.count("GET", _exact(keys[3]), since=mark) == 1)
+            await await_until(lambda: env.proxy.count("GET", exact_key(keys[3]), since=mark) == 1)
         finally:
             held.release()
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_EXPIRED) as exc:
             await loading
         assert exc.value.instance_id == saver.instance_id
-        assert env.proxy.count("HEAD", _exact(keys[1]), since=mark) == 1
-        assert env.proxy.count("HEAD", _exact(keys[3]), since=mark) == 0
+        assert env.proxy.count("HEAD", exact_key(keys[1]), since=mark) == 1
+        assert env.proxy.count("HEAD", exact_key(keys[3]), since=mark) == 0
 
     async def test_cancelled_load_leaves_no_file_and_no_fd(self, env: InstanceEnv) -> None:
         """Cancelled while a pack's GET waits: the other downloads stop, no work file stays, and
@@ -1004,7 +1005,7 @@ class TestDownloadAhead:
         keys = chain_keys(saver.state)  # type: ignore[arg-type]
         await env.manager.drain()  # the last save's old files go in a worker thread
         files = env.work_files()
-        held = env.proxy.add("GET", _exact(keys[2]), Hold())
+        held = env.proxy.add("GET", exact_key(keys[2]), Hold())
         loading = asyncio.create_task(env.load(saver.instance_id, manager=env.manager))
         try:
             await held.reached.wait()
@@ -1279,7 +1280,7 @@ class TestSupersededSave:
         a_state = await env.load(iid, manager=env.manager)
         a_vm = await env.vm_from(a_state)
         a = fake_session(vm=a_vm, vm_manager=env.vm_manager, instances=env.manager, state=a_state, new_instance_id=None)
-        head = _exact(head_object(iid))
+        head = exact_key(head_object(iid))
 
         async def b_commits_on_top(req: Request, resp: Response) -> None:
             assert resp.status == 200  # A's head landed
@@ -1320,7 +1321,7 @@ class TestSupersededSave:
         a_state = await env.load(first.instance_id, manager=env.manager)
         a_vm = await env.vm_from(a_state)
         a = fake_session(vm=a_vm, vm_manager=env.vm_manager, instances=env.manager, state=a_state, new_instance_id=None)
-        head = _exact(head_object("y-193"))
+        head = exact_key(head_object("y-193"))
         others: list[Saver] = []
 
         async def b_commits_on_top(req: Request, resp: Response) -> None:
@@ -1387,10 +1388,10 @@ class TestLoadLocalFiles:
         saver = await _chain(env, packs=1, seed=53, manager=env.manager)
         assert saver.state is not None
         worker = worker_without_base_image(env, root=tmp_path / "worker-b")
-        cached = worker.asset_dir / f"{saver.state.body.guest.base_image}.img"
+        cached = worker.assets.cache_dir / f"{saver.state.body.guest.base_image}.img"
         match step:
             case "asset":
-                disk_full_at_download(monkeypatch, env.store, under=worker.asset_dir)
+                disk_full_at_download(monkeypatch, env.store, under=worker.assets.cache_dir)
             case "body":
                 disk_full_at_download(monkeypatch, env.store, under=worker.work_dir)
             case _:
@@ -1404,7 +1405,7 @@ class TestLoadLocalFiles:
         await worker.drain()  # the partial files go in a worker thread
         # The partial files are removed; an image whose digest was checked stays in the cache
         # (the lock files of its entry stay: files.locks never deletes them).
-        assert {path for path in worker.asset_dir.iterdir() if path.suffix != ".lock"} == (
+        assert {path for path in worker.assets.cache_dir.iterdir() if path.suffix != ".lock"} == (
             set() if step == "asset" else {cached}
         )
         if step == "folder":
@@ -1413,7 +1414,7 @@ class TestLoadLocalFiles:
 
         mark = len(env.proxy.log)
         await env.check_load(saver.instance_id, generation=2, manager=worker, want=None)
-        assert {path for path in worker.asset_dir.iterdir() if path.suffix != ".lock"} == {cached}
+        assert {path for path in worker.assets.cache_dir.iterdir() if path.suffix != ".lock"} == {cached}
         assert bool(env.proxy.count("GET_RANGE", "^assets/", since=mark)) == (step == "asset")
         assert list(worker.work_dir.iterdir()) == []
         # No load holds the image any more (the failed one released its lease): eviction takes it

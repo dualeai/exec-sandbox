@@ -21,7 +21,7 @@ import pytest
 
 from exec_sandbox import qmp_events
 from exec_sandbox.qmp_events import QmpEvent, QmpEventWatch
-from tests.conftest import asyncio_with, time_with
+from tests.conftest import NESTED_QMP_LINE, asyncio_with, time_with
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -52,12 +52,15 @@ def _watch(
     )
 
 
+@pytest.mark.usefixtures("qmp_parser_too_deep")
 async def test_events_go_to_the_owner_with_their_time(short_tmp_dir: Path) -> None:
     """After the start, on_connect queries; the events before its answer and after it reach
-    on_event with their name, data and time; a line that is not JSON is skipped. EOF (QEMU's
-    exit) ends the watch."""
+    on_event with their name, data and time; a line that is not JSON (also one nested too deep
+    for the parser) is skipped, and an event whose stamp no float holds comes as made now. EOF
+    (QEMU's exit) ends the watch."""
     path = short_tmp_dir / "qmp-events.sock"
     stamp = time.time() - 0.5
+    start = time.monotonic()  # every event is read after this
 
     def event(name: str, **data: Any) -> bytes:
         timestamp = {"seconds": int(stamp), "microseconds": int(stamp % 1 * 1_000_000)}
@@ -70,7 +73,8 @@ async def test_events_go_to_the_owner_with_their_time(short_tmp_dir: Path) -> No
             if request["execute"] == "query-block":
                 writer.write(event("BLOCK_IO_ERROR", nospace=True))
             writer.write(json.dumps({"return": ["drive"], "id": request["id"]}).encode() + b"\n")
-        writer.write(b"not json\n" + event("SHUTDOWN"))
+        huge = {"event": "STOP", "data": {}, "timestamp": {"seconds": 10**400, "microseconds": 0}}
+        writer.write(b"not json\n" + NESTED_QMP_LINE + json.dumps(huge).encode() + b"\n" + event("SHUTDOWN"))
         await writer.drain()
         writer.close()
 
@@ -90,9 +94,12 @@ async def test_events_go_to_the_owner_with_their_time(short_tmp_dir: Path) -> No
     finally:
         server.close()
     assert [answer["return"] for answer in answers] == [["drive"]]
-    assert [(e.name, e.data) for e in events] == [("BLOCK_IO_ERROR", {"nospace": True}), ("SHUTDOWN", {})]
+    assert [(e.name, e.data) for e in events] == [("BLOCK_IO_ERROR", {"nospace": True}), ("STOP", {}), ("SHUTDOWN", {})]
     now = time.monotonic()
-    assert all(now - 1.5 < e.at <= now for e in events)  # made about 0.5 s ago, not at the read
+    stamped = [e.at for e in events if e.name != "STOP"]
+    assert all(start - 0.6 < at < start - 0.4 for at in stamped)  # made about 0.5 s ago, not at the read
+    (stop,) = [e.at for e in events if e.name == "STOP"]
+    assert start <= stop <= now  # no stamp a float holds: taken as made at the read
 
 
 async def test_connect_waits_as_long_as_qemu_runs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -230,10 +237,39 @@ async def test_stop_ends_the_watch_and_returns_a_caller_cancel(monkeypatch: pyte
     assert closed == [True]  # stop returned after the watch closed its socket
 
 
+def _placed(monkeypatch: pytest.MonkeyPatch, stamp: float, samples: list[tuple[float, float]]) -> float:
+    """The time a watch gives an event stamped `stamp`: it takes `samples` ((monotonic, wall -
+    monotonic), oldest first) on a fake clock, the last one at the read of the event."""
+    clock = [samples[0]]
+    monkeypatch.setattr(qmp_events, "time", time_with(monotonic=lambda: clock[0][0], time=lambda: sum(clock[0])))
+    watch = _watch([None], path=_NOWHERE, on_event=_no_event, on_connect=AsyncMock())
+    for sample in samples[:-1]:
+        clock[0] = sample
+        watch._sample()  # pyright: ignore[reportPrivateUsage]
+    clock[0] = samples[-1]
+    timestamp = {"seconds": int(stamp), "microseconds": round(stamp % 1 * 1_000_000)}
+    return watch._event_time({"event": "STOP", "timestamp": timestamp})  # pyright: ignore[reportPrivateUsage]
+
+
 class TestEventMonotonic:
-    """A QMP event's wall-clock stamp placed on the monotonic clock (_event_monotonic): samples
-    are (monotonic, wall - monotonic), oldest first, the last taken at the read (103). A test
-    cannot step the host's wall clock: the tests give the private function the samples."""
+    """A QMP event's wall-clock stamp placed on the monotonic clock. A test cannot step the
+    host's wall clock: the tests give _event_monotonic its values, or a watch a fake clock
+    (_placed)."""
+
+    @pytest.mark.parametrize(
+        ("stamp", "first_sample", "offset", "expected"),
+        [
+            (1000.0, 90.0, 900.0, 100.0),  # exact, 3 s before the read (103)
+            (996.5, 97.0, 900.0, 96.5),  # held by QEMU just before the first sample
+            (990.0, 97.0, 900.0, 103.0),  # older than the samples and a hold
+            (None, 90.0, 900.0, 103.0),  # no stamp
+            (1010.0, 90.0, 900.0, 103.0),  # a stamp after now: never later than now
+        ],
+        ids=["late-read", "held-before-the-first-sample", "older-than-the-samples", "no-stamp", "future-stamp"],
+    )
+    def test_place(self, stamp: float | None, first_sample: float, offset: float, expected: float) -> None:
+        placed = qmp_events._event_monotonic(stamp, now=103.0, first_sample=first_sample, offset=offset)  # pyright: ignore[reportPrivateUsage]
+        assert placed == expected
 
     @pytest.mark.parametrize(
         ("stamp", "samples", "expected"),
@@ -245,11 +281,10 @@ class TestEventMonotonic:
             # stamp, back step, then a sample (a reconnect's handshake) before the read: the
             # older sample shows the step
             (999.0, [(90.0, 900.0), (101.0, 899.5), (103.0, 899.5)], 103.0),
-            (996.5, [(97.0, 900.0), (103.0, 900.0)], 96.5),  # held by QEMU just before the first sample
             (1000.0, [(-161897.0, 900.0), (101.0, 900.1), (103.0, 900.3)], 103.0),  # a step in the recent pair
-            (990.0, [(97.0, 900.0), (103.0, 900.0)], 103.0),  # older than the samples and a hold
-            (None, [(90.0, 900.0), (103.0, 900.0)], 103.0),  # no stamp
-            (1010.0, [(90.0, 900.0), (103.0, 900.0)], 103.0),  # a stamp after now: never later than now
+            # the sample before a step stays until the one after it is 5 s old: then the stamp converts
+            (1004.0, [(90.0, 900.0), (95.0, 905.0), (99.9, 905.0)], 99.9),
+            (1004.0, [(90.0, 900.0), (95.0, 905.0), (100.0, 905.0)], 99.0),
         ],
         ids=[
             "late-read",
@@ -257,15 +292,30 @@ class TestEventMonotonic:
             "step-back",
             "drift",
             "step-before-the-last-sample",
-            "held-before-the-first-sample",
             "step-in-the-recent-pair",
-            "older-than-the-samples",
-            "no-stamp",
-            "future-stamp",
+            "step-kept",
+            "step-dropped",
         ],
     )
-    def test_place(self, stamp: float | None, samples: list[tuple[float, float]], expected: object) -> None:
-        assert qmp_events._event_monotonic(stamp, now=103.0, samples=samples) == expected  # pyright: ignore[reportPrivateUsage]
+    def test_a_step_among_the_samples_makes_the_event_now(
+        self, monkeypatch: pytest.MonkeyPatch, stamp: float, samples: list[tuple[float, float]], expected: object
+    ) -> None:
+        assert _placed(monkeypatch, stamp, samples) == expected
+
+    @pytest.mark.parametrize(
+        ("stamp", "expected"),
+        [
+            ({"seconds": 102, "microseconds": 500_000}, 102.5),
+            ({"seconds": 10**400, "microseconds": 0}, None),
+            ({"seconds": 102, "microseconds": 10**400}, None),
+            ({"seconds": "102", "microseconds": 0}, None),
+        ],
+        ids=["qemu", "seconds-no-float-holds", "microseconds-no-float-holds", "not-a-number"],
+    )
+    def test_stamp_of(self, stamp: dict[str, object], expected: float | None) -> None:
+        """A stamp no float holds is no stamp (the event is taken as made now), never an
+        OverflowError that ends the watch."""
+        assert qmp_events._stamp_of({"event": "STOP", "timestamp": stamp}) == expected  # pyright: ignore[reportPrivateUsage]
 
     @pytest.mark.parametrize(
         ("drift", "expected"), [(1e-5, pytest.approx(102.0)), (0.0, 103.0)], ids=["macos", "linux"]
@@ -277,13 +327,13 @@ class TestEventMonotonic:
         on Linux, where the offset never drifts, a step (made now)."""
         monkeypatch.setattr(qmp_events, "_CLOCK_DRIFT_PER_SECOND", drift)
         samples = [(-161897.0, 900.0), (101.0, 900.1004), (103.0, 900.1004)]
-        assert qmp_events._event_monotonic(900.1004 + 102.0, now=103.0, samples=samples) == expected  # pyright: ignore[reportPrivateUsage]
+        assert _placed(monkeypatch, 900.1004 + 102.0, samples) == expected
 
-    def test_this_host_allows_drift_only_on_macos(self) -> None:
+    def test_this_host_allows_drift_only_on_macos(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The case above with the drift allowance of this host: placed on macOS, made now on Linux."""
         samples = [(-161897.0, 900.0), (101.0, 900.1004), (103.0, 900.1004)]
         expected = pytest.approx(102.0) if sys.platform == "darwin" else 103.0
-        assert qmp_events._event_monotonic(900.1004 + 102.0, now=103.0, samples=samples) == expected  # pyright: ignore[reportPrivateUsage]
+        assert _placed(monkeypatch, 900.1004 + 102.0, samples) == expected
 
     def test_samples_keep_the_newest_older_than_the_history(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The samples of the last _OFFSET_HISTORY_SECONDS stay, and the newest older one (the

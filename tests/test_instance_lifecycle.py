@@ -60,6 +60,7 @@ from tests.instance_support import (
     constant_block,
     digest,
     disk_full_once,
+    exact_key,
     fake_session,
     file_digest,
     head_object,
@@ -92,10 +93,6 @@ _HYPOTHESIS = settings(
     database=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
 )
-
-
-def _exact(key: str) -> str:
-    return f"^{re.escape(key)}$"
 
 
 def _body(instance_id: str) -> str:
@@ -394,7 +391,7 @@ class TestOverlap:
         assert fork.vm.base_image_digest is not None
         image_key = asset_key(fork.vm.base_image_digest)
         env.bucket.delete(image_key)
-        gate = env.proxy.add(("PUT", "MPU_CREATE"), _exact(image_key), Hold())
+        gate = env.proxy.add(("PUT", "MPU_CREATE"), exact_key(image_key), Hold())
         saving = asyncio.create_task(lab.save(fork))
         try:
             await _within(gate.reached.wait())
@@ -462,7 +459,7 @@ class TestOverlap:
         x = await lab.base(seed=44)
         clock = LoopClock(monkeypatch)
         fork = await lab.reuse(x)  # the session arms its deadline (3600 s) at creation
-        gate = env.proxy.add("PUT_IF", _exact(head_key(x)), Hold())
+        gate = env.proxy.add("PUT_IF", exact_key(head_key(x)), Hold())
         saving = asyncio.create_task(lab.save(fork))
         try:
             await _within(gate.reached.wait())
@@ -590,7 +587,7 @@ def _gate(env: InstanceEnv, fork: Fork, instance_id: str, phase: str) -> Gate:
         case "body-put":
             rule = env.proxy.add(("PUT", "MPU_CREATE"), _body(instance_id), Hold())
         case "head-put":
-            rule = env.proxy.add("PUT_IF", _exact(head_key(instance_id)), Hold())
+            rule = env.proxy.add("PUT_IF", exact_key(head_key(instance_id)), Hold())
         case _:
             raise AssertionError(phase)
     return Gate(reached=rule.reached.wait, release=rule.release)
@@ -707,31 +704,40 @@ class TestCloseDuringSave:
 
     async def test_cancelled_save_stops_the_home_copy_first(self, lab: Lab, monkeypatch: pytest.MonkeyPatch) -> None:
         """A save cancelled while the VM is stopped and its home disk is copied: the copy stops
-        (its stop event) and the cancel comes out once the copy ended, then the VM runs again
-        (QMP cont). The rule of test_instance_e2e, without a VM. The seam: the manager module's
-        name for files.disk.clone_sparse (disk_full_once)."""
-        copying, ended = threading.Event(), threading.Event()
+        (its stop event), the cancel comes out only once the copy ended, then the VM runs again
+        (QMP migrate_cancel, cont). The rule of test_instance_e2e, without a VM. The seam: the
+        manager module's name for files.disk.clone_sparse (disk_full_once). The copy ends only
+        when the test lets it: a cancel that does not wait for it comes out first."""
+        copying, stopped, finish = threading.Event(), threading.Event(), threading.Event()
 
         def stoppable_copy(_source: Path, target: Path, *, stop: threading.Event | None) -> bool:
             target.write_bytes(b"partial")
             copying.set()
             assert stop is not None
-            stop.wait(timeout=30)
+            if stop.wait(timeout=30):
+                stopped.set()
+            finish.wait(timeout=30)
             target.unlink()
-            ended.set()
             raise InterruptedError(errno.EINTR, "The copy was stopped")
 
         instance_id = await lab.base(31)
         fork = await lab.reuse(instance_id)
         _change(fork.vm, _op("put", "ram", block=1, value=31, tag=None))
         monkeypatch.setattr(instance_manager, "clone_sparse", stoppable_copy)
+        qmp = fork.vm.qmp
         saving = asyncio.create_task(lab.save(fork))
-        assert await asyncio.to_thread(copying.wait, 10)
-        saving.cancel()
+        try:
+            assert await asyncio.to_thread(copying.wait, _WAIT)
+            saving.cancel()
+            assert await asyncio.to_thread(stopped.wait, _WAIT)  # the cancel set the copy's stop event
+            done, _ = await asyncio.wait({saving}, timeout=0.2)
+            assert not done, "the cancel came out while the copy still ran"
+            assert qmp.running is False  # the VM stays stopped while the copy runs
+        finally:
+            finish.set()
         with pytest.raises(asyncio.CancelledError):
             await _within(saving)
-        assert ended.is_set()  # the copy ended before the cancel came out
-        assert "cont" in fork.vm.qmp.commands  # the stopped VM runs again
+        assert (qmp.commands[-2:], qmp.running) == (["migrate_cancel", "cont"], True)  # then the VM runs again
         assert await lab.generation(instance_id) == 1
 
     async def test_a_cancelled_save_that_loses_removes_its_object(self, lab: Lab) -> None:
@@ -775,7 +781,7 @@ class TestCloseDuringSave:
         async def head_applied(req: Request, resp: Response) -> None:
             drained_before_write.append(draining[0].done())
 
-        head = _exact(head_key(instance_id))
+        head = exact_key(head_key(instance_id))
         gate = env.proxy.add("PUT_IF", head, Hold())
         env.proxy.add("PUT_IF", head, After(head_applied))
         saving = asyncio.create_task(lab.save(fork))
@@ -805,7 +811,7 @@ class TestWorkFileRemoval:
         env = lab.env
         instance_id = await lab.base(seed=17)
         (key,) = env.bucket.body_keys(instance_id)
-        gate = env.proxy.add("GET", _exact(key), Hold())
+        gate = env.proxy.add("GET", exact_key(key), Hold())
         loading = asyncio.create_task(env.load(instance_id, manager=env.manager))
         await _within(gate.reached.wait())
         try:
@@ -825,7 +831,7 @@ class TestWorkFileRemoval:
         instance_id = await lab.base(seed=17)
         fork = await lab.new(18, instance_id=None)
         (key,) = env.bucket.body_keys(instance_id)
-        gate = env.proxy.add("GET", _exact(key), Hold())
+        gate = env.proxy.add("GET", exact_key(key), Hold())
         loading = asyncio.create_task(env.load(instance_id, manager=env.manager))
         await _within(gate.reached.wait())
         stopping = asyncio.create_task(env.manager.stop())
@@ -991,7 +997,7 @@ class TestDiskFull:
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED) as exc:
                 await fork.session.save()
             assert exc.value.context["vm_resumed"] is True
-            assert "No space left on device" in str(exc.value)
+            assert str(exc.value) == "Migration failed: No space left on device"  # QEMU's state and reason
             assert fork.vm.qmp.commands[-2:] == ["migrate_cancel", "cont"]
             fork.vm.qmp.migration_error = None
         else:
@@ -1030,7 +1036,7 @@ class TestDiskFull:
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED) as exc:
             await fork.session.save()
         assert exc.value.context["vm_resumed"] is False
-        assert str(exc.value).startswith("Save failed and the VM did not resume:")
+        assert str(exc.value) == "Save failed and the VM did not resume: Migration failed: No space left on device"
         assert fork.session.closed
         assert env.proxy.count(("PUT", "MPU_CREATE", "PUT_IF"), since=mark) == 0
         assert await lab.generation(instance_id) == 1
@@ -1329,7 +1335,7 @@ class TestForks:
         forks = [await lab.reuse(instance_id) for _ in range(n)]
         for i, fork in enumerate(forks):
             await fork.session.exec(_op("put", "ram", block=1, value=1 + i, tag=i))
-        gate = env.proxy.add("PUT_IF", _exact(head_key(instance_id)), Hold(), times=None)
+        gate = env.proxy.add("PUT_IF", exact_key(head_key(instance_id)), Hold(), times=None)
         mark = len(env.proxy.log)
         tasks = [asyncio.create_task(lab.save(fork)) for fork in forks]
         try:
@@ -1547,8 +1553,8 @@ class TestSaveUnderNewId:
         x = await lab.base(seed=37)
         fork = await lab.reuse(x)
         await fork.session.exec(_op("put", "ram", block=1, value=37, tag=1))
-        env.proxy.add("PUT_IF", _exact(head_key("y-37")), DropAfter())
-        env.proxy.add("GET", _exact(head_key("y-37")), Fail(503, "ServiceUnavailable"), times=None)
+        env.proxy.add("PUT_IF", exact_key(head_key("y-37")), DropAfter())
+        env.proxy.add("GET", exact_key(head_key("y-37")), Fail(503, "ServiceUnavailable"), times=None)
         with pytest.raises(
             OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN
         ) as exc:
@@ -1597,7 +1603,7 @@ class TestSaveUnderNewId:
         async def delete(_req: Request) -> None:
             await remover.delete("y-45")
 
-        env.proxy.add("PUT_IF", _exact(head_key("y-45")), Before(delete))
+        env.proxy.add("PUT_IF", exact_key(head_key("y-45")), Before(delete))
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_NOT_FOUND) as exc:
             await fork.session.save(instance_id="y-45")
         assert (exc.value.action, exc.value.instance_id) == ("RECREATE", "y-45")
@@ -1613,8 +1619,8 @@ class TestSaveUnderNewId:
         env = lab.env
         x = await lab.base(seed=46)
         fork = await lab.reuse(x)
-        env.proxy.add("PUT_IF", _exact(head_key("y-46")), DropBefore(), times=None)
-        env.proxy.add("GET", _exact(head_key("y-46")), Fail(503, "ServiceUnavailable"), times=None)
+        env.proxy.add("PUT_IF", exact_key(head_key("y-46")), DropBefore(), times=None)
+        env.proxy.add("GET", exact_key(head_key("y-46")), Fail(503, "ServiceUnavailable"), times=None)
         with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN):
             await fork.session.save(instance_id="y-46")
         assert fork.session.instance == InstanceRef(instance_id=x, generation=1)
@@ -1629,7 +1635,7 @@ class TestSaveUnderNewId:
         env = lab.env
         x = await lab.base(seed=47)
         a, b = await lab.reuse(x), await lab.reuse(x)
-        gate = env.proxy.add("PUT_IF", _exact(head_key("y-47")), Hold(), times=None)
+        gate = env.proxy.add("PUT_IF", exact_key(head_key("y-47")), Hold(), times=None)
         tasks = [asyncio.create_task(lab.save_as(fork, "y-47")) for fork in (a, b)]
         try:
             await await_until(lambda: gate.hits == 2)
@@ -1692,7 +1698,7 @@ class TestSaveUnderNewId:
         env = lab.env
         x = await lab.base(seed=50)
         fork = await lab.reuse(x)
-        gate = env.proxy.add("PUT_IF", _exact(head_key("y-50")), Hold())
+        gate = env.proxy.add("PUT_IF", exact_key(head_key("y-50")), Hold())
         saving = asyncio.create_task(lab.save_as(fork, "y-50"))
         try:
             await _within(gate.reached.wait())
@@ -1711,7 +1717,7 @@ class TestSaveUnderNewId:
         env = lab.env
         x = await lab.base(seed=51)
         fork = await lab.reuse(x)
-        gate = env.proxy.add("PUT_IF", _exact(head_key("y-51")), Hold())
+        gate = env.proxy.add("PUT_IF", exact_key(head_key("y-51")), Hold())
         saving = asyncio.create_task(fork.session.save(instance_id="y-51"))
         await _within(gate.reached.wait())
         saving.cancel()
@@ -1731,8 +1737,8 @@ class TestSaveUnderNewId:
         x = await lab.base(seed=52)
         fork = await lab.reuse(x)
         await fork.session.exec(_op("put", "ram", block=1, value=52, tag=1))
-        env.proxy.add("PUT_IF", _exact(head_key(x)), DropAfter())
-        env.proxy.add("GET", _exact(head_key(x)), Fail(503, "ServiceUnavailable"), times=None)
+        env.proxy.add("PUT_IF", exact_key(head_key(x)), DropAfter())
+        env.proxy.add("GET", exact_key(head_key(x)), Fail(503, "ServiceUnavailable"), times=None)
         with pytest.raises(
             OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN
         ) as first:

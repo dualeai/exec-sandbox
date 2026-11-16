@@ -4,6 +4,7 @@ Builds QEMU command arguments based on platform capabilities, acceleration type,
 and VM configuration.
 """
 
+import logging
 import re
 from dataclasses import dataclass
 from enum import StrEnum
@@ -11,7 +12,6 @@ from pathlib import Path
 from typing import Final
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.images import GuestImages
 from exec_sandbox.permission_utils import QEMU_VM_SUDO
@@ -36,7 +36,7 @@ from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # x86 guests see one fixed CPU, not the host's, so a saved instance loads on
 # any host that has these flags: an AVX2-level (x86-64-v3) flag list on a
@@ -233,12 +233,12 @@ def command_properties(cmd: list[str], *, binary: str) -> list[tuple[str, str, l
         n += 2 if value is not None else 1
         parts = value.split(",") if value is not None else []
         driver = parts[0] if parts and "=" not in parts[0] else ""
-        pairs = [tuple(part.split("=", 1)) if "=" in part else (part, "") for part in parts[1 if driver else 0 :]]
+        pairs = [(key, value) for key, _, value in (part.partition("=") for part in parts[1 if driver else 0 :])]
         if option == "-M":
             driver = re.sub(r"-\d+\.\d+$", "", driver)
         elif option == "-object" and driver.startswith("memory-backend-"):  # ram or file (an L1 template)
             driver = "memory-backend"
-        found.append((option, driver, [(key, value) for key, value in pairs]))
+        found.append((option, driver, pairs))
     return found
 
 
@@ -519,7 +519,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                 instance_id=None,
             )
 
-    tsc_available = False  # x86 only: set below from the TSC_DEADLINE probe
     if arch == HostArch.AARCH64:
         # highmem=off: Keep all RAM below 4GB for simpler memory mapping (faster boot)
         # gic-version=3: an explicit GIC version (GICv3), the same under every accelerator
@@ -555,8 +554,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # replaces PIT as the timer source). Without TSC_DEADLINE, PIT/PIC
         # must remain enabled or the kernel hangs (no timer/interrupt source).
         # TCG and HVF never provide TSC_DEADLINE (check_tsc_deadline); KVM may lack it in nested VMs.
-        if accel_type is AccelType.KVM:
-            tsc_available = await check_tsc_deadline()
+        tsc_available = accel_type is AccelType.KVM and await check_tsc_deadline()
 
         # Build the -M value from components
         parts = [machine_type or base_machine_type(arch), "acpi=off", "x-option-roms=off"]

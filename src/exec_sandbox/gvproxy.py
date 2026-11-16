@@ -14,18 +14,17 @@ from pathlib import Path
 from typing import Any, Final
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.assets import get_gvproxy_path
 from exec_sandbox.dns_filter import generate_outbound_allow_json
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError, spawn_error
 from exec_sandbox.models import ExposedPort
-from exec_sandbox.permission_utils import grant_qemu_vm_access, probe_qemu_as_qemu_vm
-from exec_sandbox.platform_utils import ProcessWrapper
+from exec_sandbox.permission_utils import probe_qemu_as_qemu_vm, set_acl_user
+from exec_sandbox.platform_utils import ProcessWrapper, get_arch_name
 from exec_sandbox.socket_auth import create_unix_socket
 from exec_sandbox.subprocess_utils import exec_failed_error, start_drain, start_managed_process
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 _QEMU_SOCKET_CLOSED: Final = "cannot read size from socket: EOF"
@@ -236,7 +235,7 @@ async def start_gvproxy(  # noqa: PLR0915
 
     try:
         # Start gvproxy-wrapper with pre-bound FD
-        gvproxy_binary = await get_gvproxy_path(override=images_dir)
+        gvproxy_binary = await get_gvproxy_path(override=images_dir, arch=get_arch_name())
         if gvproxy_binary is None:
             raise ConfigError(
                 f"gvproxy-wrapper binary not found in {images_dir}, gvproxy-wrapper/bin, "
@@ -330,7 +329,7 @@ async def start_gvproxy(  # noqa: PLR0915
 
         # qemu-vm (QEMU through sudo) needs access to the socket before QEMU connects: without
         # it, the VM would fail later at its boot
-        if await probe_qemu_as_qemu_vm() and not await grant_qemu_vm_access(socket_path):
+        if await probe_qemu_as_qemu_vm() and not await set_acl_user([socket_path], user="qemu-vm", perms="rw"):
             raise ConfigError(
                 "Could not give qemu-vm access to the gvproxy socket (needs setfacl, package acl)",
                 code=ErrorCode.HOST_DEPENDENCY,

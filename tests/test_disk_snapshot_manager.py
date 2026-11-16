@@ -47,10 +47,9 @@ from exec_sandbox.files.locks import CacheEntry, EntryLease
 from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
 from exec_sandbox.guest_channel import StreamDeadlineExceededError, StreamResult
 from exec_sandbox.hash_utils import fingerprint
-from exec_sandbox.images import BASE_IMAGES, GuestImages, image_digest
+from exec_sandbox.images import BASE_IMAGES, image_digest
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import Language
-from exec_sandbox.platform_utils import HostArch
 from exec_sandbox.qemu_vm import QemuDiagnostics
 from exec_sandbox.settings import Settings
 from exec_sandbox.subprocess_utils import communicate_managed_process
@@ -407,40 +406,6 @@ class TestDiskSnapshotManagerIntegration:
 
         assert cached_path == snapshot_path
 
-    def test_base_image_is_the_catalog_version(self, tmp_path: Path) -> None:
-        """An older build in the folder (python-3.13) is not used: the base image is the one the
-        images catalog names (one place for a new runtime version)."""
-        images = tmp_path / "images"
-        images.mkdir()
-        host = GuestImages(images_dir=images, kernel_dir=images, download_dir=None, arch=HostArch.X86_64)
-        (images / "python-3.13-base-x86_64.qcow2").touch()
-        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND):
-            host.base_image(Language.PYTHON)
-        (images / "python-3.14-base-x86_64.qcow2").touch()
-        assert host.base_image(Language.PYTHON) == images / "python-3.14-base-x86_64.qcow2"
-
-    @pytest.mark.parametrize(
-        ("host_arch", "suffix"), [(HostArch.AARCH64, "aarch64"), (HostArch.X86_64, "x86_64")], ids=["aarch64", "x86_64"]
-    )
-    @pytest.mark.parametrize("language", list(Language), ids=[language.value for language in Language])
-    def test_base_image_skips_the_other_architecture(
-        self, tmp_path: Path, language: Language, host_arch: HostArch, suffix: str
-    ) -> None:
-        """A folder with both architectures (make build IMAGE_ARCH=all) gives the host's image,
-        and VmManager.start makes the overlay template of the same one; a download in progress (.zst) is no image."""
-        images = tmp_path / "images"
-        images.mkdir()
-        stem = {Language.PYTHON: "python-3.14-base", Language.JAVASCRIPT: "node-1.4-base", Language.RAW: "raw-base"}[
-            language
-        ]
-        for arch in ("aarch64", "x86_64"):
-            (images / f"{stem}-{arch}.qcow2").touch()
-        host = GuestImages(images_dir=images, kernel_dir=images, download_dir=None, arch=host_arch)
-        mine = images / f"{stem}-{suffix}.qcow2"
-        (images / f"{mine.name}.zst").touch()
-        assert host.base_image(language) == mine
-        assert host.present_base_images() == [mine]
-
 
 # ============================================================================
 # L2 Cache Tests - Local Disk Snapshots
@@ -569,6 +534,24 @@ class TestL2Cache:
         assert not snapshot_path.exists(), "Corrupt snapshot should be removed"
         assert not sidecar.exists(), "Its digest sidecar goes with it"
 
+    async def test_entry_paths_lists_the_images_only(self, make_snapshot_manager, tmp_path: Path) -> None:
+        """entry_paths (the L2 images describe_worker hashes): each .qcow2 of the cache folder,
+        no sidecar, lock file or build part."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir(mode=0o700)
+        for name in (
+            "python-a.qcow2",
+            "python-b.qcow2",
+            "python-a.qcow2.sha256",
+            "python-a.qcow2.lock",
+            "python-a.qcow2.use.lock",
+            "python-c.qcow2.999999999.0123abcd.part",
+        ):
+            (cache_dir / name).write_bytes(b"x")
+        snapshot_manager, _settings = await make_snapshot_manager(disk_snapshot_cache_dir=cache_dir)
+
+        assert sorted(path.name for path in snapshot_manager.entry_paths()) == ["python-a.qcow2", "python-b.qcow2"]
+
     async def test_l2_cache_empty_is_a_miss(self, make_keyed_manager) -> None:
         """An empty cache is a miss, with no lease and no lock file."""
         snapshot_manager, settings = await make_keyed_manager()
@@ -680,27 +663,6 @@ class TestL3Cache:
         assert uploaded["Metadata"]["sha256"] == hashlib.sha256(b"fake qcow2 content").hexdigest()
         assert _entries(settings.disk_snapshot_cache_dir) == [f"{_KEY}.qcow2"]
 
-    async def test_download_from_s3_success(self, make_keyed_manager, moto_s3_server, tmp_path: Path) -> None:
-        """An L3 hit is decompressed into L2 under its key, and no build runs."""
-        endpoint_url, s3_sync = moto_s3_server
-        source = tmp_path / "source.qcow2"
-        await create_test_qcow2(source)
-        original_content = source.read_bytes()
-        s3_sync.put_object(
-            Bucket=BUCKET,
-            Key=_L3_OBJECT,
-            Body=zstd.compress(original_content),
-            Metadata={"sha256": hashlib.sha256(original_content).hexdigest()},
-        )
-        snapshot_manager, settings = await make_keyed_manager(
-            s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
-        )
-
-        result = await _lookup(snapshot_manager)
-
-        assert result == settings.disk_snapshot_cache_dir / f"{_KEY}.qcow2"
-        assert result.read_bytes() == original_content
-
     async def test_l3_files_have_no_group_or_other_write(
         self, make_keyed_manager, moto_s3_server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -786,7 +748,8 @@ class TestL3Cache:
     async def test_download_from_s3_not_found(
         self, make_keyed_manager, moto_s3_server, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A missing object is an L3 miss (logged): the build runs, no error."""
+        """A missing object is an L3 miss (logged with the store's answer, not a local error):
+        the build runs, no error."""
         endpoint_url, _s3_sync = moto_s3_server
         snapshot_manager, settings = await make_keyed_manager(
             s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url
@@ -794,7 +757,7 @@ class TestL3Cache:
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.disk_snapshot_manager"):
             assert await _lookup(snapshot_manager) is None
-        assert len(_l3_miss_reasons(caplog)) == 1
+        assert _l3_miss_reasons(caplog) == ["An error occurred (404) when calling the HeadObject operation: Not Found"]
         assert _entries(settings.disk_snapshot_cache_dir) == []
 
     @pytest.mark.parametrize(
@@ -1785,7 +1748,8 @@ class TestCacheHierarchy:
         assert entry.read_bytes() == l2_content
 
     async def test_l2_populated_after_l3_download(self, make_keyed_manager, moto_s3_server, tmp_path: Path) -> None:
-        """An L3 download fills L2: the next request is an L2 hit, also once the S3 object is gone."""
+        """An L3 hit is decompressed into L2 under its key, and no build runs; the next request
+        is an L2 hit, also once the S3 object is gone."""
         endpoint_url, s3_sync = moto_s3_server
         snapshot_manager, settings = await make_keyed_manager(
             s3_bucket=BUCKET, s3_region="us-east-1", s3_endpoint_url=endpoint_url

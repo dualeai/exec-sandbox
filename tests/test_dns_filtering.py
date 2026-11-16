@@ -9,6 +9,8 @@ Tests that gvproxy-wrapper OutboundAllow filtering actually works in VMs:
 6. Boundary: large allowlists, IDN domains
 """
 
+import re
+
 import pytest
 
 from exec_sandbox.models import Language
@@ -88,8 +90,8 @@ OUTBOUND_FILTER_EDGE_CASES = [
 # Direct IP connections bypass DNS but still get blocked (no matching pattern).
 # This is stronger than DNS-only filtering which could be bypassed with IP literals.
 OUTBOUND_FILTER_SECURITY_CASES = [
-    # Direct IP connection without prior DNS resolution — no cached mapping exists,
-    # and the TLS SNI is an IP literal, not a domain pattern. Should be blocked.
+    # Direct IP connection without a DNS lookup: Python sends no SNI for an IP literal
+    # (RFC 6066), so the TLS filter has no name to match and closes the connection.
     pytest.param(["cp.cloudflare.com"], "93.184.216.34", TLS_BLOCKED, id="security-direct-ip-no-dns-blocked"),
 ]
 
@@ -107,14 +109,14 @@ def get_connection_test_code(test_domain: str, *, retries: bool) -> str:
 
     It prints CONNECTED, or BLOCKED:<exception type> (BLOCKED:Timeout from PY_SAFETY when the
     process hangs). When *retries* is True the code retries transient failures (``NET_RETRY_COUNT``
-    attempts): used for allowed-domain tests.
+    more attempts, linear backoff): used for allowed-domain tests.
     """
-    if retries:
-        return (
-            PY_SAFETY
-            + f"""
+    attempts = NET_RETRY_COUNT + 1 if retries else 1
+    return (
+        PY_SAFETY
+        + f"""
 import socket, ssl, time
-for attempt in range({NET_RETRY_COUNT + 1}):
+for attempt in range({attempts}):
     try:
         ctx = ssl.create_default_context()
         with socket.create_connection(("{test_domain}", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
@@ -122,23 +124,10 @@ for attempt in range({NET_RETRY_COUNT + 1}):
                 print("CONNECTED")
                 break
     except Exception as e:
-        if attempt < {NET_RETRY_COUNT}:
+        if attempt < {attempts - 1}:
             time.sleep({NET_RETRY_BACKOFF_S} * (attempt + 1))
             continue
         print(f"BLOCKED:{{type(e).__name__}}")
-"""
-        )
-    return (
-        PY_SAFETY
-        + f"""
-import socket, ssl
-try:
-    ctx = ssl.create_default_context()
-    with socket.create_connection(("{test_domain}", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="{test_domain}") as ssock:
-            print("CONNECTED")
-except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
 """
     )
 
@@ -172,10 +161,10 @@ async def test_outbound_filtering(
 
 
 # =============================================================================
-# HTTPS allowed/blocked (urllib, higher-level than raw socket)
+# HTTPS allowed (urllib, higher-level than raw socket); a blocked domain: test_outbound_filtering
 # =============================================================================
 async def test_outbound_filtering_http_allowed(scheduler: Scheduler) -> None:
-    """Test that allowed domain is accessible via HTTPS."""
+    """urllib HTTPS GET of an allowed domain gets status 200, and nothing else is printed."""
     code = (
         PY_SAFETY
         + f"""
@@ -192,37 +181,8 @@ except Exception as e:
         scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["pypi.org"]), code
     )
 
-    assert "STATUS:200" in result.stdout, (
+    assert result.stdout == "STATUS:200\n", (
         f"HTTPS to allowed domain failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-
-
-async def test_outbound_filtering_http_blocked(scheduler: Scheduler) -> None:
-    """urllib HTTPS to a blocked domain fails at DNS (the URLError reason is a gaierror)."""
-    code = (
-        PY_SAFETY
-        + f"""
-import urllib.request
-try:
-    with urllib.request.urlopen("https://google.com/", timeout={NET_OP_TIMEOUT_S}) as r:
-        print(f"STATUS:{{r.status}}")
-except Exception as e:
-    print(f"BLOCKED:{{type(getattr(e, 'reason', e)).__name__}}")
-"""
-    )
-
-    result = await run_once(
-        scheduler,
-        VmSpec(
-            language=Language.PYTHON,
-            allow_network=True,
-            allowed_domains=["pypi.org"],  # Only pypi allowed
-        ),
-        code,
-    )
-
-    assert result.stdout == "BLOCKED:gaierror\n", (
-        f"Expected HTTPS to google.com to fail at DNS.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 
@@ -261,7 +221,7 @@ except OSError as e:
 # RAW language tests (using curl instead of Python)
 # =============================================================================
 async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
-    """Test outbound filtering with RAW language using curl.
+    """curl (RAW language) to an allowed domain succeeds: the command prints SUCCESS only.
 
     Uses a planet-scale connectivity-check (NCSI) endpoint — no rate limits,
     no bot challenges, no scheduled downtime. No ``-f``: any HTTP response
@@ -276,7 +236,7 @@ async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
         " https://cp.cloudflare.com/generate_204 && echo 'SUCCESS' || echo 'FAILED'",
     )
 
-    assert "SUCCESS" in result.stdout, (
+    assert result.stdout == "SUCCESS\n", (
         f"curl to allowed domain failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
@@ -367,50 +327,13 @@ except Exception as e:
     )
 
 
-async def test_outbound_filtering_raw_tcp_blocked(scheduler: Scheduler) -> None:
-    """Raw TCP connections (non-TLS) to arbitrary ports are refused.
-
-    OutboundAllow only permits TLS on port 443 with matching SNI.
-    Raw TCP to other ports has no SNI to match, so it must be blocked.
-    """
-    code = (
-        PY_SAFETY
-        + f"""
-import socket
-try:
-    # Try raw TCP to port 80 (HTTP, no TLS/SNI)
-    sock = socket.create_connection(("cp.cloudflare.com", 80), timeout={NET_CONNECT_TIMEOUT_S})
-    sock.sendall(b"GET / HTTP/1.1\\r\\nHost: cp.cloudflare.com\\r\\n\\r\\n")
-    data = sock.recv(1024)
-    sock.close()
-    print(f"TCP_CONNECTED:{{len(data)}}")
-except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
-"""
-    )
-
-    result = await run_once(
-        scheduler,
-        VmSpec(
-            language=Language.PYTHON,
-            allow_network=True,
-            allowed_domains=["cp.cloudflare.com"],  # Allowed, but only TLS
-        ),
-        code,
-    )
-
-    assert result.stdout == "BLOCKED:ConnectionRefusedError\n", (
-        f"Expected raw TCP (non-TLS) to be refused by OutboundAllow.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-
-
 async def test_outbound_filtering_dns_resolve_then_ip_connect_with_sni(
     scheduler: Scheduler,
 ) -> None:
     """DNS-resolve allowed domain, then TLS-connect to the IP with correct SNI.
 
-    The proxy caches DNS resolutions and cross-checks TLS SNI against them.
-    Resolve allowed domain → get IP → TLS to that IP with matching SNI should work.
+    The proxy resolves the SNI on the host and checks that the destination IP is one of its
+    addresses: resolve allowed domain → get IP → TLS to that IP with matching SNI works.
     The TLS handshake (certificate check included) succeeds only on a real IP of the domain, not a sinkhole.
     """
     code = (
@@ -433,10 +356,8 @@ except Exception as e:
         scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
     )
 
-    assert "RESOLVED:" in result.stdout, (
-        f"DNS resolution should succeed for allowed domain.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-    assert "CONNECTED" in result.stdout, (
+    # The IP is the one the guest resolved (it varies): an IPv4 address, then the connection
+    assert re.fullmatch(r"RESOLVED:\d{1,3}(\.\d{1,3}){3}\nCONNECTED\n", result.stdout), (
         f"TLS to resolved IP with correct SNI should succeed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
@@ -448,7 +369,7 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_no_sni(
 
     Even after resolving an allowed domain, a raw TCP connection (no TLS,
     no SNI) to the resulting IP is refused. The proxy requires TLS
-    with matching SNI on port 443.
+    with matching SNI on port 443: raw TCP to another port has no SNI to match.
     """
     code = (
         PY_SAFETY

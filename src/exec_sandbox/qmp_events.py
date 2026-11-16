@@ -16,8 +16,7 @@ a stamp on the monotonic clock against its samples of time.time() - time.monoton
 from __future__ import annotations
 
 import asyncio
-import itertools
-import json
+import logging
 import math
 import sys
 import time
@@ -25,17 +24,16 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, cast
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import CommunicationError, ConfigError, SandboxError
-from exec_sandbox.qmp_client import QmpClient
+from exec_sandbox.qmp_client import QmpClient, parse_qmp_line
 from exec_sandbox.socket_auth import verify_socket_peer
 from exec_sandbox.subprocess_utils import wait_for_socket
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 _CLOCK_STEP_SECONDS: Final = 0.1
@@ -61,33 +59,30 @@ QEMU's 1 s rate limit, which holds an event with its stamp, plus a late read."""
 
 def _stamp_of(message: dict[str, Any]) -> float | None:
     """The wall-clock timestamp of a QMP event (QEMU's g_get_real_time at the event's making,
-    kept by its rate limit), or None."""
+    kept by its rate limit), or None (also for numbers no float holds: a broken QEMU)."""
     stamp = message.get("timestamp")
     if isinstance(stamp, dict):
         stamp = cast("dict[str, Any]", stamp)
         seconds, microseconds = stamp.get("seconds"), stamp.get("microseconds")
         if isinstance(seconds, int) and isinstance(microseconds, int):
-            return seconds + microseconds / 1_000_000
+            try:
+                return seconds + microseconds / 1_000_000
+            except OverflowError:
+                return None
     return None
 
 
-def _event_monotonic(stamp: float | None, *, now: float, samples: Sequence[tuple[float, float]]) -> float:
+def _event_monotonic(stamp: float | None, *, now: float, first_sample: float, offset: float) -> float:
     """time.monotonic() of an event stamped `stamp` on the wall clock, read at `now`
-    (monotonic). `samples` are the event watch's (time.monotonic(), time.time() -
-    time.monotonic()) pairs, oldest first, the last taken at this read. With no step among
-    them, a stamp after the first sample (or held by QEMU's rate limit just before it,
-    _HELD_EVENT_SECONDS) converts exactly, however late the read (a busy loop); with a step
-    among them, an older stamp, or no stamp, the event is taken as made now. Never later
-    than now."""
-    if stamp is None or not samples:
+    (monotonic), with no step of the wall clock since `first_sample` (the time.monotonic() of
+    the event watch's oldest kept sample); `offset` is time.time() - time.monotonic() at this
+    read. A stamp after the first sample (or held by QEMU's rate limit just before it,
+    _HELD_EVENT_SECONDS) converts exactly, however late the read (a busy loop); an older
+    stamp, or no stamp, is taken as made now. Never later than now."""
+    if stamp is None:
         return now
-    if any(
-        abs(later_offset - offset) > _CLOCK_STEP_SECONDS + _CLOCK_DRIFT_PER_SECOND * (later - at_sample)
-        for (at_sample, offset), (later, later_offset) in itertools.pairwise(samples)
-    ):
-        return now
-    at = stamp - samples[-1][1]
-    return now if at < samples[0][0] - _HELD_EVENT_SECONDS else min(now, at)
+    at = stamp - offset
+    return now if at < first_sample - _HELD_EVENT_SECONDS else min(now, at)
 
 
 _WATCH_RETRY_FIRST_SECONDS: Final = 0.001
@@ -130,6 +125,8 @@ class QmpEventWatch:
         self._task: asyncio.Task[None] | None = None
         # (time.monotonic(), time.time() - time.monotonic()) samples, across connections (_sample)
         self._samples: deque[tuple[float, float]] = deque()
+        # time.monotonic() of the first sample after the newest wall-clock step, None before one
+        self._step_at: float | None = None
 
     def start(self) -> None:
         """Start the watch, once."""
@@ -219,7 +216,7 @@ class QmpEventWatch:
         """One line of the monitor to on_event, with its time; a line that is not a JSON
         object with an event name is logged (unreadable) or skipped."""
         try:
-            message = json.loads(line)
+            message = parse_qmp_line(line)
         except ValueError:
             logger.warning("QEMU event line unreadable, skipped", extra={"vm_id": self._vm_id, "line": line[:200]})
             return
@@ -238,16 +235,28 @@ class QmpEventWatch:
         )
 
     def _sample(self) -> float:
-        """Keep (time.monotonic(), time.time() - time.monotonic()) now, across connections;
-        drop the samples older than _OFFSET_HISTORY_SECONDS but the newest of them (the
-        reference before a held stamp). Returns the time.monotonic() of the sample."""
+        """Keep (time.monotonic(), time.time() - time.monotonic()) now, across connections,
+        and the time of a wall-clock step since the last sample; drop the samples older than
+        _OFFSET_HISTORY_SECONDS but the newest of them (the reference before a held stamp).
+        Returns the time.monotonic() of the sample."""
         now = time.monotonic()
-        self._samples.append((now, time.time() - now))
+        offset = time.time() - now
+        if self._samples:
+            last, last_offset = self._samples[-1]
+            if abs(offset - last_offset) > _CLOCK_STEP_SECONDS + _CLOCK_DRIFT_PER_SECOND * (now - last):
+                self._step_at = now
+        self._samples.append((now, offset))
         while len(self._samples) > 1 and self._samples[1][0] <= now - _OFFSET_HISTORY_SECONDS:
             self._samples.popleft()
         return now
 
     def _event_time(self, message: dict[str, Any]) -> float:
-        """time.monotonic() of a QMP event (_event_monotonic against the kept samples)."""
+        """time.monotonic() of a QMP event: made now while the samples hold a wall-clock step
+        (the sample before the step stays until the one after it is _OFFSET_HISTORY_SECONDS
+        old: _sample), else _event_monotonic against the kept samples."""
         now = self._sample()
-        return _event_monotonic(_stamp_of(message), now=now, samples=self._samples)
+        if self._step_at is not None and self._step_at > now - _OFFSET_HISTORY_SECONDS:
+            return now
+        return _event_monotonic(
+            _stamp_of(message), now=now, first_sample=self._samples[0][0], offset=self._samples[-1][1]
+        )

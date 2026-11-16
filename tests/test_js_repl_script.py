@@ -113,12 +113,11 @@ def test_a_failed_prctl_stops_the_repl_before_any_exec() -> None:
     works = _run_repl(code, dumpable_fails=False)
     fails = _run_repl(code, dumpable_fails=True)
 
-    assert "ran" in works.stdout.decode(), works.stderr.decode()
+    assert _printed(works) == ["ran"], works.stderr.decode()
     assert works.stderr.decode().startswith("__REPL_READY__\n")  # before any exec, once
-    assert re.findall(r"^__SENTINEL_\w+?_-?\d+__$", works.stderr.decode(), re.MULTILINE) == ["__SENTINEL_s1_0__"]
-    assert fails.returncode != 0
-    assert "prctl(PR_SET_DUMPABLE, 0) failed" in fails.stderr.decode()
-    assert "ran" not in fails.stdout.decode()
+    assert _sentinels(works) == ["__SENTINEL_s1_0__"]
+    assert (fails.returncode, fails.stdout) == (1, b"")
+    assert "error: prctl(PR_SET_DUMPABLE, 0) failed" in fails.stderr.decode()
     assert "__SENTINEL_" not in fails.stderr.decode()
     assert "__REPL_READY__" not in fails.stderr.decode()  # the agent reports a REPL that did not start
 

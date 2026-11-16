@@ -9,16 +9,16 @@ none of them.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Final, cast
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import ConfigError
 from exec_sandbox.private_run_dir import PrivateRunDir, new_folder_name, remove_dead_folders
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _LIVE_RAM_ROOT: Final = Path("/dev/shm")  # noqa: S108 - only a folder of this user under it (PrivateRunDir checks it)
 """The memory file system (tmpfs) of Linux where a template save VM keeps its RAM file."""

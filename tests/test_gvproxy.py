@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from exec_sandbox import gvproxy, subprocess_utils
 from exec_sandbox.dns_filter import resolved_domains
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.gvproxy import start_gvproxy
@@ -48,14 +49,15 @@ def _unowned(_proc: ProcessWrapper, _drain: asyncio.Task[None] | None) -> None:
     ends it."""
 
 
-def _no_qemu_vm_access(stack: ExitStack, tmp_path: Path, sock: socket.socket) -> None:
-    """QEMU runs as qemu-vm and setfacl fails: start_gvproxy fails after the spawn."""
+def _no_qemu_vm_access(stack: ExitStack, tmp_path: Path, sock: socket.socket) -> AsyncMock:
+    """QEMU runs as qemu-vm and setfacl fails: start_gvproxy fails after the spawn. Returns
+    the set_acl_user stand-in."""
     stack.enter_context(patch("exec_sandbox.gvproxy.create_unix_socket", return_value=sock))
     stack.enter_context(
         patch("exec_sandbox.gvproxy.get_gvproxy_path", new_callable=AsyncMock, return_value=_stand_in(tmp_path))
     )
     stack.enter_context(patch("exec_sandbox.gvproxy.probe_qemu_as_qemu_vm", new_callable=AsyncMock, return_value=True))
-    stack.enter_context(patch("exec_sandbox.gvproxy.grant_qemu_vm_access", new_callable=AsyncMock, return_value=False))
+    acl = stack.enter_context(patch("exec_sandbox.gvproxy.set_acl_user", new_callable=AsyncMock, return_value=False))
     stack.enter_context(
         pytest.raises(
             ConfigError,
@@ -63,6 +65,7 @@ def _no_qemu_vm_access(stack: ExitStack, tmp_path: Path, sock: socket.socket) ->
             match=r"^Could not give qemu-vm access to the gvproxy socket",
         )
     )
+    return acl
 
 
 class TestStartGvproxyOwnership:
@@ -72,7 +75,7 @@ class TestStartGvproxyOwnership:
         sock = socket.socket(socket.AF_UNIX)
         lookup = asyncio.Event()
 
-        async def blocked_lookup(*, override: Path | None) -> Path | None:
+        async def blocked_lookup(*, override: Path | None, arch: str) -> Path | None:
             lookup.set()
             await asyncio.Event().wait()
             return None
@@ -105,7 +108,7 @@ class TestStartGvproxyOwnership:
         sock = socket.socket(socket.AF_UNIX)
         handed: list[tuple[ProcessWrapper, asyncio.Task[None] | None]] = []
         with ExitStack() as stack:
-            _no_qemu_vm_access(stack, tmp_path, sock)
+            acl = _no_qemu_vm_access(stack, tmp_path, sock)
             await start_gvproxy(
                 "gvproxy-owner",
                 allowed_domains=resolved_domains(None, "python"),
@@ -115,6 +118,7 @@ class TestStartGvproxyOwnership:
                 block_outbound=False,
                 on_process_started=lambda proc, drain: handed.append((proc, drain)),
             )
+        acl.assert_awaited_once_with([tmp_path / "g"], user="qemu-vm", perms="rw")
         (proc, first_drain), (same, drain) = handed
         try:
             assert (same, first_drain) == (proc, None)
@@ -123,7 +127,7 @@ class TestStartGvproxyOwnership:
             assert not drain.done()
             assert sock.fileno() == -1
         finally:
-            await cleanup_process(proc, "gvproxy", "test", term_timeout=3.0, kill_timeout=2.0, kill_first=False)
+            await cleanup_process(proc, "gvproxy", "test", term_timeout=3.0, kill_first=False)
             unregister_process(proc)
             if drain is not None:
                 await asyncio.wait((drain,))
@@ -155,15 +159,8 @@ class TestStartGvproxy:
     then waits for the exit without reading the pipes that task reads. Host only: a shell
     stands in for gvproxy-wrapper (it prints the readiness line, then waits)."""
 
-    @staticmethod
-    def _workdir(socket_path: Path) -> MagicMock:
-        workdir = MagicMock()
-        workdir.gvproxy_socket = socket_path
-        return workdir
-
     async def test_socket_failure_is_gvproxy_failed(self, tmp_path: Path) -> None:
         """A socket path above the AF_UNIX limit (104 bytes on macOS, 108 on Linux)."""
-        from exec_sandbox.gvproxy import start_gvproxy
 
         with pytest.raises(
             TransientError,
@@ -173,7 +170,7 @@ class TestStartGvproxy:
             await start_gvproxy(
                 "gvproxy-socket",
                 allowed_domains=resolved_domains(None, "python"),
-                workdir=self._workdir(tmp_path / ("s" * 120)),
+                workdir=_workdir(tmp_path / ("s" * 120)),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
@@ -181,8 +178,6 @@ class TestStartGvproxy:
             )
 
     async def test_missing_binary_is_host_dependency(self, tmp_path: Path) -> None:
-        from exec_sandbox.gvproxy import start_gvproxy
-
         sock = socket.socket(socket.AF_UNIX)
         with (
             patch("exec_sandbox.gvproxy.create_unix_socket", return_value=sock),
@@ -196,7 +191,7 @@ class TestStartGvproxy:
                 await start_gvproxy(
                     "gvproxy-binary",
                     allowed_domains=resolved_domains(None, "python"),
-                    workdir=self._workdir(tmp_path / "g"),
+                    workdir=_workdir(tmp_path / "g"),
                     images_dir=tmp_path,
                     expose_ports=None,
                     block_outbound=False,
@@ -208,7 +203,6 @@ class TestStartGvproxy:
     async def test_binary_that_cannot_run_is_host_dependency(self, tmp_path: Path, err: int) -> None:
         """A gvproxy-wrapper that is gone or that this user cannot run fails on every retry:
         FIX_CONFIG, never GVPROXY_FAILED (RETRY)."""
-        from exec_sandbox.gvproxy import start_gvproxy
 
         binary = tmp_path / "gvproxy-wrapper-test"
         if err == errno.EACCES:
@@ -227,7 +221,7 @@ class TestStartGvproxy:
                 await start_gvproxy(
                     "gvproxy-spawn",
                     allowed_domains=resolved_domains(None, "python"),
-                    workdir=self._workdir(tmp_path / "g"),
+                    workdir=_workdir(tmp_path / "g"),
                     images_dir=tmp_path,
                     expose_ports=None,
                     block_outbound=False,
@@ -243,7 +237,6 @@ class TestStartGvproxy:
         GVPROXY_FAILED (RETRY) after the 5 s readiness wait. A text file never runs as a
         shell script (ENOEXEC before the spawn). Another arch: on Linux the launch shell
         execs it and ends with 126; elsewhere Popen execs it (ENOEXEC)."""
-        from exec_sandbox.gvproxy import start_gvproxy
 
         binary = tmp_path / "gvproxy-wrapper-test"
         if kind == "other-arch":
@@ -256,7 +249,7 @@ class TestStartGvproxy:
         with (
             patch("exec_sandbox.gvproxy.create_unix_socket", return_value=sock),
             patch(
-                "exec_sandbox.gvproxy.grant_qemu_vm_access", new_callable=AsyncMock, return_value=True
+                "exec_sandbox.gvproxy.set_acl_user", new_callable=AsyncMock, return_value=True
             ),  # a fake socket: no file for the ACL
             patch("exec_sandbox.gvproxy.get_gvproxy_path", new_callable=AsyncMock, return_value=binary),
             pytest.raises(
@@ -268,7 +261,7 @@ class TestStartGvproxy:
             _, _, wait_ready = await start_gvproxy(
                 "gvproxy-format",
                 allowed_domains=resolved_domains(None, "python"),
-                workdir=self._workdir(tmp_path / "g"),
+                workdir=_workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
@@ -292,8 +285,6 @@ class TestStartGvproxy:
         end before ready raises GVPROXY_FAILED at once with its last lines in the message and
         the context. "after-the-end": the drain reads the lines only once the process
         ended (the wait waits for them)."""
-        from exec_sandbox import gvproxy, subprocess_utils
-        from exec_sandbox.gvproxy import start_gvproxy
 
         fatal = "2026/11/13 03:00:00 Error parsing outbound allow patterns: invalid character"
         binary = tmp_path / "gvproxy-wrapper-test"
@@ -316,7 +307,7 @@ class TestStartGvproxy:
         with ExitStack() as stack:
             stack.enter_context(patch("exec_sandbox.gvproxy.create_unix_socket", return_value=sock))
             stack.enter_context(
-                patch("exec_sandbox.gvproxy.grant_qemu_vm_access", new_callable=AsyncMock, return_value=True)
+                patch("exec_sandbox.gvproxy.set_acl_user", new_callable=AsyncMock, return_value=True)
             )  # a fake socket: no file for the ACL
             stack.enter_context(
                 patch("exec_sandbox.gvproxy.get_gvproxy_path", new_callable=AsyncMock, return_value=binary)
@@ -333,7 +324,7 @@ class TestStartGvproxy:
             _, _, wait_ready = await start_gvproxy(
                 "gvproxy-fatal",
                 allowed_domains=resolved_domains(None, "python"),
-                workdir=self._workdir(tmp_path / "g"),
+                workdir=_workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
@@ -367,7 +358,6 @@ class TestStartGvproxy:
         """A crash from a signal only has no panic or fatal error line: the SIGxxx: line is its
         cause, and the `runtime:` lines of its traceback do not replace it. A fatal error comes
         before its signal line (Go's throw)."""
-        from exec_sandbox.gvproxy import start_gvproxy
 
         binary = tmp_path / "gvproxy-wrapper-test"
         echoes = "".join(f'echo "{line}" >&2\n' for line in lines)
@@ -377,18 +367,22 @@ class TestStartGvproxy:
         with ExitStack() as stack:
             stack.enter_context(patch("exec_sandbox.gvproxy.create_unix_socket", return_value=sock))
             stack.enter_context(
-                patch("exec_sandbox.gvproxy.grant_qemu_vm_access", new_callable=AsyncMock, return_value=True)
+                patch("exec_sandbox.gvproxy.set_acl_user", new_callable=AsyncMock, return_value=True)
             )  # a fake socket: no file for the ACL
             stack.enter_context(
                 patch("exec_sandbox.gvproxy.get_gvproxy_path", new_callable=AsyncMock, return_value=binary)
             )
             exc_info = stack.enter_context(
-                pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GVPROXY_FAILED)
+                pytest.raises(
+                    TransientError,
+                    check=lambda e: e.code is ErrorCode.GVPROXY_FAILED,
+                    match=rf"^gvproxy-wrapper exited with code 2 before it was ready: {re.escape(cause)}$",
+                )
             )
             _, _, wait_ready = await start_gvproxy(
                 "gvproxy-signal",
                 allowed_domains=resolved_domains(None, "python"),
-                workdir=self._workdir(tmp_path / "g"),
+                workdir=_workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
@@ -396,12 +390,10 @@ class TestStartGvproxy:
             )
             await wait_ready()
         assert exc_info.value.context["crash"] == cause
-        assert str(exc_info.value).endswith(cause)
 
     async def test_end_before_ready_quotes_the_cause_of_a_go_crash(self, tmp_path: Path) -> None:
         """A Go runtime crash writes its cause first on stderr (here the one that `ulimit -u 5`
         gives), then stacks and registers: the message quotes the cause."""
-        from exec_sandbox.gvproxy import start_gvproxy
 
         cause = "runtime/cgo: pthread_create failed: Resource temporarily unavailable"
         binary = tmp_path / "gvproxy-wrapper-test"
@@ -412,7 +404,7 @@ class TestStartGvproxy:
         with ExitStack() as stack:
             stack.enter_context(patch("exec_sandbox.gvproxy.create_unix_socket", return_value=sock))
             stack.enter_context(
-                patch("exec_sandbox.gvproxy.grant_qemu_vm_access", new_callable=AsyncMock, return_value=True)
+                patch("exec_sandbox.gvproxy.set_acl_user", new_callable=AsyncMock, return_value=True)
             )  # a fake socket: no file for the ACL
             stack.enter_context(
                 patch("exec_sandbox.gvproxy.get_gvproxy_path", new_callable=AsyncMock, return_value=binary)
@@ -427,7 +419,7 @@ class TestStartGvproxy:
             _, _, wait_ready = await start_gvproxy(
                 "gvproxy-crash",
                 allowed_domains=resolved_domains(None, "python"),
-                workdir=self._workdir(tmp_path / "g"),
+                workdir=_workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
@@ -439,7 +431,6 @@ class TestStartGvproxy:
 
     async def test_fork_limit_is_gvproxy_failed(self, tmp_path: Path) -> None:
         """A fork that hits a process limit can pass later: GVPROXY_FAILED (RETRY)."""
-        from exec_sandbox.gvproxy import start_gvproxy
 
         sock = socket.socket(socket.AF_UNIX)
         with (
@@ -455,7 +446,7 @@ class TestStartGvproxy:
                 await start_gvproxy(
                     "gvproxy-spawn",
                     allowed_domains=resolved_domains(None, "python"),
-                    workdir=self._workdir(tmp_path / "g"),
+                    workdir=_workdir(tmp_path / "g"),
                     images_dir=tmp_path,
                     expose_ports=None,
                     block_outbound=False,
@@ -469,7 +460,6 @@ class TestStartGvproxy:
         this process (setpriv, with no Python preexec_fn). Its listener fd and arguments
         pass through. The OS spawn is faked (it fails with EAGAIN): the test reads what the
         launch gives it. The real end: TestEndWithThisProcess."""
-        from exec_sandbox.gvproxy import start_gvproxy
 
         sock = socket.socket(socket.AF_UNIX)
         listener = sock.fileno()
@@ -485,7 +475,7 @@ class TestStartGvproxy:
             await start_gvproxy(
                 "gvproxy-pdeath",
                 allowed_domains=resolved_domains(None, "python"),
-                workdir=self._workdir(tmp_path / "g"),
+                workdir=_workdir(tmp_path / "g"),
                 images_dir=tmp_path,
                 expose_ports=None,
                 block_outbound=False,
@@ -502,9 +492,6 @@ class TestStartGvproxy:
         """start_gvproxy returns once gvproxy-wrapper runs, so QEMU can start meanwhile;
         wait_ready() returns once the ready line comes. The stand-in prints it when
         the test makes a file."""
-        from exec_sandbox import subprocess_utils
-        from exec_sandbox.gvproxy import start_gvproxy
-        from exec_sandbox.resource_cleanup import cleanup_process
 
         real_start = subprocess_utils.start_managed_process
         go = tmp_path / "go"
@@ -519,7 +506,7 @@ class TestStartGvproxy:
             patch("exec_sandbox.gvproxy.create_unix_socket", side_effect=lambda _path: socket.socket(socket.AF_UNIX)),
             patch("exec_sandbox.gvproxy.get_gvproxy_path", new_callable=AsyncMock, return_value=Path("/bin/sh")),
             patch("exec_sandbox.gvproxy.start_managed_process", side_effect=gvproxy_stand_in),
-            patch("exec_sandbox.gvproxy.grant_qemu_vm_access", new_callable=AsyncMock),
+            patch("exec_sandbox.gvproxy.set_acl_user", new_callable=AsyncMock),
         ):
             proc, log_task, wait_ready = await start_gvproxy(
                 "gvproxy-early",
@@ -537,17 +524,12 @@ class TestStartGvproxy:
             go.touch()
             await asyncio.wait_for(ready, timeout=5)
         finally:
-            await cleanup_process(
-                proc, "gvproxy", "gvproxy-early", term_timeout=3.0, kill_timeout=2.0, kill_first=False
-            )
+            await cleanup_process(proc, "gvproxy", "gvproxy-early", term_timeout=3.0, kill_first=False)
             await asyncio.wait_for(log_task, timeout=5)
 
     async def test_process_drain_task_is_the_log_task(self, tmp_path: Path) -> None:
         """The process carries its drain task (the seam that cleanup_process reads): cleanup
         then waits for the exit without a second reader on the pipes that task reads."""
-        from exec_sandbox import subprocess_utils
-        from exec_sandbox.gvproxy import start_gvproxy
-        from exec_sandbox.resource_cleanup import cleanup_process
 
         real_start = subprocess_utils.start_managed_process
 
@@ -560,7 +542,7 @@ class TestStartGvproxy:
             patch("exec_sandbox.gvproxy.create_unix_socket", side_effect=lambda _path: socket.socket(socket.AF_UNIX)),
             patch("exec_sandbox.gvproxy.get_gvproxy_path", new_callable=AsyncMock, return_value=Path("/bin/sh")),
             patch("exec_sandbox.gvproxy.start_managed_process", side_effect=gvproxy_stand_in),
-            patch("exec_sandbox.gvproxy.grant_qemu_vm_access", new_callable=AsyncMock),
+            patch("exec_sandbox.gvproxy.set_acl_user", new_callable=AsyncMock),
         ):
             proc, log_task, _wait_ready = await start_gvproxy(
                 "gvproxy-drain",
@@ -574,7 +556,5 @@ class TestStartGvproxy:
         try:
             assert proc.drain_task is log_task
         finally:
-            await cleanup_process(
-                proc, "gvproxy", "gvproxy-drain", term_timeout=3.0, kill_timeout=2.0, kill_first=False
-            )
+            await cleanup_process(proc, "gvproxy", "gvproxy-drain", term_timeout=3.0, kill_first=False)
             await asyncio.wait_for(log_task, timeout=5)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import errno
+import logging
 import os
 import shutil
 import signal
@@ -21,7 +22,6 @@ import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, overload
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_cancellation_safe, await_settled
 from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.platform_utils import HostOS, ProcessWrapper, child_env, detect_host_os
@@ -32,7 +32,7 @@ from exec_sandbox.system_probes import probe_setpriv_pdeathsig
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Sequence
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 _SETPRIV: Final = ("setpriv", "--pdeathsig", "KILL", "--")
@@ -59,7 +59,9 @@ def child_shell(cmd: Sequence[str], *, steps: Sequence[tuple[str, str]]) -> list
     """
     if not steps:
         return list(cmd)
-    _require_executable(cmd[0])
+    # Looked up as Popen does, on the PATH of child_env() (exec_errno)
+    if (code := exec_errno(cmd[0], os.pathsep.join(os.get_exec_path(child_env())))) is not None:
+        raise OSError(code, os.strerror(code), cmd[0])
     script = "".join(f"{statement}; shift; " for statement, _ in steps) + 'exec "$@"'
     return ["/bin/sh", "-c", script, "sh", *(value for _, value in steps), *cmd]
 
@@ -86,38 +88,20 @@ _BINPRM_BUF_SIZE: Final = 256
 """The first bytes of a file that the kernel reads to choose its format (binfmt_misc magic)."""
 
 
-def _require_executable(name: str) -> None:
-    """Raise the OSError of an exec of `name` that cannot start: ENOENT when no file has
-    the name (looked up as Popen does, on the PATH of child_env()), EACCES when no such
-    file is executable, ENOEXEC when the file is not a program that the kernel runs. A
-    runnable binary is looked up once per name and PATH for the process (exec_errno); a
-    failure is looked up again at the next launch, so a binary installed meanwhile starts
-    (one changed later is seen at the exec)."""
-    path = os.pathsep.join(os.get_exec_path(child_env()))
-    if (code := exec_errno(name, path)) is not None:
-        raise OSError(code, os.strerror(code), name)
-
-
 _runnable: set[tuple[str, str]] = set()
 """The (name, PATH) pairs that exec_errno found runnable: not looked up again (tests clear it)."""
 
 
 def exec_errno(name: str, path: str) -> int | None:
-    """The errno of an exec of `name` on `path` (os.pathsep-joined) that cannot start, or None
-    (_require_executable). None is kept for the process (_runnable); an errno is not, so a
-    binary installed after a failed launch starts at the next one. A few stat calls
-    and a read of 256 bytes, as the exec itself makes; the binfmt_misc entries only for a file
-    of no known start. A file this user may run but not read (mode 0711) is left to the exec."""
+    """The errno of an exec of `name` on `path` (os.pathsep-joined) that cannot start, or None:
+    ENOENT when no file has the name, EACCES when no such file is executable, ENOEXEC when the
+    file is not a program that the kernel runs. None is kept for the process (_runnable); an
+    errno is not, so a binary installed after a failed launch starts at the next one (one
+    changed later is seen at the exec). A few stat calls and a read of 256 bytes, as the exec
+    itself makes; the binfmt_misc entries only for a file of no known start. A file this user
+    may run but not read (mode 0711 of another user) is left to the exec."""
     if (name, path) in _runnable:
         return None
-    code = _lookup_errno(name, path)
-    if code is None:
-        _runnable.add((name, path))
-    return code
-
-
-def _lookup_errno(name: str, path: str) -> int | None:
-    """exec_errno's lookup itself."""
     found = shutil.which(name, path=path)
     if found is None:
         candidates = [Path(name)] if os.sep in name else [Path(folder) / name for folder in path.split(os.pathsep)]
@@ -126,9 +110,10 @@ def _lookup_errno(name: str, path: str) -> int | None:
         with Path(found).open("rb") as file:
             start = file.read(_BINPRM_BUF_SIZE)
     except OSError:
-        return None
-    if not start.startswith(_PROGRAM_STARTS) and not _binfmt_misc_claims(found, start):
+        start = None
+    if start is not None and not start.startswith(_PROGRAM_STARTS) and not _binfmt_misc_claims(found, start):
         return errno.ENOEXEC
+    _runnable.add((name, path))
     return None
 
 
@@ -358,7 +343,6 @@ async def communicate_managed_process(
                             process_name,
                             context_id,
                             term_timeout=3.0,
-                            kill_timeout=2.0,
                             kill_first=False,
                         ):
                             unregister_process(owned_process)

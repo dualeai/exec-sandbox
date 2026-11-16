@@ -406,7 +406,6 @@ print(hashlib.sha256(data).hexdigest())
         )
 
         hashes = [r.stdout.strip() for r in results]
-        assert len(hashes) == 2
         assert all(len(h) == 64 for h in hashes), "Invalid SHA256 output"
         assert hashes[0] != hashes[1], "CRITICAL: VMs produced identical random!"
 
@@ -428,7 +427,6 @@ print(hashlib.sha256(data).hexdigest())
             result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
             hashes.append(result.stdout.strip())
 
-        assert len(hashes) == 3
         assert len(set(hashes)) == 3, f"Duplicate hashes found: {hashes}"
 
 
@@ -459,8 +457,9 @@ for i in range(1, len(data)):
         current_run = 1
 
 print(f"MAX_RUN:{max_run}")
-# For 1MB of random data, runs > 4 are extremely rare (p < 10^-10)
-# Runs > 6 indicate a broken RNG
+# In 1 MiB of random data, a run of 5 or more comes about once in 4,096 draws
+# (2^20 / 256^4), a run of 7 or more once in 268 million (2^20 / 256^6):
+# runs > 6 indicate a broken RNG
 print("PASS" if max_run <= 6 else "FAIL")
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
@@ -503,7 +502,6 @@ data = os.urandom(1024 * 1024)  # 1MB = 8M bits
 # Count 1-bits
 ones = sum(bin(b).count('1') for b in data)
 total_bits = len(data) * 8
-zeros = total_bits - ones
 
 ratio = ones / total_bits
 print(f"ONES_RATIO:{ratio:.6f}")

@@ -1,17 +1,19 @@
 # pyright: reportPrivateUsage=false
 """Unit tests of the Session calls (lifecycle checks, lock, idle deadline, write_file
-sources), of the QemuVM file calls on a fake guest channel (frames on the wire, error
-mapping), of FileOpDispatcher routing, and of the DualPortChannel reconnection probe.
+sources, which save() failures close the session), of the QemuVM file calls on a fake
+guest channel (frames on the wire, error mapping), of FileOpDispatcher routing, and of the
+DualPortChannel reconnection probe.
 
 No VM: the Session tests use a mocked QemuVM; the QemuVM tests use a real QemuVM on a
 mocked channel; the DualPortChannel tests use a real channel on a fake guest agent that
 serves the two port sockets (_FakeGuest). Covers:
 - Session calls: closed checks, lock serialization, idle deadline suspended during a
-  call, fail-fast retirement of dead VMs, close paths
+  call, fail-fast retirement of dead VMs, close paths, the save() close rule
 - write_file sources (bytes, Path, stream): checks, size limits, local errors
-- QemuVM write_file and read_file: frames sent, content round trip, error mapping
+- QemuVM write_file and read_file: frames sent, content round trip, error mapping;
+  local_path_error, the errno split of a local path
 - FileOpDispatcher message routing by op_id, transport failure
-- DualPortChannel reconnection probe and close
+- DualPortChannel reconnection probe, stream deadline and close
 """
 
 import asyncio
@@ -28,6 +30,7 @@ import re
 import tempfile
 import threading
 import time
+import tracemalloc
 import weakref
 from collections import deque
 from collections.abc import Callable
@@ -39,7 +42,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from exec_sandbox import constants
-from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_CODE_SIZE, MAX_FILE_SIZE_BYTES
 from exec_sandbox.exceptions import (
     CommunicationError,
     ConfigError,
@@ -78,6 +80,14 @@ from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType, VmState
 from tests.conftest import LoopClock, NonSeekableIO, make_destroy_mock
+
+_CODE_LIMIT = 1024 * 1024
+"""Largest code of one exec(): 1 MiB, written out (not the library's constant)."""
+_FILE_LIMIT = 500 * 1024 * 1024
+"""Largest file of write_file and read_file: 500 MiB, written out (not the library's constant)."""
+_CHUNK = 128 * 1024
+"""QemuVM.write_file reads a Path or a stream in 128 KiB chunks, and read_file decompresses
+in steps of at most 128 KiB: written out."""
 
 # ============================================================================
 # Helpers — build a Session with mocked VM + VmManager
@@ -275,20 +285,28 @@ class TestExecCodeSizeValidation:
     """Code size is checked in Session.exec() before anything reaches the guest."""
 
     async def test_code_exceeds_limit_rejected(self) -> None:
+        """Code one character over 1 MiB: CODE_INVALID with both sizes; the VM is not asked
+        and the session stays open."""
         session, mock_vm, _ = _make_session()
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID, match="Code too large"):
-            await session.exec("x" * (MAX_CODE_SIZE + 1))
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: (
+                e.code is ErrorCode.CODE_INVALID
+                and e.context == {"code_size": _CODE_LIMIT + 1, "max_code_size": _CODE_LIMIT}
+            ),
+            match=r"^Code too large: 1048577 characters exceeds the 1048576 character limit$",
+        ):
+            await session.exec("x" * (_CODE_LIMIT + 1))
         mock_vm.execute.assert_not_called()
+        assert not session.closed
 
     async def test_code_at_limit_accepted(self) -> None:
+        """Code of exactly 1 MiB goes to the VM whole, and exec() returns its result."""
         session, mock_vm, _ = _make_session()
-        await session.exec("x" * MAX_CODE_SIZE)
-        mock_vm.execute.assert_called_once()
-
-    async def test_startup_timing_and_spec_exposed(self) -> None:
-        session, _, _ = _make_session()
-        assert session.startup_timing is _STARTUP
-        assert session.spec == VmSpec(language=Language.PYTHON)
+        code = "x" * _CODE_LIMIT
+        result = await session.exec(code)
+        assert result.exit_code == 0
+        assert mock_vm.execute.call_args.kwargs["code"] == code
 
 
 # ============================================================================
@@ -443,12 +461,43 @@ class TestSaveCloseRule:
 class TestGuardNormal:
     """Happy-path tests for _guard() context manager."""
 
-    async def test_exec_calls_vm_execute(self) -> None:
-        """exec() passes through to VM.execute under _guard."""
+    async def test_exec_returns_the_vm_result_with_the_session_timing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """exec() returns the VM's result with execute_ms measured by the session around the
+        VM call, and the VM's connect_ms. A non-zero exit code (not 137) keeps the session
+        open; exec_count counts the call. A test clock moves the loop time."""
+        clock = LoopClock(monkeypatch)
         session, mock_vm, _ = _make_session()
-        await session.exec("print(1)")
-        mock_vm.execute.assert_awaited_once()
+
+        async def execute(**_kwargs: object) -> ExecutionResult:
+            await clock.advance(0.25)  # the VM call takes 250 ms
+            return ExecutionResult(
+                stdout="out\n",
+                stderr="err\n",
+                exit_code=3,
+                execution_time_ms=200,
+                external_cpu_time_ms=None,
+                external_memory_peak_mb=None,
+                timing=TimingBreakdown(execute_ms=9, connect_ms=4),
+                spawn_ms=None,
+                process_ms=None,
+            )
+
+        mock_vm.execute.side_effect = execute
+        result = await session.exec("print(1)")
+
+        assert result == ExecutionResult(
+            stdout="out\n",
+            stderr="err\n",
+            exit_code=3,
+            execution_time_ms=200,
+            external_cpu_time_ms=None,
+            external_memory_peak_mb=None,
+            timing=TimingBreakdown(execute_ms=250, connect_ms=4),
+            spawn_ms=None,
+            process_ms=None,
+        )
         assert session.exec_count == 1
+        assert not session.closed
 
     @pytest.mark.parametrize("terminal_state", [VmState.DESTROYING, VmState.DESTROYED])
     async def test_exec_closes_when_process_exit_races_normal_result(self, terminal_state: VmState) -> None:
@@ -529,7 +578,7 @@ class TestGuardNormal:
 
 
 # ============================================================================
-# _guard() — Closed session (fast path, before lock)
+# _guard() — A failed call that retired the VM
 # ============================================================================
 
 
@@ -561,8 +610,14 @@ class TestGuardFailureThatRetiresTheVm:
         assert manager.destroy_vm.await_count == int(retired)
 
 
+# ============================================================================
+# Closed session (first check, before the lock)
+# ============================================================================
+
+
 class TestGuardClosedFastPath:
-    """Tests the pre-lock closed check in _guard()."""
+    """A call on a closed session raises SessionClosedError at its first check, before it
+    takes the lock, whatever its arguments."""
 
     async def test_exec_after_close_raises(self) -> None:
         session, _, _ = _make_session()
@@ -592,7 +647,7 @@ class TestGuardClosedFastPath:
         "call",
         [
             pytest.param(lambda s, _p: s.exec("x = 1", timeout_seconds=0), id="exec-timeout"),
-            pytest.param(lambda s, _p: s.exec("x" * (MAX_CODE_SIZE + 1)), id="exec-code-size"),
+            pytest.param(lambda s, _p: s.exec("x" * (_CODE_LIMIT + 1)), id="exec-code-size"),
             pytest.param(lambda s, p: s.write_file("f.txt", p / "missing.bin"), id="write-missing-source"),
             pytest.param(lambda s, _p: s.write_file("f.txt", _closed_buffer()), id="write-closed-stream"),
             pytest.param(
@@ -676,7 +731,7 @@ class TestGuardClosedDuringLockWait:
 
 
 # ============================================================================
-# _guard() — Idle timer reset by file I/O
+# _guard() — Idle deadline re-armed by each call
 # ============================================================================
 
 
@@ -947,8 +1002,8 @@ class TestWriteFileSourceLimits:
     async def test_bytes_exactly_at_max_size_accepted(self) -> None:
         session, mock_vm, _ = _make_session()
         sizes = _record_upload_sizes(mock_vm)
-        await session.write_file("out.bin", bytes(MAX_FILE_SIZE_BYTES))
-        assert sizes == [MAX_FILE_SIZE_BYTES]
+        await session.write_file("out.bin", bytes(_FILE_LIMIT))
+        assert sizes == [_FILE_LIMIT]
 
     async def test_bytes_one_over_max_rejected(self) -> None:
         session, mock_vm, _ = _make_session()
@@ -957,19 +1012,19 @@ class TestWriteFileSourceLimits:
             check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
             match=r"^Content is 524288001 bytes, exceeds 524288000$",
         ):
-            await session.write_file("out.bin", bytes(MAX_FILE_SIZE_BYTES + 1))
+            await session.write_file("out.bin", bytes(_FILE_LIMIT + 1))
         mock_vm.write_file.assert_not_awaited()
         assert not session.closed
 
     async def test_path_exactly_at_max_size_accepted(self, tmp_path: Path) -> None:
-        source = _sparse_file(tmp_path / "exact.bin", MAX_FILE_SIZE_BYTES)
+        source = _sparse_file(tmp_path / "exact.bin", _FILE_LIMIT)
         session, mock_vm, _ = _make_session()
         sizes = _record_upload_sizes(mock_vm)
         await session.write_file("out.bin", source)
-        assert sizes == [MAX_FILE_SIZE_BYTES]
+        assert sizes == [_FILE_LIMIT]
 
     async def test_path_one_over_max_rejected(self, tmp_path: Path) -> None:
-        source = _sparse_file(tmp_path / "over.bin", MAX_FILE_SIZE_BYTES + 1)
+        source = _sparse_file(tmp_path / "over.bin", _FILE_LIMIT + 1)
         session, mock_vm, _ = _make_session()
         with pytest.raises(
             InvalidInputError,
@@ -991,8 +1046,8 @@ class TestWriteFileSourceLimits:
     async def test_seekable_stream_at_max_size_accepted(self) -> None:
         session, mock_vm, _ = _make_session()
         sizes = _record_upload_sizes(mock_vm)
-        await session.write_file("out.bin", io.BytesIO(bytes(MAX_FILE_SIZE_BYTES)))
-        assert sizes == [MAX_FILE_SIZE_BYTES]
+        await session.write_file("out.bin", io.BytesIO(bytes(_FILE_LIMIT)))
+        assert sizes == [_FILE_LIMIT]
 
     async def test_seekable_stream_over_max_rejected(self) -> None:
         session, mock_vm, _ = _make_session()
@@ -1001,7 +1056,7 @@ class TestWriteFileSourceLimits:
             check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
             match=r"^Stream content is 524288001 bytes, exceeds 524288000$",
         ):
-            await session.write_file("out.bin", io.BytesIO(bytes(MAX_FILE_SIZE_BYTES + 1)))
+            await session.write_file("out.bin", io.BytesIO(bytes(_FILE_LIMIT + 1)))
         mock_vm.write_file.assert_not_awaited()
 
     async def test_seekable_stream_limit_counts_from_its_position(self) -> None:
@@ -1009,10 +1064,10 @@ class TestWriteFileSourceLimits:
         one byte over the limit, read from offset 1, is accepted."""
         session, mock_vm, _ = _make_session()
         sizes = _record_upload_sizes(mock_vm)
-        buf = io.BytesIO(bytes(MAX_FILE_SIZE_BYTES + 1))
+        buf = io.BytesIO(bytes(_FILE_LIMIT + 1))
         buf.seek(1)
         await session.write_file("out.bin", buf)
-        assert sizes == [MAX_FILE_SIZE_BYTES]
+        assert sizes == [_FILE_LIMIT]
 
     async def test_non_seekable_stream_has_no_size_check(self) -> None:
         """A non-seekable stream has no size to check before the write: it goes to the VM
@@ -1228,8 +1283,58 @@ def _guest_file(payload: bytes, *, path: str = "file.bin", parts: int = 1) -> li
     return [*chunks, FileReadCompleteMessage(op_id="read-op", path=path, size=len(payload))]
 
 
+def _zeros_stream(size: int) -> list[StreamingMessage]:
+    """The guest's read_file messages for `size` zero bytes in one chunk message: zstd holds
+    each 128 KiB block of zeros in a few bytes. The zeros go to the compressor 1 MiB at a time
+    (no file-size buffer)."""
+    compressor = zstd.ZstdCompressor(level=3)
+    mib = bytes(1024 * 1024)
+    parts = [compressor.compress(mib) for _ in range(size // len(mib))]
+    compressed = b"".join([*parts, compressor.compress(bytes(size % len(mib))), compressor.flush()])
+    return [
+        FileChunkResponseMessage(op_id="read-op", data=compressed),
+        FileReadCompleteMessage(op_id="read-op", path="file.bin", size=size),
+    ]
+
+
+class _WriteSizes(io.RawIOBase):
+    """A read_file destination that keeps only the size of each write."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sizes: list[int] = []
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b: Any) -> int:
+        self.sizes.append(len(b))
+        return len(b)
+
+
 class TestWriteFilePathValidation:
-    """QemuVM.write_file checks the path before it sends anything (the guest checks it again)."""
+    """QemuVM.write_file, read_file and list_files check the path before they send anything
+    (the guest checks it again): a path the protocol cannot carry is PATH_INVALID, never a raw
+    pydantic error."""
+
+    @pytest.mark.parametrize(
+        ("call", "message"),
+        [
+            (lambda vm: vm.read_file("", destination=io.BytesIO()), "read_file path must not be empty"),
+            (
+                lambda vm: vm.read_file("x" * 4097, destination=io.BytesIO()),
+                "read_file path is 4097 chars, exceeds 4096",
+            ),
+            (lambda vm: vm.list_files("x" * 4097), "list_files path is 4097 chars, exceeds 4096"),
+        ],
+        ids=["read-empty", "read-too-long", "list-too-long"],
+    )
+    async def test_read_and_list_check_the_path_first(self, call: Any, message: str) -> None:
+        vm, channel, _ = await _file_io_vm("test-vm")
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID) as exc:
+            await call(vm)
+        assert exc.value.message == message
+        channel.connect.assert_not_awaited()
 
     async def test_empty_path_rejected(self) -> None:
         vm, channel, _ = await _file_io_vm("test-vm")
@@ -1238,7 +1343,7 @@ class TestWriteFilePathValidation:
             check=lambda e: e.code is ErrorCode.PATH_INVALID,
             match=r"^write_file path must not be empty$",
         ):
-            await vm.write_file("", io.BytesIO(b"data"))
+            await vm.write_file("", io.BytesIO(b"data"), make_executable=False)
         channel.connect.assert_not_awaited()
         channel.enqueue_raw.assert_not_awaited()
 
@@ -1246,7 +1351,7 @@ class TestWriteFilePathValidation:
         """A path of 4096 characters (PATH_MAX) goes to the guest."""
         path = "x" * 4096
         vm, channel, _ = await _file_io_vm("test-vm", FileWriteAckMessage(op_id="w", path=path, bytes_written=4))
-        await vm.write_file(path, io.BytesIO(b"data"))
+        await vm.write_file(path, io.BytesIO(b"data"), make_executable=False)
         assert _frames(channel)[0]["path"] == path
 
     async def test_path_over_max_length_rejected(self) -> None:
@@ -1256,7 +1361,7 @@ class TestWriteFilePathValidation:
             check=lambda e: e.code is ErrorCode.PATH_INVALID,
             match=r"^write_file path is 4097 chars, exceeds 4096$",
         ):
-            await vm.write_file("x" * 4097, io.BytesIO(b"data"))
+            await vm.write_file("x" * 4097, io.BytesIO(b"data"), make_executable=False)
         channel.connect.assert_not_awaited()
         channel.enqueue_raw.assert_not_awaited()
 
@@ -1267,11 +1372,15 @@ class TestWriteFilePathValidation:
         error = StreamingErrorMessage(op_id="w", error_type="protocol_error", message="No active write for op_id 'x'")
         vm, channel, _ = await _file_io_vm("protocol-error-vm", error)
 
-        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL, match="No active write"):
-            await vm.write_file("target.bin", io.BytesIO(b"data"))
+        with pytest.raises(
+            InternalError,
+            check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL,
+            match=r"^write_file 'target\.bin': \[protocol_error\] No active write for op_id 'x'$",
+        ):
+            await vm.write_file("target.bin", io.BytesIO(b"data"), make_executable=False)
 
-        channel.register_op.assert_called_once()
-        assert [f["action"] for f in _frames(channel)].count("write_file") == 1
+        actions = [f["action"] for f in _frames(channel)]  # one write: one header, one file_end
+        assert actions == ["write_file", *["file_chunk"] * (len(actions) - 2), "file_end"]
         channel.close.assert_not_awaited()
 
 
@@ -1312,7 +1421,7 @@ class TestWriteFileWire:
 
     @pytest.mark.parametrize(
         "size",
-        [0, 30, 2 * FILE_TRANSFER_CHUNK_SIZE + 7],
+        [0, 30, 2 * _CHUNK + 7],
         ids=["empty", "small", "three-chunks"],
     )
     async def test_content_round_trips_through_the_chunks(self, size: int) -> None:
@@ -1322,7 +1431,7 @@ class TestWriteFileWire:
         vm, channel, _ = await _file_io_vm(
             "test-vm", FileWriteAckMessage(op_id="w", path="out.bin", bytes_written=size)
         )
-        await vm.write_file("out.bin", io.BytesIO(content))
+        await vm.write_file("out.bin", io.BytesIO(content), make_executable=False)
 
         frames = _frames(channel)
         actions = [f["action"] for f in frames]
@@ -1337,7 +1446,7 @@ class TestWriteFileWire:
         vm, channel, _ = await _file_io_vm(
             "test-vm", FileWriteAckMessage(op_id="w", path="zeros.bin", bytes_written=len(content))
         )
-        await vm.write_file("zeros.bin", io.BytesIO(content))
+        await vm.write_file("zeros.bin", io.BytesIO(content), make_executable=False)
 
         frames = _frames(channel)
         wire = sum(len(f["data"]) for f in frames if f["action"] == "file_chunk")
@@ -1368,7 +1477,7 @@ class TestWriteFileCommitProtocol:
             def seekable(self) -> bool:
                 return seekable
 
-        source = FailingSource(b"head" + os.urandom(2 * FILE_TRANSFER_CHUNK_SIZE))
+        source = FailingSource(b"head" + os.urandom(2 * _CHUNK))
         source.seek(4)
         vm, channel, _ = await _file_io_vm("write-commit-vm")
         with pytest.raises(
@@ -1381,7 +1490,7 @@ class TestWriteFileCommitProtocol:
         assert [f["action"] for f in _frames(channel)] == ["write_file", "file_chunk"]  # never a file_end
         channel.close.assert_awaited_once()  # the guest drops the partial write
         channel.unregister_op.assert_called_once()
-        assert source.tell() == (4 if seekable else 4 + FILE_TRANSFER_CHUNK_SIZE)
+        assert source.tell() == (4 if seekable else 4 + _CHUNK)
 
     async def test_failed_chunk_enqueue_never_starts_the_next_source_read(self) -> None:
         """A failed enqueue cannot return while look-ahead still owns the stream."""
@@ -1392,7 +1501,7 @@ class TestWriteFileCommitProtocol:
             def read(self, _size: int) -> bytes:
                 self.reads += 1
                 if self.reads == 1:
-                    return os.urandom(FILE_TRANSFER_CHUNK_SIZE)
+                    return os.urandom(_CHUNK)
                 return b""
 
         async def failing_chunks(data: bytes) -> None:
@@ -1406,7 +1515,7 @@ class TestWriteFileCommitProtocol:
         with pytest.raises(
             OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="after dispatch"
         ):
-            await vm.write_file("target.bin", reader)  # type: ignore[arg-type]
+            await vm.write_file("target.bin", reader, make_executable=False)  # type: ignore[arg-type]
 
         assert reader.reads == 1
 
@@ -1418,7 +1527,7 @@ class TestWriteFileCommitProtocol:
         with pytest.raises(
             TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match="before dispatch"
         ):
-            await vm.write_file("target.bin", io.BytesIO(b"payload"))
+            await vm.write_file("target.bin", io.BytesIO(b"payload"), make_executable=False)
 
         channel.enqueue_raw.assert_not_awaited()
 
@@ -1428,7 +1537,7 @@ class TestWriteFileCommitProtocol:
         with pytest.raises(
             OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="after dispatch"
         ) as exc_info:
-            await vm.write_file("target.bin", io.BytesIO(b"payload"))
+            await vm.write_file("target.bin", io.BytesIO(b"payload"), make_executable=False)
 
         assert isinstance(exc_info.value.__cause__, TimeoutError)
         assert _frames(channel)[-1]["action"] == "file_end"
@@ -1441,14 +1550,23 @@ class TestWriteFileCommitProtocol:
         [("different.bin", 7), ("target.bin", 6)],
     )
     async def test_ack_must_bind_path_and_source_size(self, ack_path: str, ack_size: int) -> None:
+        """An ack for another path or another byte count than the 7 bytes sent: an unknown
+        outcome, with both sides in the context."""
         ack = FileWriteAckMessage(op_id="write-op", path=ack_path, bytes_written=ack_size)
         vm, _channel, _ = await _file_io_vm("write-commit-vm", ack)
         with pytest.raises(
             OutcomeUnknownError,
             check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN,
-            match="acknowledgement did not bind",
-        ):
-            await vm.write_file("target.bin", io.BytesIO(b"payload"))
+            match=r"^VM write-commit-vm write_file acknowledgement did not bind the requested content for 'target\.bin'$",
+        ) as exc_info:
+            await vm.write_file("target.bin", io.BytesIO(b"payload"), make_executable=False)
+        assert exc_info.value.context == {
+            "vm_id": "write-commit-vm",
+            "path": "target.bin",
+            "ack_path": ack_path,
+            "source_bytes": 7,
+            "ack_bytes_written": ack_size,
+        }
 
 
 class TestReadFileTerminalIntegrity:
@@ -1470,34 +1588,100 @@ class TestReadFileTerminalIntegrity:
             await vm.read_file("file.bin", destination=destination)
 
     async def test_request_names_the_file(self) -> None:
+        """One read_file frame names the file and carries the host clock at send time."""
         vm, channel, _ = await _file_io_vm("test-vm", *_guest_file(b"payload"))
+        before = time.time_ns()
         await vm.read_file("file.bin", destination=io.BytesIO())
+        after = time.time_ns()
         (request,) = _frames(channel)
-        assert isinstance(request.pop("host_time_ns"), int)
-        assert request == {"action": "read_file", "op_id": request["op_id"], "path": "file.bin"}
-        channel.unregister_op.assert_called_once_with(request["op_id"])
+        op_id = request["op_id"]
+        assert before <= request.pop("host_time_ns") <= after
+        assert request == {"action": "read_file", "op_id": op_id, "path": "file.bin"}
+        assert re.fullmatch(r"[0-9a-f]{32}", op_id)
+        channel.unregister_op.assert_called_once_with(op_id)
 
     @pytest.mark.parametrize("parts", [1, 3], ids=["one-chunk", "three-chunks"])
-    async def test_stream_destination_gets_every_byte(self, parts: int) -> None:
-        """The chunks of one zstd stream decode in order, also across chunk boundaries."""
-        payload = os.urandom(2 * FILE_TRANSFER_CHUNK_SIZE + 7)
+    @pytest.mark.parametrize("content", ["random", "16-values"])
+    async def test_stream_destination_gets_every_byte(self, parts: int, content: str) -> None:
+        """The chunks of one zstd stream decode in order, also across chunk boundaries, and
+        also when a chunk that is not the last decodes in several steps (16 byte values: 1.5 MiB
+        in about half the size, each of 3 chunks ~512 KiB decoded)."""
+        if content == "random":
+            payload = os.urandom(2 * _CHUNK + 7)
+        else:
+            payload = os.urandom(12 * _CHUNK).translate(bytes(i % 16 for i in range(256)))
         vm, _channel, _ = await _file_io_vm("test-vm", *_guest_file(payload, parts=parts))
         destination = io.BytesIO(b"prefix")
         destination.seek(6)
         await vm.read_file("file.bin", destination=destination)
         assert destination.getvalue() == b"prefix" + payload
 
-    @pytest.mark.parametrize("damage", ["first-chunk-lost", "last-chunk-twice"])
+    @pytest.mark.parametrize("damage", ["first-chunk-lost", "last-chunk-twice", "frame-end-lost", "data-after-the-end"])
     async def test_a_broken_compressed_stream_is_a_guest_error(self, damage: str) -> None:
-        """A chunk dropped on the way (bad base64) or sent twice breaks the one zstd stream:
-        read_file raises the library's guest error, never a raw ZstdError or EOFError."""
-        payload = os.urandom(2 * FILE_TRANSFER_CHUNK_SIZE + 7)
+        """A chunk dropped on the way (bad base64) or sent twice breaks the one zstd stream, and
+        so do a lost frame end after the whole content and bytes after the frame end in its
+        message (the size matches): read_file raises the library's guest error, never a raw
+        ZstdError or EOFError, nor a file as complete."""
+        payload = os.urandom(2 * _CHUNK + 7)
         *chunks, complete = _guest_file(payload, parts=3)
-        sent = chunks[1:] if damage == "first-chunk-lost" else [*chunks, chunks[-1]]
+        if damage == "frame-end-lost":
+            compressor = zstd.ZstdCompressor(level=3)
+            content = compressor.compress(payload) + compressor.flush(zstd.ZstdCompressor.FLUSH_BLOCK)
+            sent: list[StreamingMessage] = [FileChunkResponseMessage(op_id="read-op", data=content)]  # no flush()
+        elif damage == "data-after-the-end":
+            whole = zstd.compress(payload, level=3) + b"garbage"
+            sent = [FileChunkResponseMessage(op_id="read-op", data=whole)]
+        else:
+            sent = chunks[1:] if damage == "first-chunk-lost" else [*chunks, chunks[-1]]
         vm, _channel, _ = await _file_io_vm("test-vm", *sent, complete)
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE,
+            # The end is zstd's own text, or one of exec-sandbox's (frame end, data after it)
+            match=r"^VM test-vm read_file communication failed: read_file 'file\.bin': the compressed stream broke: .+$",
+        ):
             await vm.read_file("file.bin", destination=io.BytesIO())
-        assert "compressed stream broke" in str(exc_info.value)
+
+    async def test_a_message_that_expands_is_written_in_chunks(self) -> None:
+        """One chunk message that decodes to far more than its size (64 MiB of zeros in a few
+        KB) reaches the destination in writes of at most 128 KiB, every byte: the host never
+        holds the whole expansion."""
+        chunk, complete = _zeros_stream(64 * 1024 * 1024)
+        destination = _WriteSizes()
+        vm, _channel, _ = await _file_io_vm("test-vm", chunk, complete)
+
+        tracemalloc.start()
+        try:
+            await vm.read_file("file.bin", destination=destination)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert isinstance(chunk, FileChunkResponseMessage) and len(chunk.data) < 8 * 1024
+        assert (max(destination.sizes), sum(destination.sizes)) == (_CHUNK, 64 * 1024 * 1024)
+        assert peak < 8 * 1024 * 1024  # 0.5 MiB measured; holding the expansion is 64 MiB
+
+    @pytest.mark.parametrize(
+        ("size", "over"), [(_FILE_LIMIT, False), (_FILE_LIMIT + 1, True)], ids=["the-limit", "one-byte-more"]
+    )
+    async def test_more_than_the_file_limit_is_a_guest_error(self, size: int, over: bool) -> None:
+        """The guest opens no file over 500 MiB: a stream that decodes to more (a file that grew
+        during the read, or a hostile guest) is GUEST_UNAVAILABLE (a retry reads the file again),
+        raised before the extra byte reaches the destination."""
+        destination = _WriteSizes()
+        vm, _channel, _ = await _file_io_vm("test-vm", *_zeros_stream(size))
+
+        if over:
+            with pytest.raises(
+                TransientError,
+                check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE,
+                match=r"^VM test-vm read_file communication failed: read_file 'file\.bin': the guest sent more than "
+                r"524288000 bytes$",
+            ):
+                await vm.read_file("file.bin", destination=destination)
+        else:
+            await vm.read_file("file.bin", destination=destination)
+        assert sum(destination.sizes) == _FILE_LIMIT
 
     async def test_path_destination_is_written_whole(self, tmp_path: Path) -> None:
         payload = b"payload of the guest file"
@@ -1563,7 +1747,7 @@ class TestReadFileTerminalIntegrity:
         ) as exc_info:
             await vm.read_file("file.bin", destination=make_destination(tmp_path))
         assert isinstance(exc_info.value.__cause__, ValueError)
-        channel.register_op.assert_not_called()
+        assert _frames(channel) == []  # no request sent
         channel.unregister_op.assert_called_once()
         assert list(tmp_path.iterdir()) == []
 
@@ -1583,28 +1767,31 @@ class TestReadFileTerminalIntegrity:
             await vm.read_file("file.bin", destination=FullDisk())  # type: ignore[arg-type]
 
     @pytest.mark.parametrize(
-        ("make_error", "match"),
+        ("make_error", "match", "diagnostics"),
         [
-            pytest.param(TimeoutError, r"^VM test-vm read_file timed out for 'file\.bin'$", id="timeout"),
+            pytest.param(TimeoutError, r"^VM test-vm read_file timed out for 'file\.bin'$", True, id="timeout"),
             pytest.param(
                 lambda: ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"),
                 r"^VM test-vm read_file communication failed: .*Connection reset by peer$",
+                False,
                 id="oserror",
             ),
             pytest.param(
                 lambda: CommunicationError("channel closed", context=None),
                 r"^VM test-vm read_file communication failed: channel closed$",
+                False,
                 id="communication",
             ),
         ],
     )
     @pytest.mark.parametrize("kind", ["path", "stream"])
     async def test_transport_failure_is_guest_unavailable(
-        self, tmp_path: Path, make_error: Any, match: str, kind: str
+        self, tmp_path: Path, make_error: Any, match: str, diagnostics: bool, kind: str
     ) -> None:
         """One transport mapping for both destination kinds: a timeout, a socket error
         or a channel error is the guest's (GUEST_UNAVAILABLE, RETRY), never LOCAL_DISK or a
-        builtin. The temp file goes; the op is unregistered once."""
+        builtin. The temp file goes; the op is unregistered once. Only a deadline carries the
+        guest console and the QEMU state (`diagnostics`)."""
         error = make_error()
         vm, channel, _ = await _file_io_vm("test-vm", *_guest_file(b"payload"))
         channel.connect.side_effect = error
@@ -1616,9 +1803,7 @@ class TestReadFileTerminalIntegrity:
         assert exc_info.value.__cause__ is error
         channel.unregister_op.assert_called_once()
         assert list(tmp_path.iterdir()) == []
-        # Only a deadline carries the guest console and the QEMU state.
-        has_diagnostics = exc_info.value.context.items() >= _DEADLINE_DIAGNOSTICS.items()
-        assert has_diagnostics is isinstance(error, TimeoutError)
+        assert (exc_info.value.context.items() >= _DEADLINE_DIAGNOSTICS.items()) is diagnostics
 
     async def test_failed_stream_leaves_no_temp_file(self, tmp_path: Path) -> None:
         """The guest stream fails after the temp file opened: the temp file goes, the
@@ -1646,24 +1831,31 @@ class TestReadFileTerminalIntegrity:
         assert bytes(writer.value) == payload
 
     @pytest.mark.parametrize(
-        "written",
+        ("written", "reported"),
         [
-            pytest.param(lambda _data: 0, id="zero"),
-            pytest.param(lambda _data: None, id="none"),  # a raw non-blocking writer on would-block
-            pytest.param(lambda data: len(data) + 1, id="over-reporting"),
+            pytest.param(lambda _data: 0, "0", id="zero"),
+            pytest.param(lambda _data: None, "None", id="none"),  # a raw non-blocking writer on would-block
+            pytest.param(lambda data: len(data) + 1, "8", id="over-reporting"),
         ],
     )
-    async def test_destination_write_without_progress_is_rejected(self, written: Any) -> None:
+    async def test_destination_write_without_progress_is_rejected(self, written: Any, reported: str) -> None:
         """A writer that reports no progress (0, or None from a raw non-blocking writer) or
-        more bytes than it got cannot report success: LOCAL_DISK (an OSError), not a
-        TypeError or a short file."""
+        more bytes than it got (the 7 bytes of the file) cannot report success: LOCAL_DISK
+        (an OSError) that names what it reported, not a TypeError or a short file."""
 
         class Writer:
             def write(self, data: bytes) -> int | None:
                 return written(data)
 
         vm, _channel, _ = await _file_io_vm("test-vm", *_guest_file(b"payload"))
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK, match="no write progress"):
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.LOCAL_DISK,
+            match=(
+                r"^VM test-vm read_file could not write the local destination \(read_file destination made "
+                rf"no write progress: returned {reported} for 7 remaining bytes\)$"
+            ),
+        ):
             await vm.read_file("file.bin", destination=Writer())  # type: ignore[arg-type]
 
 
@@ -2428,16 +2620,9 @@ class TestDualPortChannelCloseResiliency:
                 ch.register_op("op-A", changes_state=True)
         assert guest.eofs == 2
 
-    async def test_close_idempotent(self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A second close() stops nothing more and closes nothing more, without error."""
-        stops: list[FileOpDispatcher] = []
-        real_stop = FileOpDispatcher.stop
-
-        async def counted_stop(dispatcher: FileOpDispatcher) -> None:
-            stops.append(dispatcher)
-            await real_stop(dispatcher)
-
-        monkeypatch.setattr(FileOpDispatcher, "stop", counted_stop)
+    async def test_close_idempotent(self, short_tmp_dir: Path) -> None:
+        """A second close() raises nothing and opens or closes nothing more: the guest saw one
+        connection and each of its two ports closed once; the channel has no dispatcher."""
         async with _FakeGuest(short_tmp_dir, []) as guest:
             ch = guest.channel()
             await ch.connect(timeout_seconds=5.0)
@@ -2448,7 +2633,7 @@ class TestDualPortChannelCloseResiliency:
             await guest.host_closed(2)
             with pytest.raises(RuntimeError, match="channel not connected"):
                 ch.register_op("op-A", changes_state=True)
-        assert (len(stops), guest.eofs) == (1, 2)
+        assert (guest.connections, guest.eofs) == (1, 2)
 
     async def test_close_in_a_cancel_handler_does_not_cancel_again(self, short_tmp_dir: Path) -> None:
         """A cleanup in a cancel handler (destroy_vm in a pool's handler, ephemeral_vm's
@@ -2478,12 +2663,18 @@ class TestDualPortChannelCloseResiliency:
 
 
 # ============================================================================
-# exposed_ports property — delegates to VM
+# Properties — exposed_ports (from the VM), startup_timing and spec
 # ============================================================================
 
 
-class TestExposedPorts:
-    """Tests for Session.exposed_ports property."""
+class TestProperties:
+    """Session properties: exposed_ports reads the VM's; startup_timing and spec are the
+    values the session was made with."""
+
+    async def test_startup_timing_and_spec_exposed(self) -> None:
+        session, _, _ = _make_session()
+        assert session.startup_timing is _STARTUP
+        assert session.spec == VmSpec(language=Language.PYTHON)
 
     async def test_exposed_ports_delegates_to_vm(self) -> None:
         """exposed_ports returns the VM's exposed_ports list."""
@@ -2538,7 +2729,8 @@ class TestDualPortStreamDeadline:
             started = time.monotonic()
             with pytest.raises(StreamDeadlineExceededError, match=r"^stream exceeded 1s total deadline$"):
                 async for _message in channel.stream_messages(
-                    ExecuteCodeRequest(language=Language.PYTHON, code="x", reseed=False), timeout=1
+                    ExecuteCodeRequest(language=Language.PYTHON, code="x", reseed=False, timeout=0, env_vars={}),
+                    timeout=1,
                 ):
                     pass
             elapsed = time.monotonic() - started
@@ -2566,12 +2758,15 @@ class TestDualPortConnectLifecycle:
             await channel.close()
         assert (guest.connections, guest.pings) == (1, [])
 
-    async def test_first_connect_after_a_restore_probes(self, short_tmp_dir: Path) -> None:
+    async def test_first_connect_after_a_restore_probes(
+        self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A channel of a guest restored from a save (mark_restored, as restore_vm does): its
         first connect sends one ping, as a reconnection does, but with host entropy, and gets
         the pong; a later reconnection pings without host entropy. That restore_vm makes the
         call is checked on a VM: without the probe, the restore of a zeroed RAM template hangs
         (test_l1_damaged_entry, test_zeroed_ram_template_...)."""
+        _probe_budget(monkeypatch, [])
         async with _FakeGuest(short_tmp_dir, []) as guest:
             channel = guest.channel()
             channel.mark_restored()
@@ -2581,10 +2776,13 @@ class TestDualPortConnectLifecycle:
             await channel.close()
         assert (guest.connections, guest.pings, guest.entropy) == (2, [1, 2], [True, False])
 
-    async def test_a_reseed_error_after_a_restore_is_guest_silent_after_restore(self, short_tmp_dir: Path) -> None:
+    async def test_a_reseed_error_after_a_restore_is_guest_silent_after_restore(
+        self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The restored guest answers its first ping with the io_error of a failed reseed:
         TransientError GUEST_SILENT_AFTER_RESTORE at once, no second ping. Another error type
         is no reseed failure: InternalError GUEST_PROTOCOL, as without a restore."""
+        _probe_budget(monkeypatch, [])  # each connect sends one ping, which waits 5 s for its answer
         async with _FakeGuest(short_tmp_dir, ["reseed-error", "error"]) as guest:
             channel = guest.channel()
             channel.mark_restored()
@@ -2599,9 +2797,10 @@ class TestDualPortConnectLifecycle:
             await channel.close()
         assert (guest.pings, guest.entropy) == ([1, 2], [True, True])  # one ping on each connection
 
-    async def test_connect_after_close_probes(self, short_tmp_dir: Path) -> None:
+    async def test_connect_after_close_probes(self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """close() does not make the channel new: the connect after it sends one ping on the
         new connection and gets the pong."""
+        _probe_budget(monkeypatch, [])
         async with _FakeGuest(short_tmp_dir, []) as guest:
             channel = await _reconnect(guest)
             await channel.connect(timeout_seconds=5.0)
@@ -2615,7 +2814,6 @@ class TestDualPortProbeSuccess:
     @pytest.mark.parametrize(
         ("answers", "pings", "connections"),
         [
-            pytest.param([], [2], 2, id="ready-at-once"),
             pytest.param(["silent", "drop", "silent"], [2, 2, 3, 3], 3, id="mixed-failures"),
             pytest.param(["silent"] * 5, [2] * 6, 2, id="last-possible-attempt"),
         ],
@@ -2665,8 +2863,11 @@ class TestDualPortProbeSuccess:
             await channel.close()
         assert (guest.pings, guest.connections) == ([2] * 4, 2)
 
-    async def test_failed_connection_is_opened_again(self, short_tmp_dir: Path) -> None:
+    async def test_failed_connection_is_opened_again(
+        self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Only a connection that failed is closed and opened again before the next ping."""
+        _probe_budget(monkeypatch, ["drop"])
         async with _FakeGuest(short_tmp_dir, ["drop"]) as guest:
             channel = await _reconnect(guest)
             await channel.connect(timeout_seconds=5.0)

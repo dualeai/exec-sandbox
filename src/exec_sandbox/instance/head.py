@@ -69,28 +69,21 @@ def open_head(data: bytes, keyring: Keyring, *, instance_id: str) -> tuple[HeadH
     try:
         body = HeadBody.model_validate_json(plain)
     except ValidationError:
-        raise other_release(instance_id, what="head body") from None
+        raise other_release(instance_id, what="head body", writer=writer_release(plain)) from None
     return header, body, data_key
 
 
-def authenticate(data: bytes, keyring: Keyring, *, instance_id: str) -> HeadHeader:
-    """Head bytes authenticated with the data key their own header names (the body is
-    not parsed): a head read back after a save may come from another saver, with
-    another data key."""
-    return open_header(data, keyring, instance_id=instance_id)[0]
-
-
 def open_header(data: bytes, keyring: Keyring, *, instance_id: str) -> tuple[HeadHeader, bytes, bytes]:
-    """The header, the plain body and the data key. Only the envelope (HeadEnvelope) is
-    read before the head authenticates: the keyring key it names (ConfigError
-    INSTANCE_KEY_MISSING: this keyring lacks it) unwraps the data key, which opens the
-    body. The rest of the header is parsed after: a header that authenticates but does
-    not parse was written by another release (RouteError, never RECREATE)."""
+    """The header, the plain body (not parsed) and the data key. Only the envelope
+    (HeadEnvelope) is read before the head authenticates: the keyring key it names
+    (ConfigError INSTANCE_KEY_MISSING: this keyring lacks it) unwraps the data key, which
+    opens the body. The rest of the header is parsed after: a header that authenticates
+    but does not parse was written by another release (RouteError, never RECREATE)."""
     header_bytes, plain, data_key = _authenticated(data, keyring, instance_id=instance_id)
     try:
         header = HeadHeader.model_validate_json(header_bytes)
     except ValidationError:
-        raise other_release(instance_id, what="head header") from None
+        raise other_release(instance_id, what="head header", writer=writer_release(plain)) from None
     return header, plain, data_key
 
 
@@ -99,13 +92,13 @@ def describe_head(
 ) -> tuple[HeadSummary, HeadBody | None, str | None]:
     """An authenticated head as describe shows it: its summary, its body (None when this
     release cannot read the header or the body: another release wrote them) and the
-    release that wrote it. Raises as open_header, but RouteError only when even the
-    summary does not parse."""
+    release that wrote it. Raises as open_header, but RouteError (with the release that
+    wrote the body, when it names one) only when even the summary does not parse."""
     header_bytes, plain, _ = _authenticated(data, keyring, instance_id=instance_id)
     try:
         summary = HeadSummary.model_validate_json(header_bytes)
     except ValidationError:
-        raise other_release(instance_id, what="head header") from None
+        raise other_release(instance_id, what="head header", writer=writer_release(plain)) from None
     try:
         HeadHeader.model_validate_json(header_bytes)
         body = HeadBody.model_validate_json(plain)

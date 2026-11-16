@@ -276,19 +276,24 @@ class TestRefused:
         assert sorted(p.name for p in tmp_path.iterdir()) == [_LOCK_FILE]
 
     @pytest.mark.parametrize(
-        ("on_get", "on_set"),
-        [(KeyringLocked("locked"), None), (None, PasswordSetError("denied"))],
+        ("on_get", "on_set", "why"),
+        [
+            (KeyringLocked("locked"), None, "KeyringLocked: locked"),
+            (None, PasswordSetError("denied"), "PasswordSetError: denied"),
+        ],
         ids=["get", "set"],
     )
-    def test_backend_error(self, tmp_path: Path, on_get: KeyringError | None, on_set: KeyringError | None) -> None:
+    def test_backend_error(
+        self, tmp_path: Path, on_get: KeyringError | None, on_set: KeyringError | None, why: str
+    ) -> None:
+        """The message names the entry and the backend's error (its class and text); the hint
+        names the variable that replaces the OS keyring; no key in either."""
         failing = _FailingBackend(on_get=on_get, on_set=on_set)
         keyring.set_keyring(as_os_backend(macOS.Keyring, failing))
-        with pytest.raises(
-            ConfigError, match="The OS keyring failed", check=lambda e: e.code is ErrorCode.INSTANCE_CONFIG
-        ) as info:
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFIG) as info:
             open_local_keyring(data_dir=tmp_path)
+        assert str(info.value) == f'The OS keyring failed on entry "exec-sandbox" / "instance-keyring": {why}'
         assert "EXEC_SANDBOX_INSTANCE_KEYRING" in _all_text(info.value)
-        assert str(on_get or on_set) in str(info.value)
         for given in failing.entries.values():
             assert given not in _all_text(info.value)
 

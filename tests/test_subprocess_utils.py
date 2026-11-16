@@ -307,6 +307,18 @@ class TestExecLookupCache:
         child_shell([program.name], steps=[(":", "x")])
         assert exec_errno(program.name, str(tmp_path)) is None
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+    def test_a_file_this_user_may_run_but_not_read_is_left_to_the_exec(self, tmp_path: Path) -> None:
+        """Execute bits only (what mode 0711 gives another user): the start of the file cannot be
+        read, so the exec decides (no ENOEXEC here, as for a readable file with the same bytes)."""
+        program = tmp_path / "qemu-system-unreadable"
+        program.write_bytes(b"not a program\n")
+        program.chmod(0o111)
+        assert exec_errno(program.name, str(tmp_path)) is None
+        program.chmod(0o755)
+        assert exec_errno(program.name, str(tmp_path)) is None  # kept: no second lookup
+        assert exec_errno(program.name, f"{tmp_path}{os.pathsep}{tmp_path}") == errno.ENOEXEC
+
 
 class TestBinfmtMisc:
     """A file of no known start that an enabled binfmt_misc entry claims: the kernel runs it
@@ -579,7 +591,6 @@ class TestCommunicateManagedProcess:
             context_id: str,
             *,
             term_timeout: float,
-            kill_timeout: float,
             kill_first: bool,
         ) -> bool:
             results.append(
@@ -589,7 +600,6 @@ class TestCommunicateManagedProcess:
                     name,
                     context_id,
                     term_timeout=term_timeout,
-                    kill_timeout=kill_timeout,
                     kill_first=kill_first,
                 )
             )
@@ -670,41 +680,11 @@ class TestDrainSubprocessOutput:
     Uses real subprocesses - no mocking.
     """
 
-    async def test_drain_both_stdout_stderr(self) -> None:
-        """Each stream goes to its own handler, and to that handler only."""
-        captured_stdout: list[str] = []
-        captured_stderr: list[str] = []
-
-        # Process that writes to both streams
-        proc = await create_process(["bash", "-c", "echo 'stdout line'; echo 'stderr line' >&2"])
-
-        await drain_subprocess_output(
-            proc,
-            stdout_handler=captured_stdout.append,
-            stderr_handler=captured_stderr.append,
-        )
-
-        await proc.wait()
-
-        assert captured_stdout == ["stdout line"]
-        assert captured_stderr == ["stderr line"]
-
-    async def test_drain_multiple_lines(self) -> None:
-        """Each line reaches the handler once, in order, without its newline."""
-        captured: list[str] = []
-
-        proc = await create_process(["bash", "-c", "echo line1; echo line2; echo line3"])
-
-        await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=[].append)
-
-        await proc.wait()
-
-        assert captured == ["line1", "line2", "line3"]
-
     async def test_drain_reads_both_pipes_at_once(self) -> None:
         """A child that writes 2 MB to stderr before it writes stdout: a drain that read stdout
         to its end first would wait for ever. asyncio buffers 128 KiB of a pipe that nobody
-        reads, the pipe holds 64 KiB more, then the child blocks on its write."""
+        reads, the pipe holds 64 KiB more, then the child blocks on its write. Each stream goes
+        to its own handler, and to that handler only."""
         captured_stdout: list[str] = []
         captured_stderr: list[str] = []
         script = "import sys; sys.stderr.write(''.join(f'err {i}\\n' for i in range(200_000))); print('out')"
@@ -722,7 +702,8 @@ class TestDrainSubprocessOutput:
         assert captured_stderr == [f"err {i}" for i in range(200_000)]
 
     async def test_drain_large_output(self) -> None:
-        """Output larger than a pipe (64 KiB): every line reaches the handler, in order."""
+        """Output larger than a pipe (64 KiB): every line reaches the handler once, in order,
+        without its newline."""
         captured: list[str] = []
 
         # 3000 lines of about 32 bytes: 95 KB

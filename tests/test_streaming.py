@@ -193,9 +193,8 @@ sys.stdout.flush()
     async def test_stdout_exceeds_max_raises_output_limit(self, scheduler: Scheduler) -> None:
         """1.2MB stdout raises InvalidInputError OUTPUT_LIMIT; the callbacks got the output up to the limit.
 
-        The guest drops the whole read that crosses the 1 MB limit (8 KiB reads), and can hold back
-        the start of a possible end marker: the callbacks get at most 1 MB and less than 9,000 B
-        under it."""
+        The guest drops the whole read that crosses the 1 MB limit (8 KiB reads): the callbacks get
+        at most 1 MB and less than 8,192 B under it."""
         stdout_chunks: list[str] = []
         target_size = 1_200_000  # 1.2MB — over 1MB limit
 
@@ -210,8 +209,72 @@ sys.stdout.flush()
             await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         joined = "".join(stdout_chunks)
-        assert 1_000_000 - 9_000 < len(joined) <= 1_000_000
+        assert 1_000_000 - 8_192 < len(joined) <= 1_000_000
         assert joined == "X" * len(joined)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param('import sys; sys.stdout.write("X" * 1_000_000)', id="read_before_the_sentinel"),
+            # A 1 MiB pipe (F_SETPIPE_SZ, 1031): most of it waits for the reads after the sentinel
+            pytest.param(
+                'import fcntl, os; fcntl.fcntl(1, 1031, 1 << 20); os.write(1, b"X" * 1_000_000)',
+                id="left_in_a_large_pipe",
+            ),
+        ],
+    )
+    async def test_stdout_at_the_cap_comes_out_whole(self, scheduler: Scheduler, code: str) -> None:
+        """Stdout of exactly 1 MB is at the cap, not past it: exit 0 with all of it."""
+        stdout_chunks: list[str] = []
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
+
+        assert result.exit_code == 0
+        assert "".join(stdout_chunks) == result.stdout == "X" * 1_000_000
+
+    @pytest.mark.parametrize("size", [1_010_000, 1_030_000, 1_050_000])
+    async def test_stdout_just_over_the_cap_is_output_limit(self, scheduler: Scheduler, size: int) -> None:
+        """Stdout a little over the 1 MB cap: the guest can read the sentinel while up to a pipe of
+        stdout is still unread, and reads that rest after its loop. Each run is OUTPUT_LIMIT with at
+        most 1 MB passed on, never the whole output (the host stops a stream past the cap and one
+        read: GUEST_PROTOCOL). 10 runs per size, each in a new session: the order of the two reads
+        is not the same in every run."""
+        for _ in range(10):
+            stdout_chunks: list[str] = []
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
+                await run_once(
+                    scheduler,
+                    VmSpec(language=Language.PYTHON),
+                    f'import sys; sys.stdout.write("X" * {size})',
+                    on_stdout=stdout_chunks.append,
+                )
+            assert 1_000_000 - 8_192 < len("".join(stdout_chunks)) <= 1_000_000  # the crossing read dropped
+
+    async def test_stdout_left_in_a_large_pipe_is_output_limit(self, scheduler: Scheduler) -> None:
+        """The exec makes its stdout pipe 1 MiB (F_SETPIPE_SZ, 1031) and writes 1,030,000 B in
+        one call: almost all of it waits in the pipe when the guest reads the sentinel, so the
+        guest reads it after its loop, on every host. Each run is OUTPUT_LIMIT with at most 1 MB
+        passed on, never exit 0 with a cut stdout, nor the whole output. 10 runs."""
+        code = 'import fcntl, os; fcntl.fcntl(1, 1031, 1 << 20); os.write(1, b"X" * 1_030_000)'
+        for _ in range(10):
+            stdout_chunks: list[str] = []
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
+                await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
+            assert 1_000_000 - 8_192 < len("".join(stdout_chunks)) <= 1_000_000  # the crossing read dropped
+
+    async def test_a_repl_that_dies_past_the_cap_is_output_limit(self, scheduler: Scheduler) -> None:
+        """Code that writes past the stdout cap and then ends its REPL (os._exit): OUTPUT_LIMIT,
+        with the REPL's exit code in the message, never exit 3 with a cut stdout. The session
+        stays open: the next exec runs on a new REPL (the state before is gone)."""
+        code = 'import os, sys; sys.stdout.write("X" * 1_100_000); sys.stdout.flush(); os._exit(3)'
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            assert (await session.exec("kept = 1; print('kept' in globals())")).stdout == "True\n"
+            with pytest.raises(
+                InvalidInputError,
+                check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT,
+                match=r"stdout 1100000 bytes exceeds 1000000 limit; the REPL then exited with code 3",
+            ):
+                await session.exec(code)
+            assert (await session.exec("print('kept' in globals())")).stdout == "False\n"
 
     async def test_stderr_exceeds_max_raises_output_limit(self, scheduler: Scheduler) -> None:
         """120KB stderr raises InvalidInputError OUTPUT_LIMIT; the callbacks got the output up to the limit.
@@ -296,10 +359,9 @@ print("error line", file=sys.stderr)
     async def test_stderr_without_trailing_newline(self, scheduler: Scheduler) -> None:
         """Residual stderr_line_buf is flushed even without trailing newline.
 
-        Requires hwaccel: the code itself is trivial (~5ms), but under TCG
-        the full VM lifecycle (L1 restore failure → cold boot fallback →
-        REPL warm-up) can consume most of the 120s test timeout, leaving
-        the guest-agent starved and causing spurious execution timeouts.
+        Requires hwaccel: the code itself is trivial (~5ms), but under TCG on a
+        loaded runner the VM start and the REPL warm-up can take most of the
+        test timeout, and the exec then times out.
         """
         stderr_chunks: list[str] = []
 
@@ -501,21 +563,6 @@ os._exit(42)
 
         assert result.exit_code == 42
         assert "".join(stdout_chunks) == result.stdout == "before-crash\n"
-
-    async def test_high_output_rate_no_data_loss(self, scheduler: Scheduler) -> None:
-        """500KB burst with no sleeps — all data received."""
-        stdout_chunks: list[str] = []
-        target_size = 500 * 1024
-
-        code = f"""
-import sys
-sys.stdout.write("D" * {target_size})
-sys.stdout.flush()
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
-
-        assert result.exit_code == 0
-        assert "".join(stdout_chunks) == result.stdout == "D" * target_size
 
     async def test_session_streaming_isolation(self, scheduler: Scheduler) -> None:
         """Session exec 1 chunks don't leak into exec 2."""

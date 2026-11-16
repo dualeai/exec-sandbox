@@ -24,6 +24,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import secrets
 import uuid
 from dataclasses import dataclass, field
@@ -128,6 +129,11 @@ def descriptors_of(path: Path) -> list[tuple[int, int]]:
 
 
 # ----------------------------------------------------------------------------- guest streams
+
+
+def exact_key(key: str) -> str:
+    """The S3 proxy key regex that matches `key` and nothing else."""
+    return f"^{re.escape(key)}$"
 
 
 def random_block(rng: random.Random) -> bytes:

@@ -131,11 +131,8 @@ class ExecuteCodeRequest(GuestAgentRequest):
         "REPL thread; bash: $RANDOM)"
     )
 
-    timeout: int = Field(
-        ge=0, le=300, default=0, description="Execution timeout in seconds (0 = the default, 300 s; max 300 s)"
-    )
+    timeout: int = Field(ge=0, le=300, description="Execution timeout in seconds (0 = the default, 300 s; max 300 s)")
     env_vars: dict[str, str] = Field(
-        default_factory=dict,
         description="Environment variables (max 100, blocked vars enforced by guest agent)",
     )
 
@@ -195,7 +192,7 @@ class InstallPackagesRequest(GuestAgentRequest):
         description="Package list with version specifiers (e.g., ['pandas==2.0.0', 'lodash@4.17.21'])",
     )
     timeout: int = Field(
-        ge=0, le=300, default=300, description="Installation timeout in seconds (0 = the default, 300 s; max 300 s)"
+        ge=0, le=300, description="Installation timeout in seconds (0 = the default, 300 s; max 300 s)"
     )
 
 
@@ -222,7 +219,7 @@ class WriteFileRequest(GuestAgentRequest):
     - Path length: PATH_MAX 4096 bytes, NAME_MAX 255 bytes per component
     - Path traversal: no escape from /home/user
     - File size: max 500 MiB (streamed in zstd chunks: memory does not grow with the file)
-    - Permissions: 0o644 default, 0o755 with make_executable=True
+    - Permissions: 0o644, or 0o755 with make_executable=True
 
     Response: FileWriteAckMessage (after file_end).
     """
@@ -234,7 +231,7 @@ class WriteFileRequest(GuestAgentRequest):
         max_length=MAX_FILE_PATH_LENGTH,
         description="Relative path in sandbox (NAME_MAX 255 bytes per component)",
     )
-    make_executable: bool = Field(default=False, description="Set executable permission (0o755 vs 0o644)")
+    make_executable: bool = Field(description="Set executable permission (0o755 vs 0o644)")
 
 
 class ReadFileRequest(GuestAgentRequest):
@@ -263,7 +260,7 @@ class ListFilesRequest(GuestAgentRequest):
     """
 
     action: Literal["list_files"] = Field(default="list_files")  # type: ignore[assignment]
-    path: str = Field(max_length=MAX_FILE_PATH_LENGTH, default="", description="Relative path (empty for sandbox root)")
+    path: str = Field(max_length=MAX_FILE_PATH_LENGTH, description="Relative path (empty for sandbox root)")
 
 
 # ============================================================================

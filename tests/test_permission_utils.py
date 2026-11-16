@@ -39,12 +39,10 @@ from exec_sandbox.permission_utils import (
     get_mode,
     get_qemu_vm_gid,
     get_qemu_vm_uid,
-    grant_qemu_vm_access,
     grant_qemu_vm_acl,
     grant_qemu_vm_dir_access,
     grant_qemu_vm_file_access,
     make_cache_dir,
-    make_owned_dir,
     private_tree_problem,
     probe_qemu_as_qemu_vm,
     probe_qemu_vm_user,
@@ -105,13 +103,22 @@ class TestPrivateTreeProblem:
         root.mkdir(mode=0o700)
         assert self._problem(root) is None
 
-    @pytest.mark.parametrize(("mode", "writable"), [(0o755, False), (0o777, True), (0o1777, False)])
+    @pytest.mark.parametrize(
+        ("mode", "hint_end"),
+        [
+            (0o755, "."),
+            (0o777, ", then `sudo chmod go-w {parent}` or `sudo chmod +t {parent}`."),
+            (0o1777, "."),
+        ],
+        ids=["0755", "0777", "sticky-1777"],
+    )
     def test_parent_of_another_user_is_refused(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int, writable: bool
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int, hint_end: str
     ) -> None:
         """Its owner can put another folder in place of the root, whatever its mode. A stat
         stands in for the other user's folder (making one needs root). When others can also
-        write it, the hint adds the mode step (else a second start fails on the mode)."""
+        write it (not sticky), the hint adds the mode step after the owner's (its mode alone is
+        no remedy; without it, a second start fails on the mode)."""
         root = tmp_path / "root"
         root.mkdir(mode=0o700)
         parent, other = root.resolve().parent, os.geteuid() + 1
@@ -126,11 +133,11 @@ class TestPrivateTreeProblem:
             )
 
         monkeypatch.setattr(Path, "lstat", lstat_as_other)
-        problem = self._problem(root)
-        assert problem is not None
-        assert f"is in {parent} (uid {other}," in problem[0]
-        assert f"sudo chown root {parent}" in problem[1]
-        assert (f"sudo chmod go-w {parent}" in problem[1]) is writable  # its mode alone is no remedy
+        assert self._problem(root) == (
+            f"is in {parent} (uid {other}, mode {oct(mode)}), which another user can change",
+            f"Use a folder whose parent folders belong to root or this user, or give {parent} to root "
+            f"(`sudo chown root {parent}`: uid {other} then no longer owns it)" + hint_end.format(parent=parent),
+        )
 
     @pytest.mark.parametrize(
         ("own_group", "problem"), [(True, False), (False, True)], ids=["own-group", "shared-group"]
@@ -527,7 +534,7 @@ class TestSudoRmOutcomes:
             assert await sudo_rm(folder) is False
         [record] = [r for r in caplog.records if r.getMessage() == "sudo rm failed"]
         assert record.__dict__["exit_code"] == 1
-        assert "Device or resource busy" in record.__dict__["stderr"]
+        assert record.__dict__["stderr"] == f"rm: cannot remove '{folder}/x': Device or resource busy"
 
     @staticmethod
     def _no_room_for_files(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -962,6 +969,18 @@ class TestLocalUsersWithPrimaryGroup:
         assert permission_utils._local_users_with_primary_group(986) == users
 
 
+_FALLBACK = "QEMU runs as this user, not as qemu-vm (less isolation): "
+"""The start of the warning of a broken step of the qemu-vm path; the step's reason follows."""
+
+
+def _shared(group: str, others: str) -> str:
+    """The reason of a qemu-vm group (gid 986) that other users share."""
+    return (
+        f"QEMU would run with group {group} (986), which other users share (other members: {others}); "
+        "they could reach every VM's sockets: give qemu-vm its own group, qemu-vm, with only this user in it"
+    )
+
+
 class TestProbeQemuAsQemuVm:
     """probe_qemu_as_qemu_vm: one QEMU identity per process, checked end to end. The host
     (Linux, qemu-vm uid 999 and gid 986) and each sudo call are stand-ins; `sudo_report` is
@@ -1042,26 +1061,52 @@ class TestProbeQemuAsQemuVm:
     @pytest.mark.parametrize(
         ("host", "reason"),
         [
-            pytest.param({"cgroup_ok": False}, "cannot put a process in a VM cgroup", id="no-delegated-cgroup"),
-            pytest.param({"sudo_rc": 1, "sudo_report": b""}, "`sudo -n -u qemu-vm` failed", id="no-sudoers-rule"),
-            pytest.param({"sudo_report": b"0027\n986\n"}, "umask 0027", id="umask-without-group-write"),
-            pytest.param({"groups": [1000]}, "not in group 986", id="group-not-live"),
             pytest.param(
-                {"group_name": "users"}, "group users (986), which other users share", id="shared-named-group"
+                {"cgroup_ok": False},
+                "this process cannot put a process in a VM cgroup (no delegated cgroup v2 subtree it runs "
+                "inside), and only a cgroup ends a qemu-vm QEMU and proves its end; see the README's cgroup setup",
+                id="no-delegated-cgroup",
             ),
-            pytest.param({"group_members": ("runner", "eve")}, "other members: eve", id="other-member"),
-            pytest.param({"primary_group_users": ("qemu-vm", "mallory")}, "other members: mallory", id="other-primary"),
+            pytest.param(
+                {"sudo_rc": 1, "sudo_report": b""},
+                "`sudo -n -u qemu-vm` failed (exit 1); add `<user> ALL=(qemu-vm) NOPASSWD: ALL` to sudoers",
+                id="no-sudoers-rule",
+            ),
+            pytest.param(
+                {"sudo_report": b"0027\n986\n"},
+                "commands run as qemu-vm get umask 0027: QEMU sockets would have no group write",
+                id="umask-without-group-write",
+            ),
+            pytest.param(
+                {"groups": [1000]},
+                "this process is not in group 986 (qemu-vm) now, so it cannot connect to the sockets QEMU makes; "
+                "add the user to the group and log in again, or start the service with `sg qemu-vm`",
+                id="group-not-live",
+            ),
+            pytest.param({"group_name": "users"}, _shared("users", "none"), id="shared-named-group"),
+            pytest.param({"group_members": ("runner", "eve")}, _shared("qemu-vm", "eve"), id="other-member"),
+            pytest.param(
+                {"primary_group_users": ("qemu-vm", "mallory")}, _shared("qemu-vm", "mallory"), id="other-primary"
+            ),
             pytest.param(
                 {"extra_group_lines": "shadowq:x:986:nobody\n"},
-                "which other users share",
+                _shared("qemu-vm", "nobody"),
                 id="second-record-other-name",
             ),
-            pytest.param({"extra_group_lines": "qemu-vm:x:986:eve\n"}, "other members: eve", id="second-record-member"),
             pytest.param(
-                {"extra_group_lines": "+shadowq:x:986:nobody\n"}, "which other users share", id="compat-record"
+                {"extra_group_lines": "qemu-vm:x:986:eve\n"}, _shared("qemu-vm", "eve"), id="second-record-member"
             ),
-            pytest.param({"chown_ok": False}, "`sudo -n chown`", id="no-root-chown"),
-            pytest.param({"rm_rc": 1}, "`sudo -n rm`", id="no-root-rm"),
+            pytest.param(
+                {"extra_group_lines": "+shadowq:x:986:nobody\n"}, _shared("qemu-vm", "nobody"), id="compat-record"
+            ),
+            pytest.param(
+                {"chown_ok": False},
+                "`sudo -n chown` as root does not work; add the sudoers lines of the README",
+                id="no-root-chown",
+            ),
+            pytest.param(
+                {"rm_rc": 1}, "`sudo -n rm` as root does not work; add the sudoers lines of the README", id="no-root-rm"
+            ),
         ],
     )
     async def test_any_broken_step_falls_back_once(
@@ -1080,9 +1125,7 @@ class TestProbeQemuAsQemuVm:
             assert await probe_qemu_as_qemu_vm() is False
 
         assert results == [False, False, False]
-        warnings = self._warnings(caplog)
-        assert len(warnings) == 1
-        assert reason in warnings[0]
+        assert self._warnings(caplog) == [_FALLBACK + reason]
 
     @pytest.mark.parametrize(("command", "root_sudos"), [("chown", ["chown"]), ("rm", ["chown", "rm"])])
     async def test_a_root_sudo_that_never_ends_falls_back_at_the_bound(
@@ -1097,8 +1140,9 @@ class TestProbeQemuAsQemuVm:
             assert await asyncio.wait_for(probe_qemu_as_qemu_vm(), timeout=5) is False
 
         assert [c[3] for c in commands[1:]] == root_sudos
-        (warning,) = self._warnings(caplog)
-        assert warning.endswith(f"`sudo -n {command}` as root does not work; add the sudoers lines of the README")
+        assert self._warnings(caplog) == [
+            f"{_FALLBACK}`sudo -n {command}` as root does not work; add the sudoers lines of the README"
+        ]
 
     async def test_unreadable_passwd_falls_back(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -1112,7 +1156,10 @@ class TestProbeQemuAsQemuVm:
         monkeypatch.setattr("exec_sandbox.permission_utils._read_passwd", unreadable)
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.permission_utils"):
             assert await probe_qemu_as_qemu_vm() is False
-        assert "cannot be read to check who else" in self._warnings(caplog)[0]
+        assert self._warnings(caplog) == [
+            f"{_FALLBACK}/etc/passwd or /etc/group cannot be read to check who else has group qemu-vm (986): "
+            "Permission denied"
+        ]
 
     async def test_root_needs_no_group(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Root connects to any socket: the group check does not apply."""
@@ -1504,12 +1551,12 @@ class TestMakeCacheDir:
 
     def test_a_file_in_the_path_is_a_setting_to_fix(self, tmp_path: Path) -> None:
         (tmp_path / "file").write_bytes(b"")
-        with pytest.raises(ConfigError) as exc:
-            make_cache_dir(tmp_path / "file" / "cache", setting="EXEC_SANDBOX_CACHE_DIR")
-        assert exc.value.code is ErrorCode.SETTING_INVALID
-        assert exc.value.context["errno"] == errno.ENOTDIR
-        assert exc.value.hint is not None
-        assert "EXEC_SANDBOX_CACHE_DIR" in exc.value.hint
+        folder = tmp_path / "file" / "cache"
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.SETTING_INVALID) as exc:
+            make_cache_dir(folder, setting="EXEC_SANDBOX_CACHE_DIR")
+        assert exc.value.message == f"Folder {folder} cannot be made: {os.strerror(errno.ENOTDIR)}"
+        assert exc.value.context == {"folder": str(folder), "errno": errno.ENOTDIR}
+        assert exc.value.hint == "Set EXEC_SANDBOX_CACHE_DIR to a folder this user can write, on a writable disk."
 
     @pytest.mark.parametrize(
         ("error", "expected", "code"),
@@ -1541,13 +1588,13 @@ class TestMakeCacheDir:
         assert exc.value.context == {"folder": str(tmp_path / "cache"), "errno": error}
 
 
-class TestMakeOwnedDir:
-    """make_private_dir, then a folder that exists must be private too."""
+class TestMakeCacheDirIsPrivate:
+    """make_cache_dir: make_private_dir, then a folder that exists must be private too."""
 
     def test_new_folders_are_private(self, tmp_path: Path) -> None:
         old = os.umask(0o002)
         try:
-            make_owned_dir(tmp_path / "a" / "b", setting="cache_dir")
+            make_cache_dir(tmp_path / "a" / "b", setting="cache_dir")
         finally:
             os.umask(old)
         assert [stat.S_IMODE(p.stat().st_mode) & 0o777 for p in (tmp_path / "a", tmp_path / "a" / "b")] == [
@@ -1560,7 +1607,7 @@ class TestMakeOwnedDir:
         folder = tmp_path / "cache"
         folder.mkdir(mode=0o711)
         folder.chmod(0o711)
-        make_owned_dir(folder, setting="cache_dir")
+        make_cache_dir(folder, setting="cache_dir")
 
     @pytest.mark.parametrize("mode", [0o775, 0o757], ids=["group-writable", "other-writable"])
     def test_existing_writable_folder_is_refused(self, tmp_path: Path, mode: int) -> None:
@@ -1568,8 +1615,11 @@ class TestMakeOwnedDir:
         folder = tmp_path / "cache"
         folder.mkdir()
         folder.chmod(mode)
-        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.SETTING_INVALID, match="group or others"):
-            make_owned_dir(folder, setting="cache_dir")
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.SETTING_INVALID) as exc:
+            make_cache_dir(folder, setting="cache_dir")
+        assert exc.value.message == f"Folder {folder} has mode {oct(mode)}: group or others have access"
+        assert exc.value.hint == f"Run `chmod 700 {folder}`."
+        assert exc.value.context == {"folder": str(folder), "setting": "cache_dir"}
 
     def test_folder_in_a_parent_others_can_change_is_refused(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1580,17 +1630,27 @@ class TestMakeOwnedDir:
         parent.mkdir()
         parent.chmod(0o775)
         monkeypatch.setattr("exec_sandbox.permission_utils._group_is_this_users", lambda _gid: False)
-        with pytest.raises(
-            ConfigError, check=lambda e: e.code is ErrorCode.SETTING_INVALID, match="another user can change"
-        ):
-            make_owned_dir(parent / "exec-sandbox" / "disk-snapshots", setting="cache_dir")
+        folder = parent / "exec-sandbox" / "disk-snapshots"
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.SETTING_INVALID) as exc:
+            make_cache_dir(folder, setting="cache_dir")
+        changes = parent.resolve()  # the check walks the real path
+        assert exc.value.message == (
+            f"Folder {folder} is in {changes} (uid {os.geteuid()}, mode 0o775), which another user can change"
+        )
+        assert exc.value.hint == (
+            f"Use a folder whose parent folders only root and this user can write, run `chmod go-w {changes}`, "
+            f"or, when others must keep writing there (a shared volume), `chmod +t {changes}` (a sticky folder "
+            "passes, as /tmp). Only the folder's owner can run these: root (sudo) for a folder of root, an init "
+            "container that runs as root for a Kubernetes emptyDir."
+        )
 
     def test_link_is_refused(self, tmp_path: Path) -> None:
         (tmp_path / "real").mkdir(mode=0o700)
         (tmp_path / "cache").symlink_to(tmp_path / "real")
         # O_NOFOLLOW | O_DIRECTORY on the link: ELOOP on Linux, ENOTDIR on macOS
-        with pytest.raises(OSError, check=lambda e: e.errno in {errno.ELOOP, errno.ENOTDIR}):
-            make_owned_dir(tmp_path / "cache", setting="cache_dir")
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.SETTING_INVALID) as exc:
+            make_cache_dir(tmp_path / "cache", setting="cache_dir")
+        assert exc.value.context["errno"] in {errno.ELOOP, errno.ENOTDIR}
 
 
 # =============================================================================
@@ -1696,16 +1756,16 @@ class TestSudoRmReal:
 class TestAclRealLinux:
     """Real ACL tests on Linux - require setfacl."""
 
-    async def test_grant_qemu_vm_access_real(self, tmp_path: Path) -> None:
-        """grant_qemu_vm_access sets ACL for qemu-vm user."""
+    async def test_set_acl_user_gives_qemu_vm_read_write(self, tmp_path: Path) -> None:
+        """set_acl_user gives the qemu-vm user read and write access by an ACL entry (the
+        gvproxy socket grant)."""
         test_file = tmp_path / "qemu_acl.txt"
         test_file.write_text("content")
 
-        result = await grant_qemu_vm_access(test_file)
+        result = await set_acl_user([test_file], user="qemu-vm", perms="rw")
 
         assert result is True
-
-        assert "user:qemu-vm" in read_acl(test_file)
+        assert read_acl(test_file)["user:qemu-vm"] == "rw-"
 
 
 # =============================================================================
@@ -1743,7 +1803,7 @@ class TestGrantQemuVmFileAccess:
         assert stat.S_IMODE(test_file.stat().st_mode) == 0o644
 
     async def test_chmod_failure_returns_false(self, tmp_path: Path) -> None:
-        """writable=False returns False when chmod fails (nonexistent file)."""
+        """writable=False returns False when the file cannot be opened for its chmod (no such file)."""
         nonexistent = tmp_path / "does_not_exist.qcow2"
 
         with patch(

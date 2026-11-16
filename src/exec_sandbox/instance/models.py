@@ -74,7 +74,7 @@ class HeadSummary(BaseModel):
 
 class HeadHeader(BaseModel):
     """Public part of a head. Not authenticated until the head body opens
-    (`head.open_head` or `head.authenticate`)."""
+    (`head.open_head` or `head.open_header`)."""
 
     model_config = _STRICT
 
@@ -83,7 +83,7 @@ class HeadHeader(BaseModel):
     commit_id: str = Field(pattern=COMMIT_ID_PATTERN)
     recent_commits: tuple[RecentCommit, ...] = Field(min_length=1, max_length=RECENT_COMMITS)
     """Newest first; the first entry is this head's own commit."""
-    key_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    key_id: str = Field(pattern=_DIGEST_PATTERN)
     """Id of the keyring key that wraps the data key."""
     wrapped_data_key: str = Field(pattern=r"^[0-9a-f]{80}$")
     """AES-KW wrap of the 32-byte data key, hex."""

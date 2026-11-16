@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -51,11 +52,11 @@ from typing import TYPE_CHECKING, Any, Final, cast
 import psutil
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_cancellation_safe, run_to_end
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError, spawn_error
 from exec_sandbox.files.disk import clone_sparse
 from exec_sandbox.process_registry import unregister_process
+from exec_sandbox.qmp_client import parse_qmp_line
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.subprocess_utils import (
     exec_failed_error,
@@ -66,7 +67,7 @@ from exec_sandbox.subprocess_utils import (
 if TYPE_CHECKING:
     from exec_sandbox.platform_utils import ProcessWrapper
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Cleanup must outlive a caller that abandons a partially-started daemon: the process
 # cleanups and the template folder removals (stop).
@@ -101,7 +102,7 @@ def _overlay_failed(message: str, *, context: dict[str, Any] | None) -> Transien
 
 
 _QCOW2_MAGIC: Final = b"QFI\xfb"
-_QCOW2_HEADER_BYTES: Final = 32  # magic(4) version(4) backing offset(8) size(4) cluster bits(4) virtual size(8)
+_QCOW2_HEADER_BYTES: Final = 32  # magic(4) version(4) backing offset(8) backing size(4) cluster bits(4) size(8)
 _QCOW2_VERSIONS: Final = (2, 3)  # version 1 ("qcow") has the same magic; QEMU's qcow2 driver refuses it
 _SECTOR_BYTES: Final = 512
 _JOB_POLL_FIRST_SECONDS: Final = 0.001  # job poll: 1 ms, doubling up to 50 ms
@@ -127,14 +128,9 @@ def _clone_overlay(src: Path, dst: Path) -> bool:
     partial `dst` is removed, one that was there is left (blocking)."""
     try:
         clone_sparse(src, dst, stop=None)  # an overlay: a reflink clone, or a copy of KBs
-    except FileExistsError:
-        return False
-    except OSError:
-        with contextlib.suppress(OSError):
-            dst.unlink()
-        return False
-    try:
         dst.chmod(stat.S_IMODE(src.stat().st_mode))
+    except FileExistsError:  # of the clone: `dst` is not ours
+        return False
     except OSError:
         with contextlib.suppress(OSError):
             dst.unlink()
@@ -216,11 +212,6 @@ class QemuStorageDaemon:
         # Template clones still being written: stop() waits for them before it removes the
         # folder, which they would fill again
         self._template_writes: set[asyncio.Future[bool]] = set()
-
-    @property
-    def started(self) -> bool:
-        """Whether daemon is running."""
-        return self._started
 
     async def start(self) -> None:
         """Start daemon and establish QMP connection.
@@ -550,14 +541,14 @@ class QemuStorageDaemon:
 
         # Read greeting
         greeting = await asyncio.wait_for(self._reader.readline(), timeout=socket_timeout)
-        greeting_data = json.loads(greeting)
-        if "QMP" not in greeting_data:
-            raise _overlay_failed(f"Invalid QMP greeting: {greeting.decode()}", context=None)
+        greeting_data = parse_qmp_line(greeting)
+        if not isinstance(greeting_data, dict) or "QMP" not in greeting_data:
+            raise _overlay_failed(f"Invalid QMP greeting: {greeting[:200]!r}", context=None)
 
         # Send capabilities
         await self._execute("qmp_capabilities")
 
-    async def _execute(self, command: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _execute(self, command: str, arguments: dict[str, Any] | None = None) -> object:
         """Execute QMP command and return result, within QEMU_STORAGE_DAEMON_SOCKET_TIMEOUT_SECONDS.
 
         Handles QMP's async event model - reads lines until we get the actual
@@ -568,7 +559,7 @@ class QemuStorageDaemon:
             arguments: Optional command arguments
 
         Returns:
-            QMP response dict (the 'return' field contents)
+            The 'return' field of QEMU's answer (an object, or a list for query-jobs)
 
         Raises:
             TransientError: OVERLAY_FAILED if command fails or not connected
@@ -576,7 +567,7 @@ class QemuStorageDaemon:
         self._request_seq += 1
         request_id = f"qsd-{self._request_seq}"
 
-        async def exchange() -> dict[str, Any]:
+        async def exchange() -> object:
             async with self._lock:
                 return await self._exchange(request_id, command, arguments)
 
@@ -584,7 +575,7 @@ class QemuStorageDaemon:
         # propagating caller cancellation. This preserves stream alignment.
         return await await_cancellation_safe(exchange())
 
-    async def _exchange(self, request_id: str, command: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    async def _exchange(self, request_id: str, command: str, arguments: dict[str, Any] | None) -> object:
         """Write one identified QMP command and consume its matching response.
 
         Raises:
@@ -654,8 +645,8 @@ class QemuStorageDaemon:
         if not line:
             raise _overlay_failed(f"QMP {command}: the daemon closed its socket (it exited)", context=None)
         try:
-            message = json.loads(line)
-        except (ValueError, RecursionError) as e:  # RecursionError: a line nested too deep
+            message = parse_qmp_line(line)
+        except ValueError as e:
             raise _overlay_failed(f"QMP {command}: a line that is not JSON: {line[:200]!r}", context=None) from e
         if not isinstance(message, dict):
             raise _overlay_failed(f"QMP {command}: a line that is not a JSON object: {line[:200]!r}", context=None)
@@ -664,13 +655,16 @@ class QemuStorageDaemon:
     async def _wait_for_job(self, job_id: str) -> None:
         """Wait for an async job to end: poll query-jobs (its status and error), with a pause
         that doubles from _JOB_POLL_FIRST_SECONDS to _JOB_POLL_MAX_SECONDS. A concluded job is
-        dismissed; a job no longer listed concluded and was auto-dismissed.
+        dismissed. The jobs it waits for (blockdev-create) are dismissed by hand (QEMU makes
+        them JOB_MANUAL_DISMISS): one that query-jobs does not list is a broken daemon, or
+        another client dismissed it.
 
         Args:
             job_id: Job ID to wait for (at most QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS)
 
         Raises:
-            TransientError: OVERLAY_FAILED if job times out or fails
+            TransientError: OVERLAY_FAILED if the job times out or fails, or query-jobs answers
+                something that is not a list of objects, or does not list the job
         """
         timeout = constants.QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS
         loop = asyncio.get_running_loop()
@@ -680,11 +674,15 @@ class QemuStorageDaemon:
             # query-jobs tells the job's end and its error (a JOB_STATUS_CHANGE event carries
             # no error): a job it lists as running is polled again, never taken as done
             result = await self._execute("query-jobs")
-            raw_jobs = cast("list[dict[str, Any]]", result) if isinstance(result, list) else []
-            job = next((raw for raw in raw_jobs if raw.get("id") == job_id), None)
+            # A broken daemon: an answer that is not a list of objects says nothing of the job
+            items = cast("list[object]", result) if isinstance(result, list) else None
+            if items is None or not all(isinstance(item, dict) for item in items):
+                raise _overlay_failed(f"query-jobs answer is not a list of objects: {result!r:.200}", context=None)
+            jobs = cast("list[dict[str, Any]]", result)
+            job = next((raw for raw in jobs if raw.get("id") == job_id), None)
 
             if job is None:
-                return  # concluded and auto-dismissed
+                raise _overlay_failed(f"query-jobs does not list job {job_id}", context=None)
 
             if job.get("status") == "concluded":
                 if error := job.get("error"):
@@ -790,7 +788,6 @@ class QemuStorageDaemon:
             "qemu-storage-daemon",
             str(self._socket_path or "qsd-startup"),
             term_timeout=2.0,
-            kill_timeout=2.0,
             kill_first=False,
         )
         if destroyed:

@@ -349,9 +349,10 @@ class TestSchedulerStart:
 
 class TestWorkerChecks:
     """What this worker must have: QEMU at or above the floor (checked by InstanceManager.open
-    before the store probe), the arch, accelerator and CPU vendor of the host that saved
-    (checked by each load, ROUTE before any download), and ACL support when QEMU runs as
-    qemu-vm (the migration file is private to this user)."""
+    before the store probe), the arch, accelerator, guest CPU model and CPU identity of the
+    host that saved, its machine type and the guest's counter rate (checked by each load,
+    ROUTE before any download), and ACL support when QEMU runs as qemu-vm (the migration file
+    is private to this user)."""
 
     @staticmethod
     def _settings(tmp_path: Path) -> Settings:
@@ -417,7 +418,12 @@ class TestWorkerChecks:
                 self._settings(tmp_path), work_dir=tmp_path / "work", vm_manager=MagicMock()
             ):
                 pass
-        assert "is on tmpfs" in str(exc.value)
+        work_dir = tmp_path / "work"
+        assert str(exc.value) == (
+            f"The work folder of saved instances, {work_dir}, is on tmpfs: a save writes the VM's memory "
+            "there, into memory charged to the VM, which then runs out of it."
+        )
+        assert exc.value.context == {"work_dir": str(work_dir), "filesystem": "tmpfs"}
         assert exc.value.hint == "Set EXEC_SANDBOX_HOME_DISK_DIR (it holds this work folder) to a folder on disk."
         assert not (tmp_path / "work").exists()
 
@@ -712,11 +718,13 @@ class TestWorkerChecks:
         if not routes:
             assert isinstance(error, InternalError)
             assert (error.code, error.instance_id) == (ErrorCode.INTERNAL, "my-vm")
-            assert str(error).endswith("cannot run a state that QEMU 11.1.3 saved: Unknown ramblock.")
+            here = ".".join(map(str, local_qemu))
+            assert str(error) == (
+                f"Instance my-vm: QEMU {here} cannot run a state that QEMU 11.1.3 saved: Unknown ramblock."
+            )
             return
         assert isinstance(error, RouteError)
         assert (error.code, error.instance_id) == (ErrorCode.INSTANCE_HOST_MISMATCH, "my-vm")
-        # The budget the VM needs (192 MB + 80 MB, 1 + 0.25 cores): this worker has no limit
         # Everything the load checked: the budget the VM needs (192 MB + 80 MB, 1 + 0.25 cores;
         # this worker has no limit) and its guest image (this worker has it)
         checked = {**target, "memory_mb": "272", "cpu": "1.25", "base_image": "0" * 64}

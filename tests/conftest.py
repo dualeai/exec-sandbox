@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import logging
 import os
 import random
@@ -19,7 +20,7 @@ import boto3
 import pytest
 from _pytest.runner import runtestprotocol
 
-from exec_sandbox import constants, subprocess_utils
+from exec_sandbox import constants, qmp_client, subprocess_utils
 from exec_sandbox._logging import LIBRARY_LOGGER_NAME, ExtrasFormatter
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
@@ -294,12 +295,7 @@ skip_unless_aarch64 = pytest.mark.skipif(
     reason="This test requires ARM64/aarch64 architecture",
 )
 
-# Combined markers for specific platform+arch combinations
-skip_unless_macos_x86_64 = pytest.mark.skipif(
-    not (detect_host_os() == HostOS.MACOS and detect_host_arch() == HostArch.X86_64),
-    reason="This test requires macOS on Intel (x86_64)",
-)
-
+# Combined marker for a platform+arch combination
 skip_unless_macos_arm64 = pytest.mark.skipif(
     not (detect_host_os() == HostOS.MACOS and detect_host_arch() == HostArch.AARCH64),
     reason="This test requires macOS on Apple Silicon (ARM64)",
@@ -322,6 +318,26 @@ skip_on_python_312_subprocess_bug = pytest.mark.skipif(
 # ============================================================================
 # Common Paths and Config Fixtures
 # ============================================================================
+
+
+NESTED_QMP_LINE = b"[" * 60_000 + b"\n"
+"""A QMP line nested too deep for the JSON parser (with the qmp_parser_too_deep fixture)."""
+
+
+@pytest.fixture
+def qmp_parser_too_deep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The JSON parser of qmp_client raises RecursionError on NESTED_QMP_LINE, on every Python.
+    3.12 and 3.13 raise at about 10,000 levels; on 3.14 the C stack sets the depth, which
+    depends on the build (52,069 to 116,220 levels measured with an 8 MB stack): a build that
+    parses 60,000 reports the arrays that never close (JSONDecodeError). The tests check the
+    readers' handling of the parser's RecursionError."""
+
+    def loads(data: bytes) -> object:
+        if data == NESTED_QMP_LINE:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+        return json.loads(data)
+
+    monkeypatch.setattr(qmp_client, "json", SimpleNamespace(loads=loads, dumps=json.dumps))
 
 
 @pytest.fixture
@@ -907,7 +923,7 @@ class LoopTimer:
 
 class LoopClock:
     """The session's loop timers on a test clock, with no real wait: session.py's own
-    `asyncio` name gives a loop whose call_later (the idle deadline) runs on this clock, and
+    `asyncio` name gives a loop whose time() and call_later (the idle deadline) run on this clock, and
     every other call goes to the real loop. The loop itself is not patched: its clock and
     timers stay those of every other task (tests/test_patch_targets.py). Create it before
     the session: the session arms its deadline at creation."""
@@ -919,6 +935,9 @@ class LoopClock:
         clock = self
 
         class _SessionLoop:
+            def time(self) -> float:  # exec() measures its call with it
+                return clock._now
+
             def call_later(self, delay: float, callback: Callable[..., object], *args: object) -> LoopTimer:
                 timer = LoopTimer(clock._now + delay, callback, args)
                 clock._timers.append(timer)

@@ -1,12 +1,12 @@
 """Tests for guest VM device-layer security hardening.
 
-Verifies that dangerous device nodes are removed, block device nodes
+Verifies that dangerous device nodes do not exist, block device nodes
 (/dev/vda, /dev/zram0) are removed after use, /dev is bind-remounted
 read-only (preventing mknod with EROFS), /dev/shm is mounted with
 restrictive flags, /tmp has nosuid/nodev flags with an explicit inode
-cap (nr_inodes=16384), per-UID tmpfs quota enforcement (usrquota),
-/proc/sys is read-only, and /bin + /sbin are bind-mounted read-only
-with nosuid (blocking path hijack attacks).
+cap (nr_inodes=16384) and a per-UID tmpfs quota (usrquota, the size of
+the mount), /proc/sys is read-only, and /bin + /sbin are bind-mounted
+read-only with nosuid and nodev (blocking path hijack attacks).
 These are defense-in-depth measures that apply regardless of UID — even
 root (the guest agent) cannot open /dev/mem or read the root disk raw.
 
@@ -54,31 +54,15 @@ def _assert_page_aligned_share(stdout: str, *, share: float) -> None:
 # Dangerous device nodes should not exist
 # =============================================================================
 class TestDangerousDeviceNodes:
-    """Dangerous device nodes are removed by tiny-init after devtmpfs mount."""
+    """Dangerous device nodes do not exist: the kernel has no DEVMEM and no DEVPORT
+    (images/kernel/exec-sandbox.config), and /dev/kmem left Linux in 5.13."""
 
-    async def test_dev_mem_not_exists(self, dual_scheduler: Scheduler) -> None:
-        """/dev/mem (raw physical memory) must not exist."""
-        result = await run_once(
-            dual_scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.path.exists('/dev/mem'))"
-        )
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "False"
-
-    async def test_dev_kmem_not_exists(self, dual_scheduler: Scheduler) -> None:
-        """/dev/kmem (kernel virtual memory) must not exist."""
-        result = await run_once(
-            dual_scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.path.exists('/dev/kmem'))"
-        )
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "False"
-
-    async def test_dev_port_not_exists(self, dual_scheduler: Scheduler) -> None:
-        """/dev/port (raw I/O port access) must not exist."""
-        result = await run_once(
-            dual_scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.path.exists('/dev/port'))"
-        )
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "False"
+    async def test_dangerous_nodes_not_exist(self, dual_scheduler: Scheduler) -> None:
+        """/dev/mem (raw physical memory), /dev/kmem (kernel virtual memory) and /dev/port (raw
+        I/O port access) do not exist."""
+        code = "import os; print([p for p in ('/dev/mem', '/dev/kmem', '/dev/port') if os.path.lexists(p)])"
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
+        assert (result.exit_code, result.stdout) == (0, "[]\n"), result.stderr
 
 
 # =============================================================================
@@ -95,41 +79,20 @@ class TestEntropyDeviceHardening:
     UID 1000 only needs read access (or getrandom() syscall).
     """
 
-    async def test_urandom_write_blocked(self, dual_scheduler: Scheduler) -> None:
-        """Writing to /dev/urandom blocked for UID 1000 (entropy injection)."""
+    async def test_write_blocked(self, dual_scheduler: Scheduler) -> None:
+        """UID 1000 cannot open /dev/urandom or /dev/random for write (entropy injection): EACCES,
+        as the mode is 0644 and the owner root."""
         code = """\
-import os
-try:
-    fd = os.open('/dev/urandom', os.O_WRONLY)
-    os.write(fd, b'\\x00' * 8000)
-    os.close(fd)
-    print('unexpected_success')
-except PermissionError:
-    print('blocked')
-except OSError as e:
-    print(f'blocked:{e.errno}')
+import errno, os
+for path in ('/dev/urandom', '/dev/random'):
+    try:
+        os.close(os.open(path, os.O_WRONLY))
+        print(f'{path}:OPENED')
+    except OSError as e:
+        print(f'{path}:{errno.errorcode[e.errno]}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "blocked"  # EACCES: mode 0644, owner root
-
-    async def test_random_write_blocked(self, dual_scheduler: Scheduler) -> None:
-        """Writing to /dev/random blocked for UID 1000."""
-        code = """\
-import os
-try:
-    fd = os.open('/dev/random', os.O_WRONLY)
-    os.write(fd, b'\\x00' * 8000)
-    os.close(fd)
-    print('unexpected_success')
-except PermissionError:
-    print('blocked')
-except OSError as e:
-    print(f'blocked:{e.errno}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "blocked"  # EACCES: mode 0644, owner root
+        assert (result.exit_code, result.stdout) == (0, "/dev/urandom:EACCES\n/dev/random:EACCES\n"), result.stderr
 
     async def test_urandom_read_still_works(self, dual_scheduler: Scheduler) -> None:
         """Reading /dev/urandom still works for UID 1000."""
@@ -175,9 +138,9 @@ class TestDevShmHardening:
         _assert_page_aligned_share(result.stdout, share=0.4)
 
     async def test_exec_blocked_on_dev_shm(self, dual_scheduler: Scheduler) -> None:
-        """Script execution is blocked on /dev/shm (noexec enforcement)."""
+        """Script execution is blocked on /dev/shm (noexec enforcement): execve() fails with EACCES."""
         code = """\
-import os, stat, subprocess
+import errno, os, stat, subprocess
 path = '/dev/shm/test_exec.sh'
 with open(path, 'w') as f:
     f.write('#!/bin/sh\\necho pwned\\n')
@@ -185,17 +148,11 @@ os.chmod(path, stat.S_IRWXU)
 try:
     r = subprocess.run([path], capture_output=True, timeout=5)
     print(f"exit={r.returncode}")
-except PermissionError:
-    print("blocked")
 except OSError as e:
-    if e.errno == 13:  # EACCES
-        print("blocked")
-    else:
-        print(f"error={e}")
+    print(errno.errorcode[e.errno])
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "blocked\n"
+        assert (result.exit_code, result.stdout) == (0, "EACCES\n"), result.stderr
 
     async def test_multiprocessing_pool_still_works(self, dual_scheduler: Scheduler) -> None:
         """multiprocessing.Pool works despite noexec on /dev/shm (regression canary).
@@ -369,10 +326,10 @@ except OSError:
         assert result.stdout == "SYMLINK_LIMIT:16382\n"
 
     async def test_hardlinks_consume_inodes(self, dual_scheduler: Scheduler) -> None:
-        """Hard links on tmpfs consume inodes (each dentry needs its own inode).
+        """Hard links on tmpfs consume inodes: each link takes one of nr_inodes.
 
-        Unlike on-disk filesystems, tmpfs allocates a new inode per dentry,
-        so hard links count against nr_inodes the same as regular files.
+        Unlike on-disk filesystems, where a link takes no inode, tmpfs reserves one
+        per link (shmem_link), so hard links count the same as regular files.
         """
         code = """\
 import os
@@ -447,18 +404,18 @@ except OSError:
             )
             assert (r2.exit_code, r2.stdout) == (0, "CORRECTLY_BLOCKED\n"), r2.stderr
 
-            # Step 3: Verify /home/user (tmpfs) still works
+            # Step 3: Verify /home/user (the ext4 home disk) still works
             r3 = await session.exec(
                 """\
 with open('/home/user/still_works.txt', 'w') as f:
     f.write('alive')
 with open('/home/user/still_works.txt') as f:
-    print(f'ROOTFS:{f.read()}')
+    print(f'HOME:{f.read()}')
 """,
             )
-            assert (r3.exit_code, r3.stdout) == (0, "ROOTFS:alive\n"), r3.stderr
+            assert (r3.exit_code, r3.stdout) == (0, "HOME:alive\n"), r3.stderr
 
-            # Step 4: Verify Python execution still works (REPL uses rootfs, not /tmp)
+            # Step 4: Verify Python execution still works (the REPL runs from /home/user, not /tmp)
             r4 = await session.exec("print(f'MATH:{2 + 2}')")
             assert (r4.exit_code, r4.stdout) == (0, "MATH:4\n"), r4.stderr
 
@@ -471,45 +428,15 @@ class TestBlockDeviceHardening:
 
     # --- Normal cases: device nodes removed and filesystem still works ---
 
-    async def test_dev_zram0_not_exists(self, dual_scheduler: Scheduler) -> None:
-        """The guest agent removes /dev/zram0 after activating swap."""
-        result = await run_once(
-            dual_scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.path.lexists('/dev/zram0'))"
-        )
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "False"
+    async def test_setup_and_alias_nodes_not_exist(self, dual_scheduler: Scheduler) -> None:
+        """/dev/zram0 (the guest agent removes it after activating swap), /dev/block (devtmpfs
+        makes no such symlinks: udev does, and the guest has no udev) and /dev/root (sometimes
+        auto-created by the kernel) do not exist."""
+        code = "import os; print([p for p in ('/dev/zram0', '/dev/block', '/dev/root') if os.path.lexists(p)])"
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
+        assert (result.exit_code, result.stdout) == (0, "[]\n"), result.stderr
 
     # --- Edge cases: alternative paths to block device are closed ---
-
-    async def test_dev_block_symlinks_broken(self, dual_scheduler: Scheduler) -> None:
-        """/dev/block/ directory is removed by tiny-init (eliminates symlink access path)."""
-        code = """\
-import os
-print(f'EXISTS:{os.path.exists("/dev/block")}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "EXISTS:False\n"
-
-    async def test_dev_root_not_accessible(self, dual_scheduler: Scheduler) -> None:
-        """/dev/root (sometimes auto-created by the kernel) does not exist."""
-        code = """\
-import os
-exists = os.path.exists('/dev/root')
-if exists:
-    # If it exists, verify it's not a working block device
-    try:
-        f = open('/dev/root', 'rb')
-        f.close()
-        print('ACCESSIBLE')
-    except (PermissionError, OSError):
-        print('BLOCKED')
-else:
-    print('NOT_EXISTS')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "NOT_EXISTS\n"
 
     async def test_proc_partitions_readable_but_no_data_access(self, dual_scheduler: Scheduler) -> None:
         """/proc/partitions shows vda metadata but the device node /dev/vda is gone."""
@@ -527,7 +454,7 @@ try:
     print('DEV_VDA_OPEN:success')
 except FileNotFoundError:
     print('DEV_VDA_OPEN:not_found')
-except (PermissionError, OSError):
+except OSError:
     print('DEV_VDA_OPEN:blocked')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
@@ -540,46 +467,36 @@ except (PermissionError, OSError):
         """mknod of a block device node fails with EPERM: UID 1000 lacks CAP_MKNOD (on any
         writable mount; nodev on /tmp and /home/user is a second layer)."""
         code = """\
-import os, stat
+import errno, os, stat
 try:
     # Attempt to create a block device node (major 253 = virtblk)
     os.mknod('/home/user/vda', 0o660 | stat.S_IFBLK, os.makedev(253, 0))
     print('CREATED')
-except PermissionError:
-    print('BLOCKED:EPERM')
 except OSError as e:
-    print(f'BLOCKED:{e.errno}')
+    print(f'BLOCKED:{errno.errorcode[e.errno]}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "BLOCKED:EPERM"
+        assert (result.exit_code, result.stdout) == (0, "BLOCKED:EPERM\n"), result.stderr
 
-    # --- Out of bounds cases: no block device nodes remain anywhere in /dev ---
+    # --- Out of bounds cases: no block device nodes remain anywhere ---
 
-    async def test_no_block_devices_in_dev(self, dual_scheduler: Scheduler) -> None:
-        """No block device nodes remain under /dev."""
+    async def test_no_block_devices(self, dual_scheduler: Scheduler) -> None:
+        """No block device nodes remain under /dev, and none are smuggled into /tmp or /home."""
         code = """\
 import os, stat
 
-block_devices = []
-for dirpath, dirnames, filenames in os.walk('/dev'):
-    for name in filenames:
-        path = os.path.join(dirpath, name)
-        try:
-            s = os.lstat(path)
-            if stat.S_ISBLK(s.st_mode):
-                block_devices.append(path)
-        except OSError:
-            pass
-
-if block_devices:
-    print(f'FOUND:{",".join(block_devices)}')
-else:
-    print('NONE')
+for top in ('/dev', '/tmp', '/home'):
+    for dirpath, dirnames, filenames in os.walk(top):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            try:
+                if stat.S_ISBLK(os.lstat(path).st_mode):
+                    print(path)
+            except OSError:
+                pass
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "NONE", f"Unexpected block device nodes found: {result.stdout.strip()}"
+        assert (result.exit_code, result.stdout) == (0, ""), result.stderr
 
 
 # =============================================================================
@@ -624,28 +541,20 @@ else:
         assert result.stdout.strip() == "NONE", f"Loop device nodes found: {result.stdout.strip()}"
 
     async def test_loop_module_not_loaded(self, dual_scheduler: Scheduler) -> None:
-        """loop kernel module is not loaded (or modules disabled entirely)."""
-        code = """\
-try:
-    with open('/proc/modules') as f:
-        modules = [line.split()[0] for line in f]
-    print(f'LOOP_LOADED:{"loop" in modules}')
-except FileNotFoundError:
-    # CONFIG_MODULES=n: /proc/modules doesn't exist — no modules at all
-    print('MODULES_DISABLED')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "MODULES_DISABLED"  # CONFIG_MODULES=n (layer 1)
+        """No loop module can be loaded: CONFIG_MODULES=n (layer 1), so /proc/modules does not exist."""
+        result = await run_once(
+            dual_scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.path.exists('/proc/modules'))"
+        )
+        assert (result.exit_code, result.stdout) == (0, "False\n"), result.stderr
 
     # --- Edge: tools that need loop devices fail gracefully ---
 
     async def test_mkfs_ext4_not_exploitable(self, dual_scheduler: Scheduler) -> None:
-        """mkfs.ext4 exists (needed by tiny-init for snapshots) but cannot format block devices.
+        """mkfs.ext4 exists but cannot format a block device.
 
-        e2fsprogs is in the image for tiny-init (root) to format ext4 drives.
-        The sandbox user (UID 1000) cannot exploit it because loop devices are
-        blocked (CONFIG_BLK_DEV_LOOP=n) and /dev/vd* nodes are not accessible.
+        e2fsprogs is in the image for tiny-init (root) to format the home disk and the
+        snapshot drive. The sandbox user (UID 1000) cannot exploit it: the kernel has no loop
+        devices (CONFIG_BLK_DEV_LOOP=n) and tiny-init removes the /dev/vd* nodes after mount.
         """
         code = """\
 import subprocess, shutil
@@ -836,31 +745,18 @@ for r in results:
         assert result.stdout == "O_WRONLY:BLOCKED:13\nO_RDWR:BLOCKED:13\nO_APPEND:BLOCKED:13\n"
 
     async def test_nested_path_write_blocked(self, dual_scheduler: Scheduler) -> None:
-        """Read-only applies recursively to deeply nested sysctl paths."""
+        """Read-only applies recursively to deeply nested sysctl paths: EROFS on
+        net/ipv4/conf/all/accept_redirects."""
         code = """\
-import os
-
-# Try a deeply nested path under /proc/sys
-nested_paths = [
-    '/proc/sys/net/ipv4/conf/all/accept_redirects',
-    '/proc/sys/net/ipv4/conf/all/send_redirects',
-    '/proc/sys/net/core/somaxconn',
-]
-for path in nested_paths:
-    if os.path.exists(path):
-        try:
-            with open(path, 'w') as f:
-                f.write('0')
-            print(f'{path}:WRITTEN')
-        except OSError as e:
-            print(f'{path}:BLOCKED:{e.errno}')
-        break
-else:
-    print('NO_NESTED_PATH_FOUND')
+try:
+    with open('/proc/sys/net/ipv4/conf/all/accept_redirects', 'w') as f:
+        f.write('0')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "/proc/sys/net/ipv4/conf/all/accept_redirects:BLOCKED:30\n"
+        assert (result.exit_code, result.stdout) == (0, "BLOCKED:30\n"), result.stderr
 
     async def test_symlink_write_through_blocked(self, dual_scheduler: Scheduler) -> None:
         """Symlink pointing to /proc/sys path — write through symlink is blocked."""
@@ -919,100 +815,44 @@ except OSError as e:
 
     async def test_binfmt_misc_register_blocked(self, dual_scheduler: Scheduler) -> None:
         """Cannot register custom binary format interpreters: binfmt_misc is absent
-        (CONFIG_BINFMT_MISC=n)."""
-        code = """\
-import os
-
-# binfmt_misc register path (may or may not exist in minimal VM)
-register_path = '/proc/sys/fs/binfmt_misc/register'
-if not os.path.exists(register_path):
-    # binfmt_misc not mounted — also safe
-    print('BLOCKED:not_mounted')
-else:
-    try:
-        with open(register_path, 'w') as f:
-            f.write(':test:M::MZ::/tmp/handler:')
-        print('REGISTERED')
-    except OSError as e:
-        print(f'BLOCKED:{e.errno}')
-"""
+        (CONFIG_BINFMT_MISC=n), so its register file does not exist."""
+        code = "import os; print(os.path.exists('/proc/sys/fs/binfmt_misc/register'))"
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "BLOCKED:not_mounted\n"
+        assert (result.exit_code, result.stdout) == (0, "False\n"), result.stderr
 
     # --- Out of bounds: privilege escalation to remount ---
 
-    async def test_remount_rw_blocked(self, dual_scheduler: Scheduler) -> None:
-        """mount -o remount,rw /proc/sys requires CAP_SYS_ADMIN."""
+    async def test_mount_and_umount_blocked(self, dual_scheduler: Scheduler) -> None:
+        """A rw remount of /proc/sys, a tmpfs over it, its umount and a new procfs at /tmp/proc
+        each require CAP_SYS_ADMIN: the command exits 1."""
         code = """\
-import subprocess
-r = subprocess.run(
-    ["mount", "-o", "remount,rw", "/proc/sys"],
-    capture_output=True, text=True, timeout=5,
-)
-print(f"EXIT:{r.returncode}")
+import os, subprocess
+os.makedirs('/tmp/proc', exist_ok=True)
+for cmd in (
+    'mount -o remount,rw /proc/sys',
+    'mount -t tmpfs none /proc/sys',
+    'umount /proc/sys',
+    'mount -t proc proc /tmp/proc',
+):
+    try:
+        print(f'{cmd}:{subprocess.run(cmd.split(), capture_output=True, timeout=5).returncode}')
+    except subprocess.TimeoutExpired:  # the other commands are still tried
+        print(f'{cmd}:TIMEOUT')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "EXIT:1\n"
-
-    async def test_bind_mount_shadow_blocked(self, dual_scheduler: Scheduler) -> None:
-        """Bind tmpfs over /proc/sys requires CAP_SYS_ADMIN."""
-        code = """\
-import subprocess
-r = subprocess.run(
-    ["mount", "-t", "tmpfs", "none", "/proc/sys"],
-    capture_output=True, text=True, timeout=5,
-)
-print(f"EXIT:{r.returncode}")
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "EXIT:1\n"
-
-    async def test_umount_proc_sys_blocked(self, dual_scheduler: Scheduler) -> None:
-        """umount /proc/sys requires CAP_SYS_ADMIN."""
-        code = """\
-import subprocess
-r = subprocess.run(
-    ["umount", "/proc/sys"],
-    capture_output=True, text=True, timeout=5,
-)
-print(f"EXIT:{r.returncode}")
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "EXIT:1\n"
-
-    async def test_mount_second_proc_blocked(self, dual_scheduler: Scheduler) -> None:
-        """Mount new procfs at /tmp/proc requires CAP_SYS_ADMIN."""
-        code = """\
-import subprocess, os
-os.makedirs("/tmp/proc", exist_ok=True)
-r = subprocess.run(
-    ["mount", "-t", "proc", "proc", "/tmp/proc"],
-    capture_output=True, text=True, timeout=5,
-)
-print(f"EXIT:{r.returncode}")
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "EXIT:1\n"
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            "mount -o remount,rw /proc/sys:1",
+            "mount -t tmpfs none /proc/sys:1",
+            "umount /proc/sys:1",
+            "mount -t proc proc /tmp/proc:1",
+        ]
 
     async def test_sysrq_disabled(self, dual_scheduler: Scheduler) -> None:
-        """kernel.sysrq must be 0 (or absent with CONFIG_MAGIC_SYSRQ=n)."""
-        code = """\
-try:
-    with open('/proc/sys/kernel/sysrq') as f:
-        val = f.read().strip()
-    print(f'SYSRQ:{val}')
-except FileNotFoundError:
-    # CONFIG_MAGIC_SYSRQ=n: sysctl doesn't exist — SysRq fully compiled out
-    print('SYSRQ_ABSENT')
-"""
+        """kernel.sysrq does not exist: CONFIG_MAGIC_SYSRQ=n compiles SysRq out."""
+        code = "import os; print(os.path.exists('/proc/sys/kernel/sysrq'))"
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "SYSRQ_ABSENT", f"Expected CONFIG_MAGIC_SYSRQ=n. stdout: {result.stdout}"
+        assert (result.exit_code, result.stdout) == (0, "False\n"), result.stderr
 
 
 # =============================================================================
@@ -1138,39 +978,20 @@ else:
     # --- Weird: creative bypass attempts ---
 
     async def test_mknod_raw_syscall_blocked(self, dual_scheduler: Scheduler) -> None:
-        """ctypes SYS_mknod proves kernel-level deny (Kata CVE-2020-2023 chain)."""
+        """The raw mknodat syscall (ctypes) is refused by the kernel (Kata CVE-2020-2023 chain)."""
         code = """\
 import ctypes, ctypes.util, errno, os, stat, platform
 
 libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
 
 # SYS_mknodat = 259 on x86_64, 33 on aarch64
-if platform.machine() == 'x86_64':
-    SYS_mknodat = 259
-else:
-    SYS_mknodat = 33
-
-# AT_FDCWD = -100
+SYS_mknodat = 259 if platform.machine() == 'x86_64' else 33
 AT_FDCWD = -100
-path = b'/dev/test_mknod'
-mode = stat.S_IFBLK | 0o660
-dev = os.makedev(253, 0)
-
-ret = libc.syscall(SYS_mknodat, AT_FDCWD, path, mode, dev)
-err = ctypes.get_errno()
-if ret == -1:
-    if err == errno.EROFS:
-        print('BLOCKED:EROFS')
-    elif err == errno.EPERM:
-        print('BLOCKED:EPERM')
-    else:
-        print(f'BLOCKED:errno_{err}')
-else:
-    print('unexpected_success')
+ret = libc.syscall(SYS_mknodat, AT_FDCWD, b'/dev/test_mknod', stat.S_IFBLK | 0o660, os.makedev(253, 0))
+print('unexpected_success' if ret == 0 else f'BLOCKED:{errno.errorcode[ctypes.get_errno()]}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "BLOCKED:EROFS"  # /dev is read-only
+        assert (result.exit_code, result.stdout) == (0, "BLOCKED:EROFS\n"), result.stderr  # /dev is read-only
 
     async def test_debugfs_not_available(self, dual_scheduler: Scheduler) -> None:
         """debugfs binary doesn't exist in minimal Alpine rootfs."""
@@ -1185,52 +1006,18 @@ print(f'DEBUGFS:{shutil.which("debugfs") is not None}')
     async def test_uevent_helper_not_writable(self, dual_scheduler: Scheduler) -> None:
         """/sys/kernel/uevent_helper not writable by UID 1000."""
         code = """\
-import os
-
-path = '/sys/kernel/uevent_helper'
-if not os.path.exists(path):
-    print('NOT_EXISTS')
-else:
-    try:
-        with open(path, 'w') as f:
-            f.write('/tmp/pwned')
-        print('WRITTEN')
-    except (PermissionError, OSError) as e:
-        print(f'BLOCKED:{e.errno}')
+try:
+    with open('/sys/kernel/uevent_helper', 'w') as f:
+        f.write('/tmp/pwned')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert result.stdout.strip() == "BLOCKED:13"
 
     # --- Out of bounds: comprehensive/adversarial ---
-
-    async def test_no_block_devices_outside_dev(self, dual_scheduler: Scheduler) -> None:
-        """No block device nodes in /tmp or /home (catches smuggled nodes)."""
-        code = """\
-import os, stat
-
-block_devices = []
-for search_dir in ['/tmp', '/home']:
-    if not os.path.isdir(search_dir):
-        continue
-    for dirpath, dirnames, filenames in os.walk(search_dir):
-        for name in filenames:
-            path = os.path.join(dirpath, name)
-            try:
-                s = os.lstat(path)
-                if stat.S_ISBLK(s.st_mode):
-                    block_devices.append(path)
-            except OSError:
-                pass
-
-if block_devices:
-    print(f'FOUND:{",".join(block_devices)}')
-else:
-    print('NONE')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.strip() == "NONE", f"Block devices outside /dev: {result.stdout}"
 
     async def test_effective_caps_no_mknod(self, dual_scheduler: Scheduler) -> None:
         """CAP_MKNOD (bit 27) and CAP_DAC_READ_SEARCH (bit 2) are both clear."""
@@ -1277,9 +1064,9 @@ except OSError as e:
 class TestRootFsReadonly:
     """Root filesystem is mounted read-only with nosuid and nodev flags.
 
-    Matches AWS Lambda rootfs flags (ro,nosuid,nodev,noatime). The rootfs
-    never enters rw state — tiny-init mounts it with MS_RDONLY from boot.
-    Prevents writing to /etc/passwd, /sbin, planting SUID binaries, or
+    Matches AWS Lambda rootfs flags (ro,nosuid,nodev,noatime). tiny-init mounts the
+    EROFS root read-only from boot (only the VM that creates a disk snapshot gets a
+    writable overlay). Prevents writing to /etc/passwd, /sbin, planting SUID binaries, or
     remounting rw to DoS subsequent code.
     """
 
@@ -1317,53 +1104,25 @@ print(f"EXIT:{r.returncode}")
         assert result.exit_code == 0
         assert result.stdout == "EXIT:1\n"
 
-    async def test_home_user_still_writable(self, dual_scheduler: Scheduler) -> None:
-        """/home/user is writable (tmpfs overlay on read-only rootfs)."""
+    async def test_home_user_and_dev_shm_still_writable(self, dual_scheduler: Scheduler) -> None:
+        """/home/user (the home disk) and /dev/shm (a tmpfs) are separate mounts: still writable."""
         code = """\
-import os
-path = '/home/user/test_rw.txt'
-with open(path, 'w') as f:
-    f.write('writable')
-with open(path) as f:
-    data = f.read()
-os.unlink(path)
-print(f'OK:{data}')
+import errno, os
+for path in ('/home/user/test_rw.txt', '/dev/shm/test_rw.txt'):
+    try:
+        with open(path, 'w') as f:
+            f.write('writable')
+        with open(path) as f:
+            print(f'{path}:{f.read()}')
+        os.unlink(path)
+    except OSError as e:  # the other path is still tried
+        print(f'{path}:{errno.errorcode[e.errno]}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "OK:writable\n"
-
-    async def test_tmp_still_writable(self, dual_scheduler: Scheduler) -> None:
-        """/tmp is writable (separate tmpfs mount)."""
-        code = """\
-import os
-path = '/tmp/test_rw.txt'
-with open(path, 'w') as f:
-    f.write('writable')
-with open(path) as f:
-    data = f.read()
-os.unlink(path)
-print(f'OK:{data}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "OK:writable\n"
-
-    async def test_dev_shm_still_writable(self, dual_scheduler: Scheduler) -> None:
-        """/dev/shm is writable (separate tmpfs mount)."""
-        code = """\
-import os
-path = '/dev/shm/test_rw.txt'
-with open(path, 'w') as f:
-    f.write('writable')
-with open(path) as f:
-    data = f.read()
-os.unlink(path)
-print(f'OK:{data}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "OK:writable\n"
+        assert (result.exit_code, result.stdout) == (
+            0,
+            "/home/user/test_rw.txt:writable\n/dev/shm/test_rw.txt:writable\n",
+        ), result.stderr
 
 
 # =============================================================================
@@ -1395,16 +1154,14 @@ class TestHomeUserDisk:
         assert result.stdout == "_repl.mjs\n_repl.py\n_repl.sh\nTAR_OK\n"
 
     async def test_size_matches_disk(self, dual_scheduler: Scheduler) -> None:
-        """Usable space is the default home disk (1024 MB) minus ext4 metadata: at least 90 %."""
+        """The default home disk (1024 MB) has 975 MB of usable space: ext4 metadata takes the rest."""
         code = """\
 import os
 s = os.statvfs('/home/user')
 print(f'MB:{s.f_blocks * s.f_frsize // (1 << 20)}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        size_mb = int(result.stdout.split("MB:")[1].split()[0])
-        assert 922 <= size_mb <= 1024  # 90 % of 1024 MB (921.6), rounded up
+        assert (result.exit_code, result.stdout) == (0, "MB:975\n"), result.stderr
 
     async def test_cloudpickle_importable(self, dual_scheduler: Scheduler) -> None:
         """cloudpickle is importable (loaded from /usr/lib/python3/site-packages)."""
@@ -1433,71 +1190,51 @@ print(f'GID:{s.st_gid}')
 # Per-UID tmpfs quota enforcement (/dev/shm: RAM-backed)
 # =============================================================================
 class TestTmpfsQuotaEnforcement:
-    """Per-UID quota (usrquota_block_hardlimit) prevents a single user from
-    consuming all tmpfs space (guest RAM). Sparse file inflation via ftruncate()
-    is allowed (metadata-only, no real pages consumed) but real writes are bounded.
-    /home/user is a disk (its size is the cap); /dev/shm is the RAM-backed
-    tmpfs these limits protect.
+    """Real writes to a RAM-backed tmpfs stop at its size; sparse files take no pages.
 
-    Three-layer defense:
-    - size= caps total tmpfs memory usage (all UIDs combined)
-    - usrquota_block_hardlimit caps per-UID real block usage
-    - list_files min(len, blocks*512) deflates apparent size in API responses
+    /dev/shm (40% of MemTotal) and /tmp (50%) are tmpfs: size= caps what all users write,
+    and the per-UID quota (usrquota_block_hardlimit) has the same value. ftruncate() to a
+    huge size takes no pages, so it succeeds, and list_files reports such a file at
+    min(size, blocks * 512) (guest-agent/src/file_io.rs). /home/user is a disk: its size
+    is the cap.
     """
 
     # --- Normal: sparse files don't consume quota ---
 
     async def test_sparse_truncate_succeeds(self, dual_scheduler: Scheduler) -> None:
-        """ftruncate() to huge apparent size succeeds on the home disk (metadata-only)."""
+        """ftruncate() to a huge apparent size succeeds and takes no block (metadata only): 50 GiB
+        on the home disk, 1 GiB on /tmp and /dev/shm (the quota counts real blocks only)."""
         code = """\
-import os
-open('/home/user/sparse', 'w').close()
-os.truncate('/home/user/sparse', 50 * 1024**3)  # 50GB apparent
-s = os.stat('/home/user/sparse')
-print(f'SIZE:{s.st_size}')
-print(f'BLOCKS:{s.st_blocks}')
+import errno, os
+for path, size in (('/home/user/sparse', 50 * 1024**3), ('/tmp/sparse', 1024**3), ('/dev/shm/sparse', 1024**3)):
+    try:
+        open(path, 'w').close()
+        os.truncate(path, size)
+        s = os.stat(path)
+        print(f'{path}:{s.st_size}:{s.st_blocks}')
+    except OSError as e:  # the other paths are still tried
+        print(f'{path}:{errno.errorcode[e.errno]}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "SIZE:53687091200\nBLOCKS:0\n"
-
-    async def test_sparse_on_tmp(self, dual_scheduler: Scheduler) -> None:
-        """Sparse files on /tmp also succeed (quota applies to real blocks only)."""
-        code = """\
-import os
-open('/tmp/sparse', 'w').close()
-os.truncate('/tmp/sparse', 1024**3)  # 1GB apparent
-print(f'SIZE:{os.stat("/tmp/sparse").st_size}')
-print(f'BLOCKS:{os.stat("/tmp/sparse").st_blocks}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "SIZE:1073741824\nBLOCKS:0\n"
-
-    async def test_sparse_on_dev_shm(self, dual_scheduler: Scheduler) -> None:
-        """Sparse files on /dev/shm also succeed."""
-        code = """\
-import os
-open('/dev/shm/sparse', 'w').close()
-os.truncate('/dev/shm/sparse', 1024**3)
-print(f'SIZE:{os.stat("/dev/shm/sparse").st_size}')
-print(f'BLOCKS:{os.stat("/dev/shm/sparse").st_blocks}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "SIZE:1073741824\nBLOCKS:0\n"
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            "/home/user/sparse:53687091200:0",
+            "/tmp/sparse:1073741824:0",
+            "/dev/shm/sparse:1073741824:0",
+        ]
 
     # --- Edge: real writes hit quota/size limit ---
 
     async def test_real_write_exceeding_limit_fails(self, dual_scheduler: Scheduler) -> None:
-        """Writing real data beyond the /dev/shm size limit produces ENOSPC or EDQUOT.
+        """Writing real data beyond the /dev/shm size fails with ENOSPC.
 
-        /dev/shm is 40% of MemTotal (~77MB at the default 192MB). Writing 300MB
-        of real data should fail. We don't check the exact error code because
-        it could be ENOSPC (size= limit) or EDQUOT (quota limit).
+        /dev/shm is 40% of MemTotal (about 68 MiB with the default 192 MB of VM memory):
+        300 MB of real data cannot fit. The per-UID quota has the same limit, and the kernel
+        checks the size before the quota (shmem_inode_acct_blocks), so the error is ENOSPC,
+        never EDQUOT.
         """
         code = """\
-import os, errno
+import errno
 # Write in 10MB chunks to /dev/shm until failure
 written = 0
 try:
@@ -1509,14 +1246,12 @@ try:
     print(f'NO_LIMIT:{written}')
 except OSError as e:
     print(f'BLOCKED:{written}')
-    print(f'ERRNO:{e.errno}')
-    # ENOSPC=28, EDQUOT=122
-    print(f'IS_DISK_ERROR:{e.errno in (28, 122)}')
+    print(errno.errorcode[e.errno])
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        # MB written before the limit (it follows the VM memory), and ENOSPC or EDQUOT
-        assert re.fullmatch(r"BLOCKED:\d+\nERRNO:\d+\nIS_DISK_ERROR:True\n", result.stdout), result.stdout
+        assert result.exit_code == 0, result.stderr
+        # MB written before the limit (it follows the VM memory), then the error
+        assert re.fullmatch(r"BLOCKED:\d+\nENOSPC\n", result.stdout), result.stdout
 
     # --- Weird: mix sparse and real ---
 
@@ -1553,7 +1288,7 @@ except OSError:
     # --- Out of bounds: VM doesn't crash ---
 
     async def test_quota_exhaustion_doesnt_crash_vm(self, dual_scheduler: Scheduler) -> None:
-        """Exhausting tmpfs quota doesn't crash the VM — exec still works after."""
+        """Filling /dev/shm to its size doesn't crash the VM — exec still works after."""
         async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Step 1: Fill /dev/shm until failure
             exhaust = """\
@@ -1599,165 +1334,57 @@ class TestSystemBinaryHardening:
     Blocks path hijack attacks where user code (UID 1000) replaces /bin/sh
     (a busybox symlink) with an arbitrary script, hijacking subsequent shebang
     (#!/bin/sh) execution within the same session. Primary protection is the
-    RO rootfs from tiny-init; the bind-mount adds nosuid as defense-in-depth.
+    RO rootfs from tiny-init; the guest agent's bind-mount adds nosuid as
+    defense-in-depth (a root from a disk snapshot is an overlay without nosuid).
 
-    Alpine 3.23+ uses usrmerge (/bin -> /usr/bin, /sbin -> /usr/sbin); mount(2)
-    resolves symlinks, so the bind-mount targets the resolved /usr/bin directory.
+    /bin and /sbin are directories of the image (no usrmerge symlinks): each is its
+    own mount.
 
     See: Microsoft Copilot Enterprise path hijack (Eye Security, April 2025).
     """
 
     # --- Normal: verify read-only mount flags ---
 
-    async def test_bin_mounted_readonly(self, dual_scheduler: Scheduler) -> None:
-        """/bin has 'ro' flag in /proc/mounts."""
-        code = """\
-with open('/proc/mounts') as f:
-    for line in f:
-        parts = line.split()
-        if len(parts) >= 4 and parts[1] == '/bin':
-            opts = parts[3].split(',')
-            print(f'RO:{"ro" in opts}')
-            break
-    else:
-        # usrmerge: /bin -> /usr/bin, check /usr instead
-        for line in open('/proc/mounts'):
-            parts = line.split()
-            if len(parts) >= 4 and parts[1] == '/usr':
-                opts = parts[3].split(',')
-                print(f'RO:{"ro" in opts}')
-                break
-        else:
-            print('NOT_FOUND')
-"""
+    async def test_bin_and_sbin_mounted_readonly(self, dual_scheduler: Scheduler) -> None:
+        """/bin and /sbin are each a read-only bind mount of the EROFS root, with nosuid and nodev
+        (as the root)."""
+        # Each path's line comes after the path: a failure names the path it is about
+        code = "print('/bin')\n" + _MOUNT_OPTIONS.format("/bin") + "print('/sbin')\n" + _MOUNT_OPTIONS.format("/sbin")
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "RO:True\n"
-
-    async def test_sbin_mounted_readonly(self, dual_scheduler: Scheduler) -> None:
-        """/sbin has 'ro' flag in /proc/mounts."""
-        code = """\
-with open('/proc/mounts') as f:
-    for line in f:
-        parts = line.split()
-        if len(parts) >= 4 and parts[1] == '/sbin':
-            opts = parts[3].split(',')
-            print(f'RO:{"ro" in opts}')
-            break
-    else:
-        # usrmerge: /sbin -> /usr/sbin, check /usr instead
-        for line in open('/proc/mounts'):
-            parts = line.split()
-            if len(parts) >= 4 and parts[1] == '/usr':
-                opts = parts[3].split(',')
-                print(f'RO:{"ro" in opts}')
-                break
-        else:
-            print('NOT_FOUND')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "RO:True\n"
+        assert result.exit_code == 0, result.stderr
+        options = "erofs ro,nosuid,nodev,noatime,user_xattr,acl,cache_strategy=readaround"
+        assert result.stdout.splitlines() == ["/bin", options, "/sbin", options]
 
     # --- Normal: write attempts blocked ---
 
-    async def test_cannot_replace_bin_sh(self, dual_scheduler: Scheduler) -> None:
-        """os.unlink('/bin/sh') is blocked with EROFS."""
+    async def test_writes_blocked(self, dual_scheduler: Scheduler) -> None:
+        """Each write to /bin or /sbin fails with EROFS: unlink of /bin/sh, a write open of
+        /bin/busybox, a new file in /bin or /sbin, a symlink in /bin. One VM tries each."""
         code = """\
-import os, errno
-try:
-    os.unlink('/bin/sh')
-    print('REMOVED')
-except OSError as e:
-    if e.errno == errno.EROFS:
-        print('BLOCKED:erofs')
-    elif e.errno == errno.EACCES:
-        print('BLOCKED:eacces')
-    else:
-        print(f'BLOCKED:errno_{e.errno}')
+import errno, os
+attempts = {
+    'unlink /bin/sh': lambda: os.unlink('/bin/sh'),
+    'open-wb /bin/busybox': lambda: open('/bin/busybox', 'wb').close(),
+    'create /bin/evil': lambda: open('/bin/evil', 'w').close(),
+    'create /sbin/evil': lambda: open('/sbin/evil', 'w').close(),
+    'symlink /bin/evil_link': lambda: os.symlink('/tmp/evil', '/bin/evil_link'),
+}
+for label, attempt in attempts.items():
+    try:
+        attempt()
+        print(f'{label}:DONE')
+    except OSError as e:
+        print(f'{label}:{errno.errorcode[e.errno]}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "BLOCKED:erofs\n"
-
-    async def test_cannot_overwrite_busybox(self, dual_scheduler: Scheduler) -> None:
-        """open('/bin/busybox', 'wb') is blocked."""
-        code = """\
-import errno
-try:
-    f = open('/bin/busybox', 'wb')
-    f.close()
-    print('OPENED')
-except OSError as e:
-    if e.errno == errno.EROFS:
-        print('BLOCKED:erofs')
-    elif e.errno == errno.EACCES:
-        print('BLOCKED:eacces')
-    else:
-        print(f'BLOCKED:errno_{e.errno}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "BLOCKED:erofs\n"
-
-    async def test_cannot_create_file_in_bin(self, dual_scheduler: Scheduler) -> None:
-        """File creation in /bin is blocked."""
-        code = """\
-import errno
-try:
-    with open('/bin/evil', 'w') as f:
-        f.write('#!/bin/sh\\necho pwned')
-    print('CREATED')
-except OSError as e:
-    if e.errno == errno.EROFS:
-        print('BLOCKED:erofs')
-    elif e.errno == errno.EACCES:
-        print('BLOCKED:eacces')
-    else:
-        print(f'BLOCKED:errno_{e.errno}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "BLOCKED:erofs\n"
-
-    async def test_cannot_create_file_in_sbin(self, dual_scheduler: Scheduler) -> None:
-        """File creation in /sbin is blocked."""
-        code = """\
-import errno
-try:
-    with open('/sbin/evil', 'w') as f:
-        f.write('#!/bin/sh\\necho pwned')
-    print('CREATED')
-except OSError as e:
-    if e.errno == errno.EROFS:
-        print('BLOCKED:erofs')
-    elif e.errno == errno.EACCES:
-        print('BLOCKED:eacces')
-    else:
-        print(f'BLOCKED:errno_{e.errno}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "BLOCKED:erofs\n"
-
-    async def test_cannot_create_symlink_in_bin(self, dual_scheduler: Scheduler) -> None:
-        """Symlink creation in /bin is blocked."""
-        code = """\
-import os, errno
-try:
-    os.symlink('/tmp/evil', '/bin/evil_link')
-    print('CREATED')
-except OSError as e:
-    if e.errno == errno.EROFS:
-        print('BLOCKED:erofs')
-    elif e.errno == errno.EACCES:
-        print('BLOCKED:eacces')
-    else:
-        print(f'BLOCKED:errno_{e.errno}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "BLOCKED:erofs\n"
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            "unlink /bin/sh:EROFS",
+            "open-wb /bin/busybox:EROFS",
+            "create /bin/evil:EROFS",
+            "create /sbin/evil:EROFS",
+            "symlink /bin/evil_link:EROFS",
+        ]
 
     # --- Normal: system binaries still functional ---
 
@@ -1777,7 +1404,7 @@ print(f'EXIT:{r.returncode}')
         assert result.stdout == "OUTPUT:OK\nEXIT:0\n"
 
     async def test_busybox_applets_still_work(self, dual_scheduler: Scheduler) -> None:
-        """Busybox applets (ls, cat) still work from /bin."""
+        """ls and cat (GNU coreutils) still run from /bin."""
         code = """\
 import subprocess
 
@@ -1807,7 +1434,7 @@ print(f'CAT_EXIT:{r.returncode}')
         ],
     )
     async def test_gnu_tool_installed(self, dual_scheduler: Scheduler, binary: str, version_marker: str) -> None:
-        """GNU coreutils variant is installed, not busybox."""
+        """The GNU version of the tool is installed, not the BusyBox applet."""
         code = f"""\
 import subprocess
 r = subprocess.run(["{binary}", "--version"], capture_output=True, text=True, timeout=5)
@@ -1820,47 +1447,24 @@ print(f'GNU:{{{version_marker!r} in r.stdout}}')
 
     # --- Weird: mount bypass attempts ---
 
-    async def test_remount_bin_rw_blocked(self, dual_scheduler: Scheduler) -> None:
-        """mount -o remount,rw /bin requires CAP_SYS_ADMIN."""
+    async def test_mounts_blocked(self, dual_scheduler: Scheduler) -> None:
+        """A rw remount of /bin or /sbin and a tmpfs over /bin each require CAP_SYS_ADMIN: the
+        command exits 1."""
         code = """\
 import subprocess
-r = subprocess.run(
-    ["mount", "-o", "remount,rw", "/bin"],
-    capture_output=True, text=True, timeout=5,
-)
-print(f"EXIT:{r.returncode}")
+for cmd in ('mount -o remount,rw /bin', 'mount -o remount,rw /sbin', 'mount -t tmpfs none /bin'):
+    try:
+        print(f'{cmd}:{subprocess.run(cmd.split(), capture_output=True, timeout=5).returncode}')
+    except subprocess.TimeoutExpired:  # the other commands are still tried
+        print(f'{cmd}:TIMEOUT')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "EXIT:1\n"
-
-    async def test_remount_sbin_rw_blocked(self, dual_scheduler: Scheduler) -> None:
-        """mount -o remount,rw /sbin requires CAP_SYS_ADMIN."""
-        code = """\
-import subprocess
-r = subprocess.run(
-    ["mount", "-o", "remount,rw", "/sbin"],
-    capture_output=True, text=True, timeout=5,
-)
-print(f"EXIT:{r.returncode}")
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "EXIT:1\n"
-
-    async def test_bind_mount_shadow_bin_blocked(self, dual_scheduler: Scheduler) -> None:
-        """Bind tmpfs over /bin requires CAP_SYS_ADMIN."""
-        code = """\
-import subprocess
-r = subprocess.run(
-    ["mount", "-t", "tmpfs", "none", "/bin"],
-    capture_output=True, text=True, timeout=5,
-)
-print(f"EXIT:{r.returncode}")
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "EXIT:1\n"
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            "mount -o remount,rw /bin:1",
+            "mount -o remount,rw /sbin:1",
+            "mount -t tmpfs none /bin:1",
+        ]
 
 
 # =============================================================================
@@ -1887,7 +1491,7 @@ class TestThreadBombMitigation:
 
     Defense-in-depth: RLIMIT_NPROC=1024 (per-UID, set via prlimit64 from the
     guest-agent after REPL spawn) is the primary defense. kernel.threads-max=1200
-    (system-wide, set in tiny-init) is the secondary defense.
+    (system-wide, a sysctl of the guest agent) is the secondary defense.
     """
 
     # --- Normal: verify limits are applied ---
@@ -1956,7 +1560,7 @@ import resource
 try:
     resource.setrlimit(resource.RLIMIT_NPROC, (9999, 9999))
     print('RAISED:True')
-except (ValueError, PermissionError, OSError) as e:
+except (ValueError, OSError) as e:
     print(f'RAISED:False:{type(e).__name__}')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)

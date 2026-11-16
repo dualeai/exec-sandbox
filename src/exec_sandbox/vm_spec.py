@@ -10,6 +10,7 @@ part of it.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -94,8 +95,8 @@ class VmSpec(BaseModel):
     def _check_host_ports(cls, ports: tuple[PortMapping, ...]) -> tuple[PortMapping, ...]:
         # gvproxy takes the forwards as one JSON object keyed by host port and protocol: a
         # host port given twice would keep one forward and drop the other with no error
-        given = [(p.external, p.protocol) for p in ports if p.external is not None]
-        twice = sorted({key for key in given if given.count(key) > 1})
+        given = Counter((p.external, p.protocol) for p in ports if p.external is not None)
+        twice = sorted(key for key, count in given.items() if count > 1)
         if twice:
             raise ValueError(f"Host port given twice: {', '.join(f'{port}/{protocol}' for port, protocol in twice)}")
         return ports

@@ -16,16 +16,19 @@ import pytest
 from exec_sandbox import Scheduler, SchedulerConfig, constants
 from exec_sandbox.models import Language
 from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import (
+    run_once,
+    run_timed,
+    skip_unless_fast_virt,
+    skip_unless_hwaccel,
+    skip_unless_macos_arm64,
+    wait_l1_saves,
+)
 
 if TYPE_CHECKING:
-    from exec_sandbox.models import ExecutionResult
     from exec_sandbox.vm_manager import VmManager
 
-from tests.conftest import run_once, run_timed
-
-from .conftest import skip_unless_fast_virt, skip_unless_hwaccel, skip_unless_macos_arm64
-
-# Memory-intensive tests that push VMs to near-maximum utilization (250MB in 256MB VM)
+# Memory-intensive tests that push VMs to high utilization (180 MB in each of 3 concurrent 256 MB VMs)
 # require fast memory operations. On x64 CI runners with nested virtualization
 # (GitHub Actions on Azure), these operations are 50-100x slower due to missing
 # TSC_DEADLINE timer support, causing timeouts and VM crashes. These tests are skipped
@@ -299,7 +302,6 @@ class TestZramMemLimit:
         return SchedulerConfig(
             images_dir=images_dir,
             auto_download_assets=False,
-            warm_pool_size=0,
             default_timeout_seconds=60,
             disk_snapshot_cache_dir=tmp_path / "l2",
             memory_snapshot_cache_dir=tmp_path / "l1",
@@ -335,11 +337,9 @@ class TestZramMemLimit:
         """A real L1-restored execution under incompressible pressure returns 137."""
         config = self._pressure_config(images_dir, tmp_path)
         async with Scheduler(config) as scheduler:
-            # First run cold-boots and schedules a background L1 save; retry
-            # through the public API until the save has landed and a run
-            # restores from L1 (no reach into private snapshot-manager state).
-            restored = None
-            for _ in range(10):
+            # The first run cold-boots and saves the L1 template in the background: the second
+            # run restores from it
+            for l1_hit in (False, True):
                 result, startup, _ = await asyncio.wait_for(
                     run_timed(
                         scheduler,
@@ -350,12 +350,8 @@ class TestZramMemLimit:
                     timeout=30,
                 )
                 assert (result.exit_code, result.stdout) == (137, "WORKLOAD_STARTED\n"), result.stderr
-                assert startup.warm_pool_hit is False
-                if startup.l1_cache_hit:
-                    restored = result
-                    break
-                await asyncio.sleep(1)
-            assert restored is not None, "no run restored from L1 within retry budget"
+                assert (startup.warm_pool_hit, startup.l1_cache_hit) == (False, l1_hit)
+                await wait_l1_saves(scheduler)
 
 
 # ============================================================================
@@ -411,9 +407,8 @@ print(f'PASS: 180MB allocated, swap_used={swap_used}MB')
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # All should succeed
-            for i, r in enumerate(results):
-                if isinstance(r, BaseException):
-                    pytest.fail(f"VM {i + 1} failed with exception: {r}")
-                result: ExecutionResult = r
+            for i, result in enumerate(results):
+                if isinstance(result, BaseException):
+                    pytest.fail(f"VM {i + 1} failed with exception: {result}")
                 assert result.exit_code == 0, f"VM {i + 1} exit_code={result.exit_code}, stderr={result.stderr}"
                 assert re.fullmatch(r"PASS: 180MB allocated, swap_used=\d+MB\n", result.stdout), result.stdout

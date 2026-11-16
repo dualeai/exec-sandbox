@@ -58,8 +58,21 @@ def test_json_round_trip() -> None:
     """A broker in another language reads the JSON form: sets become sorted lists (the same
     facts always give the same text), None stays null."""
     text = _FACTS.model_dump_json()
-    assert '"cpu":null' in text
-    assert '"machine_type":["virt","virt-11.10"]' in text
+    assert json.loads(text) == {
+        "values": {
+            "arch": "aarch64",
+            "accelerator": "hvf",
+            "cpu_model": "host",
+            "counter_hz": "24000000",
+            "qemu_version": "11.10.0",
+            "machine_type": ["virt", "virt-11.10"],
+            "base_image": ["a" * 64],
+            "packages_image": [],
+            "memory_mb": "4096",
+            "cpu": None,
+        },
+        "key_ids": ["b" * 64],
+    }
     assert WorkerFacts.model_validate_json(text) == _FACTS
     many = WorkerFacts(values={RouteKey.BASE_IMAGE: frozenset(c * 64 for c in "fedcba")}, key_ids=())
     assert json.loads(many.model_dump_json())["values"]["base_image"] == sorted(c * 64 for c in "abcdef")

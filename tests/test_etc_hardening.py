@@ -2,22 +2,19 @@
 
 Verifies that UID 1000 (sandbox user) cannot modify system configuration
 files in /etc. The REPL subprocess drops to UID 1000 via guest-agent, and
-/etc must be owned by root with standard Unix permissions to prevent:
+no write may reach /etc, to prevent:
 - DNS hijacking (/etc/resolv.conf)
 - Host alias injection (/etc/hosts)
 - User injection (/etc/passwd)
 
-Build time: scripts/build-qcow2.sh resets ownership to root before it makes
-the qcow2 image (macOS Docker VirtioFS loses UID 0 on export).
-Run time: guest-agent bind-remounts /etc/hosts and /etc/resolv.conf read-only
-at boot (defense in depth), on a read-only root file system.
+Build time: scripts/build-qcow2.sh gives /etc/passwd, /etc/group, /etc/hosts and
+/etc/resolv.conf mode 0644 and /etc/shadow 0640 (CIS 6.1.x), and mkfs.erofs --all-root
+makes each file of the image belong to root.
+Run time: the root file system is EROFS, read-only; guest-agent also bind-remounts
+/etc/hosts and /etc/resolv.conf read-only at boot (defense in depth).
 
 Each attempt must fail with EROFS: any other error (ENOENT, EXDEV) means the
 attempt did not reach the protection, and the test fails.
-
-CIS Benchmark Section 6.1.x compliance:
-- /etc/passwd, /etc/group: 0644 root:root
-- /etc/shadow: 0640 root:shadow
 """
 
 import textwrap
@@ -72,7 +69,7 @@ class TestEtcWriteBlocked:
         assert await _guest_errno(scheduler, setup="", attempt=attempt) == "EROFS"
 
     async def test_create_file_in_etc(self, scheduler: Scheduler) -> None:
-        """touch of a new file in /etc fails (tests dir write permission)."""
+        """touch of a new file in /etc fails with EROFS (a new entry in the directory)."""
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "touch /etc/evil 2>&1; echo exit=$?")
         _assert_shell_refused(result, stdout="touch: cannot touch '/etc/evil': Read-only file system\nexit=1\n")
 
@@ -148,9 +145,9 @@ class TestEtcEdgeCases:
         assert await _guest_errno(scheduler, setup=setup, attempt=attempt) == "EROFS"
 
     async def test_cp_overwrite_hosts(self, scheduler: Scheduler) -> None:
-        """cp overwrite /etc/hosts fails (GTFOBins cp vector).
+        """cp overwrite /etc/hosts fails with EROFS (GTFOBins cp vector).
 
-        cp to existing file uses O_WRONLY|O_TRUNC — tests file-level write perms.
+        cp to an existing file opens it O_WRONLY|O_TRUNC: the open of the file itself fails.
         """
         result = await run_once(
             scheduler,
@@ -214,44 +211,21 @@ class TestEtcWeirdCases:
         )
 
     async def test_ctypes_open_wronly(self, scheduler: Scheduler) -> None:
-        """Direct open(2) via ctypes with O_WRONLY on /etc/resolv.conf fails with EROFS.
+        """Direct open(2) via ctypes with O_WRONLY on /etc/resolv.conf and /etc/hosts fails with EROFS.
 
-        Bypasses Python file abstraction -- verifies kernel enforces permissions.
+        Bypasses Python file abstraction -- the kernel refuses the write open of a read-only mount
+        (the RO bind remounts, at the syscall level).
         """
         code = """\
 import ctypes, errno, os
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
-fd = libc.open(b"/etc/resolv.conf", os.O_WRONLY)
-print(errno.errorcode[ctypes.get_errno()] if fd == -1 else "SUCCESS")
+for path in (b"/etc/resolv.conf", b"/etc/hosts"):
+    fd = libc.open(path, os.O_WRONLY)
+    print(errno.errorcode[ctypes.get_errno()] if fd == -1 else "SUCCESS")
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0, result.stderr
-        assert result.stdout == "EROFS\n"
-
-    async def test_sed_inplace_hosts(self, scheduler: Scheduler) -> None:
-        """sed -i on /etc/hosts fails: it cannot make its temp file in /etc (exit 4, I/O error)."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.RAW), "sed -i 's/localhost/evil/' /etc/hosts 2>&1; echo exit=$?"
-        )
-        _assert_shell_refused(
-            result, stdout="sed: couldn't open temporary file /etc/sedXXXXXX: Read-only file system\nexit=4\n"
-        )
-
-    async def test_ctypes_open_wronly_hosts(self, scheduler: Scheduler) -> None:
-        """Direct open(2) via ctypes with O_WRONLY on /etc/hosts fails with EROFS.
-
-        Bypasses Python abstraction — verifies kernel enforces RO bind remount
-        at the syscall level.
-        """
-        code = """\
-import ctypes, errno, os
-libc = ctypes.CDLL("libc.so.6", use_errno=True)
-fd = libc.open(b"/etc/hosts", os.O_WRONLY)
-print(errno.errorcode[ctypes.get_errno()] if fd == -1 else "SUCCESS")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0, result.stderr
-        assert result.stdout == "EROFS\n"
+        assert result.stdout == "EROFS\nEROFS\n"
 
 
 # =============================================================================

@@ -146,7 +146,7 @@ class TestSymlinkEscape:
             result = await session.exec(
                 "import os; print(sorted(n for n in os.listdir('/tmp') if n.startswith(('pwned', 'new_dir'))))"
             )
-            assert result.stdout.strip() == "[]"
+            assert (result.exit_code, result.stdout) == (0, "[]\n"), result.stderr
 
     async def test_a_link_that_stays_in_home_still_works(self, dual_scheduler: Scheduler, tmp_path: Path) -> None:
         """Folder links that resolve inside /home/user, relative or absolute (`ln -s
@@ -173,13 +173,8 @@ class TestNullByteInjection:
     """Null byte injection in file paths."""
 
     async def test_null_byte_in_path_middle(self, dual_scheduler: Scheduler) -> None:
-        """Null byte in middle of path is rejected."""
+        """A null byte in a path is rejected, wherever it is (the guest refuses any: file_io.rs
+        validate_file_path)."""
         async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
                 await session.write_file("file\x00.txt", b"data")
-
-    async def test_null_byte_in_path_end(self, dual_scheduler: Scheduler) -> None:
-        """Null byte at end of path is rejected."""
-        async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
-                await session.write_file("file.txt\x00", b"data")

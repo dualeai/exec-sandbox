@@ -77,17 +77,72 @@ def _first_code(cls: type[SandboxError]) -> ErrorCode:
 class TestCodes:
     """Each code belongs to exactly one class, and each class has one action."""
 
-    def test_codes_partition_error_code(self) -> None:
-        seen: set[ErrorCode] = set()
-        for cls in ACTION_CLASSES:
-            assert cls.codes, cls.__name__
-            assert not seen & cls.codes, f"{cls.__name__} shares codes"
-            seen |= cls.codes
-        assert seen == set(ErrorCode)
+    def test_each_code_has_its_class(self) -> None:
+        """The class of each code, written out (the "Error codes" table of the README): a
+        caller picks its next step from the class, so a code that moves to another class
+        changes the contract."""
+        class_of = {code: cls for cls in ACTION_CLASSES for code in cls.codes}
+        assert sum(len(cls.codes) for cls in ACTION_CLASSES) == len(class_of)  # no code in two classes
+        assert class_of.keys() == set(ErrorCode)  # no code without a class
+        assert class_of == {
+            ErrorCode.VM_BOOT_TIMEOUT: TransientError,
+            ErrorCode.QEMU_CRASHED: TransientError,
+            ErrorCode.OVERLAY_FAILED: TransientError,
+            ErrorCode.GVPROXY_FAILED: TransientError,
+            ErrorCode.CAPACITY: TransientError,
+            ErrorCode.GUEST_UNAVAILABLE: TransientError,
+            ErrorCode.GUEST_SILENT_AFTER_RESTORE: TransientError,
+            ErrorCode.LOCAL_DISK: TransientError,
+            ErrorCode.PACKAGE_DOWNLOAD: TransientError,
+            ErrorCode.MIGRATION_FAILED: TransientError,
+            ErrorCode.ASSET_DOWNLOAD: TransientError,
+            ErrorCode.INSTANCE_STORE_UNAVAILABLE: TransientError,
+            ErrorCode.GUEST_OUTCOME_UNKNOWN: OutcomeUnknownError,
+            ErrorCode.INSTANCE_CONFLICT: OutcomeUnknownError,
+            ErrorCode.INSTANCE_SAVE_OUTCOME_UNKNOWN: OutcomeUnknownError,
+            ErrorCode.SESSION_CLOSED: SessionClosedError,
+            ErrorCode.CODE_INVALID: InvalidInputError,
+            ErrorCode.ENV_VAR_INVALID: InvalidInputError,
+            ErrorCode.OUTPUT_LIMIT: InvalidInputError,
+            ErrorCode.PATH_INVALID: InvalidInputError,
+            ErrorCode.GUEST_IO: InvalidInputError,
+            ErrorCode.ARGUMENT_INVALID: InvalidInputError,
+            ErrorCode.PACKAGE_NOT_ALLOWED: InvalidInputError,
+            ErrorCode.PACKAGE_INSTALL_FAILED: InvalidInputError,
+            ErrorCode.INSTANCE_INVALID_ID: InvalidInputError,
+            ErrorCode.SCHEDULER_STATE: InvalidInputError,
+            ErrorCode.HOST_DEPENDENCY: ConfigError,
+            ErrorCode.EXTRA_MISSING: ConfigError,
+            ErrorCode.SETTING_INVALID: ConfigError,
+            ErrorCode.ASSET_NOT_FOUND: ConfigError,
+            ErrorCode.IMAGE_DAMAGED: ConfigError,
+            ErrorCode.PLATFORM_UNSUPPORTED: ConfigError,
+            ErrorCode.MIGRATION_UNSUPPORTED: ConfigError,
+            ErrorCode.INSTANCE_CONFIG: ConfigError,
+            ErrorCode.INSTANCE_KEY_MISSING: ConfigError,
+            ErrorCode.INSTANCE_HOST_MISMATCH: RouteError,
+            ErrorCode.CAPACITY_NEVER_FITS: RouteError,
+            ErrorCode.MIGRATION_REJECTED: RouteError,
+            ErrorCode.INSTANCE_NOT_FOUND: InstanceGoneError,
+            ErrorCode.INSTANCE_EXPIRED: InstanceGoneError,
+            ErrorCode.INSTANCE_INTEGRITY: InstanceGoneError,
+            ErrorCode.CLEANUP_UNCONFIRMED: InternalError,
+            ErrorCode.GUEST_PROTOCOL: InternalError,
+            ErrorCode.INTERNAL: InternalError,
+        }
 
-    def test_each_action_belongs_to_one_class(self) -> None:
-        actions = [cls.action for cls in ACTION_CLASSES]
-        assert sorted(actions) == sorted(ErrorAction)
+    def test_each_class_has_its_action(self) -> None:
+        """The action of each class, written out: one class per action."""
+        assert {cls: cls.action for cls in ACTION_CLASSES} == {
+            TransientError: ErrorAction.RETRY,
+            OutcomeUnknownError: ErrorAction.VERIFY,
+            SessionClosedError: ErrorAction.RESTART,
+            InvalidInputError: ErrorAction.FIX_INPUT,
+            ConfigError: ErrorAction.FIX_CONFIG,
+            RouteError: ErrorAction.ROUTE,
+            InstanceGoneError: ErrorAction.RECREATE,
+            InternalError: ErrorAction.REPORT,
+        }
 
     def test_values_equal_names(self) -> None:
         assert all(member.value == member.name for member in ErrorCode)
@@ -155,15 +210,8 @@ class TestPickle:
         assert type(restored) is type(error)
         assert restored.args == error.args
         assert str(restored) == str(error)
-        assert vars(restored) == vars(error)
+        assert vars(restored) == vars(error)  # RouteError: required and found too
         assert restored.__notes__ == error.__notes__
-
-    def test_route_error_keeps_required_and_found(self) -> None:
-        error = _make(RouteError, ErrorCode.INSTANCE_HOST_MISMATCH)
-        assert isinstance(error, RouteError)
-        restored = pickle.loads(pickle.dumps(error))  # noqa: S301 - bytes produced by this test
-        assert restored.required == {"arch": "aarch64"}
-        assert restored.found == {"arch": "x86_64"}
 
 
 class TestHelpers:
@@ -345,20 +393,15 @@ class TestInternalClasses:
         assert error.context == {"socket": "/run/qmp.sock", "expected_uid": 501, "actual_uid": 0}
         assert given == {"socket": "/run/qmp.sock"}
 
-    def test_not_exported(self) -> None:
-        assert "CommunicationError" not in exec_sandbox.__all__
-        assert "SocketAuthError" not in exec_sandbox.__all__
-
 
 class TestExports:
     """The package exports exactly the 15 error names (RouteKey, RouteRule and ROUTE_ANY included)."""
 
     def test_all_holds_exactly_the_error_names(self) -> None:
+        """Each name of __all__ that comes from exceptions is the module's own object, and these
+        are the 15 public names: the transport errors (CommunicationError, SocketAuthError) are
+        not among them."""
         from_exceptions = {
             name for name in exec_sandbox.__all__ if getattr(exceptions, name, None) is getattr(exec_sandbox, name)
         }
         assert from_exceptions == PUBLIC_ERROR_NAMES
-
-    def test_names_are_the_module_objects(self) -> None:
-        for name in PUBLIC_ERROR_NAMES:
-            assert getattr(exec_sandbox, name) is getattr(exceptions, name)

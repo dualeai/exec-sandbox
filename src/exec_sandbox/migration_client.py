@@ -31,12 +31,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
+import logging
 import signal
-from typing import TYPE_CHECKING, Any, Final, Self
+from typing import TYPE_CHECKING, Any, Final, Self, cast
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_cancellation_safe
 from exec_sandbox.exceptions import (
     CommunicationError,
@@ -55,7 +54,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from pathlib import Path
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _CONNECT_TIMEOUT_SECONDS = 5.0
 _QMP_TIMEOUT = constants.MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS
@@ -186,8 +185,8 @@ class MigrationClient:
         self.qemu_closed = False
         """QEMU closed the QMP connection (EOF or a reset), as close() saw it: QEMU ends."""
 
-    async def connect(self, *, timeout: float) -> None:
-        """Connect to QMP socket and complete handshake.
+    async def connect(self) -> None:
+        """Connect to QMP socket and complete handshake (each step within _CONNECT_TIMEOUT_SECONDS).
 
         Raises:
             TransientError: MIGRATION_FAILED: connection, peer authentication or handshake failed
@@ -195,12 +194,15 @@ class MigrationClient:
         qmp: QmpClient | None = None
         try:
             reader, writer = await connect_and_verify(
-                str(self._qmp_socket), self._expected_uid, timeout=timeout, buffer_limit=QMP_BUFFER_LIMIT
+                str(self._qmp_socket),
+                self._expected_uid,
+                timeout=_CONNECT_TIMEOUT_SECONDS,
+                buffer_limit=QMP_BUFFER_LIMIT,
             )
             qmp = QmpClient(
                 reader, writer, error_factory=lambda message: _failed(message, context=None), id_prefix="migration"
             )
-            await qmp.start(timeout=timeout)
+            await qmp.start(timeout=_CONNECT_TIMEOUT_SECONDS)
         except BaseException as error:  # Every failed handshake owns socket cleanup.
             # Runs to its end; a cancel that comes meanwhile is raised after it (it wins
             # over the handshake error)
@@ -209,7 +211,8 @@ class MigrationClient:
             if isinstance(error, asyncio.CancelledError | SandboxError):
                 raise
             # CommunicationError: SocketAuthError, internal; the guest channel wraps it the same way.
-            if isinstance(error, OSError | TimeoutError | json.JSONDecodeError | CommunicationError):
+            # ValueError: a line that is not JSON (parse_qmp_line) or over QMP_BUFFER_LIMIT
+            if isinstance(error, OSError | TimeoutError | ValueError | CommunicationError):
                 raise _failed(f"QMP connection failed: {error}", context=None) from error
             raise
         self._qmp = qmp
@@ -234,20 +237,23 @@ class MigrationClient:
 
         Raises:
             TransientError: MIGRATION_FAILED: not connected, the connection failed (reset,
-                broken pipe), no response within `timeout`, a line that is not JSON, EOF, or
-                too many skipped messages
+                broken pipe), no response within `timeout`, a line that is not JSON (also not
+                UTF-8, nested too deep) or over QMP_BUFFER_LIMIT, EOF, or too many skipped
+                messages
         """
         if self._qmp is None:
             raise _failed("Not connected to QMP", context=None)
 
-        # Tag each command with a unique id and match it on the response. The
+        # QmpClient tags each command with a unique id and matches the response by it. The
         # save path interleaves stop/migrate/query-migrate where a shifted
         # response is corrupting, not benign: id-matching discards async events
         # AND any stale reply from a prior timed-out command.
         logger.debug("QMP command: %s args=%s", command, arguments)
         try:
             return await self._qmp.execute(command, arguments=arguments, timeout=timeout, on_event=None)
-        except (OSError, json.JSONDecodeError) as e:  # OSError: TimeoutError, a reset or broken pipe
+        # OSError: TimeoutError, a reset or broken pipe; ValueError: a line that is not JSON
+        # (parse_qmp_line) or over QMP_BUFFER_LIMIT (StreamReader.readline)
+        except (OSError, ValueError) as e:
             raise _failed(f"QMP {command} failed: {e!r}", context=None) from e
 
     async def _set_capabilities(
@@ -260,8 +266,8 @@ class MigrationClient:
 
         mapped-ram maps RAM pages to fixed offsets in the file (seekable),
         multifd enables multi-threaded transfer. x-ignore-shared is always sent
-        with an explicit state: on for templates (QEMU skips RAM pages backed by
-        the shared memory-backend-file and saves only device state), off
+        with an explicit state: on for templates (QEMU skips the RAM backed by the
+        shared memory-backend-file: it saves device state and the other RAM blocks), off
         otherwise, so a capability left on by an earlier command cannot leak in.
         Ref: https://www.qemu.org/docs/master/system/vm-templating.html
 
@@ -371,10 +377,11 @@ class MigrationClient:
         `cont` succeeded). Keep the VM only then; replace it after any other
         failed save.
 
-        When use_template=True, x-ignore-shared is enabled: QEMU saves only
-        device state (CPU registers, virtio rings, etc.), skipping RAM pages
-        that are backed by shared memory-backend-file. The resulting vmstate
-        is small (~100KB-1MB) instead of the full guest memory dump.
+        When use_template=True, x-ignore-shared is enabled: QEMU skips the RAM
+        backed by the shared memory-backend-file and saves device state (CPU
+        registers, virtio rings, etc.) and the other RAM blocks (on aarch64 the
+        flash and ACPI tables). The resulting vmstate holds ~3 MB of data on
+        aarch64, ~50 KB on x86_64, instead of the full guest memory dump.
 
         Raises:
             ConfigError: MIGRATION_UNSUPPORTED: QEMU below the floor or capability refused
@@ -531,7 +538,11 @@ class MigrationClient:
                     if "error" in resp:
                         raise _failed(f"query-migrate failed: {resp['error']}", context=None)
 
-                    status = resp.get("return", {}).get("status", "")
+                    info = resp.get("return")
+                    if not isinstance(info, dict):  # a broken QEMU: no status to wait for
+                        raise _failed(f"query-migrate answer is not an object: {info!r:.200}", context=None)
+                    info = cast("dict[str, Any]", info)
+                    status = info.get("status", "")
                     if status == "completed":
                         return
                     # "failing" (QEMU 11.0+): an error occurred and cleanup is underway;
@@ -539,7 +550,7 @@ class MigrationClient:
                     # here so a mid-stream failure surfaces immediately instead of burning
                     # another poll interval waiting for the "failed" transition.
                     if status in ("failed", "cancelled", "failing"):
-                        error_desc = resp.get("return", {}).get("error-desc", "unknown")
+                        error_desc = info.get("error-desc", "unknown")
                         raise failure(f"Migration {status}: {error_desc}")
 
                     await asyncio.sleep(delay)
@@ -550,7 +561,7 @@ class MigrationClient:
 
     async def __aenter__(self) -> Self:
         """Enter async context manager, connecting to QMP."""
-        await self.connect(timeout=_CONNECT_TIMEOUT_SECONDS)
+        await self.connect()
         return self
 
     async def __aexit__(

@@ -135,7 +135,7 @@ class TestLocalLookup:
         folders.put(tmp_path / "   ", HOST_GVPROXY)
         expected = folders.put(folders.cache, HOST_GVPROXY)
 
-        assert await get_gvproxy_path(override=None) == expected
+        assert await get_gvproxy_path(override=None, arch=HOST_ARCH) == expected
 
     async def test_symlink_is_followed(self, folders: Folders) -> None:
         """A symlink to a file counts as the file; the path of the link is returned."""
@@ -143,7 +143,7 @@ class TestLocalLookup:
         folders.env.mkdir()
         (folders.env / HOST_GVPROXY).symlink_to(real)
 
-        assert await get_gvproxy_path(override=None) == folders.env / HOST_GVPROXY
+        assert await get_gvproxy_path(override=None, arch=HOST_ARCH) == folders.env / HOST_GVPROXY
 
     async def test_folder_path_with_spaces(
         self, folders: Folders, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -152,7 +152,7 @@ class TestLocalLookup:
         monkeypatch.setenv("EXEC_SANDBOX_IMAGES_DIR", str(env))
         expected = folders.put(env, HOST_GVPROXY)
 
-        assert await get_gvproxy_path(override=None) == expected
+        assert await get_gvproxy_path(override=None, arch=HOST_ARCH) == expected
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every folder")
     async def test_folder_this_process_cannot_read_is_skipped(self, folders: Folders) -> None:
@@ -162,7 +162,7 @@ class TestLocalLookup:
         expected = folders.put(folders.cache, HOST_GVPROXY)
         folders.env.chmod(0)
         try:
-            assert await get_gvproxy_path(override=None) == expected
+            assert await get_gvproxy_path(override=None, arch=HOST_ARCH) == expected
         finally:
             folders.env.chmod(0o700)
 
@@ -188,10 +188,10 @@ class TestLocalLookup:
             folders.put(folders.cache, name)
 
         with patch("exec_sandbox.assets.os.path.exists", side_effect=exists):
-            assert await get_gvproxy_path(override=folders.override) == folders.override / HOST_GVPROXY
+            assert await get_gvproxy_path(override=folders.override, arch=HOST_ARCH) == folders.override / HOST_GVPROXY
             assert await ensure_assets(override=folders.override, download=False) == folders.override
             await ensure_base_image(Language.PYTHON, images_dir=folders.override)
-            assert (await ensure_assets_available())[0] == folders.cache  # the cache lookups
+            assert await ensure_assets_available() == folders.cache  # the cache lookups
 
         assert threads
         assert loop_thread not in threads
@@ -268,7 +268,7 @@ class TestEnsureAssets:
 
         assert await ensure_assets(override=folders.override, download=download) == folders.override
 
-        assert await get_gvproxy_path(override=folders.override) == folders.cache / HOST_GVPROXY
+        assert await get_gvproxy_path(override=folders.override, arch=HOST_ARCH) == folders.cache / HOST_GVPROXY
         assert os.access(folders.cache / HOST_GVPROXY, os.X_OK) is download
 
     async def test_the_images_folder_gvproxy_comes_first(self, folders: Folders) -> None:
@@ -299,7 +299,7 @@ class TestEnsureAssets:
         self._put_boot_files(folders, folders.override)
 
         assert await ensure_assets(override=folders.override, download=True) == folders.override
-        assert await get_gvproxy_path(override=folders.override) is None
+        assert await get_gvproxy_path(override=folders.override, arch=HOST_ARCH) is None
 
     async def test_a_download_puts_both_boot_files_in_the_cache(self, folders: Folders) -> None:
         """No folder holds both: images/dist holds only the initramfs, the cache only a kernel.
@@ -339,20 +339,22 @@ class TestEnsureAssets:
 
 
 class TestEnsureAssetsAvailable:
-    """ensure_assets_available: the download cache with both boot files, and the
-    gvproxy-wrapper path."""
+    """ensure_assets_available: the download cache with both boot files, and gvproxy-wrapper
+    found or downloaded."""
 
     async def test_boot_files_come_from_the_cache_gvproxy_from_the_search_folders(self, folders: Folders) -> None:
         """EXEC_SANDBOX_IMAGES_DIR holds a kernel and gvproxy-wrapper: the boot files are still
         downloaded into the cache (an images folder must hold both); gvproxy-wrapper is
-        found in the env folder, where a VM start also looks."""
+        found in the env folder, where a VM start also looks, and made executable there (the
+        release has none: offline, a download would fail)."""
         for name in (f"vmlinuz-{HOST_ARCH}", HOST_GVPROXY):
             folders.put(folders.env, name)
         folders.release(f"vmlinuz-{HOST_ARCH}.zst", b"kernel")
         folders.release(f"initramfs-{HOST_ARCH}.zst", b"initramfs")
 
-        assert await ensure_assets_available() == (folders.cache, folders.env / HOST_GVPROXY)
+        assert await ensure_assets_available() == folders.cache
         assert (folders.cache / f"initramfs-{HOST_ARCH}").read_bytes() == b"initramfs"
+        assert os.access(folders.env / HOST_GVPROXY, os.X_OK)
 
     async def test_a_failed_fetch_ends_the_others_before_the_call_raises(self, folders: Folders) -> None:
         """The release has no kernel (ASSET_NOT_FOUND at once) while the initramfs download
@@ -537,24 +539,28 @@ class TestFetchGvproxy:
         for name in order[order.index(first) :]:
             folders.put(getattr(folders, name), HOST_GVPROXY)
 
-        assert await get_gvproxy_path(override=folders.override) == getattr(folders, first) / HOST_GVPROXY
+        assert (
+            await get_gvproxy_path(override=folders.override, arch=HOST_ARCH) == getattr(folders, first) / HOST_GVPROXY
+        )
 
     async def test_get_gvproxy_path_returns_none_when_not_found(self, folders: Folders) -> None:
         """get_gvproxy_path returns None when binary not found."""
-        assert await get_gvproxy_path(override=None) is None
+        assert await get_gvproxy_path(override=None, arch=HOST_ARCH) is None
 
-    async def test_fetch_gvproxy_returns_cached_and_makes_executable(self, folders: Folders) -> None:
-        """fetch_gvproxy returns cached binary and actually makes it executable."""
-        binary = folders.put(folders.env, HOST_GVPROXY)
+    @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+    async def test_fetch_gvproxy_returns_cached_and_makes_executable(self, folders: Folders, arch: str) -> None:
+        """fetch_gvproxy returns the binary of the asked arch found in a search folder (the
+        release has none), made mode 0755."""
+        binary = folders.put(folders.env, f"gvproxy-wrapper-{HOST_OS}-{GO_ARCH[arch]}")
         binary.chmod(0o600)
 
-        assert await fetch_gvproxy(override=None, arch=HOST_ARCH) == binary
-        assert binary.stat().st_mode & stat.S_IXUSR
+        assert await fetch_gvproxy(override=None, arch=arch) == binary
+        assert stat.S_IMODE(binary.stat().st_mode) == 0o755
 
     @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
     async def test_fetch_gvproxy_downloads_the_binary_of_the_asked_arch(self, folders: Folders, arch: str) -> None:
         """The gvproxy-wrapper of the asked arch (and this OS), whatever arch this host has:
-        `sbx prefetch --arch` fills the cache of another arch. It is made executable."""
+        `sbx prefetch --arch` fills the cache of another arch. It is made mode 0755."""
         name = f"gvproxy-wrapper-{HOST_OS}-{GO_ARCH[arch]}"
         folders.release(name, arch.encode())
 
@@ -562,7 +568,7 @@ class TestFetchGvproxy:
 
         assert result == folders.cache / name
         assert result.read_bytes() == arch.encode()
-        assert result.stat().st_mode & stat.S_IXUSR
+        assert stat.S_IMODE(result.stat().st_mode) == 0o755
 
 
 # =============================================================================

@@ -7,17 +7,17 @@ temporary files (overlay, sockets).
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Self
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled
 from exec_sandbox.exceptions import ErrorCode, TransientError
 from exec_sandbox.permission_utils import sudo_rm
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _WORKDIR_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
 
@@ -121,19 +121,9 @@ class VmWorkingDirectory:
                 abandoned = cls(vm_id, Path(creation_task.result()), home_dir=home_dir)
                 cleanup_task = asyncio.create_task(abandoned.cleanup())
                 await await_settled(cleanup_task)
-                cleanup_confirmed = False
-                if not cleanup_task.cancelled():
-                    try:
-                        cleanup_confirmed = cleanup_task.result()
-                    except Exception:
-                        logger.exception(
-                            "Failed to clean abandoned VM working directory",
-                            extra={"vm_id": vm_id, "path": str(abandoned.path)},
-                        )
-                if not cleanup_confirmed:
+                # cleanup() raises no error of its own (it logs them): only a cancel
+                if cleanup_task.cancelled() or not cleanup_task.result():
                     abandoned._retain_cleanup()
-            elif not creation_task.cancelled():
-                creation_task.exception()
             raise
         except OSError as e:
             raise TransientError(

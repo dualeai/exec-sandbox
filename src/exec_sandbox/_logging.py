@@ -134,15 +134,6 @@ class _NonBlockingHandler(logging.handlers.QueueHandler):
         super().close()
 
 
-def get_logger(name: str) -> logging.Logger:
-    """Get a logger for the given module name.
-
-    All exec_sandbox modules should use this instead of logging.getLogger()
-    directly for consistent logger hierarchy.
-    """
-    return logging.getLogger(name)
-
-
 def configure_logging(
     *,
     level: int | str | None = None,

@@ -118,7 +118,8 @@ def clone_sparse_fd(src_fd: int, dst: str | Path, *, dst_dir_fd: int | None, sto
     Returns True for a copy-on-write clone (the blocks stay shared until written),
     False for a copy of the data (its blocks take free space at once). A copy of the data
     checks `stop` before each chunk: once it is set, `dst` is removed and InterruptedError
-    raised (aio_utils.run_stoppable; a clone is one call and does not stop).
+    raised (aio_utils.run_stoppable; a clone is one call and does not stop). Another
+    OSError (no SEEK_DATA: data_ranges; a full disk) leaves `dst`: the caller removes it.
     """
     if _clonefile(src_fd, dst, dst_dir_fd=dst_dir_fd):
         return True
@@ -310,6 +311,16 @@ class _Radvisory(ctypes.Structure):
     ]
 
 
+def _rd_advise(fd: int, size: int) -> int:
+    """fcntl(F_RDADVISE) of the first `size` bytes of `fd` (macOS): 0, or -1 with errno set.
+    fcntl's third argument is variadic: on Apple Silicon it goes on the stack, which ctypes
+    does only for arguments after its argtypes (without them it fails with EFAULT)."""
+    fcntl = _libc.fcntl
+    fcntl.argtypes = [ctypes.c_int, ctypes.c_int]
+    fcntl.restype = ctypes.c_int
+    return fcntl(fd, _F_RDADVISE, ctypes.byref(_Radvisory(ra_offset=0, ra_count=min(size, 2**31 - 1))))
+
+
 def advise_willneed(path: Path) -> None:
     """Ask the kernel to prefetch *path* into the page cache.
 
@@ -330,8 +341,7 @@ def advise_willneed(path: Path) -> None:
         size = os.fstat(fd).st_size
         host = detect_host_os()
         if host is HostOS.MACOS:
-            advisory = _Radvisory(ra_offset=0, ra_count=min(size, 2**31 - 1))
-            _libc.fcntl(fd, _F_RDADVISE, ctypes.byref(advisory))
+            _rd_advise(fd, size)
         elif host is HostOS.LINUX:
             os.posix_fadvise(fd, 0, size, os.POSIX_FADV_WILLNEED)  # type: ignore[attr-defined]
     except OSError:

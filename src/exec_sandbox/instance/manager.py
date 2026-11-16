@@ -35,6 +35,7 @@ import asyncio
 import contextlib
 import errno
 import itertools
+import logging
 import os
 import re
 import shutil
@@ -45,7 +46,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 
 from exec_sandbox import constants
 from exec_sandbox._imports import require_s3_instance_store
-from exec_sandbox._logging import get_logger
 from exec_sandbox._version import __version__
 from exec_sandbox.aio_utils import run_stoppable
 from exec_sandbox.base_cache_manager import BaseCacheManager
@@ -128,7 +128,7 @@ if TYPE_CHECKING:
     from exec_sandbox.vm_manager import VmManager
     from exec_sandbox.vm_spec import VmSpec
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _LOAD_ATTEMPTS = 3
 """Head reads per load while body objects vanish because newer saves replaced them."""
@@ -379,7 +379,6 @@ class InstanceManager(InstanceAdmin):
         self.work_dir = work_dir
         self.assets = assets
         """Images from the store; the Scheduler gives it to admission's eviction."""
-        self.asset_dir = assets.cache_dir
         self._vm_manager = vm_manager
         self._calls = 0
         """Saves and loads in flight (they use the store, the VM and the work folder)."""
@@ -596,7 +595,6 @@ class InstanceManager(InstanceAdmin):
         chain = (entry,) if kind == "full" or state is None else (*state.body.chain, entry)
         body = HeadBody(spec=vm.spec, host=facts, guest=guest, egress_domains=vm.egress_domains, chain=chain)
         header = self._next_header(state, instance_id=instance_id, commit_id=commit_id, data_key=data_key)
-        generation = header.generation
         commit = Commit(
             header=header, data=seal_head(header=header, body=body, data_key=data_key), keyring=self.keyring
         )
@@ -622,7 +620,7 @@ class InstanceManager(InstanceAdmin):
             self._remove_in_background(state.vmstate, state.home)
         logger.info(
             "Instance saved",
-            extra={"instance_id": instance_id, "generation": generation, "kind": kind, "object_bytes": size},
+            extra={"instance_id": instance_id, "generation": header.generation, "kind": kind, "object_bytes": size},
         )
         return InstanceState(
             header=header,
@@ -1136,11 +1134,11 @@ class InstanceManager(InstanceAdmin):
         the facts checked before (`checked`, this worker passed them) and the image."""
         if (found := await self._local_image(role=role, digest=digest, local=local)) is not None:
             return found
-        cached = self.asset_dir / f"{digest}.img"
+        cached = self.assets.cache_dir / f"{digest}.img"
         async with CacheEntry(cached).saving() as missing:  # eviction needs this lock too
             if not missing:  # another load put it there meanwhile
                 return cached, await _asset_lease(cached)
-            part = self.asset_dir / f"{digest}.{ids.new_id()}.part"
+            part = self.assets.cache_dir / f"{digest}.{ids.new_id()}.part"
             try:
                 if not await self.store.download(
                     asset_key(digest), dest=part, max_bytes=_MAX_ASSET_BYTES, expected_size=None
@@ -1171,7 +1169,7 @@ class InstanceManager(InstanceAdmin):
                 same = False
             if same:
                 return local, None
-        cached = self.asset_dir / f"{digest}.img"  # only ever renamed into place after its digest was checked
+        cached = self.assets.cache_dir / f"{digest}.img"  # only ever renamed into place after its digest was checked
         lease = await CacheEntry(cached).lease()  # None: not here (never fetched, or evicted)
         return None if lease is None else (cached, lease)
 
@@ -1200,7 +1198,7 @@ class InstanceManager(InstanceAdmin):
         """Digests of the guest images this worker downloaded from the store: each one is
         renamed to <digest>.img in the asset folder only after its digest check."""
         try:
-            names = [path.name for path in self.asset_dir.iterdir()]
+            names = [path.name for path in self.assets.cache_dir.iterdir()]
         except OSError:  # the folder is gone (a cleanup between runs): none here
             return frozenset()
         return frozenset(
@@ -1209,16 +1207,12 @@ class InstanceManager(InstanceAdmin):
             if name.endswith(".img") and re.fullmatch(r"[0-9a-f]{64}", name.removesuffix(".img"))
         )
 
-    async def _machine_facts(self) -> dict[RouteKey, str | None]:
-        """This host's checked facts (worker_facts.machine_facts)."""
-        return await machine_facts(force_emulation=self._vm_manager.settings.force_emulation)
-
     async def _found(self, target: dict[RouteKey, str]) -> dict[RouteKey, str | None]:
         """This worker's value for each key of a host target (a CONTAINS key: the target's
         value when this worker has it, else None)."""
         force_emulation = self._vm_manager.settings.force_emulation
         local = {
-            **await self._machine_facts(),
+            **await machine_facts(force_emulation=force_emulation),
             RouteKey.COUNTER_HZ: await counter_fact(force_emulation=force_emulation),
         }
         machine_types = await require_qemu_machine_types()
@@ -1272,7 +1266,7 @@ class InstanceManager(InstanceAdmin):
                 hint="Restart the worker after a QEMU change, then save a new session.",
                 instance_id=None,
             )
-        facts = await self._machine_facts()
+        facts = await machine_facts(force_emulation=self._vm_manager.settings.force_emulation)
         qemu_version = await qemu_version_fact()  # a refusal compares it with the loader's
         return HostFacts.model_validate(
             {

@@ -1,5 +1,7 @@
-"""system_probes: what a host without access to /dev/kvm is told, the setpriv probe, the O_DIRECT
-probes, the POSIX ACL read, and the probe cache."""
+"""system_probes: what a host without access to /dev/kvm is told, the /dev/kvm check with no
+answer, the setpriv probe, the probe commands (no process left behind), the O_DIRECT probes,
+the POSIX ACL read, the probe cache, the TSC deadline on macOS, the host counter rate and CPU
+identity, the guest CPU check, KVM TSC scaling, and the cgroup pids.max warning."""
 
 import asyncio
 import ctypes
@@ -384,16 +386,22 @@ class TestProbeCache:
 
 class TestTscDeadlineOnMacos:
     """An Intel Mac: HVF never passes the TSC deadline timer to the guest, whatever the host
-    CPU lists (TSCTMR in sysctl machdep.cpu.features): no TSC deadline, and no probe runs.
-    With +tsc-deadline and enforce, QEMU would refuse every VM."""
+    CPU lists (TSCTMR in sysctl machdep.cpu.features): no TSC deadline, and no CPU flags are
+    read. With +tsc-deadline and enforce, QEMU would refuse every VM."""
 
     async def test_hvf_never_has_the_deadline_timer(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        probe = AsyncMock(side_effect=AssertionError("no probe on macOS"))
-        monkeypatch.setattr(system_probes, "run_probe", probe)
+        """A CPU that lists the flag (the /proc/cpuinfo stand-in): still False on macOS."""
+        reads: list[Path] = []
+
+        def read_text(self: Path) -> str:
+            reads.append(self)
+            return "flags\t\t: fpu tsc tsc_deadline_timer\n"
+
+        monkeypatch.setattr(Path, "read_text", read_text)
         monkeypatch.setattr(system_probes, "detect_host_os", lambda: HostOS.MACOS)
         monkeypatch.setattr(system_probes, "detect_host_arch", lambda: HostArch.X86_64)
         assert await system_probes.check_tsc_deadline() is False
-        probe.assert_not_called()
+        assert reads == []
 
 
 class TestKvmCheckWithNoAnswer:
@@ -619,8 +627,17 @@ class TestGuestCpuFailures:
         )
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc:
             await system_probes.require_guest_cpu("m,+avx2,enforce", accel="kvm")
-        assert "EBX.avx2" in exc.value.message
-        assert exc.value.hint is not None and "x86-64-v3" in exc.value.hint
+        assert exc.value.message == (
+            f"This host cannot run the guest CPU ({qemu} -accel kvm -cpu m,+avx2,enforce): qemu-system-x86_64: "
+            "warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx2 [bit 5] "
+            "qemu-system-x86_64: Host doesn't support requested features"
+        )
+        assert exc.value.hint == (
+            "x86 guests need an x86-64-v3 host CPU (Intel Haswell or AMD Zen 1, or newer) "
+            "that passes these flags to its VMs."
+        )
+        assert exc.value.context == {"binary": str(qemu), "accel": "kvm", "cpu": "m,+avx2,enforce"}
+        assert system_probes.probe_cache.guest_cpu == {}
 
     async def test_another_qemu_error_can_pass(self, qemu: Path) -> None:
         """KVM out of memory: QEMU_CRASHED with QEMU's line; not kept, the next start probes."""
@@ -629,7 +646,10 @@ class TestGuestCpuFailures:
         )
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc:
             await system_probes.require_guest_cpu("m,enforce", accel="kvm")
-        assert exc.value.message.endswith("ioctl(KVM_CREATE_VM) failed: 12 Cannot allocate memory")
+        assert exc.value.message == (
+            f"QEMU did not start the guest CPU ({qemu} -accel kvm -cpu m,enforce, exit code 1): "
+            "qemu-system-x86_64: ioctl(KVM_CREATE_VM) failed: 12 Cannot allocate memory"
+        )
         assert system_probes.probe_cache.guest_cpu == {}
 
     async def test_a_signal_can_pass(self, qemu: Path) -> None:
@@ -659,6 +679,25 @@ class TestGuestCpuFailures:
             qemu,
             "cat >/dev/null\n"
             'echo \'{"QMP": {"version": {}}}\'\necho \'{"return": {}}\'\necho \'{"return": 2700000000}\'\necho \'{"return": {}}\'',
+        )
+        assert await system_probes.require_guest_cpu("m,enforce", accel="kvm") == 2_700_000_000
+
+    @pytest.mark.parametrize(
+        "bad_line",
+        ["echo '{not json'", "yes '{\"a\":' | head -n 200000 | tr -d '\\n'; echo"],
+        ids=["not-json", "object-nested-too-deep"],
+    )
+    async def test_a_line_qemu_should_not_send_is_skipped(self, qemu: Path, bad_line: str) -> None:
+        """A reply line that starts with { but is no JSON, or an object nested too deep for the
+        parser (a broken QEMU), is skipped, never a raw JSONDecodeError or RecursionError: the
+        rate comes from the lines that parse. 200,000 levels: the parser of every Python build
+        measured refuses them (RecursionError; 3.14 builds reach about 52,000 to 116,000 levels)."""
+        self._script(
+            qemu,
+            "cat >/dev/null\n"
+            'echo \'{"QMP": {"version": {}}}\'\necho \'{"return": {}}\'\n'
+            f"{bad_line}\n"
+            "echo '{\"return\": 2700000000}'\necho '{\"return\": {}}'",
         )
         assert await system_probes.require_guest_cpu("m,enforce", accel="kvm") == 2_700_000_000
 
@@ -736,3 +775,46 @@ class TestHostReadLimits:
                 await system_probes.probe_host_cpu_id()
         else:
             assert await system_probes.probe_host_cpu_id() is None  # guest_cpu_id: HOST_DEPENDENCY
+
+
+class TestCgroupPidsLimitWarning:
+    """warn_cgroup_pids_limit: the tightest pids.max from this process's cgroup up to the mount
+    root (the innermost of equal ones), warned below 8192; nothing above the mount root is read."""
+
+    @pytest.fixture
+    def mount(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """A cgroup v2 mount at tmp_path/mount, with this process in a/b/c."""
+        root = tmp_path / "mount"
+        (root / "a" / "b" / "c").mkdir(parents=True)
+        (tmp_path / "pids.max").write_text("1\n")  # above the mount root: never read
+        monkeypatch.setattr(system_probes, "CGROUP_V2_BASE_PATH", str(root))
+        monkeypatch.setattr(system_probes, "cgroup_v2_available", lambda: True)
+        monkeypatch.setattr(system_probes, "resolve_self_cgroup_v2", lambda: "/a/b/c")
+        return root
+
+    @pytest.mark.parametrize(
+        ("limits", "warned"),
+        [
+            ({".": "max\n", "a": "6000\n", "a/b": "max\n", "a/b/c": "4096\n"}, (4096, "a/b/c")),
+            ({"a": "4096\n", "a/b/c": "4096\n"}, (4096, "a/b/c")),
+            ({".": "100\n", "a/b": "9000\n"}, (100, ".")),
+            ({"a": "8192\n", "a/b": "max\n"}, None),
+            ({}, None),
+        ],
+        ids=["tightest", "equal-innermost", "mount-root", "high-enough", "no-limit"],
+    )
+    def test_the_tightest_limit_is_warned(
+        self,
+        mount: Path,
+        caplog: pytest.LogCaptureFixture,
+        limits: dict[str, str],
+        warned: tuple[int, str] | None,
+    ) -> None:
+        for folder, value in limits.items():
+            (mount / folder / "pids.max").write_text(value)
+        with caplog.at_level(logging.WARNING, logger="exec_sandbox"):
+            system_probes.warn_cgroup_pids_limit()
+        records = [r for r in caplog.records if r.getMessage().startswith("cgroup pids.max is low")]
+        assert [(getattr(r, "current", None), getattr(r, "cgroup", None)) for r in records] == (
+            [] if warned is None else [warned]
+        )

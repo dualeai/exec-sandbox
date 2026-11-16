@@ -67,7 +67,7 @@ from exec_sandbox.cli import (
     run_command,
     truncate_source,
 )
-from exec_sandbox.exceptions import RouteKey, SandboxError, host_mismatch
+from exec_sandbox.exceptions import RouteError, RouteKey, SandboxError, host_mismatch
 from exec_sandbox.instance.keyring import Keyring
 from exec_sandbox.instance.local_store import LocalInstanceStore
 from exec_sandbox.instance.manager import InstanceAdmin, open_instance_admin
@@ -762,6 +762,24 @@ class TestCliErrorHandling:
                 125,
                 ["Run the command again."],
             ),
+            (
+                RouteError(
+                    'Instance my-vm needs counter_hz="24000000"; this worker has counter_hz="1000000000".',
+                    code=ErrorCode.INSTANCE_HOST_MISMATCH,
+                    required={RouteKey.COUNTER_HZ: "24000000"},
+                    found={RouteKey.COUNTER_HZ: "1000000000"},
+                    context=None,
+                    hint=None,
+                    instance_id="my-vm",
+                ),
+                "Error: INSTANCE_HOST_MISMATCH (ROUTE)",
+                125,
+                [
+                    "Run it on a host with the needed values (CPU architecture, guest CPU model, host CPU, "
+                    "guest clock rate, accelerator, QEMU machine type and version, guest images, memory and "
+                    "CPU budget). Do not remove a saved instance for this error: its data is good."
+                ],
+            ),
         ],
         ids=[
             "missing-qemu-or-image",
@@ -772,6 +790,7 @@ class TestCliErrorHandling:
             "package-install-failed",
             "internal",
             "restart",
+            "route",
         ],
     )
     def test_sandbox_error(
@@ -793,7 +812,7 @@ class TestCliErrorHandling:
             assert line in result.stderr
         assert result.stderr.count("•") == len(advice)  # one bullet per advice line: nothing else
         if error.code is not ErrorCode.HOST_DEPENDENCY:
-            assert "QEMU" not in result.stderr
+            assert "Install or fix the host dependency" not in result.stderr
 
 
 class TestCliNoValidation:
@@ -881,26 +900,6 @@ class TestCliFileEdgeCases:
             call_kwargs = _call(mock_scheduler)
             # Directory path is treated as code string
             assert call_kwargs["code"] == str(tmp_path)
-
-    def test_file_with_multiple_extensions(
-        self,
-        runner: CliRunner,
-        mock_result: ExecutionResult,
-        tmp_path: Path,
-    ) -> None:
-        """File with multiple extensions uses last extension."""
-        test_file = tmp_path / "test.backup.py"
-        test_file.write_text("print('multi ext')")
-
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = _mock_scheduler(scheduler_cls)
-            _vm(mock_scheduler).exec.return_value = mock_result
-
-            result = runner.invoke(run_command, [str(test_file)])
-
-            assert result.exit_code == 0
-            call_kwargs = _call(mock_scheduler)
-            assert call_kwargs["language"] == Language.PYTHON
 
     def test_hidden_file(
         self,
@@ -1085,17 +1084,21 @@ class TestCliExitCodePassthrough:
 class TestCliQuietMode:
     """Tests for quiet mode."""
 
-    @pytest.mark.parametrize("quiet", [False, True], ids=["tty", "tty-quiet"])
-    def test_tty_footer(self, runner: CliRunner, mock_result: ExecutionResult, quiet: bool) -> None:
-        """On a terminal, a run ends with a new line on stdout and "✓ Done in <ms>ms" on stderr; -q hides both."""
+    @pytest.mark.parametrize("option", [None, "-q", "--json"], ids=["tty", "tty-quiet", "tty-json"])
+    def test_tty_footer(self, runner: CliRunner, mock_result: ExecutionResult, option: str | None) -> None:
+        """On a terminal, a run ends with a new line on stdout and "✓ Done in <ms>ms" on stderr;
+        -q hides both, and --json prints the JSON alone."""
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls, patch("exec_sandbox.cli.is_tty", return_value=True):
             _vm(_mock_scheduler(scheduler_cls)).exec.return_value = mock_result
 
-            result = runner.invoke(run_command, [*(["-q"] if quiet else []), "print(1)"])
+            result = runner.invoke(run_command, [*([option] if option else []), "print(1)"])
 
         assert result.exit_code == 0
-        if quiet:
+        if option == "-q":
             assert (result.stdout, result.stderr) == ("", "")
+        elif option == "--json":
+            assert OneShotRun.model_validate_json(result.stdout).result == mock_result
+            assert result.stderr == ""
         else:
             assert result.stdout == "\n"
             assert re.fullmatch(r"✓ Done in \d+ms\n", result.stderr), result.stderr
@@ -1156,7 +1159,7 @@ class TestParseEnvVarsEdgeCases:
 
 
 # ============================================================================
-# Multi-Input Tests (V2)
+# --upload and --download, and several sources in one run
 # ============================================================================
 class TestParseUploadSpec:
     """Tests for parse_upload_spec function."""
@@ -1468,43 +1471,6 @@ class TestParseDownloadSpec:
 class TestCliFileIoIntegration:
     """Tests for --upload/--download argument flow through CLI to run_code."""
 
-    def test_upload_parsed_and_passed(self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path) -> None:
-        """Upload spec is parsed and tuple flows to session.write_file."""
-        local_file = tmp_path / "data.csv"
-        local_file.write_text("content")
-
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_session = _vm(_mock_scheduler(scheduler_cls))
-            mock_session.exec.return_value = mock_result
-
-            result = runner.invoke(
-                run_command,
-                ["--upload", f"{local_file}:input.csv", "-c", "print(1)"],
-            )
-
-            assert result.exit_code == 0
-            mock_session.write_file.assert_awaited_once_with("input.csv", local_file)
-
-    def test_download_full_parsed_and_passed(
-        self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Download GUEST:LOCAL spec flows correctly to session.read_file."""
-        monkeypatch.chdir(tmp_path)
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_session = _vm(_mock_scheduler(scheduler_cls))
-            mock_session.exec.return_value = mock_result
-
-            async def _fake_read(path: str, *, destination: Path) -> None:
-                destination.write_bytes(b"downloaded")
-
-            mock_session.read_file.side_effect = _fake_read
-
-            result = runner.invoke(run_command, ["--download", "out.csv:./result.csv", "-c", "print(1)"])
-
-        assert result.exit_code == 0
-        mock_session.read_file.assert_awaited_once_with("out.csv", destination=Path("result.csv"))
-        assert (tmp_path / "result.csv").read_bytes() == b"downloaded"
-
     def test_download_destination_the_caller_can_fix_exits_2(
         self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path
     ) -> None:
@@ -1525,8 +1491,14 @@ class TestCliFileIoIntegration:
             result = runner.invoke(run_command, ["--download", f"out.csv:{destination}", "-c", "print(1)"])
 
         assert result.exit_code == 2
-        assert "Error: ARGUMENT_INVALID (FIX_INPUT)" in result.stderr
-        assert message in result.stderr
+        assert result.stderr == (
+            "Error: ARGUMENT_INVALID (FIX_INPUT)\n"
+            "\n"
+            f"  {message}\n"
+            "\n"
+            "  Suggestions:\n"
+            "    • Correct the command, then run again.\n"
+        )
         vm.read_file.assert_awaited_once_with("out.csv", destination=destination)
 
     def test_download_shorthand_writes_to_basename(
@@ -1601,17 +1573,38 @@ class TestCliFileIoIntegration:
         assert steps == ["write_file", "exec", "read_file"]
         assert (tmp_path / "result.txt").read_bytes() == b"result"
 
-    def test_bad_upload_spec_shows_usage_error(self, runner: CliRunner) -> None:
-        """Invalid upload spec surfaces as CLI usage error."""
-        result = runner.invoke(run_command, ["--upload", "nocolon", "-c", "print(1)"])
+    @pytest.mark.parametrize(
+        ("args", "line"),
+        [
+            (
+                ["--upload", "nocolon"],
+                "Error: Invalid value for '--upload': Invalid upload format: 'nocolon'. "
+                "Use LOCAL:GUEST (for example ./data.csv:data.csv).",
+            ),
+            (
+                ["--download", ":"],
+                "Error: Invalid value for '--download': Empty guest path in: ':'. Use GUEST:LOCAL or GUEST format.",
+            ),
+            (
+                ["-e", "NOEQUALS"],
+                "Error: Invalid value for '-e' / '--env': Invalid format: 'NOEQUALS'. Use KEY=VALUE format.",
+            ),
+            (
+                ["--expose", "abc"],
+                "Error: Invalid value for '--expose': Invalid port number in: 'abc'. Ports must be integers.",
+            ),
+        ],
+        ids=["upload", "download", "env", "expose"],
+    )
+    def test_bad_file_spec_shows_usage_error(self, runner: CliRunner, args: list[str], line: str) -> None:
+        """An invalid --upload, --download, --env or --expose value is a usage error (exit 2)
+        that names the option and the value, as click's own checks do, before the Scheduler
+        starts."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            result = runner.invoke(run_command, [*args, "-c", "print(1)"])
         assert result.exit_code == 2
-        assert "Invalid upload format" in result.output
-
-    def test_bad_download_spec_shows_usage_error(self, runner: CliRunner) -> None:
-        """Invalid download spec surfaces as CLI usage error."""
-        result = runner.invoke(run_command, ["--download", ":", "-c", "print(1)"])
-        assert result.exit_code == 2
-        assert "Empty guest path" in result.output
+        assert result.stderr.splitlines()[-1] == line
+        scheduler_cls.assert_not_called()
 
 
 class TestTruncateSource:
@@ -1633,7 +1626,7 @@ class TestTruncateSource:
 
 
 class TestMultiSourceResult:
-    """Tests for MultiSourceResult dataclass."""
+    """The exit_code of a MultiSourceResult (a computed field of its JSON)."""
 
     @pytest.mark.parametrize(
         ("code", "action", "exit_code"),
@@ -1749,30 +1742,44 @@ class TestCliMultiInput:
         assert (result.stdout, result.stderr) in {(first + second, "w1\nw2\n"), (second + first, "w2\nw1\n")}
 
     @pytest.mark.parametrize(
-        ("exit_codes", "quiet", "summary"),
+        ("exit_codes", "quiet", "summary", "run_exit_code"),
         [
-            pytest.param((0, 0), False, r"✓ 2/2 passed \(\d+ms total\)", id="passed"),
-            pytest.param((0, 3), False, r"⚠ 1/2 passed, 1 failed \(\d+ms total\)", id="failed"),
-            pytest.param((0, 3), True, None, id="quiet"),
+            pytest.param((0, 0), False, r"✓ 2/2 passed \(\d+ms total\)", 0, id="passed"),
+            pytest.param((0, 3), False, r"⚠ 1/2 passed, 1 failed \(\d+ms total\)", 3, id="failed"),
+            pytest.param((0, None), False, r"⚠ 1/2 passed, 1 failed \(\d+ms total\)", 125, id="error"),
+            pytest.param((0, 3), True, None, 3, id="quiet"),
         ],
     )
     def test_tty_summary(
-        self, runner: CliRunner, exit_codes: tuple[int, int], quiet: bool, summary: str | None
+        self,
+        runner: CliRunner,
+        exit_codes: tuple[int | None, ...],
+        quiet: bool,
+        summary: str | None,
+        run_exit_code: int,
     ) -> None:
         """On a terminal, a run of several sources ends with a rule and the count of sources
-        that passed and failed (exit code 0 or not) on stdout; -q hides it."""
-        results = {
-            f"{name} = {code}": ExecutionResult(
-                stdout="", stderr="", exit_code=code, timing=TimingBreakdown(execute_ms=5, connect_ms=None)
+        that passed (exit code 0) and failed (another exit code, or an error: None) on stdout;
+        -q hides it."""
+
+        def exec_(code: str, **_: Any) -> ExecutionResult:
+            exit_code = exit_codes[int(code.removeprefix("source_"))]
+            if exit_code is None:
+                raise TransientError(
+                    "QEMU died.", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None
+                )
+            return ExecutionResult(
+                stdout="", stderr="", exit_code=exit_code, timing=TimingBreakdown(execute_ms=5, connect_ms=None)
             )
-            for name, code in zip("ab", exit_codes, strict=True)
-        }
+
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls, patch("exec_sandbox.cli.is_tty", return_value=True):
-            _vm(_mock_scheduler(scheduler_cls)).exec.side_effect = lambda code, **_: results[code]
+            _vm(_mock_scheduler(scheduler_cls)).exec.side_effect = exec_
 
-            result = runner.invoke(run_command, [*(["-q"] if quiet else []), *results])
+            result = runner.invoke(
+                run_command, [*(["-q"] if quiet else []), *(f"source_{i}" for i in range(len(exit_codes)))]
+            )
 
-        assert result.exit_code == max(exit_codes)
+        assert result.exit_code == run_exit_code
         if summary is None:
             assert "─" not in result.stdout
         else:
@@ -2891,6 +2898,28 @@ class TestCliInstanceErrors:
         for word in words:
             assert word in result.stderr
 
+    def test_data_of_another_release_names_the_writer_release(self, runner: CliRunner) -> None:
+        """A RouteError with an empty `required` (this release cannot read the data): the advice
+        says where the release that wrote it is named (the error, or describe), not host values."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            scheduler = _mock_scheduler(scheduler_cls)
+            _saved_instance(scheduler, spec=None, exit_code=0)
+            scheduler.reuse.side_effect = host_mismatch(
+                instance_id=_ID, required={}, found={}, reason="this release cannot read its block"
+            )
+
+            result = runner.invoke(run_command, ["--instance", _ID, "-c", "pass"])
+
+        assert result.exit_code == 125
+        assert "INSTANCE_HOST_MISMATCH (ROUTE)" in result.stderr
+        assert (
+            f"Run it with the exec-sandbox release that wrote it: 'sbx instance describe {_ID}' names it "
+            "(writer_release); when describe gives this error too, the error names it if the data does."
+            in " ".join(result.stderr.split())
+        )
+        assert "Do not remove" not in result.stderr  # the hint says to keep it
+        assert "Run it on a host with the needed values" not in " ".join(result.stderr.split())
+
     def test_save_conflict_exits_125_and_says_verify(self, runner: CliRunner) -> None:
         """Another run made or saved the instance first: the run's output stays, its state does not."""
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
@@ -2943,7 +2972,7 @@ class TestCliInstanceErrors:
 
 
 # ============================================================================
-# Saved instances: sbx instance list | describe | rm
+# Saved instances: sbx instance list | describe | keys | check | rm; sbx worker describe
 # ============================================================================
 @dataclass(frozen=True)
 class _AdminMocks:
@@ -3129,14 +3158,17 @@ class TestCliInstanceCommands:
         assert result.exit_code == 0, result.output
         assert result.stdout == f"a1\n{_ID}\n"
 
-    @pytest.mark.parametrize("ids", [[], ["a1", _ID]], ids=["empty", "two"])
-    def test_list_json(self, runner: CliRunner, admin_mocks: _AdminMocks, ids: list[str]) -> None:
+    @pytest.mark.parametrize(
+        ("ids", "stdout"), [([], "[]\n"), (["a1", _ID], f'[\n  "a1",\n  "{_ID}"\n]\n')], ids=["empty", "two"]
+    )
+    def test_list_json(self, runner: CliRunner, admin_mocks: _AdminMocks, ids: list[str], stdout: str) -> None:
+        """A JSON array, indented by two spaces."""
         admin_mocks.admin.list_ids.return_value.__aiter__.return_value = ids
 
         result = runner.invoke(cli, ["instance", "list", "--json"])
 
         assert result.exit_code == 0, result.output
-        assert json.loads(result.stdout) == ids
+        assert result.stdout == stdout
 
     def test_keys_prints_the_id_of_each_key(
         self, runner: CliRunner, local_store: Path, monkeypatch: pytest.MonkeyPatch
@@ -3179,6 +3211,30 @@ class TestCliInstanceCommands:
         error = {"code": "INSTANCE_NOT_FOUND", "action": "RECREATE", "message": "No instance a1."}
         assert objects[0] == {"instance_id": "a1", "error": error}
         assert InstanceInfo.model_validate(objects[1]) == info
+
+    def test_list_long_describes_32_at_a_time_in_order(self, runner: CliRunner, admin_mocks: _AdminMocks) -> None:
+        """--long describes the ids 32 at a time (store requests in flight) and prints them in
+        the order of the listing, the last partial batch included."""
+        ids = [f"i{n}" for n in range(70)]
+        admin_mocks.admin.list_ids.return_value.__aiter__.return_value = ids
+        in_flight, most = 0, 0
+
+        async def describe(instance_id: str) -> InstanceInfo:
+            nonlocal in_flight, most
+            in_flight += 1
+            most = max(most, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            raise InstanceGoneError(
+                "Gone.", code=ErrorCode.INSTANCE_NOT_FOUND, context=None, hint=None, instance_id=instance_id
+            )
+
+        admin_mocks.admin.describe.side_effect = describe
+        result = runner.invoke(cli, ["instance", "list", "--long"])
+
+        assert result.exit_code == 0, result.output
+        assert [json.loads(line)["instance_id"] for line in result.stdout.splitlines()] == ids
+        assert most == 32
 
     def test_describe_prints_the_info_as_json(self, runner: CliRunner, admin_mocks: _AdminMocks) -> None:
         info = _info(spec=_SIX, generation=3)

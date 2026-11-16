@@ -9,6 +9,7 @@ import binascii
 import contextlib
 import errno
 import json
+import logging
 import signal
 import sys
 from collections import deque
@@ -27,7 +28,6 @@ from tenacity import (
 )
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import AsyncRetrying, await_settled, run_to_end
 from exec_sandbox.cgroup import NO_CGROUP_STATS, Cgroup
 from exec_sandbox.exceptions import (
@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     from exec_sandbox.files.locks import EntryLease
     from exec_sandbox.platform_utils import ProcessWrapper
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def _outcome_unknown(message: str, *, context: dict[str, Any]) -> OutcomeUnknownError:
@@ -195,10 +195,11 @@ def guest_error_to_exception(
 
     Returns:
         The error (not raised, caller raises): TransientError GUEST_UNAVAILABLE
-        when the code never ran, InvalidInputError for bad input, a path or a
-        guest I/O failure, or a command the guest agent does not know (another
-        release's agent), InternalError GUEST_PROTOCOL for the other request,
-        protocol and unknown errors.
+        when the command never ran or the guest stopped it at its deadline (an
+        exec's timeout is a result: execute drops this error for it), InvalidInputError
+        for bad input, a path or a guest I/O failure, or a command the guest agent
+        does not know (another release's agent), InternalError GUEST_PROTOCOL for
+        the other request, protocol and unknown errors.
     """
     context: dict[str, object] = {
         "vm_id": vm_id,
@@ -211,7 +212,7 @@ def guest_error_to_exception(
     cls: type[SandboxError]
     match msg.error_type:
         case constants.GuestErrorType.TIMEOUT | constants.GuestErrorType.EXECUTION:
-            cls, code = TransientError, ErrorCode.GUEST_UNAVAILABLE  # code never ran
+            cls, code = TransientError, ErrorCode.GUEST_UNAVAILABLE  # never ran, or stopped at the guest's deadline
         case constants.GuestErrorType.ENV_VAR:
             cls, code = InvalidInputError, ErrorCode.ENV_VAR_INVALID
         case constants.GuestErrorType.CODE:
@@ -408,7 +409,7 @@ class QemuVM:
         """Current VM state."""
         return self._state
 
-    async def transition_state(self, new_state: VmState) -> None:
+    def transition_state(self, new_state: VmState) -> None:
         """Transition VM to new state with validation.
 
         Validates state transition against VALID_STATE_TRANSITIONS to prevent
@@ -461,7 +462,7 @@ class QemuVM:
 
         Implementation:
         1. Connect to guest via dual-port virtio-serial channel
-        2. Send execution request JSON with action, language, code, timeout, env_vars
+        2. Send execution request JSON with action, language, code, reseed, timeout, env_vars
         3. Stream the output until the completion event, within the hard timeout
         4. Build the result: stdout, stderr, exit_code, execution_time_ms (guest), and
            the CPU time, memory peak and throttling of the VM cgroup (host)
@@ -494,7 +495,8 @@ class QemuVM:
             InvalidInputError: CODE_INVALID (code empty, whitespace-only, or
                 with null bytes), ENV_VAR_INVALID (control chars, size limits),
                 OUTPUT_LIMIT (stdout or stderr exceeded guest-enforced size
-                limits).
+                limits); PATH_INVALID, GUEST_IO or ARGUMENT_INVALID when the guest
+                answers with a path, I/O or package error (guest_error_to_exception).
             TransientError: GUEST_UNAVAILABLE on a failure before dispatch
                 (connect failure or timeout, guest readiness gate, a REPL that
                 cannot start (a VM that the guest retired after exit code 137
@@ -524,7 +526,7 @@ class QemuVM:
                 - exit_code>128: killed by signal (128 + signal_number)
                 - exit_code=-1: execution timeout (code ran too long)
         """
-        await self._check_host_disk()
+        self._check_host_disk()
         # READY, then EXECUTING with no await between (transition_state does not yield)
         if self._state != VmState.READY:
             raise InternalError(
@@ -538,7 +540,7 @@ class QemuVM:
                 hint=None,
                 instance_id=None,
             )
-        await self.transition_state(VmState.EXECUTING)
+        self.transition_state(VmState.EXECUTING)
 
         # Prepare execution request
         timeout_phase = "connect"
@@ -573,7 +575,7 @@ class QemuVM:
             if isinstance(exc, InvalidInputError):
                 # Input was invalid but VM is fine — restore READY for session reuse
                 with contextlib.suppress(InternalError):
-                    await self.transition_state(VmState.READY)
+                    self.transition_state(VmState.READY)
             raise exc from None
 
         try:
@@ -595,7 +597,7 @@ class QemuVM:
                     if msg.error_type == constants.GuestErrorType.OUTPUT_LIMIT:
                         self.reseed_next_exec = False  # the REPL ran the code, after its reseed
                     with contextlib.suppress(InternalError):
-                        await self.transition_state(VmState.READY)
+                        self.transition_state(VmState.READY)
                     raise exc
                 # Timeout: code ran too long — this is a user code result, not infrastructure.
                 # Fall through to consume_stream's default handling (exit_code=-1 + stderr message).
@@ -683,7 +685,7 @@ class QemuVM:
 
             # Success - transition back to READY for reuse (if not destroyed)
             try:
-                await self.transition_state(VmState.READY)
+                self.transition_state(VmState.READY)
             except InternalError as e:
                 # VM destroyed while executing, skip transition
                 logger.debug(
@@ -721,7 +723,7 @@ class QemuVM:
         except TimeoutError as e:
             deadline = await self.deadline_diagnostics(operation="execute")
             if timeout_phase == "connect":
-                raise await self._guest_unavailable(
+                raise self._guest_unavailable(
                     f"VM {self.vm_id} guest connection timed out before execution dispatch",
                     context={
                         "vm_id": self.vm_id,
@@ -745,7 +747,7 @@ class QemuVM:
                 },
             ) from e
         except (OSError, ValidationError, RuntimeError, CommunicationError) as e:
-            raise await self._guest_unavailable(
+            raise self._guest_unavailable(
                 f"VM {self.vm_id} communication failed: {e}",
                 context={
                     "vm_id": self.vm_id,
@@ -804,7 +806,7 @@ class QemuVM:
                 # dispatch (CommunicationError, internal: execute() turns it into
                 # GUEST_UNAVAILABLE), is a known operation outcome, but the VM
                 # that reported it has exited and is not reusable.
-                await self.begin_destroy()
+                self.begin_destroy()
                 raise
             except Exception as error:
                 raise _outcome_unknown(
@@ -822,7 +824,7 @@ class QemuVM:
             # The command result is known, but the VM is gone. Preserve the
             # terminal result and publish a non-reusable VM state; Session will
             # synchronously close/confirm cleanup before returning it.
-            await self.begin_destroy()
+            self.begin_destroy()
             return result
         finally:
             if not stream_task.done():
@@ -838,7 +840,7 @@ class QemuVM:
                 # Process death is a VM-lifetime state transition, not only an
                 # execution-race signal. This also closes the post-terminal
                 # window in which a dead VM could otherwise remain READY.
-                await self.begin_destroy()
+                self.begin_destroy()
                 return exit_code
 
             self._process_exit_task = asyncio.create_task(
@@ -851,8 +853,32 @@ class QemuVM:
     # File I/O
     # -------------------------------------------------------------------------
 
+    def _check_path(self, operation: str, path: str, *, may_be_empty: bool) -> None:
+        """Refuse a path the guest protocol cannot carry, before any request is made.
+
+        Raises:
+            InvalidInputError: PATH_INVALID: `path` is empty (unless `may_be_empty`), or
+                longer than MAX_FILE_PATH_LENGTH
+        """
+        if not path and not may_be_empty:
+            raise InvalidInputError(
+                f"{operation} path must not be empty",
+                code=ErrorCode.PATH_INVALID,
+                context={"vm_id": self.vm_id, "path": path},
+                hint=None,
+                instance_id=None,
+            )
+        if len(path) > constants.MAX_FILE_PATH_LENGTH:
+            raise InvalidInputError(
+                f"{operation} path is {len(path)} chars, exceeds {constants.MAX_FILE_PATH_LENGTH}",
+                code=ErrorCode.PATH_INVALID,
+                context={"vm_id": self.vm_id, "path_length": len(path)},
+                hint=None,
+                instance_id=None,
+            )
+
     async def write_file(  # noqa: PLR0912, PLR0915
-        self, path: str, content: IO[bytes], *, make_executable: bool = False
+        self, path: str, content: IO[bytes], *, make_executable: bool
     ) -> None:
         """Write a file to the sandbox via streaming zstd-compressed chunks.
 
@@ -886,26 +912,11 @@ class QemuVM:
                 LOCAL_DISK when QEMU stopped the VM because the host disk is full (the VM
                 is then non-reusable; a call in flight then raised OutcomeUnknownError)
             OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the transport is lost
-                after the header was dispatched — the write may have landed
+                after the header was dispatched, or the guest's acknowledgement names
+                another path or byte count — the write may have landed
         """
-        if not path:
-            raise InvalidInputError(
-                "write_file path must not be empty",
-                code=ErrorCode.PATH_INVALID,
-                context={"vm_id": self.vm_id, "path": path},
-                hint=None,
-                instance_id=None,
-            )
-        if len(path) > constants.MAX_FILE_PATH_LENGTH:
-            raise InvalidInputError(
-                f"write_file path is {len(path)} chars, exceeds {constants.MAX_FILE_PATH_LENGTH}",
-                code=ErrorCode.PATH_INVALID,
-                context={"vm_id": self.vm_id, "path_length": len(path)},
-                hint=None,
-                instance_id=None,
-            )
-
-        await self._check_host_disk()
+        self._check_path("write_file", path, may_be_empty=False)
+        self._check_host_disk()
 
         op_id = uuid4().hex
         op_queue: OperationInbox | None = None
@@ -1019,7 +1030,7 @@ class QemuVM:
             # failure reaches the dispatch check below.
             raise
         except Exception as error:
-            dispatched = op_queue is not None and op_queue.command_may_have_been_sent
+            dispatched = op_queue is not None and op_queue.command_sent_at is not None
             deadline = (
                 await self.deadline_diagnostics(operation="write_file") if isinstance(error, TimeoutError) else {}
             )
@@ -1034,12 +1045,12 @@ class QemuVM:
                     },
                 ) from error
             if isinstance(error, TimeoutError):
-                raise await self._guest_unavailable(
+                raise self._guest_unavailable(
                     f"VM {self.vm_id} write_file timed out before dispatch for '{path}'",
                     context={"vm_id": self.vm_id, "path": path, **deadline},
                 ) from error
             if isinstance(error, (OSError, CommunicationError)):
-                raise await self._guest_unavailable(
+                raise self._guest_unavailable(
                     f"VM {self.vm_id} write_file communication failed before dispatch: {error}",
                     context={"vm_id": self.vm_id, "path": path},
                 ) from error
@@ -1060,8 +1071,9 @@ class QemuVM:
         When *destination* is an ``IO[bytes]``, chunks are written directly
         to the buffer at its current position; the caller retains ownership.
 
-        Peak memory is bounded by queue depths (OP_QUEUE_DEPTH items x ~175KB),
-        not file size.
+        Peak memory is bounded by the queue depth (OP_QUEUE_DEPTH messages, each from one
+        line of at most STREAM_BUFFER_LIMIT; ~175 KB from this guest) and by one decompress
+        step (FILE_TRANSFER_CHUNK_SIZE), not by the file size.
 
         Args:
             path: Relative path in sandbox (PATH_MAX 4096, NAME_MAX 255 per component)
@@ -1082,7 +1094,8 @@ class QemuVM:
             OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the event transport
                 is lost after dispatch (propagated from the inbox)
         """
-        await self._check_host_disk()
+        self._check_path("read_file", path, may_be_empty=False)
+        self._check_host_disk()
         op_id = uuid4().hex
         try:
             if isinstance(destination, Path):
@@ -1090,12 +1103,12 @@ class QemuVM:
             else:
                 await self._recv_file_chunks(path, op_id, destination)
         except TimeoutError as e:
-            raise await self._guest_unavailable(
+            raise self._guest_unavailable(
                 f"VM {self.vm_id} read_file timed out for '{path}'",
                 context={"vm_id": self.vm_id, "path": path, **await self.deadline_diagnostics(operation="read_file")},
             ) from e
         except (OSError, CommunicationError) as e:
-            raise await self._guest_unavailable(
+            raise self._guest_unavailable(
                 f"VM {self.vm_id} read_file communication failed: {e}", context={"vm_id": self.vm_id, "path": path}
             ) from e
         finally:
@@ -1120,21 +1133,43 @@ class QemuVM:
 
             if isinstance(msg, FileChunkResponseMessage):
                 # TODO: Binary framing would eliminate the base64 overhead (~33% wire bloat)
-                try:
-                    decompressed = decompressor.decompress(msg.data)  # decoded from base64 by the parse
-                except (zstd.ZstdError, EOFError) as e:  # a chunk dropped or repeated on the way: the stream breaks
-                    raise CommunicationError(
-                        f"read_file '{path}': the compressed stream broke: {e}", context=None
-                    ) from e
-
-                await _destination_job(partial(_write_all_bytes, sink, decompressed), vm_id=self.vm_id, path=path)
-                received_size += len(decompressed)
+                data = msg.data  # decoded from base64 by the parse
+                # Steps of at most one chunk: a message of a hostile guest can hold the blocks of
+                # far more data than its own size (in a stream, a block of 128 KiB of zeros takes
+                # 4 B: one line can decode to ~12 GiB)
+                while True:
+                    try:
+                        decompressed = decompressor.decompress(data, max_length=constants.FILE_TRANSFER_CHUNK_SIZE)
+                    except (zstd.ZstdError, EOFError) as e:  # a chunk dropped or repeated on the way: the stream breaks
+                        raise CommunicationError(
+                            f"read_file '{path}': the compressed stream broke: {e}", context=None
+                        ) from e
+                    if decompressor.eof and decompressor.unused_data:  # the guest sends one frame
+                        raise CommunicationError(
+                            f"read_file '{path}': the compressed stream broke: data after its frame end",
+                            context=None,
+                        )
+                    received_size += len(decompressed)
+                    # The guest checks the size at open only: a file that grows during the read passes it
+                    if received_size > constants.MAX_FILE_SIZE_BYTES:
+                        raise CommunicationError(
+                            f"read_file '{path}': the guest sent more than {constants.MAX_FILE_SIZE_BYTES} bytes",
+                            context=None,
+                        )
+                    await _destination_job(partial(_write_all_bytes, sink, decompressed), vm_id=self.vm_id, path=path)
+                    if decompressor.eof or decompressor.needs_input:
+                        break
+                    data = b""
             elif isinstance(msg, FileReadCompleteMessage):
                 if msg.path != path or msg.size != received_size:
                     raise CommunicationError(
                         f"read_file terminal metadata mismatch for '{path}': "
                         f"path={msg.path!r}, declared_size={msg.size}, received_size={received_size}",
                         context=None,
+                    )
+                if not decompressor.eof:  # the frame's last block lost on the way: the size can still match
+                    raise CommunicationError(
+                        f"read_file '{path}': the compressed stream broke: its frame did not end", context=None
                     )
                 break
             elif isinstance(msg, StreamingErrorMessage):
@@ -1198,21 +1233,22 @@ class QemuVM:
                 is then non-reusable; a call in flight then raised OutcomeUnknownError)
             OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the transport is lost after dispatch
         """
-        await self._check_host_disk()
+        self._check_path("list_files", path, may_be_empty=True)  # empty: the sandbox root
+        self._check_host_disk()
         request = ListFilesRequest(path=path)
 
         try:
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
             response = await self.channel.send_request(request, timeout=constants.FILE_IO_TIMEOUT_SECONDS)
         except TimeoutError as e:
-            raise await self._guest_unavailable(
+            raise self._guest_unavailable(
                 f"VM {self.vm_id} list_files timed out for '{path}'",
                 context={"vm_id": self.vm_id, "path": path, **await self.deadline_diagnostics(operation="list_files")},
             ) from e
         except (OSError, CommunicationError) as e:
             # OutcomeUnknownError is a SandboxError, not a CommunicationError,
             # so post-dispatch unknown outcomes still propagate as themselves.
-            raise await self._guest_unavailable(
+            raise self._guest_unavailable(
                 f"VM {self.vm_id} list_files communication failed: {e}", context={"vm_id": self.vm_id, "path": path}
             ) from e
 
@@ -1230,7 +1266,7 @@ class QemuVM:
 
         return [FileInfo(name=e.name, is_dir=e.is_dir, size=e.size) for e in response.entries]
 
-    async def begin_destroy(self) -> None:
+    def begin_destroy(self) -> None:
         """Make the VM non-reusable while allowing cleanup retries (every state before
         DESTROYING may go to it: VALID_STATE_TRANSITIONS)."""
         if self._state not in (VmState.DESTROYING, VmState.DESTROYED):
@@ -1364,12 +1400,12 @@ class QemuVM:
         it can never run again (a warm pool never hands it out)."""
         return self._host_disk_full is not None
 
-    async def _check_host_disk(self) -> None:
+    def _check_host_disk(self) -> None:
         """Raise TransientError (LOCAL_DISK) when QEMU paused the VM because the host disk
         of its home disk is full; the VM is then non-reusable (a session closes)."""
         if self._host_disk_full is None:
             return
-        await self.begin_destroy()
+        self.begin_destroy()
         raise self._host_disk_full_error(self._host_disk_full)
 
     def _host_disk_full_error(self, context: dict[str, Any]) -> TransientError:
@@ -1389,14 +1425,14 @@ class QemuVM:
         connection when no event came (DEADLINE_DIAGNOSTICS_TIMEOUT_SECONDS)."""
         if self._host_disk_full is None and await self._qmp_run_status() == "io-error":
             self._stop_for_full_host_disk({"device": None, "operation": "write"})
-        await self._check_host_disk()
+        self._check_host_disk()
 
-    async def _guest_unavailable(self, message: str, *, context: dict[str, Any]) -> TransientError:
+    def _guest_unavailable(self, message: str, *, context: dict[str, Any]) -> TransientError:
         """The error of a call that failed before dispatch: TransientError LOCAL_DISK when
         QEMU paused the VM on a full host disk meanwhile (the stop failed the call before
         it was sent; the VM is non-reusable and a session closes), else GUEST_UNAVAILABLE."""
         if self._host_disk_full is not None:
-            await self.begin_destroy()
+            self.begin_destroy()
             return self._host_disk_full_error(self._host_disk_full)
         return TransientError(message, code=ErrorCode.GUEST_UNAVAILABLE, context=context, hint=None, instance_id=None)
 
@@ -1519,6 +1555,8 @@ class QemuVM:
                 LOCAL_DISK at once when QEMU paused the VM because the host disk is full
             ConfigError: HOST_DEPENDENCY at once when this process may not connect to
                 the guest sockets (no retry: the socket mode or the groups must change)
+            InternalError: GUEST_PROTOCOL at once when the guest answers a ping with a
+                frame this release cannot read (or, after a reconnection, with another reply)
             TimeoutError: Guest not ready within timeout
         """
 
@@ -1563,7 +1601,7 @@ class QemuVM:
             """Single guest readiness check attempt."""
             # A full host disk paused the VM (tiny-init formats the home disk): LOCAL_DISK at
             # once, not a retry until the boot deadline (TransientError is not retried here)
-            await self._check_host_disk()
+            self._check_host_disk()
             await self.channel.connect(timeout_seconds=1)
             response = await self.channel.send_request(
                 PingRequest(host_entropy=None), timeout=constants.GUEST_REQUEST_TIMEOUT_SECONDS

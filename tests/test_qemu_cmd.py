@@ -22,12 +22,20 @@ from exec_sandbox import constants, system_probes
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch
-from exec_sandbox.qemu_cmd import CounterRate, build_qemu_cmd, counter_rate, guest_cpu_id, resolve_machine_type
-from exec_sandbox.settings import Settings
+from exec_sandbox.qemu_cmd import (
+    CounterRate,
+    build_qemu_cmd,
+    command_properties,
+    counter_rate,
+    guest_cpu_id,
+    resolve_machine_type,
+)
+from exec_sandbox.settings import QemuBinaries, Settings
 from exec_sandbox.system_probes import (
     probe_qemu_accelerators,
     probe_qemu_machine_types,
     probe_qemu_version,
+    qemu_system_binary,
     require_qemu_machine_types,
     require_qemu_version,
 )
@@ -136,6 +144,42 @@ class TestOneQemuBinary:
         assert await probe_qemu_version() == (9, 2, 0)
         assert await probe_qemu_accelerators() == {"tcg", "hvf"}
         assert await _launched_binary(workdir, tmp_path) == str(on_path) == shutil.which(_NAME, path=path)
+
+    @pytest.mark.parametrize(
+        ("arch", "name", "other"),
+        [
+            (HostArch.X86_64, "qemu-system-x86_64", "qemu-system-aarch64"),
+            (HostArch.AARCH64, "qemu-system-aarch64", "qemu-system-x86_64"),
+        ],
+        ids=["x86_64", "aarch64"],
+    )
+    def test_each_arch_runs_its_own_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arch: HostArch, name: str, other: str
+    ) -> None:
+        """On any host: with no configured file, the file of the arch's own name on PATH, else
+        that bare name; the qemu-system of the other arch is never taken."""
+        binaries = QemuBinaries(qemu_bin_x86=tmp_path / "missing" / "x86", qemu_bin_arm=tmp_path / "missing" / "arm")
+        _fake_qemu(tmp_path / "on-path" / other, version="11.0.0", accelerator="kvm")
+        monkeypatch.setenv("PATH", str(tmp_path / "on-path"))
+
+        assert qemu_system_binary(binaries, arch=arch) == name
+        own = _fake_qemu(tmp_path / "on-path" / name, version="11.0.0", accelerator="kvm")
+        assert qemu_system_binary(binaries, arch=arch) == str(own)
+
+    def test_each_arch_runs_its_own_configured_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On any host: each arch runs its own configured file (EXEC_SANDBOX_QEMU_BIN_X86 or
+        _ARM), not the other arch's, nor the file of its name on PATH."""
+        x86 = _fake_qemu(tmp_path / "x86" / "qemu-system-x86_64", version="11.0.0", accelerator="kvm")
+        arm = _fake_qemu(tmp_path / "arm" / "qemu-system-aarch64", version="11.0.0", accelerator="kvm")
+        for name in ("qemu-system-x86_64", "qemu-system-aarch64"):
+            _fake_qemu(tmp_path / "on-path" / name, version="11.0.0", accelerator="kvm")
+        monkeypatch.setenv("PATH", str(tmp_path / "on-path"))
+        binaries = QemuBinaries(qemu_bin_x86=x86, qemu_bin_arm=arm)
+
+        assert (
+            qemu_system_binary(binaries, arch=HostArch.X86_64),
+            qemu_system_binary(binaries, arch=HostArch.AARCH64),
+        ) == (str(x86), str(arm))
 
 
 class TestQemuMachineTypesUnreadable:
@@ -387,7 +431,7 @@ class TestHostDiskFull:
 
         home = [arg for arg in cmd if arg.startswith(f"file={workdir.home_disk},")]
         assert len(home) == 1
-        assert "werror=enospc" in home[0].split(",")
+        assert [part for part in home[0].split(",") if part.startswith("werror=")] == ["werror=enospc"]
 
     @pytest.mark.parametrize(
         ("version", "monitor"),
@@ -459,6 +503,34 @@ class TestNamespaces:
 
         assert cmd[0] == "unshare"
         assert cmd[cmd.index("--") - 1] == "--kill-child=SIGKILL"
+
+
+class TestCommandProperties:
+    def test_each_option_as_its_driver_and_pairs(self) -> None:
+        """The options after the binary (a prefix is skipped), each with its driver (a first
+        part without "="), its keys and values (a part without "=" is a key with no value; a
+        value keeps its own "="), a machine type without its version and a RAM backend of
+        any kind as "memory-backend"."""
+        cmd = [
+            "sudo",
+            "qemu-system-x86_64",
+            "-M",
+            "virt-11.1,highmem=off",
+            "-cpu",
+            "qemu64-v1,+avx,enforce",
+            "-drive",
+            "file=/tmp/a=b.qcow2,if=none",
+            "-nographic",
+            "-object",
+            "memory-backend-file,id=mem0,share=on",
+        ]
+        assert command_properties(cmd, binary="qemu-system-x86_64") == [
+            ("-M", "virt", [("highmem", "off")]),
+            ("-cpu", "qemu64-v1", [("+avx", ""), ("enforce", "")]),
+            ("-drive", "", [("file", "/tmp/a=b.qcow2"), ("if", "none")]),
+            ("-nographic", "", []),
+            ("-object", "memory-backend", [("id", "mem0"), ("share", "on")]),
+        ]
 
 
 class TestResolveMachineType:

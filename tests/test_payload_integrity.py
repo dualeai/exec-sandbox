@@ -18,9 +18,7 @@ from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import ExecutionResult, Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
-from tests.conftest import run_once
-
-from .conftest import skip_unless_hwaccel
+from tests.conftest import run_once, skip_unless_hwaccel
 
 # =============================================================================
 # Payload size fixtures - from tiny to max stdout limit
@@ -77,74 +75,24 @@ def medium_payload_size(request: pytest.FixtureRequest) -> tuple[str, int]:
 # =============================================================================
 
 
+_PATTERN = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+"""The 62 letters and digits that each payload repeats."""
+
+
 def generate_ascii_pattern(size: int) -> bytes:
-    """Generate deterministic ASCII pattern."""
-    chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    return bytes([chars[i % len(chars)] for i in range(size)])
-
-
-def generate_sequential_bytes(size: int) -> bytes:
-    """Generate sequential bytes: 0x00, 0x01, ..., 0xFF, 0x00, ..."""
-    return bytes([i % 256 for i in range(size)])
+    """Generate deterministic ASCII pattern: _PATTERN, repeated."""
+    return (_PATTERN * (size // len(_PATTERN) + 1))[:size].encode()
 
 
 def python_code_for_ascii_pattern(size: int) -> str:
-    """Generate Python code that outputs ASCII pattern of given size.
-
-    Uses chunked string multiplication to stay within VM memory limits (256MB).
-    Each chunk is generated independently using the same deterministic pattern.
-    """
-    if size == 1:
-        return 'print("A", end="")'
-
-    # Chunked approach - generate 1MB at a time to stay within VM memory
-    # Pattern must match host's generate_ascii_pattern() exactly
-    return f"""
-import sys
-chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-size = {size}
-chars_len = len(chars)
-chunk_size = 1024 * 1024  # 1MB chunks
-
-written = 0
-while written < size:
-    # Calculate this chunk's size
-    remaining = size - written
-    this_chunk = min(chunk_size, remaining)
-
-    # Build chunk using string multiplication (fast)
-    # Offset ensures pattern continues correctly across chunks
-    offset = written % chars_len
-    rotated = chars[offset:] + chars[:offset]
-    repeats = (this_chunk // chars_len) + 2
-    chunk = (rotated * repeats)[:this_chunk]
-
-    sys.stdout.write(chunk)
-    written += this_chunk
-
-sys.stdout.flush()
-"""
+    """Generate Python code that outputs generate_ascii_pattern(size), in one write."""
+    return f"import sys; sys.stdout.write(({_PATTERN!r} * {size // len(_PATTERN) + 1})[:{size}])"
 
 
 def javascript_code_for_ascii_pattern(size: int) -> str:
     """Generate JavaScript code that outputs ASCII pattern of given size."""
-    if size > 100 * 1024:
-        # Chunked for large sizes
-        return f"""
-const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-const size = {size};
-const chunkSize = 64 * 1024;
-for (let start = 0; start < size; start += chunkSize) {{
-    const end = Math.min(start + chunkSize, size);
-    let chunk = "";
-    for (let i = start; i < end; i++) {{
-        chunk += chars[i % chars.length];
-    }}
-    process.stdout.write(chunk);
-}}
-"""
     return f"""
-const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const chars = "{_PATTERN}";
 const size = {size};
 let output = "";
 for (let i = 0; i < size; i++) {{
@@ -202,12 +150,12 @@ class TestPythonStreamingIntegrity:
         code = python_code_for_ascii_pattern(size_bytes)
 
         streamed_chunks: list[str] = []
-
-        def on_stdout(chunk: str) -> None:
-            streamed_chunks.append(chunk)
-
         result = await run_once(
-            scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=TIMEOUT_SECONDS, on_stdout=on_stdout
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            code,
+            timeout_seconds=TIMEOUT_SECONDS,
+            on_stdout=streamed_chunks.append,
         )
 
         assert result.exit_code == 0
@@ -265,7 +213,7 @@ class TestBinaryPayloadIntegrity:
         """Verify binary data integrity via base64."""
         size_name, size_bytes = small_payload_size
 
-        expected_binary = generate_sequential_bytes(size_bytes)
+        expected_binary = bytes(i % 256 for i in range(size_bytes))
         expected_hash = hashlib.sha256(expected_binary).hexdigest()
 
         code = f"""
@@ -344,7 +292,7 @@ class TestOutputOverTheLimit:
     async def test_output_over_the_limit_is_output_limit(self, scheduler: Scheduler) -> None:
         """A 500MB output fails the exec with InvalidInputError OUTPUT_LIMIT (the guest stops it
         at the limit: the size of the output does not matter)."""
-        code = python_code_for_ascii_pattern(OVER_THE_LIMIT_SIZE)
+        code = f"import sys\nfor _ in range({OVER_THE_LIMIT_SIZE // 1_000_000}):\n    sys.stdout.write('X' * 1_000_000)"
 
         with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
             await run_once(
@@ -452,15 +400,8 @@ class TestStreamingStress:
 
         for i in range(num_iterations):
             chunks: list[str] = []
-
-            def make_callback(chunk_list: list[str]) -> Callable[[str], None]:
-                def on_stdout(chunk: str) -> None:
-                    chunk_list.append(chunk)
-
-                return on_stdout
-
             result = await run_once(
-                scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30, on_stdout=make_callback(chunks)
+                scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30, on_stdout=chunks.append
             )
 
             assert result.exit_code == 0, f"Iteration {i} failed: {result.stderr}"
@@ -485,15 +426,12 @@ for i in range(1000):
 
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
-
-        def on_stdout(chunk: str) -> None:
-            stdout_chunks.append(chunk)
-
-        def on_stderr(chunk: str) -> None:
-            stderr_chunks.append(chunk)
-
         result = await run_once(
-            scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=on_stdout, on_stderr=on_stderr
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            code,
+            on_stdout=stdout_chunks.append,
+            on_stderr=stderr_chunks.append,
         )
 
         assert result.exit_code == 0, f"Interleave test failed: {result.stderr}"

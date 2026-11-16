@@ -56,8 +56,10 @@ class TestProcessRegistry:
             unregister_process(wrapper)  # type: ignore[arg-type]
             assert get_tracked_count() == 0
 
-            assert force_kill_all() == 0
-            assert proc.poll() is None
+            force_kill_all()
+            # Still alive: a SIGKILL ends `sleep` in milliseconds (poll() just after one can still be None)
+            with pytest.raises(subprocess.TimeoutExpired):
+                proc.wait(timeout=0.5)
         finally:
             proc.kill()
             proc.wait(timeout=5)
@@ -69,8 +71,9 @@ class TestProcessRegistry:
         unregister_process(None if pid is None else MockProcessWrapper(pid))  # type: ignore[arg-type]
         assert get_tracked_count() == 1
 
-    def test_force_kill_all_counts_live_groups_and_clears_registry(self):
-        """A group that ended already is not counted; a live one is. The registry is empty after."""
+    def test_force_kill_all_kills_live_groups_and_clears_registry(self):
+        """A group that ended already is skipped (no error); a live one is killed. The registry is
+        empty after."""
         ended = _group_leader("true")
         ended.wait(timeout=5)  # reaped: its process group is gone (ProcessLookupError)
         live = _group_leader("sleep", "60")
@@ -78,7 +81,7 @@ class TestProcessRegistry:
             register_process(MockProcessWrapper(ended.pid))  # type: ignore[arg-type]
             register_process(MockProcessWrapper(live.pid))  # type: ignore[arg-type]
 
-            assert force_kill_all() == 1
+            force_kill_all()
             assert get_tracked_count() == 0
             assert live.wait(timeout=5) == -signal.SIGKILL
         finally:
@@ -98,7 +101,7 @@ class TestProcessRegistryIntegration:
             register_process(MockProcessWrapper(proc.pid))  # type: ignore[arg-type]
             assert get_tracked_count() == 1
 
-            assert force_kill_all() == 1
+            force_kill_all()
             assert get_tracked_count() == 0
 
             assert proc.wait(timeout=5) == -signal.SIGKILL

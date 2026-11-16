@@ -15,12 +15,15 @@ from uuid import uuid4
 
 import pytest
 
-from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_FILE_SIZE_BYTES
+from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError, SessionClosedError, TransientError
 from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
+
+_FILE_SIZE_LIMIT = 500 * 1024 * 1024
+"""The largest file write_file takes (500 MiB), written out: a change of the limit shows here."""
 
 # ============================================================================
 # Path Edge Cases
@@ -62,7 +65,7 @@ class TestPathEdgeCases:
                 " print('ok')"
             )
 
-        assert (result.exit_code, result.stdout.strip()) == (0, "ok"), result.stderr
+        assert (result.exit_code, result.stdout) == (0, "ok\n"), result.stderr
 
     async def test_hidden_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Hidden files (dot prefix) work."""
@@ -112,13 +115,12 @@ class TestContentEdgeCases:
                 await session.read_file("does_not_exist.txt", destination=tmp_path / "out.bin")
 
     async def test_oversized_content_rejected(self, scheduler: Scheduler) -> None:
-        """Content exceeding MAX_FILE_SIZE_BYTES is rejected at the Session level (ARGUMENT_INVALID)."""
+        """Content over the 500 MiB file size limit is rejected at the Session level (ARGUMENT_INVALID)."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            oversized = b"x" * (MAX_FILE_SIZE_BYTES + 1)
-            with pytest.raises(
-                InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"
-            ):
+            oversized = b"x" * (_FILE_SIZE_LIMIT + 1)
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID) as exc:
                 await session.write_file("big.bin", oversized)
+            assert exc.value.message == "Content is 524288001 bytes, exceeds 524288000"
 
 
 # ============================================================================
@@ -155,13 +157,12 @@ class TestWriteFileInputTypes:
     async def test_write_from_oversized_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """write_file raises InvalidInputError ARGUMENT_INVALID for oversized Path."""
         big_file = tmp_path / "big.bin"
-        big_file.write_bytes(b"x" * (MAX_FILE_SIZE_BYTES + 1))
+        big_file.write_bytes(b"x" * (_FILE_SIZE_LIMIT + 1))
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            with pytest.raises(
-                InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"
-            ):
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID) as exc:
                 await session.write_file("target.bin", big_file)
+            assert exc.value.message == "File big.bin is 524288001 bytes, exceeds 524288000"
 
 
 # ============================================================================
@@ -265,8 +266,6 @@ class TestListFilesSparseDefense:
 
     async def test_binary_file_size(self, scheduler: Scheduler) -> None:
         """Binary file reports exact byte count."""
-        import os
-
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             content = os.urandom(4097)  # Just over one page
             await session.write_file("binary.bin", content)
@@ -423,16 +422,6 @@ os.truncate('/home/user/readable_sparse', 256)
 # ============================================================================
 
 
-def _make_write_header(op_id: str, path: str) -> bytes:
-    """Build a raw write_file JSON frame (every field: the guest refuses a header without one)."""
-    return json.dumps({"action": "write_file", "op_id": op_id, "path": path, "make_executable": False}).encode() + b"\n"
-
-
-def _make_file_end(op_id: str) -> bytes:
-    """Build a raw file_end JSON frame."""
-    return json.dumps({"action": "file_end", "op_id": op_id}).encode() + b"\n"
-
-
 class TestWriteAbortRecovery:
     """A write that does not end with file_end leaves no file at its final path.
 
@@ -453,9 +442,7 @@ class TestWriteAbortRecovery:
         target = "bad_chunk.bin"
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            vm = session._vm
-            channel = vm.channel
-
+            channel = session._vm.channel
             await channel.connect(5)
             op_id = uuid4().hex
 
@@ -463,24 +450,13 @@ class TestWriteAbortRecovery:
             op_queue = channel.register_op(op_id, changes_state=True)
 
             try:
-                # Send header
-                await channel.enqueue_raw(_make_write_header(op_id, target))
-
-                # Send chunk with invalid base64 (not decodeable)
-                invalid_chunk = (
-                    json.dumps(
-                        {
-                            "action": "file_chunk",
-                            "op_id": op_id,
-                            "data": "!!!NOT-VALID-BASE64!!!",
-                        }
-                    ).encode()
-                    + b"\n"
-                )
-                await channel.enqueue_raw(invalid_chunk)
-
-                # Send file_end so the guest agent doesn't hang
-                await channel.enqueue_raw(_make_file_end(op_id))
+                for frame in (
+                    # The header has every field: the guest refuses a header without one
+                    {"action": "write_file", "op_id": op_id, "path": target, "make_executable": False},
+                    {"action": "file_chunk", "op_id": op_id, "data": "!!!NOT-VALID-BASE64!!!"},  # not decodeable
+                    {"action": "file_end", "op_id": op_id},  # so the guest agent doesn't hang
+                ):
+                    await channel.enqueue_raw(json.dumps(frame).encode() + b"\n")
 
                 # Wait for response — should be an error
                 response = await asyncio.wait_for(op_queue.get(), timeout=10)

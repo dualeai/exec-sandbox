@@ -99,7 +99,7 @@ class TestStreamingLargeFiles:
     async def test_write_read_file_larger_than_vm_memory(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Write a 150 MB file to a 128 MB VM and read it back with SHA256 verification.
 
-        The home disk holds it; streaming only needs ~64 KB decompression buffer.
+        The home disk holds it: the guest keeps at most 16 chunks of a write in memory.
         """
         size = 150 * 1024 * 1024
         content = os.urandom(size)
@@ -220,8 +220,8 @@ class TestConcurrentFileTransfers:
 class TestStreamingMemoryEfficiency:
     """A transfer does not take guest memory in proportion to the file size.
 
-    Slow under TCG: memory threshold (15%) documented to pass on arm64 TCG
-    (~17-25%), but overall VM overhead makes it too slow for the default suite.
+    Slow under TCG: the threshold holds there (_GUEST_MEM_AVAILABLE_MIN_PCT), but the
+    transfers are too slow for the default suite.
     """
 
     async def test_multiple_large_files_dont_oom_small_vm(self, scheduler: Scheduler, tmp_path: Path) -> None:
@@ -255,7 +255,7 @@ class TestStreamingMemoryEfficiency:
 
         A child of the REPL samples /proc/meminfo every 50 ms. The lowest sample must stay
         at or above _GUEST_MEM_AVAILABLE_MIN_PCT of MemTotal: a write that holds the whole
-        file in guest memory leaves about 12%.
+        file in guest memory leaves 4-13%.
         """
         content = os.urandom(40 * 1024 * 1024)
 
@@ -512,7 +512,7 @@ class TestFileTransferThroughput:
                 "import hashlib; print(hashlib.sha256(open('bench.bin','rb').read()).hexdigest())"
             )
             assert result.exit_code == 0, f"Hash check failed: {result.stderr}"
-            assert result.stdout.strip() == expected_hash, "Upload data corrupted"
+            assert result.stdout == expected_hash + "\n", "Upload data corrupted"
 
         print(f"\n  UPLOAD {size_mib} MiB: {elapsed:.1f}s, {throughput:.1f} MiB/s")  # noqa: T201
 

@@ -232,8 +232,8 @@ async def test_full_host_disk_fails_the_exec_in_flight_then_every_exec(
         drop_first=False,
     )
     async with fake as (vm, _):
-        await vm.transition_state(VmState.BOOTING)
-        await vm.transition_state(VmState.READY)
+        vm.transition_state(VmState.BOOTING)
+        vm.transition_state(VmState.READY)
         # A missed event ends the exec at its 2 s host deadline, without this text.
         with pytest.raises(OutcomeUnknownError, match="host disk is full"):
             await vm.execute(
@@ -264,10 +264,10 @@ async def test_full_host_disk_fails_the_write_in_flight_then_every_write(
     async with fake as (vm, _):
         # A missed event ends the write at the 2 s timeout, without this text.
         with pytest.raises(OutcomeUnknownError, match="host disk is full"):
-            await vm.write_file("a.txt", io.BytesIO(b"data"))  # the paused guest never acks
+            await vm.write_file("a.txt", io.BytesIO(b"data"), make_executable=False)  # the paused guest never acks
 
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
-            await vm.write_file("a.txt", io.BytesIO(b"data"))
+            await vm.write_file("a.txt", io.BytesIO(b"data"), make_executable=False)
         assert vm.state is VmState.DESTROYING
 
 
@@ -398,8 +398,8 @@ class TestEventWatch:
             drop_first=False,
         )
         async with fake as (vm, _):
-            await vm.transition_state(VmState.BOOTING)
-            await vm.transition_state(VmState.READY)
+            vm.transition_state(VmState.BOOTING)
+            vm.transition_state(VmState.READY)
             start = asyncio.get_running_loop().time()
             # A missed event ends the exec at its 2 s host deadline, without this text.
             with pytest.raises(OutcomeUnknownError, match="closed its port guest-cmd"):
@@ -530,8 +530,8 @@ class TestGuestPortClosed:
 
     @staticmethod
     async def _ready(vm: QemuVM) -> None:
-        await vm.transition_state(VmState.BOOTING)
-        await vm.transition_state(VmState.READY)
+        vm.transition_state(VmState.BOOTING)
+        vm.transition_state(VmState.READY)
 
     async def test_close_fails_the_exec_in_flight_and_not_the_next_call(
         self, short_tmp_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -704,7 +704,7 @@ class TestGuestPortClosed:
         )
         async with fake as (vm, _):
             if end == "destroy":
-                await vm.begin_destroy()
+                vm.begin_destroy()
             with caplog.at_level(logging.DEBUG, logger="exec_sandbox"):
                 assert await vm.list_files("") == []
             assert [r.levelno for r in caplog.records if "closed its port" in r.getMessage()] == [logging.DEBUG] * 2

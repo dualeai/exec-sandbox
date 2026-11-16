@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import io
+import logging
 import os
 import stat
 import warnings
@@ -43,7 +44,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Self, cast
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import run_to_end
 from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS, SIGKILL_EXIT_CODE
 from exec_sandbox.exceptions import (
@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     from exec_sandbox.vm_manager import VmManager
     from exec_sandbox.vm_spec import VmSpec
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Codes of a failed migration: save() closes the session on them unless the VM runs again.
 _MIGRATION_CODES = frozenset({ErrorCode.MIGRATION_FAILED, ErrorCode.MIGRATION_UNSUPPORTED})  # what a save raises
@@ -175,7 +175,8 @@ class Session:
         """The saved instance this session continues: set by reuse() and by each
         successful save() (save(instance_id=...) moves it to the new instance); None for a
         session from new() that was never saved."""
-        return _ref(self._instance)  # the header stays in memory after close removes the files
+        state = self._instance  # the header stays in memory after close removes the files
+        return None if state is None else InstanceRef(instance_id=state.instance_id, generation=state.header.generation)
 
     @property
     def exec_count(self) -> int:
@@ -898,8 +899,3 @@ def _open_source(path: Path) -> IO[bytes]:
             raise
     except (OSError, ValueError) as e:
         raise local_path_error(e, failure="Source file cannot be opened", path=path, context={}) from e
-
-
-def _ref(state: InstanceState | None) -> InstanceRef | None:
-    """The public InstanceRef of `state` (None when there is no saved instance)."""
-    return None if state is None else InstanceRef(instance_id=state.instance_id, generation=state.header.generation)

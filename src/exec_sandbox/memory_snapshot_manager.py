@@ -29,13 +29,13 @@ import contextlib
 import errno
 import functools
 import hashlib
+import logging
 import os
 import time
 import weakref
 from typing import TYPE_CHECKING, ClassVar, Final
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox._version import __version__
 from exec_sandbox.aio_utils import run_stoppable, run_to_end
 from exec_sandbox.base_cache_manager import BaseCacheManager
@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     from exec_sandbox.vm_manager import VmManager
     from exec_sandbox.vm_spec import VmSpec
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 _BLOCK = 64 * 1024
@@ -513,29 +513,20 @@ class MemorySnapshotManager(BaseCacheManager):
             )
             return None
 
-        except BaseException as e:
-            # Catch BaseException (not just Exception) to handle CancelledError too.
-            # Prevents orphaned partial files on SIGTERM / task cancellation.
-            if not isinstance(e, Exception):
-                logger.info("L1 snapshot save cancelled, cleaning up", extra={"key": key})
-            else:
-                logger.warning(
-                    "L1 snapshot save failed",
-                    extra={"key": key, "error": str(e)},
-                    exc_info=True,
-                )
+        except Exception as e:
+            logger.warning(
+                "L1 snapshot save failed",
+                extra={"key": key, "error": str(e)},
+                exc_info=True,
+            )
             await run_to_end(discard)
-            if isinstance(e, Exception):
-                return None
+            return None
+
+        except BaseException:
+            # CancelledError too (SIGTERM, task cancellation): no partial file stays
+            logger.info("L1 snapshot save cancelled, cleaning up", extra={"key": key})
+            await run_to_end(discard)
             raise
-
-    async def can_save(self) -> bool:
-        """QEMU on this host can save L1 templates (at or above the migration floor).
-
-        Checked before booting a sacrificial VM: below the floor every save fails.
-        """
-        qemu_version = await require_qemu_version()
-        return qemu_version >= constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION
 
     async def lease(self, key: str) -> EntryLease | None:
         """A lease on the L1 entry `key` (compute_cache_key), or None: no entry, or its use
@@ -651,14 +642,15 @@ class MemorySnapshotManager(BaseCacheManager):
         layer before its VM opens it.
         Returns the background task handle so callers can optionally await or
         monitor completion. Returns None (no-op) when QEMU is below the migration
-        floor (can_save), the entry exists, a save of the key runs in this process, or a
-        restore of the key in this process found a guest that could not reseed (restore).
+        floor (checked before a save VM boots: below it every save fails), the entry
+        exists, a save of the key runs in this process, or a restore of the key in this
+        process found a guest that could not reseed (restore).
 
         Used by the scheduler after a cold boot, and by the warm pool at start.
         The save lock prevents duplicate work: while another process saves the
         same key, the task skips (BlockingIOError, logged at debug level).
         """
-        if key in self._no_save_keys or not await self.can_save():
+        if key in self._no_save_keys or await require_qemu_version() < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
             return None
         if await self.check_cache(key):
             return None
@@ -717,7 +709,6 @@ class MemorySnapshotManager(BaseCacheManager):
                             direct_write_target=None,
                             snapshot_drive=layer.path if layer is not None else None,
                             cache_leases=(layer,) if layer is not None else (),
-                            retry_profile=constants.RETRY_BACKGROUND,
                             mem_path=str(live_ram.path),
                         ) as vm:
                             # Warm REPL (the interpreter start: 0.2-0.7 s with KVM or HVF, 3-5 s

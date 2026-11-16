@@ -145,7 +145,6 @@ class TestStalledServer:
                             f"{base}/asset.bin",
                             f"sha256:{'0' * 64}",
                             path=tmp_path,
-                            setting="EXEC_SANDBOX_CACHE_DIR",
                             decompress=False,
                         ),
                         timeout=5,
@@ -168,7 +167,6 @@ class TestStalledServer:
                         f"{base}/asset.bin",
                         f"sha256:{'0' * 64}",
                         path=tmp_path,
-                        setting="EXEC_SANDBOX_CACHE_DIR",
                         decompress=False,
                     )
                 )
@@ -183,7 +181,6 @@ class TestStalledServer:
         total timeout."""
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="http://127.0.0.1/unused/v{version}",
             version="1.0.0",
         )
@@ -239,7 +236,6 @@ class TestRetrieve:
                 url="https://example.com/test.txt",
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
 
@@ -255,7 +251,6 @@ class TestRetrieve:
                 url="https://example.com/test.txt",
                 known_hash=f"sha256:{'0' * 64}",
                 path=tmp_path / "cache" / "exec-sandbox",
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
         assert exc.value.code is ErrorCode.SETTING_INVALID
@@ -275,7 +270,6 @@ class TestRetrieve:
                     url="https://example.com/test.txt",
                     known_hash=f"sha256:{'0' * 64}",
                     path=cache,
-                    setting="EXEC_SANDBOX_CACHE_DIR",
                     decompress=False,
                 )
         finally:
@@ -297,7 +291,6 @@ class TestRetrieve:
                     url="https://example.com/test.txt",
                     known_hash=f"sha256:{hashlib.sha256(content).hexdigest()}",
                     path=cache,
-                    setting="EXEC_SANDBOX_CACHE_DIR",
                     decompress=False,
                 )
         finally:
@@ -319,14 +312,12 @@ class TestRetrieve:
                     url="https://example.com/gvproxy",
                     known_hash=f"sha256:{hashlib.sha256(raw).hexdigest()}",
                     path=tmp_path,
-                    setting="EXEC_SANDBOX_CACHE_DIR",
                     decompress=False,
                 )
                 await retrieve(
                     url="https://example.com/vmlinuz.zst",
                     known_hash=f"sha256:{hashlib.sha256(compressed).hexdigest()}",
                     path=tmp_path,
-                    setting="EXEC_SANDBOX_CACHE_DIR",
                     decompress=True,
                 )
         finally:
@@ -354,14 +345,12 @@ class TestRetrieve:
                 url="https://example.com/gvproxy",
                 known_hash=f"sha256:{hashlib.sha256(raw).hexdigest()}",
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
             kernel = await retrieve(
                 url="https://example.com/vmlinuz.zst",
                 known_hash=f"sha256:{hashlib.sha256(compressed).hexdigest()}",
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=True,
             )
         assert (gvproxy.read_bytes(), kernel.read_bytes()) == (raw, b"kernel bytes")
@@ -406,7 +395,6 @@ class TestRetrieve:
                 url="https://example.com/big.bin",
                 known_hash=known_hash,
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
 
@@ -428,7 +416,6 @@ class TestRetrieve:
                 url="https://example.com/cached.txt",
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
 
@@ -437,7 +424,6 @@ class TestRetrieve:
                 url="https://example.com/cached.txt",
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
 
@@ -458,7 +444,6 @@ class TestRetrieve:
                     url=url,
                     known_hash="sha256:wronghash",
                     path=tmp_path,
-                    setting="EXEC_SANDBOX_CACHE_DIR",
                     decompress=False,
                 )
             assert attempts(m, url) == 3
@@ -479,7 +464,6 @@ class TestRetrieve:
                 url=url,
                 known_hash=f"sha256:{hashlib.sha256(content).hexdigest()}",
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
             assert attempts(m, url) == 3
@@ -499,7 +483,6 @@ class TestRetrieve:
                     url=url,
                     known_hash="sha256:abc123",
                     path=tmp_path,
-                    setting="EXEC_SANDBOX_CACHE_DIR",
                     decompress=False,
                 )
             assert attempts(m, url) == 3
@@ -535,7 +518,6 @@ class TestRetrieve:
                     url=url,
                     known_hash=f"sha256:{hashlib.sha256(b'data').hexdigest()}",
                     path=tmp_path,
-                    setting="EXEC_SANDBOX_CACHE_DIR",
                     decompress=False,
                 )
             assert attempts(m, url) == 1
@@ -555,7 +537,6 @@ class TestRetrieve:
                     url=url,
                     known_hash="sha256:abc123",
                     path=tmp_path,
-                    setting="EXEC_SANDBOX_CACHE_DIR",
                     decompress=False,
                 )
             assert attempts(m, url) == 3
@@ -573,7 +554,6 @@ class TestRetrieve:
                 url="https://example.com/nohash.txt",
                 known_hash="",
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
 
@@ -596,7 +576,6 @@ class TestRetrieve:
                 url="https://example.com/cached.txt",
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
 
@@ -621,7 +600,6 @@ class TestRetrieve:
                 url=url,
                 known_hash=f"sha256:{content_hash}",
                 path=tmp_path,
-                setting="EXEC_SANDBOX_CACHE_DIR",
                 decompress=False,
             )
 
@@ -652,16 +630,12 @@ class TestRetrieve:
             # worker thread startup (asyncio.to_thread), and hashlib module init
             # so they don't inflate the peak measurement.
             tracemalloc.start()
-            await retrieve(
-                url=url, known_hash=known_hash, path=tmp_path, setting="EXEC_SANDBOX_CACHE_DIR", decompress=False
-            )
+            await retrieve(url=url, known_hash=known_hash, path=tmp_path, decompress=False)
             tracemalloc.stop()
 
             # Measure peak memory during hash verification
             tracemalloc.start()
-            result = await retrieve(
-                url=url, known_hash=known_hash, path=tmp_path, setting="EXEC_SANDBOX_CACHE_DIR", decompress=False
-            )
+            result = await retrieve(url=url, known_hash=known_hash, path=tmp_path, decompress=False)
             _, peak_memory = tracemalloc.get_traced_memory()
             tracemalloc.stop()
             assert not m.requests  # the digest matched: the cached file, no download
@@ -690,7 +664,6 @@ class TestAsyncPooch:
 
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="https://example.com/v{version}",
             version="1.0.0",
         )
@@ -708,7 +681,6 @@ class TestAsyncPooch:
         """Should raise ConfigError ASSET_NOT_FOUND for unknown file."""
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="https://example.com",
             version="1.0.0",
         )
@@ -720,7 +692,6 @@ class TestAsyncPooch:
         """Should load registry from GitHub release API."""
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="https://github.com/owner/repo/releases/download/v{version}",
             version="1.0.0",
         )
@@ -748,7 +719,6 @@ class TestAsyncPooch:
         """Should raise ConfigError ASSET_NOT_FOUND when GitHub release not found."""
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="https://github.com/owner/repo/releases/download/v{version}",
             version="1.0.0",
         )
@@ -774,7 +744,6 @@ class TestAsyncPooch:
             monkeypatch.setenv("GITHUB_TOKEN", token)
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="https://github.com/owner/repo/releases/download/v{version}",
             version="1.0.0",
         )
@@ -806,7 +775,6 @@ class TestAsyncPooch:
         body) is a TransientError ASSET_DOWNLOAD: the same call can succeed later."""
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="https://github.com/owner/repo/releases/download/v{version}",
             version="1.0.0",
         )
@@ -822,7 +790,6 @@ class TestAsyncPooch:
         """A release asset with no digest field gets an empty hash (retrieve then skips the check)."""
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="https://github.com/owner/repo/releases/download/v{version}",
             version="1.0.0",
         )
@@ -850,7 +817,6 @@ class TestAsyncPooch:
         """Should use /releases/latest endpoint for 'latest' tag."""
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="https://github.com/owner/repo/releases/download/v{version}",
             version="1.0.0",
         )
@@ -877,7 +843,6 @@ class TestAsyncPooch:
 
         pooch = AsyncPooch(
             path=tmp_path,
-            setting="EXEC_SANDBOX_CACHE_DIR",
             base_url="https://github.com/owner/repo/releases/download/v{version}",
             version="1.0.0.dev0",  # without the GitHub tag, the URL would have v1.0.0.dev0
         )
@@ -1043,7 +1008,6 @@ class TestConcurrentRetrieve:
                         url=url,
                         known_hash=f"sha256:{compressed_hash}",
                         path=tmp_path,
-                        setting="EXEC_SANDBOX_CACHE_DIR",
                         decompress=True,
                     )
                     for _ in range(concurrency)
@@ -1072,7 +1036,6 @@ class TestConcurrentRetrieve:
                         url=url,
                         known_hash=f"sha256:{content_hash}",
                         path=tmp_path,
-                        setting="EXEC_SANDBOX_CACHE_DIR",
                         decompress=False,
                     )
                     for _ in range(concurrency)
@@ -1109,7 +1072,6 @@ class TestConcurrentRetrieve:
                             url=url,
                             known_hash=f"sha256:{hashes[url]}",
                             path=tmp_path,
-                            setting="EXEC_SANDBOX_CACHE_DIR",
                             decompress=False,
                         )
                         for url, _ in pairs
@@ -1144,7 +1106,6 @@ class TestConcurrentRetrieve:
                     url=url_fail,
                     known_hash="sha256:abc123",
                     path=tmp_path,
-                    setting="EXEC_SANDBOX_CACHE_DIR",
                     decompress=False,
                 ),
                 *[
@@ -1152,7 +1113,6 @@ class TestConcurrentRetrieve:
                         url=url,
                         known_hash=f"sha256:{content_hash}",
                         path=tmp_path,
-                        setting="EXEC_SANDBOX_CACHE_DIR",
                         decompress=False,
                     )
                     for url in ok_urls

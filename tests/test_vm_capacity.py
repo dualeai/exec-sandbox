@@ -169,7 +169,9 @@ async def test_create_vm_blocks_at_capacity(capacity_vm_manager: VmManager) -> N
             create_task.cancel()
             await asyncio.gather(create_task, return_exceptions=True)
         assert admission.lines == ["Acquiring resources", "Resource reservation acquired"]
-    assert vm3.resource_reservation is not None
+    reservation = vm3.resource_reservation
+    assert reservation is not None
+    assert (reservation.vm_id, reservation.cpu_cores) == ("test-task-3", 1.25)  # its own admitted request
 
     assert await capacity_vm_manager.destroy_vm(vm2) is True
     assert await capacity_vm_manager.destroy_vm(vm3) is True

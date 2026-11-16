@@ -7,16 +7,16 @@ Architecture (gvproxy -port-forward forwards the ports in both modes):
 - Mode 2: expose_ports with allow_network -> outbound as allowed_domains permits
 """
 
+import logging
 import socket
 from collections.abc import Sequence
 from typing import Literal
 
 from exec_sandbox import constants
-from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import ErrorCode, TransientError
 from exec_sandbox.models import ExposedPort, PortMapping
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def allocate_ephemeral_ports(count: int, *, protocol: Literal["tcp", "udp"], exclude: frozenset[int]) -> list[int]:

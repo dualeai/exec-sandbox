@@ -41,6 +41,7 @@ import asyncio
 import contextlib
 import errno
 import functools
+import logging
 import os
 import select
 import shlex
@@ -52,7 +53,6 @@ from typing import TYPE_CHECKING, Final, Self
 
 import psutil
 
-from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_cancellation_safe, run_to_end
 from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.files.disk import make_dirs
@@ -61,7 +61,7 @@ from exec_sandbox.platform_utils import HostOS, child_env, detect_host_os
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Constants
@@ -287,8 +287,14 @@ def _cgroup_can_swap(cgroup_path: Path) -> bool:
     to the mount root sets memory.swap.max to 0. A container started without swap sees the
     host's swap (psutil.swap_memory), but its cgroup namespace root (the mount root, as the
     container sees it) forbids swap."""
-    if not _host_has_swap() or _swappiness() == 0:
+    try:
+        if psutil.swap_memory().total == 0:  # SwapTotal: where anon pages above memory.high can go
+            return False
+    except OSError:  # no /proc/meminfo
         return False
+    with contextlib.suppress(OSError, ValueError):  # an unreadable vm.swappiness is not 0
+        if int(_SWAPPINESS.read_text()) == 0:
+            return False
     base = Path(CGROUP_V2_BASE_PATH)
     for folder in cgroup_path.parents:
         if folder != base and base not in folder.parents:
@@ -299,23 +305,6 @@ def _cgroup_can_swap(cgroup_path: Path) -> bool:
         except OSError:
             continue  # no swap controller file at this level
     return True
-
-
-def _swappiness() -> int | None:
-    """vm.swappiness, or None if it cannot be read."""
-    try:
-        return int(_SWAPPINESS.read_text().strip())
-    except (OSError, ValueError):
-        return None
-
-
-def _host_has_swap() -> bool:
-    """Whether the host has swap (psutil.swap_memory: SwapTotal > 0): where anon pages above a
-    cgroup's memory.high can go."""
-    try:
-        return psutil.swap_memory().total > 0
-    except OSError:  # no /proc/meminfo
-        return False
 
 
 def _write_cgroup_optional(path: Path, value: str) -> None:

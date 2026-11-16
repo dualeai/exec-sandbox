@@ -52,29 +52,13 @@ class TestMinimalDeviceSet:
         """The guest has exactly the virtio devices of a VM without a network: entropy (rng),
         console (virtio-serial), and two block devices (the root image and the home disk)."""
         code = """\
-import os, glob
-devices = []
-# Check /sys/bus/virtio/devices for virtio devices
-for dev_path in sorted(glob.glob('/sys/bus/virtio/devices/*')):
-    name = os.path.basename(dev_path)
-    try:
-        with open(os.path.join(dev_path, 'device')) as f:
-            device_id = f.read().strip()
-        devices.append(f"{name}:{device_id}")
-    except (FileNotFoundError, PermissionError):
-        devices.append(f"{name}:unknown")
-
-for d in devices:
-    print(f"VIRTIO:{d}")
-if not devices:
-    print("NO_VIRTIO_DEVICES")
+import glob
+print(sorted(open(f'{d}/device').read().strip() for d in glob.glob('/sys/bus/virtio/devices/*')))
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0, result.stderr
         # virtio IDs: 0x0002 block, 0x0003 console (virtio-serial), 0x0004 entropy (rng).
         # Any other is extra attack surface: balloon 0x0005, virtio-snd 0x0019 (CVE-2024-7730).
-        device_ids = sorted(line.rsplit(":", 1)[-1] for line in result.stdout.splitlines())
-        assert device_ids == ["0x0002", "0x0002", "0x0003", "0x0004"], result.stdout
+        assert (result.exit_code, result.stdout) == (0, "['0x0002', '0x0002', '0x0003', '0x0004']\n"), result.stderr
 
     async def test_no_pci_non_virtio_devices(self, scheduler: Scheduler) -> None:
         """No legacy PCI devices (IDE, AHCI, e1000, rtl8139, AC97, etc.).
@@ -82,27 +66,13 @@ if not devices:
         CVE-2020-14364: USB emulation OOB R/W — example of legacy device bugs.
         """
         code = """\
-import os, glob
-non_virtio = []
-for dev_path in glob.glob('/sys/bus/pci/devices/*/driver'):
-    try:
-        driver = os.readlink(dev_path)
-        driver_name = os.path.basename(driver)
-        # virtio-pci is expected, everything else is suspect
-        if 'virtio' not in driver_name:
-            non_virtio.append(driver_name)
-    except (OSError, PermissionError):
-        continue
-
-if non_virtio:
-    for d in non_virtio:
-        print(f"NON_VIRTIO:{d}")
-else:
-    print("ONLY_VIRTIO")
+import glob, os
+drivers = [os.path.basename(os.readlink(link)) for link in glob.glob('/sys/bus/pci/devices/*/driver')]
+print([d for d in drivers if 'virtio' not in d])  # virtio-pci is expected, everything else is suspect
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "ONLY_VIRTIO\n"  # no PCI device bound to a driver other than virtio
+        # No PCI device bound to a driver other than virtio
+        assert (result.exit_code, result.stdout) == (0, "[]\n"), result.stderr
 
 
 # =============================================================================
@@ -115,30 +85,11 @@ class TestNoUsbDevices:
     USBDevice setup_len exceeding data_buf[4096]. No USB = no risk.
     """
 
-    async def test_no_usb_bus(self, scheduler: Scheduler) -> None:
-        """USB bus should not exist in the guest."""
-        code = """\
-import os
-usb_exists = os.path.isdir('/sys/bus/usb')
-print(f"USB_BUS:{usb_exists}")
-"""
+    async def test_no_usb_bus_or_devices(self, scheduler: Scheduler) -> None:
+        """No USB bus in the guest, and no /dev/bus/usb or /dev/usb device nodes."""
+        code = "import os; print([p for p in ('/sys/bus/usb', '/dev/bus/usb', '/dev/usb') if os.path.lexists(p)])"
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "USB_BUS:False\n"
-
-    async def test_no_usb_devices_in_dev(self, scheduler: Scheduler) -> None:
-        """No /dev/bus/usb or USB-related device nodes."""
-        code = """\
-import os
-checks = [
-    os.path.exists('/dev/bus/usb'),
-    os.path.exists('/dev/usb'),
-]
-print(f"USB_DEV:{any(checks)}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "USB_DEV:False\n"
+        assert (result.exit_code, result.stdout) == (0, "[]\n"), result.stderr
 
 
 # =============================================================================
@@ -148,45 +99,21 @@ class TestNoMultimediaDevices:
     """Sound and display devices add attack surface without value for
     code execution sandboxes."""
 
-    async def test_no_sound_devices(self, scheduler: Scheduler) -> None:
-        """No ALSA/sound devices should exist."""
-        code = """\
-import os
-sound_evidence = []
-if os.path.exists('/dev/snd'):
-    sound_evidence.append('/dev/snd')
-if os.path.exists('/dev/dsp'):
-    sound_evidence.append('/dev/dsp')
-# /sys/class/sound may exist as empty sysfs dir — only counts if populated
-if os.path.isdir('/sys/class/sound') and os.listdir('/sys/class/sound'):
-    sound_evidence.append('/sys/class/sound:populated')
-print(f"SOUND:{bool(sound_evidence)}")
-if sound_evidence:
-    print(f"EVIDENCE:{sound_evidence}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "SOUND:False\n"
-
-    async def test_no_graphics_devices(self, scheduler: Scheduler) -> None:
-        """No framebuffer or DRM graphics devices.
+    async def test_no_sound_or_graphics_devices(self, scheduler: Scheduler) -> None:
+        """No ALSA/sound device, framebuffer or DRM graphics device: no /dev/snd, /dev/dsp,
+        /dev/fb0 or /dev/dri node, and the sound, graphics and drm sysfs classes are empty or
+        absent.
 
         CVE-2023-20869: VMware Bluetooth device sharing stack overflow
         demonstrates that peripheral device emulation is dangerous.
         """
         code = """\
 import os
-checks = [
-    os.path.exists('/dev/fb0'),
-    os.path.isdir('/dev/dri'),
-    os.path.isdir('/sys/class/graphics') and len(os.listdir('/sys/class/graphics')) > 0,
-    os.path.isdir('/sys/class/drm') and len(os.listdir('/sys/class/drm')) > 0,
-]
-print(f"GRAPHICS:{any(checks)}")
+print([p for p in ('/dev/snd', '/dev/dsp', '/dev/fb0', '/dev/dri') if os.path.lexists(p)])
+print([c for c in ('sound', 'graphics', 'drm') if os.path.isdir(f'/sys/class/{c}') and os.listdir(f'/sys/class/{c}')])
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "GRAPHICS:False\n"
+        assert (result.exit_code, result.stdout) == (0, "[]\n[]\n"), result.stderr
 
 
 # =============================================================================
@@ -195,27 +122,12 @@ print(f"GRAPHICS:{any(checks)}")
 class TestNoLegacyDevices:
     """Legacy devices (floppy, parallel, PS/2) add attack surface."""
 
-    async def test_no_floppy_device(self, scheduler: Scheduler) -> None:
-        """No floppy disk device nodes."""
-        code = """\
-import os
-floppy = os.path.exists('/dev/fd0') or os.path.exists('/dev/fd1')
-print(f"FLOPPY:{floppy}")
-"""
+    async def test_no_floppy_or_parallel_port(self, scheduler: Scheduler) -> None:
+        """No floppy disk (/dev/fd0, /dev/fd1) or parallel port (/dev/parport*, /dev/lp*) device
+        nodes."""
+        code = "import glob; print(glob.glob('/dev/fd[01]') + glob.glob('/dev/parport*') + glob.glob('/dev/lp*'))"
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "FLOPPY:False\n"
-
-    async def test_no_parallel_port(self, scheduler: Scheduler) -> None:
-        """No parallel port device nodes."""
-        code = """\
-import os, glob
-parports = glob.glob('/dev/parport*') + glob.glob('/dev/lp*')
-print(f"PARPORT:{len(parports)}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "PARPORT:0\n"
+        assert (result.exit_code, result.stdout) == (0, "[]\n"), result.stderr
 
 
 # =============================================================================
@@ -255,25 +167,11 @@ class TestNoLegacyNicDevices:
     async def test_no_legacy_nic_drivers(self, scheduler: Scheduler) -> None:
         """A VM with a network device: each network interface with a device uses virtio_net."""
         code = """\
-import os, glob
-net_drivers = []
-for dev_path in glob.glob('/sys/class/net/*/device/driver'):
-    try:
-        driver = os.readlink(dev_path)
-        driver_name = os.path.basename(driver)
-        net_drivers.append(driver_name)
-    except (OSError, PermissionError):
-        continue
-
-if net_drivers:
-    for d in net_drivers:
-        print(f"NET_DRIVER:{d}")
-else:
-    print("NO_NET_DRIVERS")
+import glob, os
+print([os.path.basename(os.readlink(link)) for link in glob.glob('/sys/class/net/*/device/driver')])
 """
         result = await run_once(scheduler, _NETWORK_DEVICE, code)
-        assert result.exit_code == 0, result.stderr
-        assert result.stdout == "NET_DRIVER:virtio_net\n"
+        assert (result.exit_code, result.stdout) == (0, "['virtio_net']\n"), result.stderr
 
 
 # =============================================================================
@@ -323,39 +221,29 @@ class TestQemuSandboxFlags:
 
     async def test_dev_holds_only_known_device_nodes(self, scheduler: Scheduler) -> None:
         """Each node in /dev is a known one: the guest gets no node of another emulated device
-        (a QMP channel among them)."""
-        code = """\
-import os, glob
-# Check for any unusual character devices that might indicate QMP access
-unusual = []
-for dev in glob.glob('/dev/*'):
-    basename = os.path.basename(dev)
-    # Known safe devices
-    safe = {'null', 'zero', 'full', 'random', 'urandom', 'tty',
-            'console', 'ptmx', 'pts', 'shm', 'mqueue', 'fd',
-            'stdin', 'stdout', 'stderr', 'kmsg', 'cpu_dma_latency',
-            'virtio-ports', 'iommu', 'zram0',
-            'gpiochip0',   # PL061 GPIO on ARM64 QEMU virt (selected by GPIO_PL061)
-            'nvme-fabrics',  # NVMe fabrics control plane (no NVMe hardware, benign)
-            'vmci',     # VMware VMCI kernel driver (AMD platform artifact, no host exposure)
-            'nvram',    # Non-volatile RAM device (architecture-specific, read-only)
-            'hwrng'}    # Hardware RNG via virtio-rng (feeds /dev/random entropy pool)
-    if basename not in safe and not basename.startswith(('tty', 'vcs', 'vcsa', 'hvc', 'vport', 'rtc')):
-        try:
-            st = os.stat(dev)
-            unusual.append(f"{dev}")
-        except OSError:
-            pass
+        (a QMP channel among them).
 
-if unusual:
-    for u in unusual:
-        print(f"UNUSUAL_DEV:{u}")
-else:
-    print("MINIMAL_DEVICES")
+        No allowance for nodes the guest cannot have: the kernel has no GPIOLIB, NVMe, VMCI,
+        NVRAM, IOMMUFD or VT (images/kernel/exec-sandbox.config), the guest agent removes
+        /dev/zram0 before user code runs, and nothing mounts /dev/pts or /dev/mqueue.
+        """
+        code = """\
+import glob, os
+# Known safe devices
+safe = {'null', 'zero', 'full', 'random', 'urandom', 'tty',
+        'console', 'ptmx', 'shm', 'fd',
+        'stdin', 'stdout', 'stderr', 'kmsg', 'cpu_dma_latency',
+        'virtio-ports',
+        'hwrng'}    # Hardware RNG via virtio-rng (feeds /dev/random entropy pool)
+# ttyS*/ttyAMA0: serial ports; hvc*: virtio consoles; vport*: virtio-serial ports;
+# rtc*: the ARM64 virt PL031 clock. A dangling symlink is no node.
+for dev in glob.glob('/dev/*'):
+    name = os.path.basename(dev)
+    if name not in safe and not name.startswith(('tty', 'hvc', 'vport', 'rtc')) and os.path.exists(dev):
+        print(dev)
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "MINIMAL_DEVICES\n"
+        assert (result.exit_code, result.stdout) == (0, ""), result.stderr  # no unknown device node
 
     async def test_virtio_net_minimal_features(self, scheduler: Scheduler) -> None:
         """The virtio-net device of a VM with a network device has the features QEMU turns off,
@@ -368,28 +256,15 @@ else:
         Reducing features reduces QEMU code paths reachable from guest.
         """
         code = """\
-import os, glob
-for dev_path in sorted(glob.glob('/sys/bus/virtio/devices/*')):
-    try:
-        with open(os.path.join(dev_path, 'device')) as f:
-            device_id = f.read().strip()
-        # virtio-net device ID is 0x0001
-        if device_id == '0x0001':
-            features_path = os.path.join(dev_path, 'features')
-            if os.path.exists(features_path):
-                with open(features_path) as f:
-                    features = f.read().strip()
-                print(f"NET_FEATURES:{features}")
-            else:
-                print("NET_FEATURES:unavailable")
-    except (OSError, PermissionError):
-        continue
+import glob
+for d in glob.glob('/sys/bus/virtio/devices/*'):
+    if open(f'{d}/device').read().strip() == '0x0001':  # virtio-net
+        print(open(f'{d}/features').read().strip())
 """
         result = await run_once(scheduler, _NETWORK_DEVICE, code)
         assert result.exit_code == 0, result.stderr
-        (line,) = result.stdout.splitlines()
-        features = line.removeprefix("NET_FEATURES:")
-        assert len(features) >= 64, line  # one char per bit: 64, or 128 on kernels with more feature bits
+        (features,) = result.stdout.splitlines()
+        assert len(features) >= 64, features  # one char per bit: 64, or 128 on kernels with more feature bits
         # virtio-net feature bits: CSUM 0, GSO 6, HOST_TSO4 11, HOST_TSO6 12, MRG_RXBUF 15,
         # CTRL_RX 18, GUEST_ANNOUNCE 21, MQ 22, RSS 60
         bits = {"CSUM": 0, "GSO": 6, "HOST_TSO4": 11, "HOST_TSO6": 12, "MRG_RXBUF": 15}
@@ -400,7 +275,8 @@ for dev_path in sorted(glob.glob('/sys/bus/virtio/devices/*')):
         """Nested virtualization must be disabled.
 
         CVE-2024-50115: KVM nSVM nCR3 register handling bug in nested AMD SVM.
-        Our microvm config sets virtualization=off.
+        The guest CPU has no VMX or SVM: -svm,-vmx on x86 (qemu_cmd.py _X86_CPU_FLAGS),
+        virtualization=off on the ARM64 virt machine.
         """
         code = """\
 import os

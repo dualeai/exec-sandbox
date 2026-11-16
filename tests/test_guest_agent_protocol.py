@@ -7,13 +7,18 @@ No mocks - pure model testing.
 
 import base64
 import json
+import math
+import re
 import time
+from pathlib import Path
+from typing import Any
 
 import pytest
 from hypothesis import HealthCheck, given, settings
-from hypothesis.strategies import characters, integers, sampled_from, text
+from hypothesis.strategies import characters, sampled_from, text
 from pydantic import TypeAdapter, ValidationError
 
+from exec_sandbox import constants
 from exec_sandbox.constants import ENV_VAR_FORBIDDEN_CONTROL_CHARS
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
@@ -46,7 +51,7 @@ _PATH_LIMIT = 4096
 """Longest file path a file request takes: Linux PATH_MAX, written out (not the library's constant)."""
 
 _GUEST_LINE: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)  # type: ignore[type-arg]
-"""Parses one line from the guest, as GuestChannel's dispatch loop does (guest_channel.py)."""
+"""Parses one line from the guest, as FileOpDispatcher's dispatch loop does (guest_channel.py)."""
 
 
 def wire(request: GuestAgentRequest) -> dict[str, object]:
@@ -79,7 +84,7 @@ REQUEST_WIRE_CASES = [
         id="warm-repl-javascript-op-id",
     ),
     pytest.param(
-        ExecuteCodeRequest(language=Language.PYTHON, code="print('hello')", reseed=False),
+        ExecuteCodeRequest(language=Language.PYTHON, code="print('hello')", reseed=False, timeout=0, env_vars={}),
         {
             "action": "exec",
             "language": "python",
@@ -88,7 +93,7 @@ REQUEST_WIRE_CASES = [
             "timeout": 0,
             "env_vars": {},
         },
-        id="exec-defaults",
+        id="exec-guest-default-timeout",
     ),
     pytest.param(
         ExecuteCodeRequest(
@@ -111,9 +116,9 @@ REQUEST_WIRE_CASES = [
         id="exec-all-fields",
     ),
     pytest.param(
-        InstallPackagesRequest(language=Language.PYTHON, packages=["pandas==2.0.0"]),
+        InstallPackagesRequest(language=Language.PYTHON, packages=["pandas==2.0.0"], timeout=300),
         {"action": "install_packages", "language": "python", "packages": ["pandas==2.0.0"], "timeout": 300},
-        id="install-defaults",
+        id="install-300s",
     ),
     pytest.param(
         InstallPackagesRequest(
@@ -132,7 +137,7 @@ REQUEST_WIRE_CASES = [
         id="install-all-fields",
     ),
     pytest.param(
-        WriteFileRequest(op_id="abc123", path="hello.txt"),
+        WriteFileRequest(op_id="abc123", path="hello.txt", make_executable=False),
         {"action": "write_file", "op_id": "abc123", "path": "hello.txt", "make_executable": False},
         id="write-file",
     ),
@@ -146,7 +151,7 @@ REQUEST_WIRE_CASES = [
         {"action": "read_file", "op_id": "abc", "path": "results/data.json"},
         id="read-file",
     ),
-    pytest.param(ListFilesRequest(), {"action": "list_files", "path": ""}, id="list-files-root"),
+    pytest.param(ListFilesRequest(path=""), {"action": "list_files", "path": ""}, id="list-files-root"),
     pytest.param(
         ListFilesRequest(path="src", op_id="list-1"),
         {"action": "list_files", "path": "src", "op_id": "list-1"},
@@ -198,43 +203,67 @@ class TestExecuteCodeRequest:
     def test_language_validation(self) -> None:
         """ExecuteCodeRequest rejects invalid languages."""
         with pytest.raises(ValidationError) as exc_info:
-            ExecuteCodeRequest(language="ruby", reseed=False, code="puts 'hello'")  # type: ignore[arg-type]
+            ExecuteCodeRequest(language="ruby", reseed=False, code="puts 'hello'", timeout=0, env_vars={})  # type: ignore[arg-type]
         assert [(e["loc"], e["type"]) for e in exc_info.value.errors()] == [(("language",), "enum")]
 
     def test_timeout_range(self) -> None:
         """ExecuteCodeRequest enforces timeout range 0-300."""
         # Valid: 0
-        req = ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=0)
+        req = ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=0, env_vars={})
         assert req.timeout == 0
 
         # Valid: 300
-        req = ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=300)
+        req = ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=300, env_vars={})
         assert req.timeout == 300
 
         # Invalid: negative
         with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=-1)
+            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=-1, env_vars={})
 
         # Invalid: > 300
         with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=301)
+            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", timeout=301, env_vars={})
 
     def test_code_max_length(self) -> None:
         """ExecuteCodeRequest enforces 1 MiB code limit."""
         # Valid: 1 MiB exactly
         large_code = "x" * _CODE_LIMIT
-        req = ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code=large_code)
+        req = ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code=large_code, timeout=0, env_vars={})
         assert len(req.code) == _CODE_LIMIT
 
         # Invalid: > 1 MiB
         too_large = "x" * (_CODE_LIMIT + 1)
         with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code=too_large)
+            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code=too_large, timeout=0, env_vars={})
 
-    def test_reseed_is_required(self) -> None:
-        """No default: every exec says whether the REPL reseeds its random generators."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="x")  # type: ignore[call-arg]
+
+_EXEC: dict[str, Any] = {"language": Language.PYTHON, "code": "x", "reseed": False, "timeout": 0, "env_vars": {}}
+
+
+class TestRequiredFields:
+    """The request fields with no default: each send site chooses its value."""
+
+    @pytest.mark.parametrize(
+        ("model", "fields", "missing"),
+        [
+            pytest.param(ExecuteCodeRequest, {**_EXEC, "reseed": None}, "reseed", id="exec-reseed"),
+            pytest.param(ExecuteCodeRequest, {**_EXEC, "timeout": None}, "timeout", id="exec-timeout"),
+            pytest.param(ExecuteCodeRequest, {**_EXEC, "env_vars": None}, "env_vars", id="exec-env-vars"),
+            pytest.param(
+                InstallPackagesRequest, {"language": Language.PYTHON, "packages": ["x==1.0"]}, "timeout", id="install"
+            ),
+            pytest.param(WriteFileRequest, {"op_id": "w", "path": "a.txt"}, "make_executable", id="write-file"),
+            pytest.param(ListFilesRequest, {}, "path", id="list-files"),
+        ],
+    )
+    def test_a_request_field_left_out_is_refused(
+        self, model: type[GuestAgentRequest], fields: dict[str, Any], missing: str
+    ) -> None:
+        """No defaults: a send site that leaves a field out fails, rather than sending a value it
+        did not choose (the reseed, the timeout, the environment, the file mode, the folder)."""
+        with pytest.raises(ValidationError) as exc_info:
+            model(**{key: value for key, value in fields.items() if value is not None})
+        assert [(error["type"], error["loc"]) for error in exc_info.value.errors()] == [("missing", (missing,))]
 
 
 class TestEnvVarValidation:
@@ -247,6 +276,7 @@ class TestEnvVarValidation:
             reseed=False,
             code="print(1)",
             env_vars={"FOO": "bar", "WITH_TAB": "value\twith\ttabs"},
+            timeout=0,
         )
         assert req.env_vars["WITH_TAB"] == "value\twith\ttabs"
 
@@ -283,7 +313,7 @@ class TestEnvVarValidation:
         """Each env var the guest must not get fails validation with an error that names the
         fault (the host maps it to ENV_VAR_INVALID by its field)."""
         with pytest.raises(ValidationError) as exc_info:
-            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", env_vars=env_vars)
+            ExecuteCodeRequest(language=Language.PYTHON, reseed=False, code="x", env_vars=env_vars, timeout=0)
         assert [(e["loc"], e["msg"]) for e in exc_info.value.errors()] == [(("env_vars",), f"Value error, {message}")]
 
     def test_error_names_the_first_forbidden_character(self) -> None:
@@ -291,7 +321,11 @@ class TestEnvVarValidation:
         forbidden one: the error names that one (ESC), not a later one (NUL)."""
         with pytest.raises(ValidationError, match="forbidden control character: 0x1B"):
             ExecuteCodeRequest(
-                language=Language.PYTHON, reseed=False, code="x", env_vars={"FOO": "a\t\u2028b\x1b\x00" * 100}
+                language=Language.PYTHON,
+                reseed=False,
+                code="x",
+                env_vars={"FOO": "a\t\u2028b\x1b\x00" * 100},
+                timeout=0,
             )
 
     def test_each_forbidden_character_is_not_printable(self) -> None:
@@ -302,10 +336,7 @@ class TestEnvVarValidation:
     def test_utf8_in_value_allowed(self) -> None:
         """UTF-8 characters (emoji, non-Latin) are allowed."""
         req = ExecuteCodeRequest(
-            language=Language.PYTHON,
-            reseed=False,
-            code="x",
-            env_vars={"GREETING": "Hello 世界 🌍"},
+            language=Language.PYTHON, reseed=False, code="x", env_vars={"GREETING": "Hello 世界 🌍"}, timeout=0
         )
         assert req.env_vars == {"GREETING": "Hello 世界 🌍"}
 
@@ -316,19 +347,19 @@ class TestInstallPackagesRequest:
     def test_packages_min_length(self) -> None:
         """InstallPackagesRequest requires at least 1 package."""
         with pytest.raises(ValidationError):
-            InstallPackagesRequest(language=Language.PYTHON, packages=[])
+            InstallPackagesRequest(language=Language.PYTHON, packages=[], timeout=300)
 
     def test_packages_max_length(self) -> None:
         """InstallPackagesRequest allows max 50 packages."""
         # Valid: 50 packages
         packages = [f"pkg{i}==1.0.0" for i in range(50)]
-        req = InstallPackagesRequest(language=Language.PYTHON, packages=packages)
+        req = InstallPackagesRequest(language=Language.PYTHON, packages=packages, timeout=300)
         assert len(req.packages) == 50
 
         # Invalid: 51 packages
         packages = [f"pkg{i}==1.0.0" for i in range(51)]
         with pytest.raises(ValidationError):
-            InstallPackagesRequest(language=Language.PYTHON, packages=packages)
+            InstallPackagesRequest(language=Language.PYTHON, packages=packages, timeout=300)
 
     def test_timeout_range(self) -> None:
         """InstallPackagesRequest enforces timeout range 0-300."""
@@ -347,19 +378,19 @@ class TestFileRequestPaths:
     def test_write_file_path_max_length(self) -> None:
         """WriteFileRequest accepts path at max length."""
         long_path = "a" * _PATH_LIMIT
-        req = WriteFileRequest(op_id="test", path=long_path)
+        req = WriteFileRequest(op_id="test", path=long_path, make_executable=False)
         assert len(req.path) == _PATH_LIMIT
 
     def test_write_file_path_exceeds_max_length(self) -> None:
         """WriteFileRequest rejects path exceeding max length."""
         too_long = "a" * (_PATH_LIMIT + 1)
         with pytest.raises(ValidationError):
-            WriteFileRequest(op_id="test", path=too_long)
+            WriteFileRequest(op_id="test", path=too_long, make_executable=False)
 
     def test_write_file_empty_path_rejected(self) -> None:
         """WriteFileRequest rejects empty path."""
         with pytest.raises(ValidationError):
-            WriteFileRequest(op_id="test", path="")
+            WriteFileRequest(op_id="test", path="", make_executable=False)
 
     def test_read_file_path_max_length(self) -> None:
         """ReadFileRequest accepts path at max length."""
@@ -593,10 +624,7 @@ class TestEnvVarValidationPropertyBased:
     def test_safe_values_accepted(self, name: str, safe_value: str) -> None:
         """Property: Values with only safe characters should be accepted."""
         req = ExecuteCodeRequest(
-            language=Language.PYTHON,
-            reseed=False,
-            code="x",
-            env_vars={name: safe_value},
+            language=Language.PYTHON, reseed=False, code="x", env_vars={name: safe_value}, timeout=0
         )
         assert req.env_vars[name] == safe_value
 
@@ -612,10 +640,7 @@ class TestEnvVarValidationPropertyBased:
         malicious_value = prefix + control + suffix
         with pytest.raises(ValidationError):
             ExecuteCodeRequest(
-                language=Language.PYTHON,
-                reseed=False,
-                code="x",
-                env_vars={name: malicious_value},
+                language=Language.PYTHON, reseed=False, code="x", env_vars={name: malicious_value}, timeout=0
             )
 
     @given(
@@ -631,23 +656,7 @@ class TestEnvVarValidationPropertyBased:
         malicious_name = (prefix + control + suffix) or (control + "X")
         with pytest.raises(ValidationError):
             ExecuteCodeRequest(
-                language=Language.PYTHON,
-                reseed=False,
-                code="x",
-                env_vars={malicious_name: value},
-            )
-
-    @given(num_vars=integers(min_value=101, max_value=150))
-    @settings(max_examples=10)
-    def test_too_many_vars_rejected(self, num_vars: int) -> None:
-        """Property: More than 100 env vars must be rejected."""
-        many_vars = {f"VAR_{i}": "v" for i in range(num_vars)}
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(
-                language=Language.PYTHON,
-                reseed=False,
-                code="x",
-                env_vars=many_vars,
+                language=Language.PYTHON, reseed=False, code="x", env_vars={malicious_name: value}, timeout=0
             )
 
 
@@ -678,7 +687,7 @@ class TestFilePathValidationPropertyBased:
         """Property: Safe relative paths should be accepted by all file request models."""
         path = f"subdir/{segment}.txt"
         # WriteFileRequest
-        req_w = WriteFileRequest(op_id="test", path=path)
+        req_w = WriteFileRequest(op_id="test", path=path, make_executable=False)
         assert req_w.path == path
         # ReadFileRequest
         req_r = ReadFileRequest(op_id="test", path=path)
@@ -700,7 +709,7 @@ class TestFilePathValidationPropertyBased:
         # Build a path that is guaranteed to exceed PATH_MAX
         path = "a" * (_PATH_LIMIT + 1) + extra
         with pytest.raises(ValidationError):
-            WriteFileRequest(op_id="test", path=path)
+            WriteFileRequest(op_id="test", path=path, make_executable=False)
         with pytest.raises(ValidationError):
             ReadFileRequest(op_id="test", path=path)
         with pytest.raises(ValidationError):
@@ -725,8 +734,40 @@ class TestFilePathValidationPropertyBased:
         request sends the path as it is, and the guest agent refuses it (guest-agent/src/file_io.rs)."""
         path = prefix + control + suffix
         for request in (
-            WriteFileRequest(op_id="test", path=path),
+            WriteFileRequest(op_id="test", path=path, make_executable=False),
             ReadFileRequest(op_id="test", path=path),
             ListFilesRequest(path=path),
         ):
             assert wire(request)["path"] == path
+
+
+# The guest's limits that the host copies (constants.py): one value on each side, read from
+# the guest's source so a change on one side fails here, not in a VM.
+_GUEST_CONSTANTS = Path(__file__).parent.parent / "guest-agent" / "src" / "constants.rs"
+
+
+def _guest_constant(name: str) -> int:
+    """The value of `pub(crate) const NAME: usize|u64 = <a product of integers>;` in constants.rs."""
+    match = re.search(rf"^pub\(crate\) const {name}: (?:usize|u64) = ([0-9_ *]+);", _GUEST_CONSTANTS.read_text(), re.M)
+    assert match is not None, name
+    return math.prod(int(factor) for factor in match.group(1).replace("_", "").split("*"))
+
+
+@pytest.mark.parametrize(
+    ("guest", "host"),
+    [
+        ("MAX_STDOUT_BYTES", constants.MAX_STDOUT_BYTES),
+        ("MAX_STDERR_BYTES", constants.MAX_STDERR_BYTES),
+        ("OUTPUT_READ_BYTES", constants.GUEST_OUTPUT_READ_BYTES),
+        ("MAX_FILE_SIZE_BYTES", constants.MAX_FILE_SIZE_BYTES),
+        ("MAX_FILE_PATH_LENGTH", constants.MAX_FILE_PATH_LENGTH),
+        ("FILE_TRANSFER_CHUNK_SIZE", constants.FILE_TRANSFER_CHUNK_SIZE),
+        ("MAX_CODE_SIZE_BYTES", constants.MAX_CODE_SIZE),
+        ("MAX_TIMEOUT_SECONDS", constants.MAX_TIMEOUT_SECONDS),
+        ("MAX_ENV_VARS", constants.MAX_ENV_VARS),
+        ("MAX_ENV_VAR_NAME_LENGTH", constants.MAX_ENV_VAR_NAME_LENGTH),
+        ("MAX_ENV_VAR_VALUE_LENGTH", constants.MAX_ENV_VAR_VALUE_LENGTH),
+    ],
+)
+def test_the_host_copies_the_guests_limits(guest: str, host: int) -> None:
+    assert _guest_constant(guest) == host

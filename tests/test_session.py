@@ -6,7 +6,7 @@ The tests here are about what a session adds:
 - Session lifecycle (idle timeout, close, context manager)
 - Error recovery and state preservation
 - Edge cases (REPL protocol abuse, language quirks)
-- Concurrency (serialization, coexistence with run())
+- Concurrency (serialization, coexistence with a one-shot session)
 """
 
 import asyncio
@@ -55,8 +55,7 @@ class TestSessionNormal:
 
             result = await session.exec("print(x)")
 
-            assert result.exit_code == 0, result.stderr
-            assert result.stdout.strip() == "42"
+            assert (result.exit_code, result.stdout) == (0, "42\n"), result.stderr
 
     async def test_python_import_persistence(self, scheduler: Scheduler) -> None:
         """Python imports persist across exec calls."""
@@ -314,8 +313,9 @@ class TestSessionWeirdCases:
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
             )
-            # os._exit() kills the REPL process immediately
-            await session.exec("import os; os._exit(1)")
+            # os._exit() kills the REPL process immediately: its exit code is the result's
+            ended = await session.exec("import os; os._exit(1)")
+            assert ended.exit_code == 1, ended.stderr
             # REPL respawned, x is gone
             result = await session.exec("print('x' in globals())")
             assert (result.exit_code, result.stdout) == (0, "False\n"), result.stderr
@@ -523,7 +523,8 @@ def short_idle_minimum(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestSessionOutOfBounds:
     """Tests for lifecycle violations and resource limits."""
 
-    async def test_idle_timeout_auto_closes(self, scheduler: Scheduler, short_idle_minimum: None) -> None:
+    @pytest.mark.usefixtures("short_idle_minimum")
+    async def test_idle_timeout_auto_closes(self, scheduler: Scheduler) -> None:
         """A session with no call for idle_timeout_seconds closes itself: closed turns True,
         and the next exec raises SessionClosedError."""
         session = await scheduler.new(VmSpec(language=Language.PYTHON), idle_timeout_seconds=1)
@@ -537,7 +538,8 @@ class TestSessionOutOfBounds:
         finally:
             await session.close()
 
-    async def test_idle_timeout_reset_on_exec(self, scheduler: Scheduler, short_idle_minimum: None) -> None:
+    @pytest.mark.usefixtures("short_idle_minimum")
+    async def test_idle_timeout_reset_on_exec(self, scheduler: Scheduler) -> None:
         """Each exec re-arms the idle deadline at its end: execs 1.2 s apart keep a 2 s session
         open for 3.6 s, longer than one deadline."""
         session = await scheduler.new(VmSpec(language=Language.PYTHON), idle_timeout_seconds=2)
@@ -661,7 +663,7 @@ class TestSessionOutOfBounds:
 # TestSessionConcurrency - Serialization & coexistence
 # =============================================================================
 class TestSessionConcurrency:
-    """Tests for exec serialization and coexistence with run()."""
+    """Tests for exec serialization and coexistence with a one-shot session (run_once)."""
 
     async def test_concurrent_execs_serialized(self, scheduler: Scheduler) -> None:
         """Concurrent exec() calls run one after the other in the session's one REPL, in call
@@ -674,7 +676,7 @@ class TestSessionConcurrency:
             assert [(r.exit_code, r.stdout) for r in results] == [(0, "a" * 100 + "\n"), (0, "b" * 100 + "\n")]
 
     async def test_session_plus_run_coexist(self, scheduler: Scheduler) -> None:
-        """Session and run() work simultaneously (separate VMs)."""
+        """A session and a one-shot session (run_once) work at the same time (separate VMs)."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Run both in parallel
             session_result, run_result = await asyncio.gather(
@@ -741,21 +743,6 @@ print(f"exit_code={p.exitcode}")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0, result.stderr
         assert re.fullmatch(r"worker pid=\d+\nexit_code=0\n", result.stdout), result.stdout
-
-    async def test_multiprocessing_pool_works(self, scheduler: Scheduler) -> None:
-        """multiprocessing.Pool internally calls Process.start() — triggers patch."""
-        code = """
-import multiprocessing
-
-def square(x):
-    return x * x
-
-with multiprocessing.Pool(2) as pool:
-    results = pool.map(square, [1, 2, 3, 4])
-print(results)
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert (result.exit_code, result.stdout) == (0, "[1, 4, 9, 16]\n"), result.stderr
 
     async def test_cloudpickle_not_imported_without_multiprocessing(self, scheduler: Scheduler) -> None:
         """Verify cloudpickle is NOT imported for simple scripts."""

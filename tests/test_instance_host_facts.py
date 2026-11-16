@@ -109,8 +109,12 @@ async def test_unknown_machine_type_is_not_saved(instance_env: InstanceEnv, tmp_
     store gets nothing (a load starts QEMU with that type)."""
     vm = await _vm_on_a_layer(instance_env, tmp_path)
     vm.machine_type = None
-    with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY, match="machine type"):
+    with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc:
         await instance_env.manager.save(vm, None, new_instance_id=None, resumed=lambda: None)  # type: ignore[arg-type]
+    assert exc.value.message == (
+        f"VM {vm.vm_id}: the QEMU machine type it runs is unknown (this QEMU does not list the "
+        "type it started with). It was not saved."
+    )
     assert await instance_env.store.list_objects("") == []
 
 
@@ -293,7 +297,7 @@ async def test_a_loaded_image_is_never_evicted(instance_env: InstanceEnv, tmp_pa
 
     state = await env.load(saver.instance_id, manager=worker)
     assert guest.packages_image is not None
-    cached = {worker.asset_dir / f"{digest}.img" for digest in (guest.base_image, guest.packages_image)}
+    cached = {worker.assets.cache_dir / f"{digest}.img" for digest in (guest.base_image, guest.packages_image)}
     assert {state.base_image, state.packages_image} == cached
     assert {lease.path for lease in state.asset_leases} == cached
     assert await worker.assets.eviction_order().evict_next() is None  # in use: skipped
@@ -353,7 +357,7 @@ async def test_a_failed_load_releases_the_images_it_leased(instance_env: Instanc
 
     with pytest.raises(RouteError, check=lambda e: e.code is ErrorCode.INSTANCE_HOST_MISMATCH):
         await env.load(saver.instance_id, manager=worker)
-    cached = worker.asset_dir / f"{guest.base_image}.img"
+    cached = worker.assets.cache_dir / f"{guest.base_image}.img"
     assert cached.exists()
     assert (await worker.assets.eviction_order().evict_next() or 0) > 0
     assert not cached.exists()
@@ -372,7 +376,7 @@ async def test_a_check_releases_its_lease(instance_env: InstanceEnv, tmp_path: P
     await worker.check(saver.instance_id, packages_image=no_packages)
     evictions = worker.assets.eviction_order()
     assert [(await evictions.evict_next() or 0) > 0 for _ in range(2)] == [True, True]  # base and L2
-    assert not (worker.asset_dir / f"{guest.base_image}.img").exists()
+    assert not (worker.assets.cache_dir / f"{guest.base_image}.img").exists()
 
 
 async def test_two_loads_of_one_image_download_it_once(instance_env: InstanceEnv, tmp_path: Path) -> None:

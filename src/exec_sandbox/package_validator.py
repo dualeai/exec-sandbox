@@ -10,10 +10,12 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError
-from exec_sandbox.models import Language  # noqa: TC001 - Used at runtime (language.value)
+
+if TYPE_CHECKING:
+    from exec_sandbox.models import Language
 
 # Package name extraction pattern
 # Matches: alphanumeric, underscore, hyphen, dot followed by the first character of a version operator

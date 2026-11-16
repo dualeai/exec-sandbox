@@ -211,7 +211,7 @@ class TestSaveFailures:
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
                 await vm.save()
             assert exc.value.action == "RETRY"
-            assert down.hits >= 1
+            assert down.hits == 1  # one upload attempt: no SDK retry (AWS_MAX_ATTEMPTS=1), no second upload
             assert s3_proxy.count("PUT_IF", _HEAD, since=mark) == 0  # no head write
             down.remove()
             assert not vm.closed
@@ -629,7 +629,9 @@ class TestAssets:
             key = f"{prefix}assets/sha256/{info.guest.base_image}"
             s3.delete_object(Bucket=BUCKET, Key=key)  # type: ignore[attr-defined]
             await vm.save()
-        assert s3.head_object(Bucket=BUCKET, Key=key)["ContentLength"] > 0  # type: ignore[attr-defined]
+        # The whole image is back: its bytes hash to the digest that names its key
+        stored = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()  # type: ignore[attr-defined]
+        assert hashlib.sha256(stored).hexdigest() == info.guest.base_image
 
     async def test_damaged_store_copy_routes(
         self,

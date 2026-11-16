@@ -1,8 +1,10 @@
-"""Unit tests for the cancellation-safe task ownership primitives.
+"""Unit tests for the cancellation-safe task ownership primitives, and the retry loop.
 
 These helpers back every owned-teardown loop in the codebase, so their
 truth table is pinned directly: settled / cancelled-then-settled /
-task-cancelled / task-error / cancellation + task-error (chained).
+task-cancelled / task-error / cancellation + task-error (chained) for
+await_settled and await_cancellation_safe; then gather_or_cancel, run_to_end,
+run_stoppable and AsyncRetrying.
 """
 
 import asyncio

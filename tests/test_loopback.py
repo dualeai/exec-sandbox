@@ -19,14 +19,16 @@ from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import run_once
 
 
-def _py_tcp_server_code(response: str, bind: str = "127.0.0.1") -> str:
-    """Self-contained asyncio TCP echo-server that prints the response payload."""
+def _py_tcp_roundtrip_code(*, bind: str) -> str:
+    """Self-contained asyncio TCP server on `bind` that answers PING with PONG: the client
+    connects to 127.0.0.1 and prints what it sent and got."""
     return f"""\
 import asyncio
 
 async def main():
     async def handle(reader, writer):
-        writer.write(b'{response}')
+        await reader.read(1024)
+        writer.write(b'PONG')
         await writer.drain()
         writer.close()
         await writer.wait_closed()
@@ -35,31 +37,34 @@ async def main():
     port = server.sockets[0].getsockname()[1]
 
     reader, writer = await asyncio.open_connection('127.0.0.1', port)
+    writer.write(b'PING')
+    await writer.drain()
     resp = await reader.read(1024)
     writer.close()
     await writer.wait_closed()
     server.close()
     await server.wait_closed()
-    print(resp.decode())
+    print(f"sent:PING recv:{{resp.decode()}}")
 
 asyncio.run(main())
 """
 
 
-def _js_http_fetch_code(response: str, fetch_host: str = "127.0.0.1") -> str:
-    """Self-contained node:http server + fetch that prints the response body."""
+def _js_http_fetch_code(*, fetch_host: str) -> str:
+    """Self-contained node:http server on 127.0.0.1 + fetch of `fetch_host` that prints the
+    status and the body."""
     return f"""\
 const http = require('http');
 const server = http.createServer((req, res) => {{
   res.writeHead(200);
-  res.end('{response}');
+  res.end('HELLO_FROM_SERVER');
 }});
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const port = server.address().port;
 const res = await fetch('http://{fetch_host}:' + port);
 const body = await res.text();
 server.close();
-console.log(body);
+console.log('status:' + res.status + ' body:' + body);
 """
 
 
@@ -96,52 +101,15 @@ class TestLoopbackTcpRoundtrip:
 
     async def test_python_tcp_loopback(self, scheduler: Scheduler) -> None:
         """Python TCP server + client on 127.0.0.1 exchange PING/PONG."""
-        code = """\
-import asyncio
-
-async def main():
-    async def handle(reader, writer):
-        await reader.read(1024)
-        writer.write(b'PONG')
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-
-    server = await asyncio.start_server(handle, '127.0.0.1', 0)
-    port = server.sockets[0].getsockname()[1]
-
-    reader, writer = await asyncio.open_connection('127.0.0.1', port)
-    writer.write(b'PING')
-    await writer.drain()
-    resp = await reader.read(1024)
-    writer.close()
-    await writer.wait_closed()
-    server.close()
-    await server.wait_closed()
-    print(f"sent:PING recv:{resp.decode()}")
-
-asyncio.run(main())
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), _py_tcp_roundtrip_code(bind="127.0.0.1"))
         assert result.exit_code == 0
         assert result.stdout == "sent:PING recv:PONG\n"
 
     async def test_javascript_http_server_fetch(self, scheduler: Scheduler) -> None:
         """node:http createServer + fetch on 127.0.0.1: the case that fails when lo is down."""
-        code = """\
-const http = require('http');
-const server = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('HELLO_FROM_SERVER');
-});
-await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-const port = server.address().port;
-const res = await fetch('http://127.0.0.1:' + port);
-const body = await res.text();
-server.close();
-console.log('status:' + res.status + ' body:' + body);
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
+        result = await run_once(
+            scheduler, VmSpec(language=Language.JAVASCRIPT), _js_http_fetch_code(fetch_host="127.0.0.1")
+        )
         assert result.exit_code == 0
         assert result.stdout == "status:200 body:HELLO_FROM_SERVER\n"
 
@@ -172,11 +140,9 @@ class TestLoopbackEdgeCases:
 
     async def test_python_bind_0000_connect_localhost(self, scheduler: Scheduler) -> None:
         """Bind 0.0.0.0, connect via 127.0.0.1 — common server pattern."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.PYTHON), _py_tcp_server_code("WILDCARD_OK", bind="0.0.0.0")
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), _py_tcp_roundtrip_code(bind="0.0.0.0"))
         assert result.exit_code == 0
-        assert result.stdout == "WILDCARD_OK\n"
+        assert result.stdout == "sent:PING recv:PONG\n"
 
     async def test_python_localhost_dns_resolves(self, scheduler: Scheduler) -> None:
         """socket.getaddrinfo('localhost', ...) resolves to 127.0.0.1 only (AF_INET)."""
@@ -193,12 +159,10 @@ print('resolved:' + ','.join(addrs))
     async def test_javascript_localhost_string_resolves(self, scheduler: Scheduler) -> None:
         """fetch('http://localhost:...') works — validates /etc/hosts config."""
         result = await run_once(
-            scheduler,
-            VmSpec(language=Language.JAVASCRIPT),
-            _js_http_fetch_code("LOCALHOST_STR", fetch_host="localhost"),
+            scheduler, VmSpec(language=Language.JAVASCRIPT), _js_http_fetch_code(fetch_host="localhost")
         )
         assert result.exit_code == 0
-        assert result.stdout == "LOCALHOST_STR\n"
+        assert result.stdout == "status:200 body:HELLO_FROM_SERVER\n"
 
     async def test_python_sequential_bind_reuse(self, scheduler: Scheduler) -> None:
         """Bind, close, re-bind same port with SO_REUSEADDR — port reuse on loopback."""
@@ -256,38 +220,25 @@ print(f"udp:{data.decode()} from:{addr[0]}")
 import asyncio
 
 async def main():
-    async def handle_a(reader, writer):
-        writer.write(b'SERVER_A')
-        await writer.drain()
+    def replying(reply):
+        async def handle(reader, writer):
+            writer.write(reply)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        return handle
+
+    servers = [await asyncio.start_server(replying(reply), '127.0.0.1', 0) for reply in (b'SERVER_A', b'SERVER_B')]
+    replies = []
+    for server in servers:
+        reader, writer = await asyncio.open_connection('127.0.0.1', server.sockets[0].getsockname()[1])
+        replies.append((await reader.read(1024)).decode())
         writer.close()
         await writer.wait_closed()
-
-    async def handle_b(reader, writer):
-        writer.write(b'SERVER_B')
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-
-    srv1 = await asyncio.start_server(handle_a, '127.0.0.1', 0)
-    srv2 = await asyncio.start_server(handle_b, '127.0.0.1', 0)
-    port1 = srv1.sockets[0].getsockname()[1]
-    port2 = srv2.sockets[0].getsockname()[1]
-
-    r1, w1 = await asyncio.open_connection('127.0.0.1', port1)
-    resp1 = await r1.read(1024)
-    w1.close()
-    await w1.wait_closed()
-
-    r2, w2 = await asyncio.open_connection('127.0.0.1', port2)
-    resp2 = await r2.read(1024)
-    w2.close()
-    await w2.wait_closed()
-
-    srv1.close()
-    srv2.close()
-    await srv1.wait_closed()
-    await srv2.wait_closed()
-    print(f"{resp1.decode()},{resp2.decode()}")
+    for server in servers:
+        server.close()
+        await server.wait_closed()
+    print(','.join(replies))
 
 asyncio.run(main())
 """
@@ -342,7 +293,7 @@ class TestLoopbackOutOfBounds:
     """Privilege and resource constraints apply to loopback too."""
 
     async def test_python_privileged_port_rejected(self, scheduler: Scheduler) -> None:
-        """UID 1000 cannot bind to port 80 on loopback (PermissionError/OSError)."""
+        """UID 1000 cannot bind to port 80 on loopback: EACCES (no CAP_NET_BIND_SERVICE)."""
         code = """\
 import socket, errno
 try:
@@ -351,17 +302,14 @@ try:
     s.close()
     print("unexpected_success")
 except OSError as e:
-    if e.errno in (errno.EACCES, errno.EPERM):
-        print("blocked")
-    else:
-        print(f"unexpected_error:{e.errno}")
+    print(f"blocked:{errno.errorcode[e.errno]}")
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout == "blocked\n"
+        assert (result.exit_code, result.stdout) == (0, "blocked:EACCES\n"), result.stderr
 
     async def test_python_ephemeral_port_bind(self, scheduler: Scheduler) -> None:
-        """Python binds 127.0.0.1 port 0 and gets an OS-assigned unprivileged port."""
+        """Python binds 127.0.0.1 port 0 and gets a port of the kernel's ephemeral range
+        (net.ipv4.ip_local_port_range, default 32768-60999)."""
         code = """\
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -374,4 +322,4 @@ print(f"ephemeral:{port}")
         assert result.exit_code == 0
         port = re.fullmatch(r"ephemeral:(\d+)\n", result.stdout)
         assert port, result.stdout
-        assert int(port[1]) > 1024  # OS-assigned, from the unprivileged range
+        assert 32768 <= int(port[1]) <= 60999, result.stdout
