@@ -209,7 +209,7 @@ its current `session.exposed_ports[0].url` (3000 is the example above):
 qurl publish http://127.0.0.1:3000 --id sandbox-review-1 --name "Sandbox review" --allow-device-key '<reviewer-public-key>' -o json
 ```
 
-Use a fresh Connector ID. Check that `found_existing` is false and `private`
+Use a fresh local ID. Check that `found_existing` is false and `private`
 is true before continuing; a retry can reuse an existing resource and policy.
 Do not combine this device-key method with `--access` or the separate browser
 email/passkey approval workflow.
@@ -221,16 +221,15 @@ qurl get '<CRID>' --file -
 ```
 
 This prints the HTTP response body. Check that it is the expected app content.
-The reviewer can also use `qurl get '<CRID>'` from an interactive terminal to
-open an access link in a browser, but the browser interaction has not been
-validated with exec-sandbox.
+From an interactive terminal, `qurl get '<CRID>'` opens the access link in
+the reviewer's browser instead.
 
 To stop issuing new links to that device, run
 `qurl grants '<CRID>' --remove '<reviewer-public-key>'`. Already-issued links
 keep their own expiry. Delete the share with `qurl delete '<CRID>'` **before**
 closing or reusing the sandbox session: its host port can later belong to a
-different app. This manual workflow does not automate VM lifecycle cleanup or
-implement `ExposedPort.public_url`, wildcard hostnames, or unattended webhooks.
+different app. This is a manual workflow; it does not automate VM lifecycle
+cleanup or implement `ExposedPort.public_url`.
 
 ## Saved instances
 
