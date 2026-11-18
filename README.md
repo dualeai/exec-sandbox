@@ -186,6 +186,51 @@ async with await scheduler.new(spec) as session:
 - Port forwarding works without `allow_network`; all outbound TCP and UDP then stays blocked.
 - After `reuse()`, the ports open again: a fixed host port must be free on this host, and a dynamic one can change (read `exposed_ports` again).
 
+### Optional private access for a reviewer device
+
+[qURL](https://qurl.link/?utm_source=exec-sandbox-github&utm_medium=referral&utm_campaign=first-share-pilot)
+is a hosted option for a person or agent with the qURL CLI to fetch an HTTP app
+through its host-loopback port. Identity comes before connection: only approved
+devices can obtain access links, and the app needs no public inbound port.
+This uses LayerV's service, not a self-hosted exec-sandbox ingress provider.
+
+Install the [qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli)
+on both machines. On the reviewer's machine, get its public device key:
+
+```sh
+qurl whoami -o json
+```
+
+Send only `device_public_key_b64` to the publisher through a trusted channel.
+Keep the sandbox session and guest HTTP server running. On the host, publish
+its current `session.exposed_ports[0].url` (3000 is the example above):
+
+```sh
+qurl publish http://127.0.0.1:3000 --id sandbox-review-1 --name "Sandbox review" --allow-device-key '<reviewer-public-key>' -o json
+```
+
+Use a fresh local ID. Check that `found_existing` is false and `private`
+is true before continuing; a retry can reuse an existing resource and policy.
+Do not combine this device-key method with `--access` or the separate browser
+email/passkey approval workflow.
+
+Send the returned CRID to the reviewer. On their machine:
+
+```sh
+qurl get '<CRID>' --file -
+```
+
+This prints the HTTP response body. Check that it is the expected app content.
+From an interactive terminal, `qurl get '<CRID>'` opens the access link in
+the reviewer's browser instead.
+
+To stop issuing new links to that device, run
+`qurl grants '<CRID>' --remove '<reviewer-public-key>'`. Already-issued links
+keep their own expiry. Delete the share with `qurl delete '<CRID>'` **before**
+closing or reusing the sandbox session: its host port can later belong to a
+different app. This is a manual workflow; it does not automate VM lifecycle
+cleanup or implement `ExposedPort.public_url`.
+
 ## Saved instances
 
 `save()` writes the state of a VM (RAM, processes, files in `/home/user`), compressed and encrypted, to the instance store. `reuse()` continues it later, on any worker of the same host kind. Every worker needs QEMU 11.0 or later (else the `Scheduler` start fails with `ConfigError` `MIGRATION_UNSUPPORTED`) and a keyring: set `EXEC_SANDBOX_INSTANCE_KEYRING`, or pass `instance_keyring=` in code ([Keys](#keys)).
